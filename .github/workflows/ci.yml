@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: python -m pip install -e '.[dev]'
+
+      - name: Format
+        run: ruff format --check .
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Typecheck
+        run: mypy app
+
+      - name: Tests
+        run: pytest
+
+      - name: Repository safety policy
+        run: python scripts/check_repository.py
+
+      - name: Whitespace check
+        run: git diff --check
+
+      - name: Generate synthetic CI environment
+        shell: bash
+        run: |
+          SESSION_SECRET="$(python -m app.cli generate-session-secret)"
+          MASTER_KEY="$(python -m app.cli generate-master-key)"
+          ADMIN_HASH="$(python -c 'from app.core.security import hash_password; print(hash_password("ci-only-password"))')"
+          {
+            echo 'ENVIRONMENT=test'
+            echo 'PUBLIC_DOMAIN=localhost'
+            echo 'PUBLIC_RTMP_HOST=localhost'
+            echo 'RTMP_BIND_ADDRESS=127.0.0.1'
+            echo 'HTTP_BIND_ADDRESS=127.0.0.1'
+            echo 'ADMIN_LOGIN=ci-admin'
+            echo 'COOKIE_SECURE=false'
+            echo 'TRUSTED_PROXIES=127.0.0.1,::1'
+            printf 'SESSION_SECRET=%s\n' "$SESSION_SECRET"
+            printf 'MASTER_ENCRYPTION_KEY=%s\n' "$MASTER_KEY"
+            printf "ADMIN_PASSWORD_HASH='%s'\n" "$ADMIN_HASH"
+          } > .env.ci
+
+      - name: Compose configuration
+        run: docker compose -p adojapan-restream --env-file .env.ci -f compose.yml config --quiet
+
+      - name: Build images
+        run: docker compose -p adojapan-restream --env-file .env.ci -f compose.yml build
+
+      - name: Container health smoke
+        run: |
+          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml up -d --wait --wait-timeout 90
+          curl --fail --silent http://127.0.0.1:8088/health/live
+          curl --fail --silent http://127.0.0.1:8088/health/ready
+
+      - name: Synthetic RTMP ingest smoke
+        shell: bash
+        run: |
+          INGEST_KEY="$(docker compose -p adojapan-restream --env-file .env.ci -f compose.yml exec -T backend python -c 'from app.core.config import Settings; from app.core.security import decrypt_destination_key; from app.db import Database; s=Settings.from_env(); print(decrypt_destination_key(Database(s.database_path).get_ingest_encrypted(), s.master_encryption_key))')"
+          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml exec -T -e CI_INGEST_KEY="$INGEST_KEY" backend sh -ec '
+            ffmpeg -nostdin -hide_banner -loglevel error -re \
+              -f lavfi -i testsrc=size=320x180:rate=15 \
+              -f lavfi -i sine=frequency=440:sample_rate=44100 \
+              -t 12 -c:v libx264 -preset ultrafast -tune zerolatency \
+              -pix_fmt yuv420p -c:a aac -f flv \
+              "rtmp://mediamtx:1935/live/${CI_INGEST_KEY}" >/tmp/ci-ingest.log 2>&1 &
+            media_pid=$!
+            trap "kill -TERM ${media_pid} 2>/dev/null || true" EXIT
+            attempts=0
+            until curl --fail --silent "http://mediamtx:9997/v3/paths/get/live%2F${CI_INGEST_KEY}" >/dev/null; do
+              attempts=$((attempts + 1))
+              [ "$attempts" -lt 10 ] || { sed -n "1,40p" /tmp/ci-ingest.log; exit 1; }
+              sleep 1
+            done
+          '
+
+      - name: Safe diagnostic logs on failure
+        if: failure()
+        run: docker compose -p adojapan-restream --env-file .env.ci -f compose.yml logs --tail=100
+
+      - name: Stop CI project
+        if: always()
+        run: docker compose -p adojapan-restream --env-file .env.ci -f compose.yml down --remove-orphans

@@ -1,0 +1,33 @@
+# The authenticated path contains the ingest key. Info-level connection logs would expose it.
+logLevel: error
+logDestinations: [stdout]
+logStructured: true
+readTimeout: 10s
+writeTimeout: 10s
+writeQueueSize: 512
+
+authMethod: http
+authHTTPAddress: http://backend:8000/internal/mediamtx/auth
+authHTTPExclude:
+  - action: api
+  - action: metrics
+  - action: pprof
+
+api: true
+apiAddress: :9997
+apiAllowOrigins: []
+metrics: false
+pprof: false
+playback: false
+
+rtsp: false
+rtmp: true
+rtmpAddress: :1935
+rtmpEncryption: "no"
+hls: false
+webrtc: false
+srt: false
+moq: false
+
+paths:
+  all_others: {}

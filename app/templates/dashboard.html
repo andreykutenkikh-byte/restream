@@ -1,0 +1,530 @@
+{% extends "base.html" %}
+
+{% set ingest_data = ingest if ingest is defined else {} %}
+{% set destination_items = destinations if destinations is defined else [] %}
+{% set ingest_state = ingest_data.status|default('offline', true) %}
+
+{% block title %}Панель управления · AdoJapan Restream{% endblock %}
+{% block body_class %}dashboard-page{% endblock %}
+
+{% block header %}
+  <header class="site-header">
+    <div class="shell site-header__inner">
+      <a class="brand" href="/" aria-label="AdoJapan Restream — панель управления">
+        <span class="brand-mark" aria-hidden="true">
+          <span class="brand-mark__sun"></span>
+          <span class="brand-mark__wave"></span>
+        </span>
+        <span class="brand-copy">
+          <strong>AdoJapan</strong>
+          <span>Restream</span>
+        </span>
+      </a>
+
+      <div class="header-actions">
+        <div class="header-signal" data-header-signal aria-live="polite">
+          <span class="status-dot status-dot--neutral" data-header-signal-dot></span>
+          <span data-header-signal-label>
+            {% if ingest_state in ['live', 'online', 'streaming'] %}
+              Сигнал поступает
+            {% elif ingest_state in ['connecting', 'starting'] %}
+              Подключение
+            {% elif ingest_state == 'unstable' %}
+              Поток нестабилен
+            {% elif ingest_state == 'error' %}
+              Ошибка потока
+            {% else %}
+              Нет сигнала
+            {% endif %}
+          </span>
+        </div>
+
+        <span class="header-user">
+          {{ current_user.login if current_user is defined and current_user.login is defined else 'Администратор' }}
+        </span>
+
+        <form method="post" action="/api/auth/logout" data-logout-form>
+          <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
+          <button class="button button--quiet button--small" type="submit">
+            Выйти
+          </button>
+        </form>
+      </div>
+    </div>
+  </header>
+{% endblock %}
+
+{% block content %}
+  <div class="shell dashboard" data-dashboard>
+    <div class="page-heading">
+      <div>
+        <p class="eyebrow">Панель управления</p>
+        <h1>Управление трансляцией</h1>
+        <p class="page-heading__lead">
+          Подключите источник и выберите площадки, куда отправить эфир.
+        </p>
+      </div>
+      <button class="button button--primary" type="button" data-open-destination>
+        <span aria-hidden="true">＋</span>
+        Добавить площадку
+      </button>
+    </div>
+
+    <div class="dashboard-grid dashboard-grid--top">
+      <section class="panel connection-panel" aria-labelledby="obs-title">
+        <div class="panel__heading">
+          <div class="section-icon section-icon--obs" aria-hidden="true">OBS</div>
+          <div>
+            <p class="eyebrow">Источник</p>
+            <h2 id="obs-title">Подключение OBS</h2>
+          </div>
+        </div>
+
+        <p class="panel__intro">
+          Скопируйте эти данные в настройках трансляции OBS. Ключ никому не
+          передавайте.
+        </p>
+
+        <div class="connection-fields" data-ingest-connection>
+          <div class="connection-field">
+            <label for="rtmp-server-url">RTMP-сервер</label>
+            <div class="copy-field">
+              <input
+                id="rtmp-server-url"
+                class="mono-input"
+                type="text"
+                value="{{ ingest_data.rtmp_server_url|default('', true) }}"
+                placeholder="Загрузка…"
+                readonly
+                spellcheck="false"
+                data-ingest-url
+              >
+              <button
+                class="icon-button"
+                type="button"
+                data-copy-from="#rtmp-server-url"
+                aria-label="Скопировать адрес RTMP-сервера"
+                title="Скопировать"
+              >
+                <svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20">
+                  <path d="M8 8V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-3M5 8h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2Z"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="connection-field">
+            <label for="ingest-stream-key">Ключ трансляции</label>
+            <div class="copy-field copy-field--secret">
+              <input
+                id="ingest-stream-key"
+                class="mono-input"
+                type="password"
+                value="{{ ingest_data.stream_key|default('', true) }}"
+                placeholder="••••••••••••••••"
+                readonly
+                spellcheck="false"
+                autocomplete="off"
+                data-ingest-key
+              >
+              <button
+                class="text-icon-button"
+                type="button"
+                data-password-toggle="#ingest-stream-key"
+                aria-label="Показать ключ трансляции"
+                aria-pressed="false"
+              >
+                <span data-toggle-label>Показать</span>
+              </button>
+              <button
+                class="icon-button"
+                type="button"
+                data-copy-from="#ingest-stream-key"
+                aria-label="Скопировать ключ трансляции"
+                title="Скопировать"
+              >
+                <svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20">
+                  <path d="M8 8V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-3M5 8h9a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2Z"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="connection-actions">
+          <button class="button button--secondary button--small" type="button" data-open-rotate>
+            Сменить ключ
+          </button>
+          <span class="muted-copy">Старый ключ сразу перестанет работать</span>
+        </div>
+
+        <details class="setup-guide">
+          <summary>Как подключить OBS</summary>
+          <ol>
+            <li>Откройте <strong>Настройки → Вещание</strong> в OBS.</li>
+            <li>Выберите сервис «Настраиваемый».</li>
+            <li>Вставьте RTMP-сервер и ключ трансляции.</li>
+            <li>Нажмите «Запустить трансляцию» в OBS.</li>
+          </ol>
+        </details>
+      </section>
+
+      <section class="panel signal-panel" aria-labelledby="signal-title" data-signal-panel>
+        <div class="panel__heading panel__heading--split">
+          <div class="panel__heading-group">
+            <div class="signal-orbit" aria-hidden="true">
+              <span></span><span></span><span></span>
+            </div>
+            <div>
+              <p class="eyebrow">Входящий сигнал</p>
+              <h2 id="signal-title">Состояние эфира</h2>
+            </div>
+          </div>
+          <button
+            class="icon-button icon-button--plain"
+            type="button"
+            data-refresh-dashboard
+            aria-label="Обновить состояние"
+            title="Обновить"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20">
+              <path d="M20 6v5h-5M4 18v-5h5m10.2-2A8 8 0 0 0 5.6 7M4.8 14A8 8 0 0 0 18.4 17"/>
+            </svg>
+          </button>
+        </div>
+
+        <div class="signal-state" data-ingest-state data-state="{{ ingest_state }}">
+          <span class="status-dot status-dot--large status-dot--neutral" data-ingest-dot></span>
+          <div>
+            <strong data-ingest-label>
+              {% if ingest_state in ['live', 'online', 'streaming'] %}
+                Трансляция поступает
+              {% elif ingest_state in ['connecting', 'starting'] %}
+                Подключение
+              {% elif ingest_state == 'unstable' %}
+                Нестабильный поток
+              {% elif ingest_state == 'error' %}
+                Ошибка потока
+              {% else %}
+                Сигнал не поступает
+              {% endif %}
+            </strong>
+            <span data-ingest-description>Проверяем подключение источника…</span>
+          </div>
+        </div>
+
+        <dl class="signal-metadata" data-signal-metadata>
+          <div data-metadata-row="resolution" hidden>
+            <dt>Разрешение</dt>
+            <dd data-metadata="resolution">—</dd>
+          </div>
+          <div data-metadata-row="fps" hidden>
+            <dt>Частота кадров</dt>
+            <dd data-metadata="fps">—</dd>
+          </div>
+          <div data-metadata-row="codecs" hidden>
+            <dt>Формат</dt>
+            <dd data-metadata="codecs">—</dd>
+          </div>
+          <div data-metadata-row="bitrate" hidden>
+            <dt>Текущий битрейт</dt>
+            <dd data-metadata="bitrate">—</dd>
+          </div>
+          <div data-metadata-row="uptime" hidden>
+            <dt>В эфире</dt>
+            <dd data-metadata="uptime">—</dd>
+          </div>
+        </dl>
+
+        <div class="signal-placeholder" data-signal-placeholder>
+          <span aria-hidden="true">◌</span>
+          Параметры появятся, когда начнёт поступать сигнал.
+        </div>
+
+        <p class="updated-at" data-ingest-updated>Обновляем состояние…</p>
+      </section>
+    </div>
+
+    <section class="destinations-section" aria-labelledby="destinations-title">
+      <div class="section-heading">
+        <div>
+          <div class="heading-with-count">
+            <h2 id="destinations-title">Площадки</h2>
+            <span class="count-badge" data-destination-count>{{ destination_items|length }}</span>
+          </div>
+          <p>Выберите, куда передавать входящую трансляцию.</p>
+        </div>
+        <button class="button button--secondary section-add-button" type="button" data-open-destination>
+          <span aria-hidden="true">＋</span>
+          Добавить площадку
+        </button>
+      </div>
+
+      <div class="loading-state" data-destinations-loading hidden aria-live="polite">
+        <span class="spinner" aria-hidden="true"></span>
+        Загружаем площадки…
+      </div>
+
+      <div class="inline-alert" data-destinations-error role="alert" hidden>
+        <div>
+          <strong>Не удалось загрузить площадки</strong>
+          <span>Проверьте соединение и попробуйте ещё раз.</span>
+        </div>
+        <button class="button button--secondary button--small" type="button" data-retry-destinations>
+          Повторить
+        </button>
+      </div>
+
+      <div class="destination-list" id="destination-list" data-destination-list>
+        {% for destination in destination_items %}
+          {% set destination_state = destination.state|default('stopped', true) %}
+          <article
+            class="destination-card"
+            data-destination-id="{{ destination.id }}"
+            data-destination-name="{{ destination.name }}"
+            data-destination-url="{{ destination.server_url|default('', true) }}"
+            data-destination-enabled="{{ 'true' if destination.enabled|default(true) else 'false' }}"
+            data-destination-has-key="{{ 'true' if destination.has_stream_key|default(true) else 'false' }}"
+          >
+            <div class="destination-card__identity">
+              <span class="destination-avatar" aria-hidden="true">{{ destination.name[:1]|upper }}</span>
+              <div>
+                <h3>{{ destination.name }}</h3>
+                <p title="{{ destination.server_url|default('', true) }}">
+                  {{ destination.server_url|default('RTMP-адрес сохранён', true) }}
+                </p>
+              </div>
+            </div>
+
+            <div class="destination-card__status">
+              <span class="status-pill" data-state="{{ destination_state }}">
+                <span class="status-dot"></span>
+                {% if destination_state in ['running', 'live'] %}
+                  В эфире
+                {% elif destination_state in ['starting', 'connecting', 'reconnecting'] %}
+                  Подключение
+                {% elif destination_state == 'waiting_for_input' %}
+                  Ожидает сигнал
+                {% elif destination_state == 'stopping' %}
+                  Останавливается
+                {% elif destination_state in ['error', 'failed'] %}
+                  Ошибка
+                {% else %}
+                  Остановлено
+                {% endif %}
+              </span>
+              {% if destination.uptime_seconds is defined and destination.uptime_seconds %}
+                <span class="destination-stat">Работает {{ destination.uptime_seconds }} сек.</span>
+              {% endif %}
+              {% if destination.last_error is defined and destination.last_error %}
+                <span class="destination-hint">Требуется внимание</span>
+              {% endif %}
+            </div>
+
+            <div class="destination-card__toggle">
+              <label class="switch">
+                <input
+                  type="checkbox"
+                  data-destination-toggle
+                  aria-label="Включить площадку {{ destination.name }}"
+                  {% if destination.enabled|default(true) %}checked{% endif %}
+                >
+                <span class="switch__track" aria-hidden="true"><span></span></span>
+                <span class="switch__label">Активна</span>
+              </label>
+            </div>
+
+            <div class="destination-card__actions">
+              {% if destination_state in ['running', 'live', 'starting', 'connecting', 'reconnecting', 'waiting_for_input'] %}
+                <form method="post" action="/api/destinations/{{ destination.id }}/stop" data-destination-action="stop">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
+                  <button class="button button--danger-soft button--small" type="submit">Остановить</button>
+                </form>
+              {% else %}
+                <form method="post" action="/api/destinations/{{ destination.id }}/start" data-destination-action="start">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
+                  <button class="button button--primary button--small" type="submit">
+                    Запустить
+                  </button>
+                </form>
+              {% endif %}
+              <button class="button button--quiet button--small" type="button" data-edit-destination>
+                Изменить
+              </button>
+              <button
+                class="icon-button icon-button--plain icon-button--danger"
+                type="button"
+                data-open-delete
+                aria-label="Удалить площадку {{ destination.name }}"
+                title="Удалить"
+              >
+                <svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20">
+                  <path d="M4 7h16M9 7V4h6v3m3 0-1 14H7L6 7m4 4v6m4-6v6"/>
+                </svg>
+              </button>
+            </div>
+          </article>
+        {% endfor %}
+      </div>
+
+      <div class="empty-state" data-destinations-empty {% if destination_items %}hidden{% endif %}>
+        <div class="empty-state__art" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </div>
+        <h3>Площадок пока нет</h3>
+        <p>Добавьте YouTube, VK или любой другой RTMP/RTMPS-сервис.</p>
+        <button class="button button--primary" type="button" data-open-destination>
+          Добавить первую площадку
+        </button>
+      </div>
+
+      <noscript>
+        <p class="inline-alert inline-alert--notice">
+          Для управления площадками включите JavaScript. Состояния трансляции
+          доступны в разметке страницы.
+        </p>
+      </noscript>
+    </section>
+  </div>
+
+  <dialog class="modal" id="destination-dialog" data-destination-dialog aria-labelledby="destination-dialog-title">
+    <form method="post" action="/api/destinations" data-destination-form>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
+      <input type="hidden" name="destination_id" value="">
+
+      <div class="modal__header">
+        <div>
+          <p class="eyebrow">Направление эфира</p>
+          <h2 id="destination-dialog-title" data-destination-form-title>Новая площадка</h2>
+        </div>
+        <button class="modal__close" type="button" data-close-dialog aria-label="Закрыть">
+          <svg aria-hidden="true" viewBox="0 0 24 24" width="22" height="22">
+            <path d="m6 6 12 12M18 6 6 18"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="modal__body">
+        <div class="form-alert" role="alert" data-destination-form-error hidden></div>
+
+        <div class="field">
+          <label for="destination-name">Название</label>
+          <input
+            id="destination-name"
+            name="name"
+            type="text"
+            placeholder="Например, YouTube"
+            maxlength="80"
+            autocomplete="off"
+            required
+          >
+        </div>
+
+        <div class="field">
+          <label for="destination-url">RTMP/RTMPS-адрес</label>
+          <input
+            id="destination-url"
+            name="server_url"
+            type="url"
+            inputmode="url"
+            placeholder="rtmps://example.com/live"
+            pattern="rtmps?://.+"
+            maxlength="1024"
+            autocapitalize="none"
+            spellcheck="false"
+            required
+          >
+          <p class="field__help">Адрес сервера из настроек трансляции площадки.</p>
+        </div>
+
+        <div class="field">
+          <label for="destination-key">Ключ трансляции</label>
+          <div class="password-field">
+            <input
+              id="destination-key"
+              name="stream_key"
+              type="password"
+              placeholder="Вставьте ключ площадки"
+              minlength="8"
+              maxlength="1024"
+              autocomplete="new-password"
+              spellcheck="false"
+              required
+            >
+            <button
+              class="password-toggle"
+              type="button"
+              data-password-toggle="#destination-key"
+              aria-label="Показать ключ площадки"
+              aria-pressed="false"
+            >
+              <span data-toggle-label>Показать</span>
+            </button>
+          </div>
+          <p class="field__help" data-key-help>
+            Ключ будет зашифрован и больше не отобразится целиком.
+          </p>
+        </div>
+
+        <label class="check-row">
+          <input type="checkbox" name="enabled" checked>
+          <span>
+            <strong data-enabled-title>Запустить после сохранения</strong>
+            <small data-enabled-help>Площадка начнёт ожидать входящий сигнал.</small>
+          </span>
+        </label>
+      </div>
+
+      <div class="modal__footer">
+        <button class="button button--quiet" type="button" data-close-dialog>Отмена</button>
+        <button class="button button--primary" type="submit">
+          <span class="button__label" data-destination-submit-label>Добавить</span>
+          <span class="button__loader" aria-hidden="true"></span>
+        </button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="modal modal--confirm" id="rotate-key-dialog" data-rotate-dialog aria-labelledby="rotate-title">
+    <form method="post" action="/api/ingest/rotate" data-rotate-form>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
+      <div class="confirm-icon confirm-icon--warning" aria-hidden="true">!</div>
+      <h2 id="rotate-title">Сменить ключ трансляции?</h2>
+      <p>
+        Старый ключ сразу перестанет работать. Если эфир уже идёт, соединение с
+        OBS прервётся — новый ключ потребуется вставить вручную.
+      </p>
+      <div class="modal__footer modal__footer--centered">
+        <button class="button button--quiet" type="button" data-close-dialog>Отмена</button>
+        <button class="button button--danger" type="submit">
+          <span class="button__label">Сменить ключ</span>
+          <span class="button__loader" aria-hidden="true"></span>
+        </button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="modal modal--confirm" id="delete-destination-dialog" data-delete-dialog aria-labelledby="delete-title">
+    <form method="post" action="/api/destinations" data-delete-form>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
+      <input type="hidden" name="destination_id" value="">
+      <div class="confirm-icon confirm-icon--danger" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="24" height="24">
+          <path d="M4 7h16M9 7V4h6v3m3 0-1 14H7L6 7m4 4v6m4-6v6"/>
+        </svg>
+      </div>
+      <h2 id="delete-title">Удалить площадку?</h2>
+      <p>
+        Площадка <strong data-delete-name></strong> будет остановлена и удалена.
+        Это действие нельзя отменить.
+      </p>
+      <div class="modal__footer modal__footer--centered">
+        <button class="button button--quiet" type="button" data-close-dialog>Отмена</button>
+        <button class="button button--danger" type="submit">
+          <span class="button__label">Удалить</span>
+          <span class="button__loader" aria-hidden="true"></span>
+        </button>
+      </div>
+    </form>
+  </dialog>
+{% endblock %}
