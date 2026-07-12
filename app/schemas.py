@@ -22,7 +22,8 @@ class MediaMTXAuthRequest(StrictModel):
     action: str = Field(max_length=32)
     path: str = Field(default="", max_length=1024)
     protocol: str = Field(default="", max_length=32)
-    id: str = Field(default="", max_length=256)
+    # MediaMTX serializes a missing protocol connection ID as JSON null.
+    id: str | None = Field(default=None, max_length=256)
     query: str = Field(default="", max_length=2048)
     userAgent: str = Field(default="", max_length=1024)  # noqa: N815
 

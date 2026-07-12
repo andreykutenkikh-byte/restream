@@ -1,7 +1,7 @@
 import logging
 import sys
 
-from app.logging_config import RedactingFormatter
+from app.logging_config import RedactingFormatter, configure_logging
 
 
 def test_formatter_redacts_exception_text() -> None:
@@ -21,3 +21,10 @@ def test_formatter_redacts_exception_text() -> None:
     rendered = formatter.format(record)
     assert "do-not-log-this" not in rendered
     assert "[REDACTED]" in rendered
+
+
+def test_http_transport_access_logs_are_never_verbose() -> None:
+    configure_logging("DEBUG")
+
+    assert logging.getLogger("httpx").getEffectiveLevel() == logging.WARNING
+    assert logging.getLogger("httpcore").getEffectiveLevel() == logging.WARNING

@@ -89,7 +89,10 @@ jobs:
             attempts=0
             until curl --fail --silent "http://mediamtx:9997/v3/paths/get/live%2F${CI_INGEST_KEY}" >/dev/null; do
               attempts=$((attempts + 1))
-              [ "$attempts" -lt 10 ] || { sed -n "1,40p" /tmp/ci-ingest.log; exit 1; }
+              [ "$attempts" -lt 20 ] || {
+                sed -n "1,40p" /tmp/ci-ingest.log | sed "s/${CI_INGEST_KEY}/[REDACTED]/g"
+                exit 1
+              }
               sleep 1
             done
           '

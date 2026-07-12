@@ -87,11 +87,25 @@ def test_full_administrative_smoke_flow(settings: Settings, admin_password: str)
         assert ingest.json()["rtmp_server_url"] == "rtmp://testserver/live"
 
         auth_payload = {
+            "user": "",
+            "password": "",
+            "token": "",
+            "ip": "172.18.0.1",
             "action": "publish",
-            "protocol": "rtmp",
             "path": f"live/{initial_key}",
+            "protocol": "rtmp",
+            "id": None,
+            "query": "",
+            "userAgent": "FMLE/3.0 (compatible; Lavf)",
         }
-        assert client.post("/internal/mediamtx/auth", json=auth_payload).status_code == 204
+        assert (
+            client.post(
+                "/internal/mediamtx/auth",
+                json=auth_payload,
+                headers={"Host": "backend:8000"},
+            ).status_code
+            == 204
+        )
         assert (
             client.post(
                 "/internal/mediamtx/auth",

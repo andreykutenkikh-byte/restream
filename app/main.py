@@ -75,7 +75,12 @@ def create_app(
     app.state.destination_lock = asyncio.Lock()
     app.state.templates = Jinja2Templates(directory=PACKAGE_DIR / "templates")
 
-    allowed_hosts = sorted({settings.public_domain, "localhost", "127.0.0.1", "testserver"})
+    # MediaMTX reaches the private auth callback through the Compose service
+    # DNS name. Keep that single internal host explicit so TrustedHost remains
+    # effective for every public request.
+    allowed_hosts = sorted(
+        {settings.public_domain, "backend", "localhost", "127.0.0.1", "testserver"}
+    )
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
     app.mount("/static", StaticFiles(directory=PACKAGE_DIR / "static"), name="static")
     app.include_router(router)

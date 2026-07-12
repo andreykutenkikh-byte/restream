@@ -57,3 +57,12 @@ def test_mediamtx_control_api_stays_internal_and_auth_is_delegated() -> None:
     assert config["hls"] is False
     assert config["webrtc"] is False
     assert config["srt"] is False
+
+
+def test_docker_build_context_excludes_generated_environment_files() -> None:
+    root = Path(__file__).resolve().parents[2]
+    patterns = (root / ".dockerignore").read_text(encoding="utf-8").splitlines()
+
+    assert ".env" in patterns
+    assert ".env.*" in patterns
+    assert "!.env.example" in patterns

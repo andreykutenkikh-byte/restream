@@ -30,3 +30,8 @@ def configure_logging(level: str) -> None:
     root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(level)
+
+    # httpx logs complete request URLs at INFO. MediaMTX control paths include
+    # the ingest key, so transport access logs must never inherit INFO/DEBUG.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
