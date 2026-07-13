@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+
+{% block title %}Вход · AdoJapan Restream{% endblock %}
+{% block body_class %}login-page{% endblock %}
+
+{% block content %}
+  <div class="login-layout">
+    <section class="login-intro" aria-labelledby="login-brand-title">
+      <a class="brand brand--large" href="/" aria-label="AdoJapan Restream">
+        <span class="brand-mark" aria-hidden="true">
+          <span class="brand-mark__sun"></span>
+          <span class="brand-mark__wave"></span>
+        </span>
+        <span class="brand-copy">
+          <strong id="login-brand-title">AdoJapan</strong>
+          <span>Restream</span>
+        </span>
+      </a>
+
+      <div class="login-intro__copy">
+        <p class="eyebrow">Единая точка вещания</p>
+        <h1>Одна трансляция.<br>Все ваши площадки.</h1>
+        <p>
+          Подключите OBS один раз и управляйте отправкой эфира на нужные
+          платформы из понятной панели.
+        </p>
+      </div>
+
+      <div class="login-signal" aria-hidden="true">
+        <span></span><span></span><span></span><span></span><span></span>
+      </div>
+    </section>
+
+    <section class="login-panel" aria-labelledby="login-title">
+      <div class="login-card">
+        <div class="login-card__heading">
+          <p class="eyebrow">Панель управления</p>
+          <h2 id="login-title">Добро пожаловать</h2>
+          <p>Войдите с учётными данными администратора.</p>
+        </div>
+
+        {% if error is defined and error %}
+          <div class="form-alert" role="alert" data-login-error>
+            {{ error }}
+          </div>
+        {% else %}
+          <div class="form-alert" role="alert" data-login-error hidden></div>
+        {% endif %}
+
+        <form class="auth-form" method="post" action="/api/auth/login" data-login-form>
+          <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
+
+          <div class="field">
+            <label for="login">Логин</label>
+            <input
+              id="login"
+              name="login"
+              type="text"
+              autocomplete="username"
+              autocapitalize="none"
+              spellcheck="false"
+              maxlength="128"
+              required
+              autofocus
+            >
+          </div>
+
+          <div class="field">
+            <label for="password">Пароль</label>
+            <div class="password-field">
+              <input
+                id="password"
+                name="password"
+                type="password"
+                autocomplete="current-password"
+                maxlength="1024"
+                required
+              >
+              <button
+                class="password-toggle"
+                type="button"
+                data-password-toggle="#password"
+                aria-label="Показать пароль"
+                aria-pressed="false"
+              >
+                <span data-toggle-label>Показать</span>
+              </button>
+            </div>
+          </div>
+
+          <button class="button button--primary button--wide" type="submit">
+            <span class="button__label">Войти</span>
+            <span class="button__loader" aria-hidden="true"></span>
+          </button>
+        </form>
+
+        <p class="login-note">
+          Регистрация закрыта. Доступ выдаётся администратором сервиса.
+        </p>
+      </div>
+
+      <p class="login-footer">restream.adojapan.ru</p>
+    </section>
+  </div>
+{% endblock %}

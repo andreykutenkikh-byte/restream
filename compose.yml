@@ -1,0 +1,111 @@
+name: adojapan-restream
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:-localhost}
+      PUBLIC_RTMP_HOST: ${PUBLIC_RTMP_HOST:-localhost}
+      PUBLIC_RTMP_PORT: ${PUBLIC_RTMP_PORT:-1935}
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET is required}
+      WORKER_AUTH_PASSWORD: ${WORKER_AUTH_PASSWORD:?WORKER_AUTH_PASSWORD is required}
+      MASTER_ENCRYPTION_KEY: ${MASTER_ENCRYPTION_KEY:?MASTER_ENCRYPTION_KEY is required}
+      ADMIN_LOGIN: ${ADMIN_LOGIN:?ADMIN_LOGIN is required}
+      ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?ADMIN_PASSWORD_HASH is required}
+      SQLITE_PATH: /srv/app/data/restream.db
+      MEDIAMTX_API_URL: http://mediamtx:9997
+      MEDIAMTX_INTERNAL_RTMP_URL: rtmp://mediamtx:1935
+      MAX_DESTINATIONS: ${MAX_DESTINATIONS:-2}
+      RECONNECT_INITIAL_SECONDS: ${RECONNECT_INITIAL_SECONDS:-2}
+      RECONNECT_MAX_SECONDS: ${RECONNECT_MAX_SECONDS:-30}
+      RECONNECT_STABLE_SECONDS: ${RECONNECT_STABLE_SECONDS:-30}
+      RECONNECT_MAX_FAST_FAILURES: ${RECONNECT_MAX_FAST_FAILURES:-6}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-127.0.0.1,::1}
+      FORWARDED_ALLOW_IPS: ${TRUSTED_PROXIES:-127.0.0.1,::1}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-43200}
+      WORKER_AUTH_USER: ${WORKER_AUTH_USER:-adojapan-worker}
+    ports:
+      - "${HTTP_BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-8088}:8000/tcp"
+    volumes:
+      - database:/srv/app/data
+      - logs:/srv/app/logs
+      - backups:/srv/app/backups
+    networks:
+      - internal
+      - egress
+    depends_on:
+      mediamtx:
+        condition: service_healthy
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cpus: "0.45"
+    mem_limit: 512m
+    pids_limit: 96
+    stop_grace_period: 20s
+    restart: on-failure:5
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8000/health/live"]
+      interval: 15s
+      timeout: 4s
+      retries: 4
+      start_period: 15s
+    logging: &rotated-logs
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  mediamtx:
+    image: bluenviron/mediamtx:1.19.2
+    command: ["/mediamtx.yml"]
+    ports:
+      - "${RTMP_BIND_ADDRESS:-127.0.0.1}:${PUBLIC_RTMP_PORT:-1935}:1935/tcp"
+    volumes:
+      - ./mediamtx/mediamtx.yml:/mediamtx.yml:ro
+    networks:
+      - internal
+      - ingest
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cpus: "0.25"
+    mem_limit: 256m
+    pids_limit: 64
+    stop_grace_period: 10s
+    restart: on-failure:5
+    healthcheck:
+      test: ["CMD", "/mediamtx", "--version"]
+      interval: 15s
+      timeout: 4s
+      retries: 4
+      start_period: 5s
+    logging: *rotated-logs
+
+networks:
+  internal:
+    driver: bridge
+    internal: true
+  egress:
+    driver: bridge
+  ingest:
+    driver: bridge
+
+volumes:
+  database:
+  logs:
+  backups:

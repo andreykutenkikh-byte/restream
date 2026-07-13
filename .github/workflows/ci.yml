@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned dependency manager
+        run: python -m pip install "uv==0.11.28"
+
+      - name: Dependency lock synchronization
+        run: uv lock --check
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Generate synthetic CI environment
+        shell: bash
+        run: |
+          SESSION_SECRET="$(uv run --locked python -m app.cli generate-session-secret)"
+          WORKER_AUTH_PASSWORD="$(uv run --locked python -m app.cli generate-worker-auth-password)"
+          MASTER_KEY="$(uv run --locked python -m app.cli generate-master-key)"
+          ADMIN_HASH="$(uv run --locked python -c 'from app.core.security import hash_password; print(hash_password("ci-only-password"))')"
+          {
+            echo 'ENVIRONMENT=test'
+            echo 'PUBLIC_DOMAIN=localhost'
+            echo 'PUBLIC_RTMP_HOST=localhost'
+            echo 'RTMP_BIND_ADDRESS=127.0.0.1'
+            echo 'HTTP_BIND_ADDRESS=127.0.0.1'
+            echo 'ADMIN_LOGIN=ci-admin'
+            echo 'COOKIE_SECURE=false'
+            echo 'TRUSTED_PROXIES=127.0.0.1,::1'
+            printf 'SESSION_SECRET=%s\n' "$SESSION_SECRET"
+            printf 'WORKER_AUTH_PASSWORD=%s\n' "$WORKER_AUTH_PASSWORD"
+            printf 'MASTER_ENCRYPTION_KEY=%s\n' "$MASTER_KEY"
+            printf "ADMIN_PASSWORD_HASH='%s'\n" "$ADMIN_HASH"
+          } > .env.ci
+
+      - name: Format
+        run: uv run --locked ruff format --check .
+
+      - name: Lint
+        run: uv run --locked ruff check .
+
+      - name: Typecheck
+        run: uv run --locked mypy app scripts/ci_output_smoke.py
+
+      - name: Tests
+        run: uv run --locked pytest
+
+      - name: Repository safety policy
+        run: uv run --locked python scripts/check_repository.py
+
+      - name: JavaScript syntax
+        run: node --check app/static/app.js
+
+      - name: Whitespace check
+        run: git diff --check
+
+      - name: Compose configurations
+        run: |
+          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml config --quiet
+          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.ci.yml config --quiet
+
+      - name: Build images
+        run: docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.ci.yml build
+
+      - name: Container health smoke
+        run: |
+          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.ci.yml up -d --wait --wait-timeout 90
+          curl --fail --silent http://127.0.0.1:8088/health/live
+          curl --fail --silent http://127.0.0.1:8088/health/ready
+
+      - name: Real RTMP output end-to-end smoke
+        run: uv run --locked python scripts/ci_output_smoke.py
+
+      - name: Safe diagnostic logs on failure
+        if: failure()
+        run: |
+          if [ -f .env.ci ]; then
+            docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.ci.yml logs --tail=100 || true
+          fi
+
+      - name: Stop CI project
+        if: always()
+        run: |
+          if [ -f .env.ci ]; then
+            set +e
+            docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.ci.yml down --remove-orphans --volumes
+            cleanup_status=$?
+            rm -f .env.ci
+            exit "$cleanup_status"
+          fi

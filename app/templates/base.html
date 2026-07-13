@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="theme-color" content="#f7f5f1">
+    <meta name="csrf-token" content="{{ csrf_token|default('', true) }}">
+    <meta name="api-base" content="/api">
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+    <title>{% block title %}AdoJapan Restream{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='styles.css') if url_for is defined else '/static/styles.css' }}">
+    {% block head %}{% endblock %}
+  </head>
+  <body class="{% block body_class %}{% endblock %}">
+    <a class="skip-link" href="#main-content">Перейти к содержимому</a>
+
+    {% block header %}{% endblock %}
+
+    <main id="main-content" tabindex="-1">
+      {% block content %}{% endblock %}
+    </main>
+
+    <div
+      class="toast-region"
+      data-toast-region
+      aria-label="Уведомления"
+      aria-live="polite"
+      aria-relevant="additions"
+    ></div>
+
+    <script src="{{ url_for('static', path='app.js') if url_for is defined else '/static/app.js' }}" defer></script>
+    {% block scripts %}{% endblock %}
+  </body>
+</html>
