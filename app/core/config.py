@@ -72,6 +72,7 @@ class Settings:
     admin_password_hash: str
     database_path: Path
     mediamtx_api_url: str
+    mediamtx_hls_url: str
     mediamtx_internal_rtmp_url: str
     max_destinations: int
     reconnect_initial_seconds: float
@@ -123,11 +124,24 @@ class Settings:
             raise ConfigurationError("ADMIN_PASSWORD_HASH must be an Argon2id hash")
 
         mediamtx_api_url = os.getenv("MEDIAMTX_API_URL", "http://mediamtx:9997").rstrip("/")
+        mediamtx_hls_url = os.getenv("MEDIAMTX_HLS_URL", "http://mediamtx:8888").rstrip("/")
         mediamtx_internal_rtmp_url = os.getenv(
             "MEDIAMTX_INTERNAL_RTMP_URL", "rtmp://mediamtx:1935"
         ).rstrip("/")
         if urlparse(mediamtx_api_url).scheme not in {"http", "https"}:
             raise ConfigurationError("MEDIAMTX_API_URL must be an HTTP(S) URL")
+        parsed_hls_url = urlparse(mediamtx_hls_url)
+        if (
+            parsed_hls_url.scheme not in {"http", "https"}
+            or not parsed_hls_url.hostname
+            or parsed_hls_url.username is not None
+            or parsed_hls_url.password is not None
+            or parsed_hls_url.params
+            or parsed_hls_url.query
+            or parsed_hls_url.fragment
+            or parsed_hls_url.path not in {"", "/"}
+        ):
+            raise ConfigurationError("MEDIAMTX_HLS_URL must be an HTTP(S) origin")
         if urlparse(mediamtx_internal_rtmp_url).scheme != "rtmp":
             raise ConfigurationError("MEDIAMTX_INTERNAL_RTMP_URL must be an RTMP URL")
 
@@ -163,6 +177,7 @@ class Settings:
             admin_password_hash=admin_password_hash,
             database_path=Path(os.getenv("SQLITE_PATH", "./data/restream.db")),
             mediamtx_api_url=mediamtx_api_url,
+            mediamtx_hls_url=mediamtx_hls_url,
             mediamtx_internal_rtmp_url=mediamtx_internal_rtmp_url,
             max_destinations=_integer("MAX_DESTINATIONS", 2, minimum=1, maximum=10),
             reconnect_initial_seconds=_float(

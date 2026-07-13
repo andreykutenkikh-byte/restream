@@ -124,7 +124,7 @@ class ApplicationRuntime:
             return protocol == "rtmp" and hmac.compare_digest(path, expected_path)
         if action == "read":
             return (
-                protocol == "rtmp"
+                protocol in {"rtmp", "hls"}
                 and hmac.compare_digest(path, expected_path)
                 and hmac.compare_digest(user, self.settings.worker_auth_user)
                 and hmac.compare_digest(password, self.settings.worker_auth_password)

@@ -6,6 +6,10 @@
 
 {% block title %}Панель управления · AdoJapan Restream{% endblock %}
 {% block body_class %}dashboard-page{% endblock %}
+{% block head %}
+  <script src="/static/vendor/hls.min.js" defer></script>
+  <script src="/static/preview-player.js" defer></script>
+{% endblock %}
 
 {% block header %}
   <header class="site-header">
@@ -213,7 +217,45 @@
           </div>
         </div>
 
-        <dl class="signal-metadata" data-signal-metadata>
+        <div
+          class="signal-preview"
+          data-signal-preview
+          data-preview-state="{{ 'loading' if ingest_state in ['live', 'online', 'streaming', 'unstable'] else 'offline' }}"
+        >
+          <video
+            data-ingest-video
+            autoplay
+            muted
+            playsinline
+            controls
+            preload="metadata"
+            aria-label="Предпросмотр входящего эфира"
+          ></video>
+
+          <span class="signal-preview__live" aria-hidden="true">
+            <span></span>
+            LIVE
+          </span>
+
+          <div class="signal-preview__message signal-preview__message--offline" role="status">
+            <span>Предпросмотр появится после запуска трансляции в OBS</span>
+          </div>
+
+          <div class="signal-preview__message signal-preview__message--loading" role="status">
+            <span class="spinner" aria-hidden="true"></span>
+            <span>Подготавливаем предпросмотр…</span>
+          </div>
+
+          <div class="signal-preview__message signal-preview__message--error" role="status">
+            <strong>Не удалось открыть предпросмотр</strong>
+            <span>Входящий поток продолжает приниматься.</span>
+            <button class="button button--secondary button--small" type="button" data-preview-retry>
+              Повторить
+            </button>
+          </div>
+        </div>
+
+        <dl class="signal-metadata" data-signal-metadata hidden>
           <div data-metadata-row="resolution" hidden>
             <dt>Разрешение</dt>
             <dd data-metadata="resolution">—</dd>
@@ -235,11 +277,6 @@
             <dd data-metadata="uptime">—</dd>
           </div>
         </dl>
-
-        <div class="signal-placeholder" data-signal-placeholder>
-          <span aria-hidden="true">◌</span>
-          Параметры появятся, когда начнёт поступать сигнал.
-        </div>
 
         <p class="updated-at" data-ingest-updated>Обновляем состояние…</p>
       </section>

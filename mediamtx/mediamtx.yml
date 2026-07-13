@@ -24,7 +24,8 @@ rtsp: false
 rtmp: true
 rtmpAddress: :1935
 rtmpEncryption: "no"
-hls: false
+hls: true
+hlsAddress: :8888
 webrtc: false
 srt: false
 moq: false

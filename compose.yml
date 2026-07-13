@@ -17,6 +17,7 @@ services:
       ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?ADMIN_PASSWORD_HASH is required}
       SQLITE_PATH: /srv/app/data/restream.db
       MEDIAMTX_API_URL: http://mediamtx:9997
+      MEDIAMTX_HLS_URL: http://mediamtx:8888
       MEDIAMTX_INTERNAL_RTMP_URL: rtmp://mediamtx:1935
       MAX_DESTINATIONS: ${MAX_DESTINATIONS:-2}
       RECONNECT_INITIAL_SECONDS: ${RECONNECT_INITIAL_SECONDS:-2}

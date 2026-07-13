@@ -73,6 +73,31 @@ def test_public_rtmp_url_includes_alternative_port(monkeypatch: pytest.MonkeyPat
     assert settings.public_rtmp_url == "rtmp://restream.example.test:1936/live"
 
 
+def test_mediamtx_hls_url_defaults_to_internal_origin(monkeypatch: pytest.MonkeyPatch) -> None:
+    valid_environment(monkeypatch)
+
+    assert Settings.from_env().mediamtx_hls_url == "http://mediamtx:8888"
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "file:///tmp/hls",
+        "http://worker:secret@mediamtx:8888",
+        "http://mediamtx:8888/live/key",
+        "http://mediamtx:8888?upstream=http://example.test",
+    ),
+)
+def test_mediamtx_hls_url_rejects_non_origin_values(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    valid_environment(monkeypatch)
+    monkeypatch.setenv("MEDIAMTX_HLS_URL", value)
+
+    with pytest.raises(ConfigurationError, match="MEDIAMTX_HLS_URL"):
+        Settings.from_env()
+
+
 def test_production_secure_cookie_default(monkeypatch: pytest.MonkeyPatch) -> None:
     valid_environment(monkeypatch)
     monkeypatch.setenv("ENVIRONMENT", "production")
