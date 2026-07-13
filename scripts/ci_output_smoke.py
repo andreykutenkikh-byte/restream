@@ -333,12 +333,34 @@ def main() -> int:
             lambda: client.request("GET", "/api/ingest/status"),
             lambda item: item.get("state") == "live",
         )
-        live = wait_for(
-            "destination state live",
-            lambda: destination(client, created_id),
-            lambda item: bool(item and item.get("state") == "live"),
-            timeout=50,
-        )
+        try:
+            live = wait_for(
+                "destination state live",
+                lambda: destination(client, created_id),
+                lambda item: bool(item and item.get("state") == "live"),
+                timeout=50,
+            )
+        except SmokeFailure:
+            current = destination(client, created_id) or {}
+            sink = receiver_path()
+            processes = process_snapshot()
+            state = str(current.get("state", "unknown"))
+            if state not in {
+                "stopped",
+                "waiting_for_input",
+                "connecting",
+                "live",
+                "reconnecting",
+                "failed",
+            }:
+                state = "unknown"
+            raise SmokeFailure(
+                "destination did not confirm live media "
+                f"(state={state}, restarts={int(current.get('restart_count', 0) or 0)}, "
+                f"receiver_ready={bool(sink and sink.get('ready'))}, "
+                f"receiver_bytes={receiver_bytes(sink)}, "
+                f"ffmpeg_processes={len(processes.get('ffmpeg', ()))})"
+            ) from None
         if live.get("state") != "live":
             raise SmokeFailure("destination never reported confirmed media progress")
 
