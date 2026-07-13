@@ -195,6 +195,7 @@ exec ffmpeg -nostdin -hide_banner -loglevel error -re \\
   -f lavfi -i testsrc=size=320x180:rate=15 \\
   -f lavfi -i sine=frequency=440:sample_rate=44100 \\
   -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p \\
+  -g 30 -keyint_min 30 -sc_threshold 0 \\
   -c:a aac -f flv \\
   "rtmp://mediamtx:1935/live/${{CI_INGEST_KEY}}" \\
   >/tmp/ci-e2e-publisher.log 2>&1
