@@ -281,7 +281,6 @@
   };
 
   const destinationStateCopy = {
-    running: { label: "В эфире", tone: "success" },
     live: { label: "В эфире", tone: "success" },
     starting: { label: "Подключение", tone: "warning" },
     connecting: { label: "Подключение", tone: "warning" },

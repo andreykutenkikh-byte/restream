@@ -13,22 +13,28 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
-          cache: pip
 
-      - name: Install
-        run: python -m pip install -e '.[dev]'
+      - name: Install pinned dependency manager
+        run: python -m pip install "uv==0.11.28"
+
+      - name: Dependency lock synchronization
+        run: uv lock --check
+
+      - name: Install locked dependencies
+        run: uv sync --locked
 
       - name: Generate synthetic CI environment
         shell: bash
         run: |
-          SESSION_SECRET="$(python -m app.cli generate-session-secret)"
-          MASTER_KEY="$(python -m app.cli generate-master-key)"
-          ADMIN_HASH="$(python -c 'from app.core.security import hash_password; print(hash_password("ci-only-password"))')"
+          SESSION_SECRET="$(uv run --locked python -m app.cli generate-session-secret)"
+          WORKER_AUTH_PASSWORD="$(uv run --locked python -m app.cli generate-worker-auth-password)"
+          MASTER_KEY="$(uv run --locked python -m app.cli generate-master-key)"
+          ADMIN_HASH="$(uv run --locked python -c 'from app.core.security import hash_password; print(hash_password("ci-only-password"))')"
           {
             echo 'ENVIRONMENT=test'
             echo 'PUBLIC_DOMAIN=localhost'
@@ -39,74 +45,63 @@ jobs:
             echo 'COOKIE_SECURE=false'
             echo 'TRUSTED_PROXIES=127.0.0.1,::1'
             printf 'SESSION_SECRET=%s\n' "$SESSION_SECRET"
+            printf 'WORKER_AUTH_PASSWORD=%s\n' "$WORKER_AUTH_PASSWORD"
             printf 'MASTER_ENCRYPTION_KEY=%s\n' "$MASTER_KEY"
             printf "ADMIN_PASSWORD_HASH='%s'\n" "$ADMIN_HASH"
           } > .env.ci
 
       - name: Format
-        run: ruff format --check .
+        run: uv run --locked ruff format --check .
 
       - name: Lint
-        run: ruff check .
+        run: uv run --locked ruff check .
 
       - name: Typecheck
-        run: mypy app
+        run: uv run --locked mypy app scripts/ci_output_smoke.py
 
       - name: Tests
-        run: pytest
+        run: uv run --locked pytest
 
       - name: Repository safety policy
-        run: python scripts/check_repository.py
+        run: uv run --locked python scripts/check_repository.py
+
+      - name: JavaScript syntax
+        run: node --check app/static/app.js
 
       - name: Whitespace check
         run: git diff --check
 
-      - name: Compose configuration
-        run: docker compose -p adojapan-restream --env-file .env.ci -f compose.yml config --quiet
+      - name: Compose configurations
+        run: |
+          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml config --quiet
+          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.ci.yml config --quiet
 
       - name: Build images
-        run: docker compose -p adojapan-restream --env-file .env.ci -f compose.yml build
+        run: docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.ci.yml build
 
       - name: Container health smoke
         run: |
-          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml up -d --wait --wait-timeout 90
+          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.ci.yml up -d --wait --wait-timeout 90
           curl --fail --silent http://127.0.0.1:8088/health/live
           curl --fail --silent http://127.0.0.1:8088/health/ready
 
-      - name: Synthetic RTMP ingest smoke
-        shell: bash
-        run: |
-          INGEST_KEY="$(docker compose -p adojapan-restream --env-file .env.ci -f compose.yml exec -T backend python -c 'from app.core.config import Settings; from app.core.security import decrypt_destination_key; from app.db import Database; s=Settings.from_env(); print(decrypt_destination_key(Database(s.database_path).get_ingest_encrypted(), s.master_encryption_key))')"
-          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml exec -T -e CI_INGEST_KEY="$INGEST_KEY" backend sh -ec '
-            ffmpeg -nostdin -hide_banner -loglevel error -re \
-              -f lavfi -i testsrc=size=320x180:rate=15 \
-              -f lavfi -i sine=frequency=440:sample_rate=44100 \
-              -t 12 -c:v libx264 -preset ultrafast -tune zerolatency \
-              -pix_fmt yuv420p -c:a aac -f flv \
-              "rtmp://mediamtx:1935/live/${CI_INGEST_KEY}" >/tmp/ci-ingest.log 2>&1 &
-            media_pid=$!
-            trap "kill -TERM ${media_pid} 2>/dev/null || true" EXIT
-            attempts=0
-            until curl --fail --silent "http://mediamtx:9997/v3/paths/get/live%2F${CI_INGEST_KEY}" >/dev/null; do
-              attempts=$((attempts + 1))
-              [ "$attempts" -lt 20 ] || {
-                sed -n "1,40p" /tmp/ci-ingest.log | sed "s/${CI_INGEST_KEY}/[REDACTED]/g"
-                exit 1
-              }
-              sleep 1
-            done
-          '
+      - name: Real RTMP output end-to-end smoke
+        run: uv run --locked python scripts/ci_output_smoke.py
 
       - name: Safe diagnostic logs on failure
         if: failure()
         run: |
           if [ -f .env.ci ]; then
-            docker compose -p adojapan-restream --env-file .env.ci -f compose.yml logs --tail=100 || true
+            docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.ci.yml logs --tail=100 || true
           fi
 
       - name: Stop CI project
         if: always()
         run: |
           if [ -f .env.ci ]; then
-            docker compose -p adojapan-restream --env-file .env.ci -f compose.yml down --remove-orphans || true
+            set +e
+            docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.ci.yml down --remove-orphans --volumes
+            cleanup_status=$?
+            rm -f .env.ci
+            exit "$cleanup_status"
           fi

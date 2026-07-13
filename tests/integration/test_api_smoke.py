@@ -121,6 +121,20 @@ def test_full_administrative_smoke_flow(settings: Settings, admin_password: str)
             ).status_code
             == 401
         )
+        reader_payload = {
+            **auth_payload,
+            "action": "read",
+            "user": settings.worker_auth_user,
+            "password": "wrong-worker-password",
+        }
+        assert client.post("/internal/mediamtx/auth", json=reader_payload).status_code == 401
+        assert (
+            client.post(
+                "/internal/mediamtx/auth",
+                json={**reader_payload, "password": settings.worker_auth_password},
+            ).status_code
+            == 204
+        )
 
         destination_secret = "test-destination-secret"
         create_payload = {
@@ -143,6 +157,8 @@ def test_full_administrative_smoke_flow(settings: Settings, admin_password: str)
         listed = client.get("/api/destinations")
         assert listed.status_code == 200
         assert destination_secret not in json.dumps(listed.json())
+        assert settings.worker_auth_password not in json.dumps(listed.json())
+        assert settings.worker_auth_password not in client.get("/").text
 
         started = client.post(
             f"/api/destinations/{destination_id}/start",

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools==80.9.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -18,7 +18,7 @@ dependencies = [
   "uvicorn[standard]>=0.34,<1",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
   "mypy>=1.15,<2",
   "pytest>=8.3,<9",
@@ -26,6 +26,9 @@ dev = [
   "PyYAML>=6,<7",
   "ruff>=0.9,<1",
 ]
+
+[tool.uv]
+required-version = "==0.11.28"
 
 [tool.setuptools.packages.find]
 include = ["app*", "scripts*"]

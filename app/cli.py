@@ -23,12 +23,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="AdoJapan Restream initialization helpers")
     parser.add_argument(
         "command",
-        choices=("generate-master-key", "generate-session-secret", "hash-password"),
+        choices=(
+            "generate-master-key",
+            "generate-session-secret",
+            "generate-worker-auth-password",
+            "hash-password",
+        ),
     )
     args = parser.parse_args()
     if args.command == "generate-master-key":
         print(generate_master_key())
-    elif args.command == "generate-session-secret":
+    elif args.command in {"generate-session-secret", "generate-worker-auth-password"}:
         print(secrets.token_urlsafe(48))
     else:
         print(_hash_password_interactively())

@@ -1,0 +1,35 @@
+# Test-only RTMP sink. This file is loaded only by compose.ci.yml.
+logLevel: error
+logDestinations: [stdout]
+logStructured: true
+readTimeout: 10s
+writeTimeout: 10s
+
+authMethod: internal
+authInternalUsers:
+  - user: any
+    permissions:
+      - action: publish
+        path: ci-output/ci-e2e
+      - action: read
+        path: ci-output/ci-e2e
+      - action: api
+
+api: true
+apiAddress: :9997
+apiAllowOrigins: []
+metrics: false
+pprof: false
+playback: false
+
+rtsp: false
+rtmp: true
+rtmpAddress: :1935
+rtmpEncryption: "no"
+hls: false
+webrtc: false
+srt: false
+moq: false
+
+paths:
+  all_others: {}

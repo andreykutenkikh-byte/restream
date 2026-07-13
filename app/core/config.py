@@ -85,6 +85,8 @@ class Settings:
     ffmpeg_binary: str
     ffprobe_binary: str
     worker_auth_user: str
+    worker_auth_password: str
+    test_destination_allowlist: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -95,6 +97,24 @@ class Settings:
         session_secret = _required("SESSION_SECRET")
         if len(session_secret) < 32:
             raise ConfigurationError("SESSION_SECRET must contain at least 32 characters")
+
+        worker_auth_password = _required("WORKER_AUTH_PASSWORD")
+        if len(worker_auth_password) < 32:
+            raise ConfigurationError("WORKER_AUTH_PASSWORD must contain at least 32 characters")
+        if environment == "production" and worker_auth_password == session_secret:
+            raise ConfigurationError(
+                "WORKER_AUTH_PASSWORD must be independent from SESSION_SECRET in production"
+            )
+
+        test_destination_allowlist = tuple(
+            item.strip()
+            for item in os.getenv("TEST_DESTINATION_ALLOWLIST", "").split(",")
+            if item.strip()
+        )
+        if test_destination_allowlist and environment != "test":
+            raise ConfigurationError(
+                "TEST_DESTINATION_ALLOWLIST is permitted only when ENVIRONMENT=test"
+            )
 
         master_encryption_key = _required("MASTER_ENCRYPTION_KEY")
         admin_login = _required("ADMIN_LOGIN")
@@ -159,15 +179,11 @@ class Settings:
             ffmpeg_binary=os.getenv("FFMPEG_BINARY", "ffmpeg").strip(),
             ffprobe_binary=os.getenv("FFPROBE_BINARY", "ffprobe").strip(),
             worker_auth_user=os.getenv("WORKER_AUTH_USER", "adojapan-worker").strip(),
+            worker_auth_password=worker_auth_password,
+            test_destination_allowlist=test_destination_allowlist,
         )
 
     @property
     def public_rtmp_url(self) -> str:
         port = "" if self.public_rtmp_port == 1935 else f":{self.public_rtmp_port}"
         return f"rtmp://{self.public_rtmp_host}{port}/live"
-
-    @property
-    def worker_auth_password(self) -> str:
-        """Use the session secret as an internal-only MediaMTX reader credential."""
-
-        return self.session_secret

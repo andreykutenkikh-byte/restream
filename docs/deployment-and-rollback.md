@@ -7,7 +7,8 @@ plan for a separately approved change window.
 
 1. Complete `docs/production-audit.md` and record a go decision.
 2. Install the repository under `/opt/adojapan-restream` with a production `.env` owned by the
-   deployment account and excluded from Git.
+   deployment account and excluded from Git. Generate and store independent values for
+   `SESSION_SECRET` and `WORKER_AUTH_PASSWORD`; production startup rejects reuse between them.
 3. Back up the project SQLite database and the one reverse-proxy site file to be changed.
 4. Validate configuration with the explicit project name.
 5. Build and start only this project:

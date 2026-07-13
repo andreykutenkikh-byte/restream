@@ -299,7 +299,7 @@
             <div class="destination-card__status">
               <span class="status-pill" data-state="{{ destination_state }}">
                 <span class="status-dot"></span>
-                {% if destination_state in ['running', 'live'] %}
+                {% if destination_state == 'live' %}
                   В эфире
                 {% elif destination_state in ['starting', 'connecting', 'reconnecting'] %}
                   Подключение
@@ -335,7 +335,7 @@
             </div>
 
             <div class="destination-card__actions">
-              {% if destination_state in ['running', 'live', 'starting', 'connecting', 'reconnecting', 'waiting_for_input'] %}
+              {% if destination_state in ['live', 'starting', 'connecting', 'reconnecting', 'waiting_for_input'] %}
                 <form method="post" action="/api/destinations/{{ destination.id }}/stop" data-destination-action="stop">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
                   <button class="button button--danger-soft button--small" type="submit">Остановить</button>

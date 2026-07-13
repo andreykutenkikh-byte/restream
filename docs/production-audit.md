@@ -47,7 +47,8 @@ validate the new site configuration, and use a safe reload. Then verify:
 2. This project's liveness and readiness endpoints are healthy.
 3. HTTPS, login, logout, session flags, and CSRF behavior work.
 4. A short synthetic RTMP ingest is accepted with a temporary test key.
-5. One temporary local RTMP/RTMPS output receives the stream.
+5. One approved synthetic RTMP/RTMPS receiver with a public destination address receives the
+   stream. Never enable the CI-only local destination allowlist in production.
 6. CPU, RAM, process counts, and OOM history stay within the approved envelope.
 7. Stopping this project does not affect any existing service.
 
@@ -78,7 +79,8 @@ Record an owner and evidence for every item before proceeding:
 18. Verify HTTPS and the dedicated host routing.
 19. Verify login, CSRF protection, logout, and cookie flags.
 20. Run a short synthetic RTMP ingest test.
-21. Run one short synthetic RTMP/RTMPS output test without a real platform key.
+21. Run one short synthetic RTMP/RTMPS output test against an approved public-address receiver
+    without a real platform key; do not set `TEST_DESTINATION_ALLOWLIST` in production.
 22. Capture CPU and RAM during the media test.
 23. Confirm no OOM event occurred.
 24. Stop only this project and confirm other services remain healthy.

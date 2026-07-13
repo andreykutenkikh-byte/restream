@@ -10,6 +10,7 @@ from app.core.validation import (
     URLValidationError,
     check_codec_compatibility,
     check_stream_compatibility,
+    destination_validator,
     ensure_stream_compatible,
     is_public_address,
     parse_destination_url,
@@ -181,6 +182,52 @@ def test_one_private_dns_answer_rejects_the_entire_hostname() -> None:
             "stream.example.com",
             resolver=lambda _: (PUBLIC_V4, "10.0.0.5"),
         )
+
+
+def test_exact_private_destination_allowlist_is_test_only() -> None:
+    server_url = "rtmp://ci-rtmp-receiver:1935/ci-output"
+    validator = destination_validator(
+        environment="test",
+        test_allowlist=(server_url,),
+        resolver=lambda _: ("172.30.0.4",),
+    )
+
+    result = validator(server_url)
+
+    assert result.value == server_url
+    assert result.resolved_addresses == (ipaddress.ip_address("172.30.0.4"),)
+    with pytest.raises(URLValidationError):
+        validator("rtmp://ci-rtmp-receiver:1935/other")
+
+
+def test_test_destination_allowlist_is_impossible_in_production() -> None:
+    server_url = "rtmp://ci-rtmp-receiver:1935/ci-output"
+
+    with pytest.raises(URLValidationError, match="ENVIRONMENT=test"):
+        destination_validator(environment="production", test_allowlist=(server_url,))
+
+    production_validator = destination_validator(environment="production")
+    with pytest.raises(URLValidationError):
+        production_validator(server_url)
+
+
+@pytest.mark.parametrize(
+    "server_url",
+    (
+        "http://ci-rtmp-receiver:1935/ci-output",
+        "rtmp://user:password@ci-rtmp-receiver:1935/ci-output",
+        "rtmp://ci-rtmp-receiver:1935/ci-output?token=value",
+    ),
+)
+def test_even_allowlisted_test_destinations_reject_unsafe_syntax(server_url: str) -> None:
+    validator = destination_validator(
+        environment="test",
+        test_allowlist=(server_url,),
+        resolver=lambda _: ("172.30.0.4",),
+    )
+
+    with pytest.raises(URLValidationError):
+        validator(server_url)
 
 
 def test_empty_and_failed_dns_answers_are_rejected() -> None:

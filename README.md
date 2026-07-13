@@ -8,6 +8,13 @@ toolchain.
 Production domain: `restream.adojapan.ru`. Stage 1 prepares deployment assets but does not
 change production.
 
+## Branch and release workflow
+
+`main` is the stable release branch. Changes are developed on feature branches, validated by a
+draft pull request, reviewed, and merged only after approval. CI runs for every pull request and
+again for pushes to `main`. A merge does not authorize production deployment: the audit and
+production gate below remain a separate explicit change.
+
 ## Architecture
 
 ```text
@@ -56,26 +63,27 @@ services to satisfy these values.
    cp .env.example .env
    ```
 
-2. Create a local Python environment and install the project helpers:
+2. Install the pinned `uv` version and synchronize the locked production dependencies:
 
    ```bash
-   python3 -m venv .venv
-   . .venv/bin/activate
-   python -m pip install -e .
+   python3 -m pip install 'uv==0.11.28'
+   uv sync --locked --no-dev
    ```
 
 3. Generate each value once. Keep the output out of shell history, chat, issue trackers, and
    Git:
 
    ```bash
-   python -m app.cli generate-session-secret
-   python -m app.cli generate-master-key
-   python -m app.cli hash-password
+   uv run --locked --no-dev python -m app.cli generate-session-secret
+   uv run --locked --no-dev python -m app.cli generate-worker-auth-password
+   uv run --locked --no-dev python -m app.cli generate-master-key
+   uv run --locked --no-dev python -m app.cli hash-password
    ```
 
-4. Put the outputs into `.env`. Keep the Argon2id hash single-quoted so its dollar signs remain
-   literal. For local HTTP, leave `COOKIE_SECURE=false`. Production requires HTTPS and
-   `COOKIE_SECURE=true`.
+4. Put the outputs into `.env`. `SESSION_SECRET` and `WORKER_AUTH_PASSWORD` protect independent
+   trust domains and must be different random values. Keep the Argon2id hash single-quoted so
+   its dollar signs remain literal. For local HTTP, leave `COOKIE_SECURE=false`. Production
+   requires HTTPS and `COOKIE_SECURE=true`.
 
 5. Validate and start only this project:
 
@@ -108,16 +116,18 @@ docker compose -p adojapan-restream -f compose.yml stop
 `.env.example` documents every supported variable:
 
 - environment, public web domain, public RTMP host/port, and local bind addresses;
-- required session secret, Fernet master key, admin login, and Argon2id password hash;
+- required, independent session and MediaMTX worker secrets, Fernet master key, admin login,
+  and Argon2id password hash;
 - project SQLite path and internal MediaMTX API/RTMP URLs;
 - destination limit and bounded reconnect timings;
 - log level, trusted proxy addresses, session lifetime, and secure-cookie mode.
 
 There are no fallback values for cryptographic secrets or admin credentials. Startup fails with
-a clear configuration error when they are missing or malformed. Never replace the master key
-without an explicit key-rotation/migration procedure: existing destination secrets would become
-unreadable. `TRUSTED_PROXIES` accepts explicit IP/CIDR entries only; determine the production
-Docker bridge source during the audit and never use a trust-all wildcard.
+a clear configuration error when they are missing or malformed. `WORKER_AUTH_PASSWORD` must be
+at least 32 characters; production also rejects it when it equals `SESSION_SECRET`. Never replace
+the master key without an explicit key-rotation/migration procedure: existing destination secrets
+would become unreadable. `TRUSTED_PROXIES` accepts explicit IP/CIDR entries only; determine the
+production Docker bridge source during the audit and never use a trust-all wildcard.
 
 ## Login and sessions
 
@@ -143,14 +153,19 @@ Destination states:
 
 - `stopped`;
 - `waiting_for_input` (enabled, but no incoming signal);
-- `connecting`;
-- `live`;
+- `connecting` (FFmpeg is running, but outgoing media has not yet been confirmed);
+- `live` only after machine-readable FFmpeg progress proves positive outgoing media time or
+  sustained output-byte growth;
 - `reconnecting` with bounded exponential delay;
 - `failed` after incompatible media or too many quick failures.
 
 Starting a destination while ingest is offline does not launch FFmpeg. The supervisor waits with
 negligible CPU use and starts automatically when H.264 video with optional AAC audio appears.
 When input disappears, the owned process receives graceful termination and returns to waiting.
+FFmpeg start and progress are each bounded by a 15-second timeout. A process that merely stays
+alive, opens a TCP socket, or stops reporting outgoing progress never becomes or remains `live`;
+it enters the existing reconnect/backoff path. Process start time and confirmed transmission start
+time are tracked separately, and fast-failure counters reset only after confirmed stable transfer.
 
 ## Destination safety
 
@@ -165,6 +180,11 @@ argument array with shell execution disabled. Central redaction removes credenti
 query parameters, bearer values, and known stream keys from the bounded diagnostic tail.
 MediaMTX stays at error-only logging because its authenticated path contains the ingest key;
 ordinary publish/read connection lines are therefore never written to Docker logs.
+
+Private and loopback destinations remain rejected in every production path. The CI-only
+`TEST_DESTINATION_ALLOWLIST` is an exact URL match accepted only with `ENVIRONMENT=test`; setting
+it in development or production fails startup. The receiver exists only in `compose.ci.yml` and
+is absent from the production Compose definition.
 
 ## Isolation and resources
 
@@ -218,17 +238,29 @@ all volumes.
 
 ## Tests and repository checks
 
-Install development dependencies, then run:
+Install development dependencies from the committed lock, verify that it still matches
+`pyproject.toml`, then run the checks through the locked environment:
 
 ```bash
-python -m pip install -e '.[dev]'
-ruff format --check .
-ruff check .
-mypy app
-pytest
-python scripts/check_repository.py
+python -m pip install 'uv==0.11.28'
+uv sync --locked
+uv lock --check
+uv run --locked ruff format --check .
+uv run --locked ruff check .
+uv run --locked mypy app scripts/ci_output_smoke.py
+uv run --locked pytest
+uv run --locked python scripts/check_repository.py
+node --check app/static/app.js
 git diff --check
 ```
+
+`uv.lock` pins the complete production and development dependency graph. Change direct
+dependencies only in `pyproject.toml`, regenerate the lock with `uv lock`, and commit both files.
+CI rejects a stale lock before running the rest of the checks. Docker installs its production
+subset from this same lock with `uv sync --locked --no-dev --no-editable`.
+The Python and MediaMTX base images use exact version tags. Digest pinning is intentionally
+deferred until the production audit records the target architecture and the reviewed security
+update procedure; changing a digest will then be an explicit dependency update.
 
 Validate the container definition with populated non-production test values:
 
@@ -244,6 +276,14 @@ Tests cover cryptography, password verification, URL/SSRF rules, private and loo
 log redaction, codec compatibility, stream-key rotation, session/CSRF enforcement, destination
 limits, MediaMTX status mapping, worker transitions/backoff/termination, and the complete API
 smoke flow. Tests never call a real streaming platform or use real keys.
+
+GitHub Actions additionally loads `compose.ci.yml` and runs a real output smoke through the public
+API: login and CSRF, destination creation/start, synthetic H.264/AAC ingest, the application's
+actual stream-copy FFmpeg worker, and an isolated MediaMTX receiver. The receiver API must report
+growing inbound bytes, `ffprobe` must count H.264 video and AAC audio packets, and the application
+must report confirmed `live`. CI then stops the destination, requires the receiver path to vanish,
+checks that no worker or child FFmpeg remains, deletes the destination, and always tears down the
+test Compose project. Synthetic credentials are never printed.
 
 ## Reverse proxy and production gate
 
@@ -262,8 +302,9 @@ deployment stops if CPU, RAM, swap, disk, or port headroom is insufficient.
 ## Troubleshooting
 
 **The backend exits immediately.** Read only the short error and check that all required secret
-variables exist, the password hash is Argon2id, and the Fernet key was generated by the helper.
-Do not paste `.env` into logs or support requests.
+variables exist, `SESSION_SECRET` and `WORKER_AUTH_PASSWORD` are independent, the password hash
+is Argon2id, and the Fernet key was generated by the helper. Do not paste `.env` into logs or
+support requests.
 
 **OBS cannot publish.** Confirm OBS uses the displayed server and separate current key. Rotation
 invalidates the old path immediately. Check that the configured public RTMP port matches the safe

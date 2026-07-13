@@ -65,6 +65,19 @@ def test_redact_text_masks_known_secret_assignments_bearer_and_embedded_url() ->
     assert "example.com/live" in redacted
 
 
+def test_worker_auth_password_is_redacted_from_configuration_and_rtmp_urls() -> None:
+    worker_secret = "worker-auth-secret-that-must-never-be-logged"
+    redacted = redact_text(
+        "WORKER_AUTH_PASSWORD=" + worker_secret + " "
+        "rtmp://mediamtx/live/input?user=worker&pass=" + worker_secret,
+        secrets=(worker_secret,),
+    )
+
+    assert worker_secret not in redacted
+    assert "[REDACTED]" in redacted
+    assert "mediamtx/live/input" in redacted
+
+
 def test_redact_text_masks_quoted_structured_values() -> None:
     redacted = redact_text('{"password": "secret", "event": "login"}')
 

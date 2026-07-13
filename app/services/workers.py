@@ -149,7 +149,8 @@ class WorkerRuntimeConfig:
     ffmpeg_executable: str = "ffmpeg"
     input_poll_seconds: float = 1.0
     process_poll_seconds: float = 0.5
-    live_after_seconds: float = 1.0
+    start_timeout_seconds: float = 15.0
+    progress_timeout_seconds: float = 15.0
     terminate_grace_seconds: float = 5.0
     stop_timeout_seconds: float = 8.0
     ingest_error_tolerance: int = 2
@@ -162,13 +163,13 @@ class WorkerRuntimeConfig:
         for name in (
             "input_poll_seconds",
             "process_poll_seconds",
+            "start_timeout_seconds",
+            "progress_timeout_seconds",
             "terminate_grace_seconds",
             "stop_timeout_seconds",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
-        if self.live_after_seconds < 0:
-            raise ValueError("live_after_seconds must not be negative")
         if self.ingest_error_tolerance < 0:
             raise ValueError("ingest_error_tolerance must not be negative")
         if self.diagnostic_lines < 1 or self.diagnostic_line_chars < 32:
@@ -187,6 +188,8 @@ class ProcessHandle(Protocol):
     def terminate(self) -> None: ...
 
     def kill(self) -> None: ...
+
+    def iter_progress(self) -> AsyncIterator[str]: ...
 
     def iter_stderr(self) -> AsyncIterator[str]: ...
 
@@ -240,6 +243,36 @@ class AsyncioProcessHandle:
             with suppress(ProcessLookupError):
                 self._process.kill()
 
+    async def iter_progress(self) -> AsyncIterator[str]:
+        """Drain machine-readable progress without retaining unbounded stdout."""
+
+        stdout = self._process.stdout
+        if stdout is None:
+            return
+
+        # FFmpeg's progress protocol consists of very small ``key=value``
+        # records. Reading bounded chunks keeps the pipe flowing even if a
+        # malformed producer omits newlines. Oversized records are discarded,
+        # never accumulated or exposed as diagnostics.
+        buffer = bytearray()
+        discarding = False
+        while True:
+            chunk = await stdout.read(4096)
+            if not chunk:
+                break
+            for byte in chunk:
+                if byte == 10:  # ``\n``
+                    if not discarding and buffer:
+                        yield buffer.decode("ascii", errors="ignore").rstrip("\r")
+                    buffer.clear()
+                    discarding = False
+                elif not discarding:
+                    if len(buffer) < 1024:
+                        buffer.append(byte)
+                    else:
+                        buffer.clear()
+                        discarding = True
+
     async def iter_stderr(self) -> AsyncIterator[str]:
         stderr = self._process.stderr
         if stderr is None:
@@ -261,7 +294,7 @@ class AsyncioProcessLauncher:
         process = await asyncio.create_subprocess_exec(
             *tuple(argv),
             stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=use_process_group,
         )
@@ -277,8 +310,11 @@ def build_ffmpeg_argv(
         ffmpeg_executable,
         "-hide_banner",
         "-nostdin",
+        "-nostats",
         "-loglevel",
         "warning",
+        "-progress",
+        "pipe:1",
         "-i",
         spec.input_url,
         "-map",
@@ -460,6 +496,76 @@ def check_stream_compatibility(ingest: IngestSnapshot) -> tuple[bool, str | None
     if ingest.audio_codec and ingest.audio_codec != "aac":
         return False, "Incoming audio must use AAC or be absent for stream copy"
     return True, None
+
+
+_OUT_TIME_RE = re.compile(
+    r"(?P<hours>\d{1,6}):(?P<minutes>[0-5]\d):(?P<seconds>[0-5]\d)"
+    r"(?:\.(?P<fraction>\d{1,6}))?"
+)
+
+
+@dataclass(slots=True)
+class _ProgressEvidence:
+    """Bounded aggregate of FFmpeg progress; raw stdout is never retained."""
+
+    max_out_time_us: int = 0
+    max_total_size: int | None = None
+    confirmed_at: float | None = None
+    last_growth_at: float | None = None
+
+    @staticmethod
+    def _bounded_nonnegative_int(value: str) -> int | None:
+        if not value or len(value) > 20 or not value.isascii() or not value.isdecimal():
+            return None
+        parsed = int(value)
+        return parsed if parsed >= 0 else None
+
+    @staticmethod
+    def _out_time_us(value: str) -> int | None:
+        if len(value) > 24:
+            return None
+        match = _OUT_TIME_RE.fullmatch(value)
+        if match is None:
+            return None
+        fraction = (match.group("fraction") or "").ljust(6, "0")
+        seconds = (
+            int(match.group("hours")) * 3600
+            + int(match.group("minutes")) * 60
+            + int(match.group("seconds"))
+        )
+        return seconds * 1_000_000 + int(fraction or "0")
+
+    def observe(self, line: str, observed_at: float) -> None:
+        """Consume one bounded ``key=value`` record from ``-progress``."""
+
+        if not line or len(line) > 1024 or "=" not in line:
+            return
+        key, value = line.split("=", 1)
+        grew = False
+
+        if key in {"out_time_us", "out_time_ms"}:
+            parsed = self._bounded_nonnegative_int(value)
+            if parsed is not None and parsed > self.max_out_time_us:
+                self.max_out_time_us = parsed
+                grew = parsed > 0
+        elif key == "out_time":
+            parsed = self._out_time_us(value)
+            if parsed is not None and parsed > self.max_out_time_us:
+                self.max_out_time_us = parsed
+                grew = parsed > 0
+        elif key in {"total_size", "bytes"}:
+            parsed = self._bounded_nonnegative_int(value)
+            previous = self.max_total_size
+            if parsed is not None and (previous is None or parsed > previous):
+                self.max_total_size = parsed
+                # A lone non-zero size is not sufficient: unlike a positive
+                # media timestamp, byte count must demonstrate actual growth.
+                grew = previous is not None and parsed > previous
+
+        if grew:
+            if self.confirmed_at is None:
+                self.confirmed_at = observed_at
+            self.last_growth_at = observed_at
 
 
 @dataclass(slots=True)
@@ -705,7 +811,24 @@ class WorkerManager:
         except Exception:
             slot.diagnostics.append("FFmpeg diagnostic stream ended unexpectedly")
 
-    async def _finish_diagnostics(self, task: asyncio.Task[None]) -> None:
+    async def _drain_progress(
+        self,
+        process: ProcessHandle,
+        evidence: _ProgressEvidence,
+    ) -> None:
+        """Continuously drain stdout and retain only aggregate progress values."""
+
+        try:
+            async for line in process.iter_progress():
+                evidence.observe(line, self._monotonic())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A broken progress stream cannot prove readiness. The bounded
+            # start/progress timeout will terminate the process and reconnect.
+            return
+
+    async def _finish_reader(self, task: asyncio.Task[None]) -> None:
         try:
             await asyncio.wait_for(
                 asyncio.shield(task),
@@ -746,25 +869,76 @@ class WorkerManager:
         process: ProcessHandle,
         exit_task: asyncio.Task[int],
         process_started: float,
+        progress: _ProgressEvidence,
     ) -> tuple[str, int | None, float]:
         ingest_errors = 0
+        transmission_started: float | None = None
+        stable_failure_count_cleared = False
         while True:
             if slot.stop_event.is_set() or not slot.desired_running:
                 stopped = await self._terminate_process(process, exit_task)
                 return ("stopped" if stopped else "stop_failed", None, 0.0)
 
             code = await self._wait_for_exit(exit_task, self._runtime.process_poll_seconds)
-            runtime = max(0.0, self._monotonic() - process_started)
+            now = self._monotonic()
+            runtime = max(0.0, now - process_started)
             if code is not None or exit_task.done():
                 if code is None:
                     code = exit_task.result()
-                return "exited", code, runtime
+                confirmed_runtime = (
+                    max(0.0, now - progress.confirmed_at)
+                    if progress.confirmed_at is not None
+                    else 0.0
+                )
+                return "exited", code, confirmed_runtime
 
-            if runtime >= self._runtime.live_after_seconds and slot.state in {
+            if progress.confirmed_at is not None and transmission_started is None:
+                transmission_started = progress.confirmed_at
+                slot.live_since = self._utcnow()
+                await self._transition(slot, WorkerState.LIVE)
+
+            transmission_runtime = (
+                max(0.0, now - transmission_started) if transmission_started is not None else 0.0
+            )
+            if (
+                transmission_started is not None
+                and not stable_failure_count_cleared
+                and transmission_runtime >= self._reconnect.stable_after_seconds
+            ):
+                stable_failure_count_cleared = True
+                if slot.consecutive_failures:
+                    slot.consecutive_failures = 0
+                    await self._emit_status(slot)
+
+            if transmission_started is None and runtime >= self._runtime.start_timeout_seconds:
+                slot.last_error = "FFmpeg did not report outgoing media before the start timeout"
+                stopped = await self._terminate_process(process, exit_task)
+                return (
+                    "start_timeout" if stopped else "stop_failed",
+                    None,
+                    0.0,
+                )
+
+            last_growth = progress.last_growth_at
+            if (
+                transmission_started is not None
+                and last_growth is not None
+                and now - last_growth >= self._runtime.progress_timeout_seconds
+            ):
+                slot.last_error = "FFmpeg outgoing media progress stopped"
+                stopped = await self._terminate_process(process, exit_task)
+                return (
+                    "progress_timeout" if stopped else "stop_failed",
+                    None,
+                    transmission_runtime,
+                )
+
+            if progress.confirmed_at is not None and slot.state in {
                 WorkerState.CONNECTING,
                 WorkerState.RECONNECTING,
             }:
-                slot.live_since = self._utcnow()
+                # This is normally handled above. It also covers a state
+                # callback that synchronously changed presentation state.
                 await self._transition(slot, WorkerState.LIVE)
 
             ingest = await self._load_ingest()
@@ -777,13 +951,21 @@ class WorkerManager:
 
             if not ingest.available:
                 stopped = await self._terminate_process(process, exit_task)
-                return ("input_lost" if stopped else "stop_failed", None, runtime)
+                return (
+                    "input_lost" if stopped else "stop_failed",
+                    None,
+                    transmission_runtime,
+                )
 
             compatible, compatibility_error = check_stream_compatibility(ingest)
             if not compatible:
                 slot.last_error = compatibility_error
                 stopped = await self._terminate_process(process, exit_task)
-                return ("incompatible" if stopped else "stop_failed", None, runtime)
+                return (
+                    "incompatible" if stopped else "stop_failed",
+                    None,
+                    transmission_runtime,
+                )
 
     async def _record_start_failure(
         self, slot: _WorkerSlot, failure_count: int, message: str
@@ -828,6 +1010,7 @@ class WorkerManager:
                     await self._transition(slot, WorkerState.FAILED, force=True)
                     break
 
+                slot.last_error = None
                 await self._transition(
                     slot,
                     WorkerState.CONNECTING if first_process else WorkerState.RECONNECTING,
@@ -857,16 +1040,24 @@ class WorkerManager:
                     self._drain_diagnostics(slot, process, spec),
                     name=f"ffmpeg-diagnostics-{slot.destination_id}",
                 )
+                progress = _ProgressEvidence()
+                progress_task = asyncio.create_task(
+                    self._drain_progress(process, progress),
+                    name=f"ffmpeg-progress-{slot.destination_id}",
+                )
                 exit_task = asyncio.create_task(
                     process.wait(), name=f"ffmpeg-exit-{slot.destination_id}"
                 )
 
                 outcome, exit_code, runtime = await self._monitor_process(
-                    slot, process, exit_task, process_started
+                    slot, process, exit_task, process_started, progress
                 )
                 slot.process = None
                 slot.started_at = None
-                await self._finish_diagnostics(diagnostics_task)
+                await asyncio.gather(
+                    self._finish_reader(diagnostics_task),
+                    self._finish_reader(progress_task),
+                )
 
                 if outcome == "stopped":
                     break
@@ -876,8 +1067,13 @@ class WorkerManager:
                     await self._transition(slot, WorkerState.FAILED, force=True)
                     break
                 if outcome == "input_lost":
-                    failures = 0
-                    slot.consecutive_failures = 0
+                    # Losing ingest is not evidence that the destination ever
+                    # recovered. Preserve accumulated fast output failures
+                    # unless this attempt delivered confirmed media for the
+                    # configured stable period.
+                    if runtime >= self._reconnect.stable_after_seconds:
+                        failures = 0
+                        slot.consecutive_failures = 0
                     await self._transition(slot, WorkerState.WAITING_FOR_INPUT)
                     slot.live_since = None
                     continue
@@ -892,7 +1088,7 @@ class WorkerManager:
                     failures = 1
                 else:
                     failures += 1
-                message = f"FFmpeg exited unexpectedly (code {exit_code})"
+                message = slot.last_error or f"FFmpeg exited unexpectedly (code {exit_code})"
                 if not await self._record_start_failure(slot, failures, message):
                     break
         except asyncio.CancelledError:

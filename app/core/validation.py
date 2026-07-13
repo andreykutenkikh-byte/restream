@@ -11,7 +11,7 @@ import ipaddress
 import re
 import socket
 import unicodedata
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import SplitResult, unquote, urlsplit
@@ -361,6 +361,80 @@ def validate_destination_url(
         port=parsed.port,
         resolved_addresses=addresses,
     )
+
+
+def destination_validator(
+    *,
+    environment: str,
+    test_allowlist: Sequence[str] = (),
+    resolver: AddressResolver | None = None,
+) -> Callable[[str], ValidatedDestinationURL]:
+    """Build the runtime URL validator with a fail-closed CI-only exception.
+
+    The exception is an exact match against an explicitly configured value and
+    can only exist in the ``test`` environment. Every other URL continues
+    through the normal public-address SSRF policy.
+    """
+
+    allowed = tuple(dict.fromkeys(test_allowlist))
+    if allowed and environment != "test":
+        raise URLValidationError("test destination allowlist requires ENVIRONMENT=test")
+
+    def validate(value: str) -> ValidatedDestinationURL:
+        if value not in allowed:
+            return validate_destination_url(value, resolver=resolver)
+
+        parsed = _parse_exact_test_destination(value)
+        chosen_resolver = resolver or resolve_host_addresses
+        try:
+            addresses = tuple(
+                dict.fromkeys(
+                    _address_from_record(item) for item in chosen_resolver(parsed.hostname)
+                )
+            )
+        except (socket.gaierror, OSError) as exc:
+            raise URLValidationError("test destination hostname could not be resolved") from exc
+        if not addresses:
+            raise URLValidationError("test destination hostname resolved to no addresses")
+        return ValidatedDestinationURL(
+            value=parsed.value,
+            scheme=parsed.scheme,
+            hostname=parsed.hostname,
+            port=parsed.port,
+            resolved_addresses=addresses,
+        )
+
+    return validate
+
+
+def _parse_exact_test_destination(value: str) -> ParsedDestinationURL:
+    """Parse an already allowlisted test URL without permitting unsafe syntax."""
+
+    if not value or len(value) > MAX_DESTINATION_URL_LENGTH:
+        raise URLValidationError("test destination URL length is invalid")
+    if _contains_unsafe_character(value) or _contains_unsafe_character(unquote(value)):
+        raise URLValidationError("test destination URL contains unsafe characters")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise URLValidationError("test destination URL is malformed") from exc
+    scheme = parsed.scheme.lower()
+    if scheme not in ALLOWED_DESTINATION_SCHEMES:
+        raise URLValidationError("only rtmp:// and rtmps:// test destinations are allowed")
+    if not parsed.netloc or parsed.hostname is None:
+        raise URLValidationError("test destination hostname is missing")
+    if parsed.username is not None or parsed.password is not None:
+        raise URLValidationError("credentials must not be embedded in test destination URLs")
+    if parsed.query or parsed.fragment:
+        raise URLValidationError("queries and fragments are not allowed in test destinations")
+    hostname = parsed.hostname.rstrip(".").lower()
+    if not hostname or "%" in hostname:
+        raise URLValidationError("test destination hostname is invalid")
+    selected_port = port if port is not None else DEFAULT_DESTINATION_PORTS[scheme]
+    if not 1 <= selected_port <= 65_535:
+        raise URLValidationError("test destination port must be between 1 and 65535")
+    return ParsedDestinationURL(value, scheme, hostname, selected_port, parsed)
 
 
 def validate_rtmp_url(

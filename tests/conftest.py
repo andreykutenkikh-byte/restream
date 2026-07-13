@@ -40,6 +40,8 @@ def settings(tmp_path: Path, admin_password: str) -> Settings:
         ffmpeg_binary="ffmpeg",
         ffprobe_binary="ffprobe",
         worker_auth_user="test-worker",
+        worker_auth_password="test-worker-password-that-is-independent",
+        test_destination_allowlist=(),
     )
 
 

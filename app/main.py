@@ -19,6 +19,7 @@ from fastapi.templating import Jinja2Templates
 from app import __version__
 from app.api import router
 from app.core.config import Settings
+from app.core.validation import destination_validator
 from app.db import Database
 from app.logging_config import configure_logging
 from app.login_limiter import LoginRateLimiter
@@ -44,8 +45,10 @@ def create_app(
         "mediamtx": mediamtx,
         "worker_launcher": worker_launcher,
     }
-    if url_validator is not None:
-        runtime_kwargs["url_validator"] = url_validator
+    runtime_kwargs["url_validator"] = url_validator or destination_validator(
+        environment=settings.environment,
+        test_allowlist=settings.test_destination_allowlist,
+    )
     runtime = ApplicationRuntime(settings, database, **runtime_kwargs)
 
     @asynccontextmanager
