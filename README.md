@@ -47,11 +47,12 @@ in-memory process manager; stale PIDs are never trusted after restart.
 ## Requirements
 
 - Docker Engine with the Compose v2 plugin
-- roughly 768 MiB RAM and 0.7 CPU available for the committed container limits
+- roughly 768 MiB RAM, 0.70 CPU, and 160 PIDs available for the base local profile
+- at least 576 MiB RAM, 0.60 CPU, and 160 PIDs available for the shared-host production profile
 - an available local HTTP port (default `127.0.0.1:8088`)
 - an available RTMP port (local default `127.0.0.1:1935`)
 
-Final production limits and ports must be approved after the audit in
+Production limits and ports must still pass the audit in
 [`docs/production-audit.md`](docs/production-audit.md). Do not take resources from existing
 services to satisfy these values.
 
@@ -207,6 +208,37 @@ Committed starting limits:
 | backend + up to 2 copy workers | 0.45 | 512 MiB | 96 | `127.0.0.1:8088 → 8000` |
 | MediaMTX | 0.25 | 256 MiB | 64 | `127.0.0.1:1935 → 1935` |
 
+The prepared shared-host production profile is the fail-closed override
+`compose.production.yml`. It must always be loaded after `compose.yml`; it tightens resource and
+destination limits without replacing the base security, networks, volumes, healthchecks, or log
+policy. It also fixes the following effective values, regardless of development defaults in the
+production `.env`:
+
+- `ENVIRONMENT=production`
+- `COOKIE_SECURE=true`
+- `MAX_DESTINATIONS=1`
+- `PUBLIC_DOMAIN=restream.adojapan.ru`
+- `PUBLIC_RTMP_HOST=restream.adojapan.ru`
+- `PUBLIC_RTMP_PORT=1935`
+
+This project has one defined public identity, so fixing it in the override removes both the
+`localhost` fallback and operator drift. Production `.env` values cannot disable secure cookies
+or switch the profile back to development. `SESSION_SECRET` and `WORKER_AUTH_PASSWORD` remain
+separate required secrets and must contain independent values.
+
+| Service | CPU | RAM | PIDs | Production setting |
+| --- | ---: | ---: | ---: | --- |
+| backend + one copy worker | 0.40 | 384 MiB | 96 | `MAX_DESTINATIONS=1` |
+| MediaMTX | 0.20 | 192 MiB | 64 | no additional published port |
+| **Total** | **0.60** | **576 MiB** | **160** | one destination |
+
+The public RTMP identity is `restream.adojapan.ru:1935`; it is distinct from the host-side bind.
+The planned server is `147.45.231.225`. The base Compose file hard-codes the HTTP host address to
+loopback, so HTTP stays on `127.0.0.1:8088` for the existing reverse proxy and cannot be opened by
+an environment override. The RTMP bind address remains controlled by the separately approved
+`RTMP_BIND_ADDRESS`; the reviewed host mapping is `147.45.231.225:1935`. These values describe a
+future deployment and do not authorize one.
+
 The backend's internet-capable network is required only for user-configured destinations.
 MediaMTX shares only the private control network with the backend and joins a separate ingress
 bridge solely so Docker can publish its single RTMP port.
@@ -272,18 +304,41 @@ docker compose -p adojapan-restream --env-file .env -f compose.yml ps
 docker compose -p adojapan-restream --env-file .env -f compose.yml stop
 ```
 
+For a separately approved production change, every Compose lifecycle command must load the
+shared-host override after the base file. The validation command is safe to run before that
+window; the build, start, status, logs, stop, and rollback commands are shown here for exactness,
+not as authorization to execute them:
+
+```bash
+docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml config --quiet
+docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml build
+docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml up -d
+docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml ps
+docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml logs --tail=100 backend mediamtx
+docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml stop
+docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml down --remove-orphans
+```
+
 Tests cover cryptography, password verification, URL/SSRF rules, private and loopback addresses,
 log redaction, codec compatibility, stream-key rotation, session/CSRF enforcement, destination
 limits, MediaMTX status mapping, worker transitions/backoff/termination, and the complete API
 smoke flow. Tests never call a real streaming platform or use real keys.
 
-GitHub Actions additionally loads `compose.ci.yml` and runs a real output smoke through the public
-API: login and CSRF, destination creation/start, synthetic H.264/AAC ingest, the application's
-actual stream-copy FFmpeg worker, and an isolated MediaMTX receiver. The receiver API must report
-growing inbound bytes, `ffprobe` must count H.264 video and AAC audio packets, and the application
-must report confirmed `live`. CI then stops the destination, requires the receiver path to vanish,
-checks that no worker or child FFmpeg remains, deletes the destination, and always tears down the
-test Compose project. Synthetic credentials are never printed.
+The GitHub Actions runtime smoke must use the same file order for configuration, build, startup,
+logs, and cleanup: `compose.yml`, then `compose.production.yml`, then `compose.ci.yml`. Loaded last,
+the CI-only override switches the synthetic runtime to `ENVIRONMENT=test` and
+`COOKIE_SECURE=false`, adds the exact test destination allowlist and isolated receiver, and is
+never part of a production lifecycle command.
+
+A successful run for the reviewed commit is required to establish evidence that this effective
+model enforces the shared-host limits. It must inspect only `NanoCpus`, `Memory`, `PidsLimit`,
+status, and health, confirming backend limits of 0.40 CPU, 384 MiB, and 96 PIDs and MediaMTX limits
+of 0.20 CPU, 192 MiB, and 64 PIDs. Through the public API it must create and start the first
+destination, reject a second with `409 destination_limit_reached` while the first remains active,
+then complete synthetic H.264/AAC ingest, the real stream-copy FFmpeg worker, packet/byte and
+`live` assertions, worker shutdown, destination deletion, and cleanup with the same three files.
+No environment, credential, or stream key may be printed. This CI evidence does not authorize a
+deployment.
 
 ## Reverse proxy and production gate
 
@@ -291,6 +346,10 @@ test Compose project. Synthetic credentials are never printed.
 proxy. Do not install another global proxy. A future approved deployment must first identify the
 current proxy, back up only the dedicated site file, validate it, and safely reload without
 changing other domains.
+
+The Phase 2 preparation audit did not deploy Restream or change DNS, host/provider firewall
+rules, Nginx, or any existing service. DNS and firewall remain explicit no-go gates documented
+in the production audit.
 
 - [Production audit and go/no-go checklist](docs/production-audit.md)
 - [Controlled deployment and project-only rollback](docs/deployment-and-rollback.md)

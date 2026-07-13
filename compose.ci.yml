@@ -1,6 +1,8 @@
 services:
   backend:
     environment:
+      ENVIRONMENT: test
+      COOKIE_SECURE: "false"
       TEST_DESTINATION_ALLOWLIST: rtmp://ci-rtmp-receiver:1935/ci-output
     depends_on:
       ci-rtmp-receiver:

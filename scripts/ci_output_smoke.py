@@ -2,7 +2,8 @@
 
 The script deliberately prints no ingest or destination key and never includes
 captured FFmpeg output in failures. It expects the project to be running with
-``compose.ci.yml`` and performs its own best-effort cleanup on every exit path.
+the base, production, and CI Compose files and performs its own best-effort
+cleanup on every exit path.
 """
 
 from __future__ import annotations
@@ -35,6 +36,8 @@ COMPOSE = (
     ".env.ci",
     "-f",
     "compose.yml",
+    "-f",
+    "compose.production.yml",
     "-f",
     "compose.ci.yml",
 )
@@ -71,10 +74,16 @@ class APIClient:
         try:
             response = self._opener.open(request, timeout=10)
         except HTTPError as exc:
-            code = "unknown"
+            error_payload: Any = None
             with suppress(Exception):
-                body = json.loads(exc.read().decode("utf-8"))
-                code = str(body.get("error", {}).get("code", code))
+                error_payload = json.loads(exc.read().decode("utf-8"))
+            if exc.code in expected:
+                return error_payload
+            code = "unknown"
+            if isinstance(error_payload, dict):
+                error = error_payload.get("error")
+                if isinstance(error, dict):
+                    code = str(error.get("code", code))
             raise SmokeFailure(f"HTTP API {method} {path} failed: {exc.code} ({code})") from None
         if response.status not in expected:
             raise SmokeFailure(
@@ -371,6 +380,28 @@ def main() -> int:
             lambda item: bool(item and item.get("ready") and receiver_bytes(item) > 0),
         )
         first_bytes = receiver_bytes(first)
+
+        limited = client.request(
+            "POST",
+            "/api/destinations",
+            {
+                "name": "CI destination limit probe",
+                "server_url": RECEIVER_SERVER,
+                "stream_key": "ci-limit-probe",
+                "enabled": False,
+            },
+            csrf=True,
+            expected=(409,),
+        )
+        if not isinstance(limited, dict) or limited.get("error", {}).get("code") != (
+            "destination_limit_reached"
+        ):
+            raise SmokeFailure("second destination did not return destination_limit_reached")
+        first_after_limit = destination(client, created_id)
+        if not first_after_limit or first_after_limit.get("state") != "live":
+            raise SmokeFailure("first destination stopped during destination-limit probe")
+        print("E2E: second destination rejected with 409 while the first remained live")
+
         time.sleep(2)
         second = receiver_path()
         second_bytes = receiver_bytes(second)

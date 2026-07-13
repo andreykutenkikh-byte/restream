@@ -30,7 +30,7 @@ services:
       SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-43200}
       WORKER_AUTH_USER: ${WORKER_AUTH_USER:-adojapan-worker}
     ports:
-      - "${HTTP_BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-8088}:8000/tcp"
+      - "127.0.0.1:${HTTP_PORT:-8088}:8000/tcp"
     volumes:
       - database:/srv/app/data
       - logs:/srv/app/logs
