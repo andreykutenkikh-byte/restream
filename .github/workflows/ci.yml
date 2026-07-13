@@ -52,7 +52,7 @@ jobs:
         run: uv run --locked ruff check .
 
       - name: Typecheck
-        run: uv run --locked mypy app scripts/ci_output_smoke.py scripts/validate_production_compose.py
+        run: uv run --locked mypy app scripts
 
       - name: Tests
         run: uv run --locked pytest
@@ -61,7 +61,16 @@ jobs:
         run: uv run --locked python scripts/check_repository.py
 
       - name: JavaScript syntax
-        run: node --check app/static/app.js
+        run: |
+          node --check app/static/app.js
+          node --check app/static/preview-player.js
+
+      - name: JavaScript tests
+        run: node --test tests/frontend/preview-player.test.js
+
+      - name: Shell syntax
+        shell: bash
+        run: for file in scripts/*.sh; do sh -n "$file"; done
 
       - name: Whitespace check
         run: git diff --check
@@ -91,11 +100,16 @@ jobs:
       - name: Real RTMP output end-to-end smoke
         run: uv run --locked python scripts/ci_output_smoke.py
 
+      - name: Post-preview runtime limits
+        run: sh scripts/check_runtime_limits.sh
+
       - name: Safe diagnostic logs on failure
         if: failure()
         run: |
           if [ -f .env.ci ]; then
-            docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml logs --tail=100 || true
+            # MediaMTX paths contain the synthetic ingest key; keep even CI
+            # failure output limited to the application's redacted logs.
+            docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml logs --tail=100 backend || true
           fi
 
       - name: Stop CI project

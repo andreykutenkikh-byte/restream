@@ -38,3 +38,35 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  ci-rtmp-publisher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["sh", "-c", "while :; do sleep 3600; done"]
+    networks:
+      - internal
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cpus: "0.15"
+    mem_limit: 128m
+    pids_limit: 32
+    stop_grace_period: 10s
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "python", "--version"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
