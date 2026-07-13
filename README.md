@@ -47,11 +47,12 @@ in-memory process manager; stale PIDs are never trusted after restart.
 ## Requirements
 
 - Docker Engine with the Compose v2 plugin
-- roughly 768 MiB RAM and 0.7 CPU available for the committed container limits
+- roughly 768 MiB RAM, 0.70 CPU, and 160 PIDs available for the base local profile
+- at least 576 MiB RAM, 0.60 CPU, and 160 PIDs available for the shared-host production profile
 - an available local HTTP port (default `127.0.0.1:8088`)
 - an available RTMP port (local default `127.0.0.1:1935`)
 
-Final production limits and ports must be approved after the audit in
+Production limits and ports must still pass the audit in
 [`docs/production-audit.md`](docs/production-audit.md). Do not take resources from existing
 services to satisfy these values.
 
@@ -207,6 +208,23 @@ Committed starting limits:
 | backend + up to 2 copy workers | 0.45 | 512 MiB | 96 | `127.0.0.1:8088 → 8000` |
 | MediaMTX | 0.25 | 256 MiB | 64 | `127.0.0.1:1935 → 1935` |
 
+The prepared shared-host production profile is the minimal override
+`compose.production.yml`. It must always be loaded after `compose.yml`; it tightens resource and
+destination limits without replacing the base security, networks, volumes, healthchecks, or log
+policy.
+
+| Service | CPU | RAM | PIDs | Production setting |
+| --- | ---: | ---: | ---: | --- |
+| backend + one copy worker | 0.40 | 384 MiB | 96 | `MAX_DESTINATIONS=1` |
+| MediaMTX | 0.20 | 192 MiB | 64 | no additional published port |
+| **Total** | **0.60** | **576 MiB** | **160** | one destination |
+
+The planned server is `147.45.231.225`. The base Compose file hard-codes the HTTP host address
+to loopback, so HTTP stays on `127.0.0.1:8088` for the existing reverse proxy and cannot be
+opened by an environment override. The RTMP bind address remains configurable; the reviewed
+target is `147.45.231.225:1935`. These values describe a future deployment and do not authorize
+one.
+
 The backend's internet-capable network is required only for user-configured destinations.
 MediaMTX shares only the private control network with the backend and joins a separate ingress
 bridge solely so Docker can publish its single RTMP port.
@@ -272,6 +290,21 @@ docker compose -p adojapan-restream --env-file .env -f compose.yml ps
 docker compose -p adojapan-restream --env-file .env -f compose.yml stop
 ```
 
+For a separately approved production change, every Compose lifecycle command must load the
+shared-host override after the base file. The validation command is safe to run before that
+window; the build, start, status, logs, stop, and rollback commands are shown here for exactness,
+not as authorization to execute them:
+
+```bash
+docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml config --quiet
+docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml build
+docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml up -d
+docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml ps
+docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml logs --tail=100 backend mediamtx
+docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml stop
+docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml down --remove-orphans
+```
+
 Tests cover cryptography, password verification, URL/SSRF rules, private and loopback addresses,
 log redaction, codec compatibility, stream-key rotation, session/CSRF enforcement, destination
 limits, MediaMTX status mapping, worker transitions/backoff/termination, and the complete API
@@ -291,6 +324,10 @@ test Compose project. Synthetic credentials are never printed.
 proxy. Do not install another global proxy. A future approved deployment must first identify the
 current proxy, back up only the dedicated site file, validate it, and safely reload without
 changing other domains.
+
+The Phase 2 preparation audit did not deploy Restream or change DNS, host/provider firewall
+rules, Nginx, or any existing service. DNS and firewall remain explicit no-go gates documented
+in the production audit.
 
 - [Production audit and go/no-go checklist](docs/production-audit.md)
 - [Controlled deployment and project-only rollback](docs/deployment-and-rollback.md)

@@ -40,7 +40,6 @@ jobs:
             echo 'PUBLIC_DOMAIN=localhost'
             echo 'PUBLIC_RTMP_HOST=localhost'
             echo 'RTMP_BIND_ADDRESS=127.0.0.1'
-            echo 'HTTP_BIND_ADDRESS=127.0.0.1'
             echo 'ADMIN_LOGIN=ci-admin'
             echo 'COOKIE_SECURE=false'
             echo 'TRUSTED_PROXIES=127.0.0.1,::1'
@@ -74,6 +73,7 @@ jobs:
       - name: Compose configurations
         run: |
           docker compose -p adojapan-restream --env-file .env.ci -f compose.yml config --quiet
+          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml config --quiet
           docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.ci.yml config --quiet
 
       - name: Build images

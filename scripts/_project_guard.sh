@@ -3,7 +3,7 @@ set -eu
 
 PROJECT_NAME="adojapan-restream"
 
-if [ ! -f "compose.yml" ] || [ ! -d "app" ] || [ ! -d "mediamtx" ]; then
+if [ ! -f "compose.yml" ] || [ ! -f "compose.production.yml" ] || [ ! -d "app" ] || [ ! -d "mediamtx" ]; then
   echo "Run this command from the AdoJapan Restream repository root." >&2
   exit 2
 fi
@@ -28,6 +28,13 @@ fi
 for script in scripts/*.sh; do
   if grep 'docker compose' "$script" | grep -v 'docker compose -p adojapan-restream' >/dev/null 2>&1; then
     echo "A Compose command without the fixed project name was detected in $script." >&2
+    exit 2
+  fi
+done
+
+for script in scripts/start.sh scripts/stop.sh scripts/rollback.sh; do
+  if grep 'docker compose' "$script" | grep -v -- 'docker compose -p adojapan-restream -f compose.yml -f compose.production.yml' >/dev/null 2>&1; then
+    echo "A production Compose command without the shared-host override was detected in $script." >&2
     exit 2
   fi
 done

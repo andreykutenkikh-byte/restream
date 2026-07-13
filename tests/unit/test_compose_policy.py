@@ -1,4 +1,5 @@
 import re
+from decimal import Decimal
 from pathlib import Path
 
 import yaml
@@ -12,6 +13,11 @@ def load_compose() -> dict[str, object]:
 def load_ci_override() -> dict[str, object]:
     root = Path(__file__).resolve().parents[2]
     return yaml.safe_load((root / "compose.ci.yml").read_text(encoding="utf-8"))
+
+
+def load_production_override() -> dict[str, object]:
+    root = Path(__file__).resolve().parents[2]
+    return yaml.safe_load((root / "compose.production.yml").read_text(encoding="utf-8"))
 
 
 def test_compose_project_is_isolated_and_bounded() -> None:
@@ -43,12 +49,57 @@ def test_compose_project_is_isolated_and_bounded() -> None:
 
 def test_only_web_loopback_and_rtmp_are_published() -> None:
     services = load_compose()["services"]
-    assert services["backend"]["ports"] == [
-        "${HTTP_BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-8088}:8000/tcp"
-    ]
+    assert services["backend"]["ports"] == ["127.0.0.1:${HTTP_PORT:-8088}:8000/tcp"]
     assert services["mediamtx"]["ports"] == [
         "${RTMP_BIND_ADDRESS:-127.0.0.1}:${PUBLIC_RTMP_PORT:-1935}:1935/tcp"
     ]
+
+
+def test_shared_host_production_override_is_minimal_and_bounded() -> None:
+    override = load_production_override()
+    assert set(override) == {"services"}
+    assert set(override["services"]) == {"backend", "mediamtx"}
+
+    backend = override["services"]["backend"]
+    mediamtx = override["services"]["mediamtx"]
+    assert set(backend) == {"cpus", "mem_limit", "pids_limit", "environment"}
+    assert set(mediamtx) == {"cpus", "mem_limit", "pids_limit"}
+    assert backend == {
+        "cpus": "0.40",
+        "mem_limit": "384m",
+        "pids_limit": 96,
+        "environment": {"MAX_DESTINATIONS": "1"},
+    }
+    assert mediamtx == {"cpus": "0.20", "mem_limit": "192m", "pids_limit": 64}
+
+    services = override["services"].values()
+    assert sum(Decimal(service["cpus"]) for service in services) <= Decimal("0.60")
+    assert sum(int(service["mem_limit"].removesuffix("m")) for service in services) <= 576
+    assert sum(service["pids_limit"] for service in services) == 160
+
+
+def test_production_override_cannot_weaken_isolation_or_publish_extra_ports() -> None:
+    override = load_production_override()
+    forbidden_keys = {
+        "ports",
+        "networks",
+        "network_mode",
+        "volumes",
+        "privileged",
+        "security_opt",
+        "cap_drop",
+        "read_only",
+    }
+    for service in override["services"].values():
+        assert forbidden_keys.isdisjoint(service)
+        assert "/var/run/" + "docker.sock" not in str(service)
+
+    base_services = load_compose()["services"]
+    assert base_services["backend"]["ports"] == ["127.0.0.1:${HTTP_PORT:-8088}:8000/tcp"]
+    assert base_services["mediamtx"]["ports"] == [
+        "${RTMP_BIND_ADDRESS:-127.0.0.1}:${PUBLIC_RTMP_PORT:-1935}:1935/tcp"
+    ]
+    assert "ci-rtmp-receiver" not in override["services"]
 
 
 def test_worker_auth_password_is_a_separate_required_compose_secret() -> None:
@@ -136,12 +187,18 @@ def test_ci_runtime_always_uses_test_override_and_cleans_up() -> None:
     ]
 
     assert runtime_commands
-    production_validation = (
+    base_validation = (
         "docker compose -p adojapan-restream --env-file .env.ci -f compose.yml config --quiet"
     )
+    production_validation = (
+        "docker compose -p adojapan-restream --env-file .env.ci -f compose.yml "
+        "-f compose.production.yml config --quiet"
+    )
+    assert base_validation in runtime_commands
     assert production_validation in runtime_commands
     assert all(
-        line == production_validation or "-f compose.yml -f compose.ci.yml" in line
+        line in {base_validation, production_validation}
+        or "-f compose.yml -f compose.ci.yml" in line
         for line in runtime_commands
     )
     assert "Real RTMP output end-to-end smoke" in workflow
@@ -151,6 +208,17 @@ def test_ci_runtime_always_uses_test_override_and_cleans_up() -> None:
     assert "cleanup_status=$?" in workflow
     assert 'exit "$cleanup_status"' in workflow
     assert "rm -f .env.ci" in workflow
+
+
+def test_production_scripts_always_use_shared_host_override() -> None:
+    root = Path(__file__).resolve().parents[2]
+    required_files = "-f compose.yml -f compose.production.yml"
+    compose_command = "docker " + "compose"
+    for name in ("start.sh", "stop.sh", "rollback.sh"):
+        script = (root / "scripts" / name).read_text(encoding="utf-8")
+        compose_lines = [line for line in script.splitlines() if compose_command in line]
+        assert compose_lines
+        assert all(required_files in line for line in compose_lines)
 
 
 def test_ci_targets_main_and_third_party_actions_are_commit_pinned() -> None:
