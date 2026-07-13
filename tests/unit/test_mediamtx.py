@@ -74,10 +74,27 @@ def test_async_client_encodes_path_and_returns_normalized_status() -> None:
     transport = FakeTransport(
         {
             "item": {
-                "ready": True,
-                "readyTime": "2026-07-12T10:00:00Z",
-                "bytesReceived": 42,
-                "tracks": ["H264", "MPEG-4 Audio"],
+                "available": True,
+                "availableTime": "2026-07-12T10:00:00Z",
+                "readyTime": "2026-07-12T09:00:00Z",
+                "inboundBytes": 42,
+                "bytesReceived": 7,
+                "tracks": ["VP9", "Opus"],
+                "tracks2": [
+                    {
+                        "codec": "H264",
+                        "codecProps": {
+                            "width": 1920,
+                            "height": 1080,
+                            "profile": "High",
+                            "level": "4.2",
+                        },
+                    },
+                    {
+                        "codec": "MPEG4Audio",
+                        "codecProps": {"sampleRate": 48000, "channelCount": 2},
+                    },
+                ],
             }
         }
     )
@@ -90,8 +107,13 @@ def test_async_client_encodes_path_and_returns_normalized_status() -> None:
     assert status.is_available
     assert status.metadata.video_codec == "h264"
     assert status.metadata.audio_codec == "aac"
+    assert status.metadata.width == 1920
+    assert status.metadata.height == 1080
+    assert status.metadata.fps is None
+    assert status.metadata.tracks == ("h264", "aac")
     assert status.bytes_received == 42
     assert status.since is not None
+    assert status.since.hour == 10
 
 
 def test_client_maps_not_found_and_arbitrary_transport_failure_safely() -> None:
