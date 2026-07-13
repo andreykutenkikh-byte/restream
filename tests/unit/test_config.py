@@ -80,6 +80,14 @@ def test_production_secure_cookie_default(monkeypatch: pytest.MonkeyPatch) -> No
     assert settings.cookie_secure is True
 
 
+def test_production_rejects_insecure_cookie_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    valid_environment(monkeypatch)
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("COOKIE_SECURE", "false")
+    with pytest.raises(ConfigurationError, match="COOKIE_SECURE must be true"):
+        Settings.from_env()
+
+
 def test_destination_allowlist_can_only_be_configured_in_test(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

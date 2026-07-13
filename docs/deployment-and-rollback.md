@@ -8,15 +8,32 @@ performed while preparing this plan. The planned shared host is `147.45.231.225`
 
 ## Required production profile
 
-Every production Compose command must load `compose.production.yml` after `compose.yml`. The
-override restricts the backend to 0.40 CPU, 384 MiB RAM, 96 PIDs, and one destination; it
-restricts MediaMTX to 0.20 CPU, 192 MiB RAM, and 64 PIDs. The aggregate ceiling is 0.60 CPU,
-576 MiB RAM, and 160 PIDs.
+Every production Compose command must load exactly `compose.yml` followed by
+`compose.production.yml`. The CI-only `compose.ci.yml` and `TEST_DESTINATION_ALLOWLIST` must never
+enter the production lifecycle. The production override restricts the backend to 0.40 CPU,
+384 MiB RAM, 96 PIDs, and one destination; it restricts MediaMTX to 0.20 CPU, 192 MiB RAM, and
+64 PIDs. The aggregate ceiling is 0.60 CPU, 576 MiB RAM, and 160 PIDs.
+
+The override is fail-closed: its effective values are `ENVIRONMENT=production`,
+`COOKIE_SECURE=true`, `MAX_DESTINATIONS=1`, `PUBLIC_DOMAIN=restream.adojapan.ru`,
+`PUBLIC_RTMP_HOST=restream.adojapan.ru`, and `PUBLIC_RTMP_PORT=1935`. This repository has one
+defined public identity, so these fixed values prevent a production `.env` from selecting
+development mode, insecure cookies, or `localhost`. The `.env` must still provide independent
+`SESSION_SECRET` and `WORKER_AUTH_PASSWORD` values.
 
 The base Compose file fixes the HTTP host address to loopback, keeping HTTP on
-`127.0.0.1:8088` without an environment override. The RTMP bind remains configurable; the reviewed target is
-`147.45.231.225:1935`. Confirm both effective mappings with a parser that emits only these safe
-fields before any build or start; never print the resolved production environment.
+`127.0.0.1:8088` without an environment override. The public RTMP identity is
+`restream.adojapan.ru:1935`; the host-side bind remains separately configurable through the
+approved `RTMP_BIND_ADDRESS`, with reviewed target `147.45.231.225:1935`. Confirm both effective
+mappings with a parser that emits only these safe fields before any build or start; never print
+the resolved production environment.
+
+A successful GitHub Actions run for the exact reviewed commit must first exercise the shared-host
+limits with `compose.yml`, `compose.production.yml`, and the CI-only `compose.ci.yml` in that order,
+confirm the actual Docker resource limits, and reject a second destination with
+`409 destination_limit_reached`. That synthetic evidence is not deployment authorization. The
+DNS-owner and host/provider firewall gates in the production audit remain NO-GO until separately
+approved.
 
 ## Deployment
 

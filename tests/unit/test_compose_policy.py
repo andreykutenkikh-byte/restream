@@ -68,7 +68,14 @@ def test_shared_host_production_override_is_minimal_and_bounded() -> None:
         "cpus": "0.40",
         "mem_limit": "384m",
         "pids_limit": 96,
-        "environment": {"MAX_DESTINATIONS": "1"},
+        "environment": {
+            "ENVIRONMENT": "production",
+            "COOKIE_SECURE": "true",
+            "MAX_DESTINATIONS": "1",
+            "PUBLIC_DOMAIN": "restream.adojapan.ru",
+            "PUBLIC_RTMP_HOST": "restream.adojapan.ru",
+            "PUBLIC_RTMP_PORT": "1935",
+        },
     }
     assert mediamtx == {"cpus": "0.20", "mem_limit": "192m", "pids_limit": 64}
 
@@ -107,9 +114,13 @@ def test_worker_auth_password_is_a_separate_required_compose_secret() -> None:
     backend_environment = load_compose()["services"]["backend"]["environment"]
     template = (root / ".env.example").read_text(encoding="utf-8")
 
+    assert backend_environment["SESSION_SECRET"] == (
+        "${SESSION_SECRET:?SESSION_SECRET is required}"
+    )
     assert backend_environment["WORKER_AUTH_PASSWORD"] == (
         "${WORKER_AUTH_PASSWORD:?WORKER_AUTH_PASSWORD is required}"
     )
+    assert backend_environment["SESSION_SECRET"] != backend_environment["WORKER_AUTH_PASSWORD"]
     assert "WORKER_AUTH_PASSWORD=REQUIRED_INDEPENDENT_RANDOM_VALUE" in template
 
 
@@ -138,6 +149,7 @@ def test_docker_build_context_excludes_generated_environment_files() -> None:
 
 def test_ci_receiver_is_absent_from_production_compose_and_strictly_isolated() -> None:
     assert "ci-rtmp-receiver" not in load_compose()["services"]
+    assert "ci-rtmp-receiver" not in load_production_override()["services"]
 
     override = load_ci_override()
     receiver = override["services"]["ci-rtmp-receiver"]
@@ -150,10 +162,35 @@ def test_ci_receiver_is_absent_from_production_compose_and_strictly_isolated() -
     assert receiver["logging"]["options"] == {"max-size": "10m", "max-file": "3"}
 
     backend = override["services"]["backend"]
-    assert backend["environment"]["TEST_DESTINATION_ALLOWLIST"] == (
-        "rtmp://ci-rtmp-receiver:1935/ci-output"
-    )
+    assert backend["environment"] == {
+        "ENVIRONMENT": "test",
+        "COOKIE_SECURE": "false",
+        "TEST_DESTINATION_ALLOWLIST": "rtmp://ci-rtmp-receiver:1935/ci-output",
+    }
     assert backend["depends_on"]["ci-rtmp-receiver"] == {"condition": "service_healthy"}
+
+
+def test_ci_override_is_the_only_compose_test_mode_and_allowlist_source() -> None:
+    root = Path(__file__).resolve().parents[2]
+    compose_files = {
+        path.name: yaml.safe_load(path.read_text(encoding="utf-8"))
+        for path in root.glob("compose*.yml")
+    }
+    test_mode_files = {
+        name
+        for name, document in compose_files.items()
+        if document["services"].get("backend", {}).get("environment", {}).get("ENVIRONMENT")
+        == "test"
+    }
+    allowlist_files = {
+        name
+        for name, document in compose_files.items()
+        if "TEST_DESTINATION_ALLOWLIST"
+        in document["services"].get("backend", {}).get("environment", {})
+    }
+
+    assert test_mode_files == {"compose.ci.yml"}
+    assert allowlist_files == {"compose.ci.yml"}
 
 
 def test_ci_receiver_accepts_only_the_exact_smoke_path() -> None:
@@ -194,13 +231,29 @@ def test_ci_runtime_always_uses_test_override_and_cleans_up() -> None:
         "docker compose -p adojapan-restream --env-file .env.ci -f compose.yml "
         "-f compose.production.yml config --quiet"
     )
+    production_effective_validation = (
+        "docker compose -p adojapan-restream --env-file .env.ci -f compose.yml "
+        "-f compose.production.yml config --format json"
+    )
+    runtime_files = "-f compose.yml -f compose.production.yml -f compose.ci.yml"
     assert base_validation in runtime_commands
     assert production_validation in runtime_commands
     assert all(
         line in {base_validation, production_validation}
-        or "-f compose.yml -f compose.ci.yml" in line
+        or line.startswith(production_effective_validation)
+        or runtime_files in line
         for line in runtime_commands
     )
+    assert any(runtime_files in line and " config --quiet" in line for line in runtime_commands)
+    assert any(runtime_files in line and line.endswith(" build") for line in runtime_commands)
+    assert any(runtime_files in line and " up -d --wait" in line for line in runtime_commands)
+    assert any(runtime_files in line and " logs --tail=100" in line for line in runtime_commands)
+    assert any(
+        runtime_files in line and " down --remove-orphans --volumes" in line
+        for line in runtime_commands
+    )
+    assert "scripts/validate_production_compose.py" in workflow
+    assert "sh scripts/check_runtime_limits.sh" in workflow
     assert "Real RTMP output end-to-end smoke" in workflow
     assert "python scripts/ci_output_smoke.py" in workflow
     assert "if: always()" in workflow
@@ -208,6 +261,40 @@ def test_ci_runtime_always_uses_test_override_and_cleans_up() -> None:
     assert "cleanup_status=$?" in workflow
     assert 'exit "$cleanup_status"' in workflow
     assert "rm -f .env.ci" in workflow
+
+
+def test_ci_runtime_limits_and_destination_limit_are_exercised() -> None:
+    root = Path(__file__).resolve().parents[2]
+    runtime_check = (root / "scripts" / "check_runtime_limits.sh").read_text(encoding="utf-8")
+    smoke = (root / "scripts" / "ci_output_smoke.py").read_text(encoding="utf-8")
+    runtime_files = "-f compose.yml -f compose.production.yml -f compose.ci.yml"
+
+    assert runtime_files in runtime_check
+    assert "docker inspect --format" in runtime_check
+    for field in (
+        ".HostConfig.NanoCpus",
+        ".HostConfig.Memory",
+        ".HostConfig.PidsLimit",
+        ".State.Status",
+        ".State.Health.Status",
+    ):
+        assert field in runtime_check
+    assert ".Config.Env" not in runtime_check
+    assert "400000000 402653184 96" in runtime_check
+    assert "200000000 201326592 64" in runtime_check
+
+    compose_definition = smoke.split("COMPOSE = (", maxsplit=1)[1].split(")", maxsplit=1)[0]
+    assert compose_definition.count('"compose.yml"') == 1
+    assert compose_definition.count('"compose.production.yml"') == 1
+    assert compose_definition.count('"compose.ci.yml"') == 1
+    assert (
+        compose_definition.index('"compose.yml"')
+        < compose_definition.index('"compose.production.yml"')
+        < compose_definition.index('"compose.ci.yml"')
+    )
+    assert "expected=(409,)" in smoke
+    assert "destination_limit_reached" in smoke
+    assert 'first_after_limit.get("state") != "live"' in smoke
 
 
 def test_production_scripts_always_use_shared_host_override() -> None:
@@ -219,6 +306,7 @@ def test_production_scripts_always_use_shared_host_override() -> None:
         compose_lines = [line for line in script.splitlines() if compose_command in line]
         assert compose_lines
         assert all(required_files in line for line in compose_lines)
+        assert "compose.ci.yml" not in script
 
 
 def test_ci_targets_main_and_third_party_actions_are_commit_pinned() -> None:

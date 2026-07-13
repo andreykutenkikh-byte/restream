@@ -208,10 +208,23 @@ Committed starting limits:
 | backend + up to 2 copy workers | 0.45 | 512 MiB | 96 | `127.0.0.1:8088 → 8000` |
 | MediaMTX | 0.25 | 256 MiB | 64 | `127.0.0.1:1935 → 1935` |
 
-The prepared shared-host production profile is the minimal override
+The prepared shared-host production profile is the fail-closed override
 `compose.production.yml`. It must always be loaded after `compose.yml`; it tightens resource and
 destination limits without replacing the base security, networks, volumes, healthchecks, or log
-policy.
+policy. It also fixes the following effective values, regardless of development defaults in the
+production `.env`:
+
+- `ENVIRONMENT=production`
+- `COOKIE_SECURE=true`
+- `MAX_DESTINATIONS=1`
+- `PUBLIC_DOMAIN=restream.adojapan.ru`
+- `PUBLIC_RTMP_HOST=restream.adojapan.ru`
+- `PUBLIC_RTMP_PORT=1935`
+
+This project has one defined public identity, so fixing it in the override removes both the
+`localhost` fallback and operator drift. Production `.env` values cannot disable secure cookies
+or switch the profile back to development. `SESSION_SECRET` and `WORKER_AUTH_PASSWORD` remain
+separate required secrets and must contain independent values.
 
 | Service | CPU | RAM | PIDs | Production setting |
 | --- | ---: | ---: | ---: | --- |
@@ -219,11 +232,12 @@ policy.
 | MediaMTX | 0.20 | 192 MiB | 64 | no additional published port |
 | **Total** | **0.60** | **576 MiB** | **160** | one destination |
 
-The planned server is `147.45.231.225`. The base Compose file hard-codes the HTTP host address
-to loopback, so HTTP stays on `127.0.0.1:8088` for the existing reverse proxy and cannot be
-opened by an environment override. The RTMP bind address remains configurable; the reviewed
-target is `147.45.231.225:1935`. These values describe a future deployment and do not authorize
-one.
+The public RTMP identity is `restream.adojapan.ru:1935`; it is distinct from the host-side bind.
+The planned server is `147.45.231.225`. The base Compose file hard-codes the HTTP host address to
+loopback, so HTTP stays on `127.0.0.1:8088` for the existing reverse proxy and cannot be opened by
+an environment override. The RTMP bind address remains controlled by the separately approved
+`RTMP_BIND_ADDRESS`; the reviewed host mapping is `147.45.231.225:1935`. These values describe a
+future deployment and do not authorize one.
 
 The backend's internet-capable network is required only for user-configured destinations.
 MediaMTX shares only the private control network with the backend and joins a separate ingress
@@ -310,13 +324,21 @@ log redaction, codec compatibility, stream-key rotation, session/CSRF enforcemen
 limits, MediaMTX status mapping, worker transitions/backoff/termination, and the complete API
 smoke flow. Tests never call a real streaming platform or use real keys.
 
-GitHub Actions additionally loads `compose.ci.yml` and runs a real output smoke through the public
-API: login and CSRF, destination creation/start, synthetic H.264/AAC ingest, the application's
-actual stream-copy FFmpeg worker, and an isolated MediaMTX receiver. The receiver API must report
-growing inbound bytes, `ffprobe` must count H.264 video and AAC audio packets, and the application
-must report confirmed `live`. CI then stops the destination, requires the receiver path to vanish,
-checks that no worker or child FFmpeg remains, deletes the destination, and always tears down the
-test Compose project. Synthetic credentials are never printed.
+The GitHub Actions runtime smoke must use the same file order for configuration, build, startup,
+logs, and cleanup: `compose.yml`, then `compose.production.yml`, then `compose.ci.yml`. Loaded last,
+the CI-only override switches the synthetic runtime to `ENVIRONMENT=test` and
+`COOKIE_SECURE=false`, adds the exact test destination allowlist and isolated receiver, and is
+never part of a production lifecycle command.
+
+A successful run for the reviewed commit is required to establish evidence that this effective
+model enforces the shared-host limits. It must inspect only `NanoCpus`, `Memory`, `PidsLimit`,
+status, and health, confirming backend limits of 0.40 CPU, 384 MiB, and 96 PIDs and MediaMTX limits
+of 0.20 CPU, 192 MiB, and 64 PIDs. Through the public API it must create and start the first
+destination, reject a second with `409 destination_limit_reached` while the first remains active,
+then complete synthetic H.264/AAC ingest, the real stream-copy FFmpeg worker, packet/byte and
+`live` assertions, worker shutdown, destination deletion, and cleanup with the same three files.
+No environment, credential, or stream key may be printed. This CI evidence does not authorize a
+deployment.
 
 ## Reverse proxy and production gate
 

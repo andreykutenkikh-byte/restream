@@ -36,12 +36,8 @@ jobs:
           MASTER_KEY="$(uv run --locked python -m app.cli generate-master-key)"
           ADMIN_HASH="$(uv run --locked python -c 'from app.core.security import hash_password; print(hash_password("ci-only-password"))')"
           {
-            echo 'ENVIRONMENT=test'
-            echo 'PUBLIC_DOMAIN=localhost'
-            echo 'PUBLIC_RTMP_HOST=localhost'
             echo 'RTMP_BIND_ADDRESS=127.0.0.1'
             echo 'ADMIN_LOGIN=ci-admin'
-            echo 'COOKIE_SECURE=false'
             echo 'TRUSTED_PROXIES=127.0.0.1,::1'
             printf 'SESSION_SECRET=%s\n' "$SESSION_SECRET"
             printf 'WORKER_AUTH_PASSWORD=%s\n' "$WORKER_AUTH_PASSWORD"
@@ -56,7 +52,7 @@ jobs:
         run: uv run --locked ruff check .
 
       - name: Typecheck
-        run: uv run --locked mypy app scripts/ci_output_smoke.py
+        run: uv run --locked mypy app scripts/ci_output_smoke.py scripts/validate_production_compose.py
 
       - name: Tests
         run: uv run --locked pytest
@@ -71,19 +67,26 @@ jobs:
         run: git diff --check
 
       - name: Compose configurations
+        shell: bash
         run: |
+          set -o pipefail
           docker compose -p adojapan-restream --env-file .env.ci -f compose.yml config --quiet
           docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml config --quiet
-          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.ci.yml config --quiet
+          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml config --format json \
+            | uv run --locked python scripts/validate_production_compose.py
+          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml config --quiet
 
       - name: Build images
-        run: docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.ci.yml build
+        run: docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml build
 
       - name: Container health smoke
         run: |
-          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.ci.yml up -d --wait --wait-timeout 90
+          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml up -d --wait --wait-timeout 90
           curl --fail --silent http://127.0.0.1:8088/health/live
           curl --fail --silent http://127.0.0.1:8088/health/ready
+
+      - name: Effective runtime limits
+        run: sh scripts/check_runtime_limits.sh
 
       - name: Real RTMP output end-to-end smoke
         run: uv run --locked python scripts/ci_output_smoke.py
@@ -92,7 +95,7 @@ jobs:
         if: failure()
         run: |
           if [ -f .env.ci ]; then
-            docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.ci.yml logs --tail=100 || true
+            docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml logs --tail=100 || true
           fi
 
       - name: Stop CI project
@@ -100,7 +103,7 @@ jobs:
         run: |
           if [ -f .env.ci ]; then
             set +e
-            docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.ci.yml down --remove-orphans --volumes
+            docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml down --remove-orphans --volumes
             cleanup_status=$?
             rm -f .env.ci
             exit "$cleanup_status"

@@ -4,7 +4,12 @@ services:
     mem_limit: 384m
     pids_limit: 96
     environment:
+      ENVIRONMENT: production
+      COOKIE_SECURE: "true"
       MAX_DESTINATIONS: "1"
+      PUBLIC_DOMAIN: restream.adojapan.ru
+      PUBLIC_RTMP_HOST: restream.adojapan.ru
+      PUBLIC_RTMP_PORT: "1935"
 
   mediamtx:
     cpus: "0.20"

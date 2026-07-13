@@ -49,10 +49,19 @@ lifecycle command. The effective limits must be exactly:
 | MediaMTX | 0.20 | 192 MiB | 64 | n/a |
 | **Total** | **0.60** | **576 MiB** | **160** | **1** |
 
-The planned server is `147.45.231.225`. The base Compose file fixes the HTTP host address to
-loopback; verify the effective HTTP mapping is `127.0.0.1:8088`. RTMP remains configurable; the planned mapping is
-`147.45.231.225:1935`. A different RTMP address or port requires a fresh port, DNS/firewall, and
-documentation review.
+The override must also make the security mode and public identity fail-closed. Its effective
+values are `ENVIRONMENT=production`, `COOKIE_SECURE=true`, `MAX_DESTINATIONS=1`,
+`PUBLIC_DOMAIN=restream.adojapan.ru`, `PUBLIC_RTMP_HOST=restream.adojapan.ru`, and
+`PUBLIC_RTMP_PORT=1935`. These fixed values are appropriate because this project has one defined
+public identity; a production `.env` cannot replace them with development mode, insecure cookies,
+or `localhost`. `SESSION_SECRET` and `WORKER_AUTH_PASSWORD` remain independently supplied secrets
+and must not be reused.
+
+The public RTMP identity is `restream.adojapan.ru:1935`; the host-side bind is separate. The
+planned server is `147.45.231.225`. The base Compose file fixes the HTTP host address to loopback;
+verify the effective HTTP mapping is `127.0.0.1:8088`. The reviewed RTMP bind is
+`147.45.231.225:1935` and remains controlled by the approved `RTMP_BIND_ADDRESS`. A different RTMP
+address or port requires a fresh port, DNS/firewall, and documentation review.
 
 Validate the effective production model before build or start:
 
@@ -62,6 +71,21 @@ docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.pr
 
 Use a structured parser to inspect only service names, resource limits, destination count, and
 published addresses. Never print the resolved production environment.
+
+## CI evidence gate
+
+Before a deployment can be considered, a successful GitHub Actions run for the exact reviewed
+commit must exercise the effective Compose order `compose.yml`, `compose.production.yml`, then
+`compose.ci.yml` for build, startup, logs, and cleanup. The last file is CI-only: it switches the
+synthetic runtime to `ENVIRONMENT=test` and `COOKIE_SECURE=false`, adds the exact destination
+allowlist and isolated receiver, and must never enter a production lifecycle command.
+
+The run must safely confirm the actual backend limits of 0.40 CPU, 384 MiB, and 96 PIDs and the
+MediaMTX limits of 0.20 CPU, 192 MiB, and 64 PIDs without printing container environments. The API
+test must keep the first destination active while a second is rejected with
+`409 destination_limit_reached`, then complete the synthetic media path and cleanup. Even a green
+run is test evidence only: it does not deploy the production model, authorize deployment, or
+close the DNS and firewall NO-GO gates below.
 
 ## DNS cutover gate
 

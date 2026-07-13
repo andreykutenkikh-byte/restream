@@ -148,6 +148,9 @@ class Settings:
         log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
         if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
             raise ConfigurationError("LOG_LEVEL is invalid")
+        cookie_secure = _boolean("COOKIE_SECURE", environment == "production")
+        if environment == "production" and not cookie_secure:
+            raise ConfigurationError("COOKIE_SECURE must be true in production")
 
         return cls(
             environment=environment,
@@ -174,7 +177,7 @@ class Settings:
             ),
             log_level=log_level,
             trusted_proxies=trusted_proxies,
-            cookie_secure=_boolean("COOKIE_SECURE", environment == "production"),
+            cookie_secure=cookie_secure,
             session_ttl_seconds=_integer("SESSION_TTL_SECONDS", 43200, minimum=300, maximum=604800),
             ffmpeg_binary=os.getenv("FFMPEG_BINARY", "ffmpeg").strip(),
             ffprobe_binary=os.getenv("FFPROBE_BINARY", "ffprobe").strip(),
