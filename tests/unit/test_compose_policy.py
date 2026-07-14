@@ -27,6 +27,7 @@ def test_compose_project_is_isolated_and_bounded() -> None:
     assert set(services) == {"backend", "mediamtx"}
     for service in services.values():
         assert "container_name" not in service
+        assert "expose" not in service
         assert "network_mode" not in service
         assert service.get("privileged") is not True
         assert service["cpus"]
@@ -53,6 +54,8 @@ def test_only_web_loopback_and_rtmp_are_published() -> None:
     assert services["mediamtx"]["ports"] == [
         "${RTMP_BIND_ADDRESS:-127.0.0.1}:${PUBLIC_RTMP_PORT:-1935}:1935/tcp"
     ]
+    assert "expose" not in services["mediamtx"]
+    assert "8888" not in str(services["mediamtx"]["ports"])
 
 
 def test_shared_host_production_override_is_minimal_and_bounded() -> None:
@@ -89,6 +92,7 @@ def test_production_override_cannot_weaken_isolation_or_publish_extra_ports() ->
     override = load_production_override()
     forbidden_keys = {
         "ports",
+        "expose",
         "networks",
         "network_mode",
         "volumes",
@@ -133,9 +137,15 @@ def test_mediamtx_control_api_stays_internal_and_auth_is_delegated() -> None:
     assert config["api"] is True
     assert config["rtmp"] is True
     assert config["rtsp"] is False
-    assert config["hls"] is False
+    assert config["hls"] is True
+    assert config["hlsAddress"] == ":8888"
     assert config["webrtc"] is False
     assert config["srt"] is False
+
+    services = load_compose()["services"]
+    assert services["backend"]["environment"]["MEDIAMTX_HLS_URL"] == ("http://mediamtx:8888")
+    assert "internal" in services["backend"]["networks"]
+    assert "internal" in services["mediamtx"]["networks"]
 
 
 def test_docker_build_context_excludes_generated_environment_files() -> None:
@@ -147,9 +157,10 @@ def test_docker_build_context_excludes_generated_environment_files() -> None:
     assert "!.env.example" in patterns
 
 
-def test_ci_receiver_is_absent_from_production_compose_and_strictly_isolated() -> None:
-    assert "ci-rtmp-receiver" not in load_compose()["services"]
-    assert "ci-rtmp-receiver" not in load_production_override()["services"]
+def test_ci_media_helpers_are_absent_from_production_and_strictly_isolated() -> None:
+    for service_name in ("ci-rtmp-receiver", "ci-rtmp-publisher"):
+        assert service_name not in load_compose()["services"]
+        assert service_name not in load_production_override()["services"]
 
     override = load_ci_override()
     receiver = override["services"]["ci-rtmp-receiver"]
@@ -160,6 +171,17 @@ def test_ci_receiver_is_absent_from_production_compose_and_strictly_isolated() -
     assert "no-new-privileges:true" in receiver["security_opt"]
     assert receiver["cpus"] and receiver["mem_limit"] and receiver["pids_limit"]
     assert receiver["logging"]["options"] == {"max-size": "10m", "max-file": "3"}
+
+    publisher = override["services"]["ci-rtmp-publisher"]
+    assert "ports" not in publisher
+    assert "environment" not in publisher
+    assert publisher["networks"] == ["internal"]
+    assert publisher["read_only"] is True
+    assert publisher["cap_drop"] == ["ALL"]
+    assert "no-new-privileges:true" in publisher["security_opt"]
+    assert publisher["cpus"] and publisher["mem_limit"] and publisher["pids_limit"]
+    assert publisher["restart"] == "no"
+    assert publisher["logging"]["options"] == {"max-size": "10m", "max-file": "3"}
 
     backend = override["services"]["backend"]
     assert backend["environment"] == {
@@ -254,6 +276,9 @@ def test_ci_runtime_always_uses_test_override_and_cleans_up() -> None:
     )
     assert "scripts/validate_production_compose.py" in workflow
     assert "sh scripts/check_runtime_limits.sh" in workflow
+    assert "node --check app/static/app.js" in workflow
+    assert "node --check app/static/preview-player.js" in workflow
+    assert "node --test tests/frontend/preview-player.test.js" in workflow
     assert "Real RTMP output end-to-end smoke" in workflow
     assert "python scripts/ci_output_smoke.py" in workflow
     assert "if: always()" in workflow
@@ -295,6 +320,14 @@ def test_ci_runtime_limits_and_destination_limit_are_exercised() -> None:
     assert "expected=(409,)" in smoke
     assert "destination_limit_reached" in smoke
     assert 'first_after_limit.get("state") != "live"' in smoke
+    assert "assert_hls_port_is_internal()" in smoke
+    assert "fetch_preview_segment(client, ingest_key)" in smoke
+    assert "sample_active_preview_usage(client, preview.media_playlist_path)" in smoke
+    assert "service=PUBLISHER_SERVICE" in smoke
+    assert "expected=(401,)" in smoke
+    assert "expected=(404, 409)" in smoke
+    assert "{{.CPUPerc}}|{{.MemUsage}}" in smoke
+    assert 'item.get("bitrate_bps") is None' in smoke
 
 
 def test_production_scripts_always_use_shared_host_override() -> None:

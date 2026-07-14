@@ -27,6 +27,7 @@ def settings(tmp_path: Path, admin_password: str) -> Settings:
         admin_password_hash=hash_password(admin_password),
         database_path=tmp_path / "restream.db",
         mediamtx_api_url="http://mediamtx.test:9997",
+        mediamtx_hls_url="http://mediamtx.test:8888",
         mediamtx_internal_rtmp_url="rtmp://mediamtx.test:1935",
         max_destinations=2,
         reconnect_initial_seconds=0.01,

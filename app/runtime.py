@@ -18,6 +18,7 @@ from app.core.security import (
 )
 from app.core.validation import ValidatedDestinationURL, validate_destination_url
 from app.db import Database
+from app.services.bitrate import IngestBitrateSampler
 from app.services.mediamtx import IngestStatus, MediaMTXClient
 from app.services.workers import (
     DestinationSpec,
@@ -39,12 +40,14 @@ class ApplicationRuntime:
         database: Database,
         *,
         mediamtx: MediaMTXClient | None = None,
+        bitrate_sampler: IngestBitrateSampler | None = None,
         url_validator: URLValidator = validate_destination_url,
         worker_launcher: Any | None = None,
     ) -> None:
         self.settings = settings
         self.database = database
         self.mediamtx = mediamtx or MediaMTXClient(settings.mediamtx_api_url)
+        self._bitrate_sampler = bitrate_sampler or IngestBitrateSampler()
         self.url_validator = url_validator
         self.workers = WorkerManager(
             self._destination_spec,
@@ -112,6 +115,7 @@ class ApplicationRuntime:
                 # MediaMTX cannot be reached, restore the still-working key.
                 self.database.set_ingest_encrypted(old_encrypted)
                 raise
+            self._bitrate_sampler.reset()
             self.workers.notify_ingest_changed()
             self.database.add_audit_event("ingest.rotated")
             return new_key
@@ -124,7 +128,7 @@ class ApplicationRuntime:
             return protocol == "rtmp" and hmac.compare_digest(path, expected_path)
         if action == "read":
             return (
-                protocol == "rtmp"
+                protocol in {"rtmp", "hls"}
                 and hmac.compare_digest(path, expected_path)
                 and hmac.compare_digest(user, self.settings.worker_auth_user)
                 and hmac.compare_digest(password, self.settings.worker_auth_password)
@@ -213,8 +217,11 @@ class ApplicationRuntime:
         return [self.destination_view(item) for item in self.database.list_destinations()]
 
     async def ingest_view(self) -> dict[str, Any]:
-        status = await self.ingest_status()
+        ingest_path = self.ingest_path()
+        status = await self.mediamtx.get_ingest_status(ingest_path)
         metadata = status.metadata.to_dict()
+        bitrate_bps = self._bitrate_sampler.sample(stream_id=ingest_path, status=status)
+        metadata["bitrate_bps"] = bitrate_bps
         uptime_seconds = None
         if status.since:
             uptime_seconds = max(0, int((datetime.now(UTC) - status.since).total_seconds()))

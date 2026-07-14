@@ -25,6 +25,7 @@ from app.logging_config import configure_logging
 from app.login_limiter import LoginRateLimiter
 from app.runtime import ApplicationRuntime, URLValidator
 from app.services.mediamtx import MediaMTXClient
+from app.services.preview import PreviewService
 from app.session import SessionManager
 
 LOGGER = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ def create_app(
     settings: Settings | None = None,
     *,
     mediamtx: MediaMTXClient | None = None,
+    preview: PreviewService | None = None,
     url_validator: URLValidator | None = None,
     worker_launcher: Any | None = None,
 ) -> FastAPI:
@@ -50,6 +52,11 @@ def create_app(
         test_allowlist=settings.test_destination_allowlist,
     )
     runtime = ApplicationRuntime(settings, database, **runtime_kwargs)
+    preview_service = preview or PreviewService(
+        settings.mediamtx_hls_url,
+        username=settings.worker_auth_user,
+        password=settings.worker_auth_password,
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -58,7 +65,10 @@ def create_app(
         try:
             yield
         finally:
-            await runtime.shutdown()
+            try:
+                await preview_service.close()
+            finally:
+                await runtime.shutdown()
 
     app = FastAPI(
         title="AdoJapan Restream",
@@ -71,6 +81,7 @@ def create_app(
     app.state.settings = settings
     app.state.database = database
     app.state.runtime = runtime
+    app.state.preview = preview_service
     app.state.sessions = SessionManager(
         database, settings.session_secret, settings.session_ttl_seconds
     )
@@ -99,7 +110,8 @@ def create_app(
         response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; script-src 'self'; style-src 'self'; "
-            "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; "
+            "img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; "
+            "frame-ancestors 'none'; "
             "base-uri 'none'; form-action 'self'"
         )
         if request.url.path.startswith("/api/") or request.url.path in {"/", "/login"}:

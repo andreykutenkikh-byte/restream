@@ -19,27 +19,29 @@ production gate below remain a separate explicit change.
 
 ```text
 OBS -- RTMP /live/<ingest-key> --> MediaMTX
-                                      |
-                                      | authenticated internal RTMP read
-                                      v
-                         FastAPI process manager
-                           |                |
-                           v                v
-                      FFmpeg copy      FFmpeg copy
-                           |                |
-                           v                v
-                       destination 1    destination 2
+               |                         |
+               | internal HLS remux      | authenticated internal RTMP read
+               v                         v
+       authenticated FastAPI       FastAPI process manager
+         same-origin proxy           |                |
+               |                     v                v
+               v                FFmpeg copy      FFmpeg copy
+         browser preview              |                |
+                                      v                v
+                                  destination 1    destination 2
 ```
 
-- **MediaMTX 1.19.2** accepts RTMP and exposes its control API only on the private project
-  network. Every publish/read request is authorized by the backend.
+- **MediaMTX 1.19.2** accepts RTMP, remuxes the incoming H.264/AAC stream to HLS without
+  transcoding, and exposes its control and HLS listeners only on the private project network.
+  Every publish/read request is authorized by the backend.
 - **FastAPI** serves the Russian UI and JSON API, holds server-side sessions, queries MediaMTX,
-  and owns FFmpeg child processes.
+  proxies HLS to the authenticated same-origin browser, and owns FFmpeg child processes.
 - **SQLite** persists the encrypted ingest configuration, encrypted destination keys,
   destination intent/state metadata, hashed sessions, schema version, and a bounded audit tail.
 - **One FFmpeg supervisor per destination** uses an argument array with no shell and `-c copy`.
   A failed destination cannot stop another destination.
-- **Server templates, CSS, and small JavaScript** require no client build step.
+- **Server templates, CSS, small JavaScript, and local hls.js 1.6.16** require no runtime CDN
+  or client build step. Safari uses native HLS when available.
 
 The SQLite record says which destinations should run. Actual worker state always comes from the
 in-memory process manager; stale PIDs are never trusted after restart.
@@ -119,7 +121,7 @@ docker compose -p adojapan-restream -f compose.yml stop
 - environment, public web domain, public RTMP host/port, and local bind addresses;
 - required, independent session and MediaMTX worker secrets, Fernet master key, admin login,
   and Argon2id password hash;
-- project SQLite path and internal MediaMTX API/RTMP URLs;
+- project SQLite path and internal MediaMTX API/RTMP/HLS URLs;
 - destination limit and bounded reconnect timings;
 - log level, trusted proxy addresses, session lifetime, and secure-cookie mode.
 
@@ -149,6 +151,20 @@ Incoming signal states:
 - `live` — stream is available;
 - `unstable` — stream exists but reports instability;
 - `error` — status cannot be determined safely.
+
+The authenticated incoming-signal card can play that exact stream before any destination is
+started. MediaMTX performs an on-demand HLS remux only: no preview FFmpeg process, transcoding,
+recording, or quality ladder exists. Browser requests use only
+`/api/ingest/preview/index.m3u8` and same-origin media assets. The backend supplies internal reader
+credentials, retains MediaMTX's HLS session server-side, and never returns the ingest key, worker
+password, Docker address, or upstream session cookie. The local hls.js 1.6.16 handles
+Chromium/Firefox; Safari uses native HLS. Preview audio starts muted.
+
+The status API derives incoming bitrate from monotonic growth of MediaMTX's cumulative received
+byte counter. The first sample is unknown; subsequent samples use a bounded smoothed rolling rate.
+The sampler resets on offline, key/session changes, counter rollback, or stale samples and stores no
+history in SQLite. Resolution and codecs come from MediaMTX when available; FPS remains unknown
+unless a reliable source provides it.
 
 Destination states:
 
@@ -191,10 +207,11 @@ is absent from the production Compose definition.
 
 Compose creates project-scoped database, log, and backup volumes; an internal backend/MediaMTX
 network; a dedicated MediaMTX ingest bridge for its published RTMP port; and a separate backend
-egress network. MediaMTX's API is not published. The web port binds to loopback for the existing
-reverse proxy, and local RTMP also binds to loopback until an audited production change explicitly
-selects the external address. The MediaMTX auth hook accepts only direct private/loopback clients,
-rejects forwarded requests, and the proxy example blocks `/internal/` outright.
+egress network. MediaMTX's API and HLS port `8888` are not published. The backend reaches HLS only
+through the internal network. The web port binds to loopback for the existing reverse proxy, and
+local RTMP also binds to loopback until an audited production change explicitly selects the
+external address. The MediaMTX auth hook accepts only direct private/loopback clients, rejects
+forwarded requests, and the proxy example blocks `/internal/` outright.
 
 Both containers drop Linux capabilities, prevent privilege escalation, use read-only root filesystems,
 have PID/CPU/RAM limits, bounded JSON log rotation, healthchecks, finite failure restarts, and
@@ -279,10 +296,12 @@ uv sync --locked
 uv lock --check
 uv run --locked ruff format --check .
 uv run --locked ruff check .
-uv run --locked mypy app scripts/ci_output_smoke.py
+uv run --locked mypy app scripts
 uv run --locked pytest
 uv run --locked python scripts/check_repository.py
 node --check app/static/app.js
+node --check app/static/preview-player.js
+node --test tests/frontend/preview-player.test.js
 git diff --check
 ```
 
@@ -327,18 +346,22 @@ smoke flow. Tests never call a real streaming platform or use real keys.
 The GitHub Actions runtime smoke must use the same file order for configuration, build, startup,
 logs, and cleanup: `compose.yml`, then `compose.production.yml`, then `compose.ci.yml`. Loaded last,
 the CI-only override switches the synthetic runtime to `ENVIRONMENT=test` and
-`COOKIE_SECURE=false`, adds the exact test destination allowlist and isolated receiver, and is
-never part of a production lifecycle command.
+`COOKIE_SECURE=false`, adds the exact test destination allowlist plus isolated receiver and
+publisher helpers, and is never part of a production lifecycle command.
 
 A successful run for the reviewed commit is required to establish evidence that this effective
 model enforces the shared-host limits. It must inspect only `NanoCpus`, `Memory`, `PidsLimit`,
 status, and health, confirming backend limits of 0.40 CPU, 384 MiB, and 96 PIDs and MediaMTX limits
-of 0.20 CPU, 192 MiB, and 64 PIDs. Through the public API it must create and start the first
-destination, reject a second with `409 destination_limit_reached` while the first remains active,
-then complete synthetic H.264/AAC ingest, the real stream-copy FFmpeg worker, packet/byte and
-`live` assertions, worker shutdown, destination deletion, and cleanup with the same three files.
-No environment, credential, or stream key may be printed. This CI evidence does not authorize a
-deployment.
+of 0.20 CPU, 192 MiB, and 64 PIDs. A separately constrained, internal-only CI publisher generates
+synthetic H.264/AAC so encoder work cannot contaminate backend measurements. Through the public API
+the run confirms received-byte growth and calculated bitrate, rejects unauthenticated preview,
+fetches an authenticated HLS playlist and media segment, verifies port `8888` has no host binding,
+keeps authenticated preview requests active, and prints sanitized backend/MediaMTX CPU and RAM
+usage. It then creates and starts the first destination, rejects a second with `409
+destination_limit_reached` while the first remains active, and completes the real stream-copy
+worker, packet/byte assertions, shutdown, offline bitrate reset, destination deletion, and cleanup
+with the same three runtime files. No environment, credential, stream key, or internal HLS session
+may be printed. This CI evidence does not authorize a deployment.
 
 ## Reverse proxy and production gate
 
@@ -372,6 +395,10 @@ host mapping.
 **A destination stays in “Waiting for input”.** Start OBS first and confirm ingest is `live`.
 FFmpeg is intentionally not launched without input.
 
+**The incoming preview is loading.** Confirm ingest is `live` and H.264/AAC-compatible. Check only
+this project's backend and MediaMTX logs. Do not publish port `8888`; the backend reaches it through
+the internal Compose network and the browser must always use the authenticated same-origin API.
+
 **A destination fails as incompatible.** Stage 1 requires H.264 video and AAC or no audio. It
 will not silently transcode, change resolution, or change FPS.
 
@@ -387,12 +414,12 @@ backend logs; do not restart the Docker daemon or unrelated services.
 - at most two destinations by default (configurable, capped at ten);
 - stream copy only: no transcoding, resizing, FPS conversion, overlays, titles, or recording;
 - no OAuth or automatic YouTube/VK/Twitch broadcast creation;
-- no browser preview, quality ladder, or public registration;
+- one source-quality authenticated preview, with no quality ladder or public registration;
+- no persisted bitrate history or synthetic browser speed test;
 - no production deployment in this stage.
 
 ## Stage 2
 
-The next stage can add an authenticated HLS/WebRTC player, browser upload-speed measurement,
-OBS bitrate/resolution/FPS recommendations, actual bitrate history, richer monitoring, and later
-multiple users. Stage 1 deliberately does not simulate a speed test or expose MediaMTX preview
-ports.
+The next stage can add browser upload-speed measurement, OBS bitrate/resolution/FPS
+recommendations, actual bitrate history, richer monitoring, and later multiple users. Stage 1
+deliberately does not simulate a speed test or expose MediaMTX preview ports.

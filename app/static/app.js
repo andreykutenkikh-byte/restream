@@ -7,9 +7,20 @@
   const destinationCache = new Map();
   let csrfToken = csrfMeta?.content || "";
   let statusRequestPending = false;
+  let statusRefreshRequested = false;
+  let ingestStatusGeneration = 0;
   let destinationRequestPending = false;
   let destinationsLoaded = false;
   let sessionReady = Promise.resolve();
+  let previewController = null;
+  let ingestPollTimer = null;
+  let lastIngestState = "offline";
+  let lastIngestMetadata = {};
+  let previewResolution = "";
+
+  const PREVIEW_URL = "/api/ingest/preview/index.m3u8";
+  const INGEST_POLL_LIVE_MS = 2000;
+  const INGEST_POLL_OFFLINE_MS = 7000;
 
   class ApiError extends Error {
     constructor(message, status = 0, payload = null) {
@@ -103,6 +114,8 @@
 
     if (!response.ok) {
       if (response.status === 401 && !allowUnauthorized && !document.querySelector("[data-login-form]")) {
+        clearIngestPoll();
+        previewController?.suspend("offline");
         window.location.assign("/login");
       }
       throw new ApiError(safeServerMessage(payload) || response.statusText, response.status, payload);
@@ -214,20 +227,40 @@
   }
 
   function formatBitrate(data) {
-    let mbps = null;
-    const present = value => value !== null && value !== undefined && value !== "";
-    if (present(data?.bitrate_mbps) && Number.isFinite(Number(data.bitrate_mbps))) {
-      mbps = Number(data.bitrate_mbps);
-    } else if (present(data?.bitrate_bps) && Number.isFinite(Number(data.bitrate_bps))) {
-      mbps = Number(data.bitrate_bps) / 1_000_000;
+    let bps = null;
+    const present = (value) => value !== null && value !== undefined && value !== "";
+    if (present(data?.bitrate_bps) && Number.isFinite(Number(data.bitrate_bps))) {
+      bps = Number(data.bitrate_bps);
     } else if (present(data?.bitrate_kbps) && Number.isFinite(Number(data.bitrate_kbps))) {
-      mbps = Number(data.bitrate_kbps) / 1_000;
+      bps = Number(data.bitrate_kbps) * 1000;
+    } else if (present(data?.bitrate_mbps) && Number.isFinite(Number(data.bitrate_mbps))) {
+      bps = Number(data.bitrate_mbps) * 1_000_000;
     } else if (present(data?.bitrate) && Number.isFinite(Number(data.bitrate))) {
       const value = Number(data.bitrate);
-      mbps = value >= 100_000 ? value / 1_000_000 : value >= 1_000 ? value / 1_000 : value;
+      bps = value >= 100_000 ? value : value >= 1000 ? value * 1000 : value * 1_000_000;
     }
-    if (mbps === null || mbps < 0) return "";
-    return `${mbps.toLocaleString("ru-RU", { maximumFractionDigits: 1 })} Мбит/с`;
+    if (bps === null || !Number.isFinite(bps) || bps < 0) return "";
+    if (bps < 1_000_000) {
+      return `${Math.round(bps / 1000).toLocaleString("ru-RU")} Кбит/с`;
+    }
+    return `${(bps / 1_000_000).toLocaleString("ru-RU", { maximumFractionDigits: 1 })} Мбит/с`;
+  }
+
+  function formatCodec(value) {
+    const codec = String(value || "").trim().toLowerCase();
+    const labels = {
+      aac: "AAC",
+      avc: "H.264",
+      avc1: "H.264",
+      h264: "H.264",
+      h265: "H.265",
+      hevc: "H.265",
+      mp3: "MP3",
+      opus: "Opus",
+      vp8: "VP8",
+      vp9: "VP9",
+    };
+    return labels[codec] || String(value || "").trim().toUpperCase();
   }
 
   function formatUpdatedAt(date = new Date()) {
@@ -317,14 +350,52 @@
     }
   }
 
-  function setMetadataValue(name, value) {
+  function setMetadataValue(name, value, { showWhenMissing = false } = {}) {
     const row = document.querySelector(`[data-metadata-row="${name}"]`);
     const output = document.querySelector(`[data-metadata="${name}"]`);
     if (!row || !output) return false;
     const present = value !== null && value !== undefined && value !== "";
-    row.hidden = !present;
-    if (present) output.textContent = value;
-    return present;
+    row.hidden = !present && !showWhenMissing;
+    output.textContent = present ? value : "—";
+    return !row.hidden;
+  }
+
+  function renderIngestMetadata() {
+    const metadata = lastIngestMetadata;
+    const showMetadata = ["live", "unstable"].includes(lastIngestState);
+    const width = Number(metadata.width);
+    const height = Number(metadata.height);
+    const dimensions =
+      Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0
+        ? `${Math.round(width)} × ${Math.round(height)}`
+        : "";
+    const resolution = showMetadata ? dimensions || metadata.resolution || previewResolution : "";
+    const fpsNumber = Number(metadata.fps ?? metadata.frame_rate);
+    const fps =
+      showMetadata && Number.isFinite(fpsNumber) && fpsNumber > 0
+        ? `${fpsNumber.toLocaleString("ru-RU", { maximumFractionDigits: 2 })} кадр/с`
+        : "";
+    const codecValues = Array.isArray(metadata.codecs)
+      ? metadata.codecs
+      : metadata.codecs
+        ? String(metadata.codecs).split(/\s*\+\s*/)
+        : [metadata.video_codec, metadata.audio_codec].filter(Boolean);
+    const codecs = showMetadata ? codecValues.map(formatCodec).filter(Boolean).join(" + ") : "";
+    const bitrate = showMetadata ? formatBitrate(metadata) : "";
+    const uptime = showMetadata
+      ? formatDuration(metadata.uptime_seconds ?? metadata.uptime ?? metadata.duration_seconds)
+      : "";
+
+    const visibleRows = [
+      setMetadataValue("resolution", resolution),
+      setMetadataValue("fps", fps),
+      setMetadataValue("codecs", codecs),
+      setMetadataValue("bitrate", bitrate, { showWhenMissing: showMetadata }),
+      setMetadataValue("uptime", uptime),
+    ].filter(Boolean).length;
+
+    const metadataList = document.querySelector("[data-signal-metadata]");
+    if (metadataList) metadataList.hidden = visibleRows === 0;
   }
 
   function updateIngestStatus(payload) {
@@ -335,6 +406,8 @@
     const metadata = { ...data, ...(data.metadata || {}) };
     const state = normalizeIngestState(data.status || data.state || data.ingest_status);
     const copy = ingestStateCopy[state];
+    lastIngestState = state;
+    lastIngestMetadata = metadata;
     const stateBox = document.querySelector("[data-ingest-state]");
     const label = document.querySelector("[data-ingest-label]");
     const description = document.querySelector("[data-ingest-description]");
@@ -356,37 +429,12 @@
       item.classList.add(`status-dot--${copy.tone}`);
     });
 
-    const resolution =
-      metadata.resolution ||
-      (metadata.width && metadata.height ? `${metadata.width} × ${metadata.height}` : "");
-    const fpsNumber = Number(metadata.fps ?? metadata.frame_rate);
-    const fps = Number.isFinite(fpsNumber) && fpsNumber > 0
-      ? `${fpsNumber.toLocaleString("ru-RU", { maximumFractionDigits: 2 })} кадр/с`
-      : "";
-    const codecs =
-      metadata.codecs ||
-      [metadata.video_codec, metadata.audio_codec]
-        .filter(Boolean)
-        .map((codec) => String(codec).toUpperCase())
-        .join(" + ");
-    const bitrate = formatBitrate(metadata);
-    const uptime = formatDuration(metadata.uptime_seconds ?? metadata.uptime ?? metadata.duration_seconds);
-
-    const visibleRows = [
-      setMetadataValue("resolution", resolution),
-      setMetadataValue("fps", fps),
-      setMetadataValue("codecs", codecs),
-      setMetadataValue("bitrate", bitrate),
-      setMetadataValue("uptime", uptime),
-    ].filter(Boolean).length;
-
-    const metadataList = document.querySelector("[data-signal-metadata]");
-    const placeholder = document.querySelector("[data-signal-placeholder]");
-    if (metadataList) metadataList.hidden = visibleRows === 0;
-    if (placeholder) placeholder.hidden = visibleRows > 0;
+    previewController?.setStreamState(state);
+    renderIngestMetadata();
 
     const updated = document.querySelector("[data-ingest-updated]");
     if (updated) updated.textContent = formatUpdatedAt();
+    return state;
   }
 
   function destinationArray(payload) {
@@ -511,17 +559,82 @@
     }
   }
 
+  function initializeIngestPreview() {
+    const container = document.querySelector("[data-signal-preview]");
+    const video = document.querySelector("[data-ingest-video]");
+    if (!container || !video) return;
+
+    if (typeof window.IngestPreviewController !== "function") {
+      container.dataset.previewState = "error";
+      return;
+    }
+
+    previewController = new window.IngestPreviewController({
+      video,
+      container,
+      hlsClass: window.Hls || null,
+      sourceUrl: PREVIEW_URL,
+      onResolution: (width, height) => {
+        previewResolution = width && height ? `${width} × ${height}` : "";
+        renderIngestMetadata();
+      },
+    });
+
+    const initialState = normalizeIngestState(
+      document.querySelector("[data-ingest-state]")?.dataset.state,
+    );
+    lastIngestState = initialState;
+    previewController.setStreamState(initialState);
+    document.querySelector("[data-preview-retry]")?.addEventListener("click", () => {
+      previewController?.retry();
+    });
+  }
+
+  function clearIngestPoll() {
+    if (ingestPollTimer !== null) {
+      window.clearTimeout(ingestPollTimer);
+      ingestPollTimer = null;
+    }
+  }
+
+  function ingestPollDelay() {
+    return ["connecting", "live", "unstable"].includes(lastIngestState)
+      ? INGEST_POLL_LIVE_MS
+      : INGEST_POLL_OFFLINE_MS;
+  }
+
+  function scheduleIngestPoll(delay = null) {
+    clearIngestPoll();
+    if (document.visibilityState !== "visible") return;
+    ingestPollTimer = window.setTimeout(async () => {
+      ingestPollTimer = null;
+      await loadIngestStatus({ silent: true });
+      scheduleIngestPoll();
+    }, delay ?? ingestPollDelay());
+  }
+
   async function loadIngestStatus({ silent = false } = {}) {
-    if (statusRequestPending) return;
+    if (statusRequestPending) {
+      statusRefreshRequested = true;
+      return lastIngestState;
+    }
     statusRequestPending = true;
+    const generation = ingestStatusGeneration;
     try {
-      updateIngestStatus(await apiRequest("/ingest/status"));
+      const payload = await apiRequest("/ingest/status");
+      if (generation !== ingestStatusGeneration) return lastIngestState;
+      return updateIngestStatus(payload);
     } catch (error) {
       if (!silent) showToast("Не удалось обновить состояние", friendlyError(error), "error");
       const updated = document.querySelector("[data-ingest-updated]");
       if (updated) updated.textContent = "Не удалось обновить состояние";
+      return lastIngestState;
     } finally {
       statusRequestPending = false;
+      if (statusRefreshRequested) {
+        statusRefreshRequested = false;
+        void loadIngestStatus({ silent: true });
+      }
     }
   }
 
@@ -725,9 +838,10 @@
     const dashboard = document.querySelector("[data-dashboard]");
     if (!dashboard) return;
 
+    initializeIngestPreview();
     sessionReady = loadSession();
     void loadIngestConnection();
-    void loadIngestStatus();
+    void loadIngestStatus().finally(() => scheduleIngestPoll());
     void loadDestinations();
 
     document.querySelectorAll("[data-open-destination]").forEach((button) => {
@@ -738,6 +852,7 @@
       const button = event.currentTarget;
       button.disabled = true;
       await Promise.all([loadIngestConnection(), loadIngestStatus(), loadDestinations({ silent: true })]);
+      scheduleIngestPoll();
       button.disabled = false;
     });
 
@@ -753,6 +868,9 @@
       event.preventDefault();
       const form = event.currentTarget;
       await sessionReady;
+      ingestStatusGeneration += 1;
+      clearIngestPoll();
+      previewController?.suspend("offline");
       setBusy(form, true);
       try {
         const payload = await apiRequest("/ingest/rotate", { method: "POST" });
@@ -762,6 +880,9 @@
       } catch (error) {
         showToast("Не удалось сменить ключ", friendlyError(error), "error");
       } finally {
+        previewController?.resume();
+        void loadIngestStatus({ silent: true });
+        scheduleIngestPoll(INGEST_POLL_LIVE_MS);
         setBusy(form, false);
       }
     });
@@ -830,9 +951,31 @@
       }
     });
 
-    window.setInterval(() => {
-      if (document.visibilityState === "visible") void loadIngestStatus({ silent: true });
-    }, 5000);
+    document.addEventListener("visibilitychange", () => {
+      ingestStatusGeneration += 1;
+      if (document.visibilityState !== "visible") {
+        clearIngestPoll();
+        previewController?.suspend("offline");
+        return;
+      }
+      previewController?.resume();
+      void loadIngestStatus({ silent: true });
+      scheduleIngestPoll(INGEST_POLL_LIVE_MS);
+    });
+
+    window.addEventListener("pagehide", () => {
+      ingestStatusGeneration += 1;
+      clearIngestPoll();
+      previewController?.suspend("offline");
+    });
+
+    window.addEventListener("pageshow", () => {
+      if (!previewController?.suspended || document.visibilityState !== "visible") return;
+      ingestStatusGeneration += 1;
+      previewController.resume();
+      void loadIngestStatus({ silent: true });
+      scheduleIngestPoll(INGEST_POLL_LIVE_MS);
+    });
 
     window.setInterval(() => {
       const listHasFocus = document.querySelector("[data-destination-list]:focus-within");
@@ -902,11 +1045,17 @@
       event.preventDefault();
       const form = event.currentTarget;
       await sessionReady;
+      ingestStatusGeneration += 1;
+      clearIngestPoll();
+      previewController?.suspend("offline");
       setBusy(form, true);
       try {
         await apiRequest("/auth/logout", { method: "POST" });
         window.location.assign("/login");
       } catch (error) {
+        previewController?.resume();
+        void loadIngestStatus({ silent: true });
+        scheduleIngestPoll(INGEST_POLL_LIVE_MS);
         showToast("Не удалось выйти", friendlyError(error), "error");
         setBusy(form, false);
       }

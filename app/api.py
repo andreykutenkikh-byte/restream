@@ -9,7 +9,7 @@ from ipaddress import ip_address
 from typing import Annotated, Any, NoReturn, cast
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 
@@ -20,6 +20,12 @@ from app.db import Database
 from app.login_limiter import LoginRateLimiter
 from app.runtime import ApplicationRuntime
 from app.schemas import DestinationCreate, DestinationUpdate, LoginRequest, MediaMTXAuthRequest
+from app.services.preview import (
+    PreviewInvalidRequest,
+    PreviewService,
+    PreviewUnavailable,
+    PreviewUpstreamError,
+)
 from app.session import SessionManager
 
 SESSION_COOKIE = "adojapan_session"
@@ -38,6 +44,10 @@ def _database(request: Request) -> Database:
 
 def _sessions(request: Request) -> SessionManager:
     return cast(SessionManager, request.app.state.sessions)
+
+
+def _preview(request: Request) -> PreviewService:
+    return cast(PreviewService, request.app.state.preview)
 
 
 def _templates(request: Request) -> Jinja2Templates:
@@ -296,12 +306,58 @@ async def ingest_status(request: Request) -> dict[str, Any]:
     return await _runtime(request).ingest_view()
 
 
+@router.get("/api/ingest/preview/{asset}", dependencies=[Depends(require_session)])
+async def ingest_preview(
+    asset: str,
+    request: Request,
+    range_header: Annotated[str | None, Header(alias="Range")] = None,
+) -> StreamingResponse:
+    if asset == "index.m3u8" and not (await _runtime(request).ingest_status()).is_available:
+        await _preview(request).reset()
+        _fail(
+            status.HTTP_404_NOT_FOUND,
+            "preview_not_available",
+            "Предпросмотр пока недоступен",
+        )
+    try:
+        upstream = await _preview(request).open(
+            _runtime(request).ingest_path(),
+            asset,
+            query_items=request.query_params.multi_items(),
+            range_header=range_header,
+        )
+    except PreviewInvalidRequest:
+        _fail(
+            status.HTTP_400_BAD_REQUEST,
+            "invalid_preview_asset",
+            "Запрошен недопустимый ресурс предпросмотра",
+        )
+    except PreviewUnavailable:
+        _fail(
+            status.HTTP_404_NOT_FOUND,
+            "preview_not_available",
+            "Предпросмотр пока недоступен",
+        )
+    except PreviewUpstreamError:
+        _fail(
+            status.HTTP_502_BAD_GATEWAY,
+            "preview_unavailable",
+            "Не удалось открыть предпросмотр",
+        )
+    return StreamingResponse(
+        upstream.body,
+        status_code=upstream.status_code,
+        headers=upstream.headers,
+    )
+
+
 @router.post("/api/ingest/rotate")
 async def rotate_ingest(
     request: Request, _: dict[str, str] = Depends(require_csrf)
 ) -> dict[str, Any]:
     runtime = _runtime(request)
     key = await runtime.rotate_ingest_key()
+    await _preview(request).reset()
     return {
         "rtmp_server_url": runtime.settings.public_rtmp_url,
         "stream_key": key,

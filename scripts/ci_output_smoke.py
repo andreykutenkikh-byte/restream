@@ -10,14 +10,18 @@ from __future__ import annotations
 
 import http.cookiejar
 import json
+import re
 import subprocess
 import sys
+import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 from urllib.error import HTTPError
+from urllib.parse import parse_qsl, unquote, urlsplit
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +30,13 @@ RECEIVER_SERVER = "rtmp://ci-rtmp-receiver:1935/ci-output"
 RECEIVER_KEY = "ci-e2e"
 RECEIVER_PATH = "ci-output/ci-e2e"
 PUBLISHER_PID_FILE = "/tmp/ci-e2e-publisher.pid"  # noqa: S108 - isolated container tmpfs
+PUBLISHER_SERVICE = "ci-rtmp-publisher"
+PREVIEW_INDEX = "/api/ingest/preview/index.m3u8"
+MAX_PLAYLIST_BYTES = 1024 * 1024
+MAX_SEGMENT_BYTES = 8 * 1024 * 1024
+_HLS_ASSET = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,191}\.(?:m3u8|ts|mp4|mp)\Z")
+_HLS_URI = re.compile(r'URI="([^"]+)"')
+_SAFE_HLS_QUERY = frozenset({"_HLS_msn", "_HLS_part", "_HLS_skip"})
 
 COMPOSE = (
     "docker",
@@ -45,6 +56,24 @@ COMPOSE = (
 
 class SmokeFailure(RuntimeError):
     """A secret-safe, actionable smoke failure."""
+
+
+@dataclass(frozen=True, slots=True)
+class RawResponse:
+    """Bounded response used for playlists and media without exposing private URLs."""
+
+    status: int
+    headers: Mapping[str, str]
+    body: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class PreviewProbe:
+    """Verified preview bytes plus the media playlist used for sustained reads."""
+
+    playlist_bytes: int
+    segment_bytes: int
+    media_playlist_path: str
 
 
 class APIClient:
@@ -102,10 +131,50 @@ class APIClient:
         if not self.csrf_token:
             raise SmokeFailure("login did not return a CSRF token")
 
+    def raw_request(
+        self,
+        path: str,
+        *,
+        expected: Sequence[int] = (200,),
+        headers: Mapping[str, str] | None = None,
+        max_bytes: int,
+    ) -> RawResponse:
+        request = Request(  # noqa: S310 - fixed loopback HTTP origin
+            BASE_URL + path,
+            headers={"Accept": "*/*", **dict(headers or {})},
+            method="GET",
+        )
+        try:
+            response = self._opener.open(request, timeout=15)
+        except HTTPError as exc:
+            try:
+                body = exc.read(max_bytes + 1)
+                response_headers = {key.lower(): value for key, value in exc.headers.items()}
+            finally:
+                exc.close()
+            if exc.code not in expected:
+                raise SmokeFailure(f"preview API returned unexpected status {exc.code}") from None
+            if len(body) > max_bytes:
+                raise SmokeFailure("preview API error response exceeded its size limit") from None
+            return RawResponse(exc.code, response_headers, body)
+
+        try:
+            body = response.read(max_bytes + 1)
+            response_headers = {key.lower(): value for key, value in response.headers.items()}
+            response_status = response.status
+        finally:
+            response.close()
+        if response_status not in expected:
+            raise SmokeFailure(f"preview API returned unexpected status {response_status}")
+        if len(body) > max_bytes:
+            raise SmokeFailure("preview API response exceeded its size limit")
+        return RawResponse(response_status, response_headers, body)
+
 
 def compose_exec(
     command: Sequence[str],
     *,
+    service: str = "backend",
     detach: bool = False,
     environment: dict[str, str] | None = None,
     timeout: float = 30,
@@ -115,7 +184,7 @@ def compose_exec(
         args.append("-d")
     for key, value in (environment or {}).items():
         args.extend(("-e", f"{key}={value}"))
-    args.extend(("backend", *command))
+    args.extend((service, *command))
     try:
         result = subprocess.run(  # noqa: S603 - fixed Compose executable and controlled argv
             args,
@@ -150,6 +219,263 @@ def wait_for(
                 return last
         time.sleep(interval)
     raise SmokeFailure(f"timed out waiting for {description}")
+
+
+def _host_command(command: Sequence[str], *, timeout: float = 20) -> str:
+    try:
+        result = subprocess.run(  # noqa: S603 - fixed Docker executable and controlled argv
+            command,
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SmokeFailure("Docker runtime inspection did not complete") from exc
+    if result.returncode != 0:
+        raise SmokeFailure("Docker runtime inspection failed")
+    return result.stdout.strip()
+
+
+def compose_container_id(service: str) -> str:
+    container_id = _host_command((*COMPOSE, "ps", "-q", service))
+    if not re.fullmatch(r"[0-9a-f]{12,64}", container_id):
+        raise SmokeFailure(f"{service} container ID was unavailable")
+    return container_id
+
+
+def assert_hls_port_is_internal() -> None:
+    container_id = compose_container_id("mediamtx")
+    for template in (
+        "{{json .HostConfig.PortBindings}}",
+        "{{json .NetworkSettings.Ports}}",
+    ):
+        output = _host_command(("docker", "inspect", "--format", template, container_id))
+        try:
+            bindings = json.loads(output)
+        except json.JSONDecodeError as exc:
+            raise SmokeFailure("MediaMTX port inspection returned invalid data") from exc
+        if isinstance(bindings, dict) and bindings.get("8888/tcp"):
+            raise SmokeFailure("MediaMTX HLS port 8888 was published on the host")
+
+
+def runtime_usage_sample() -> dict[str, tuple[str, str]]:
+    usage: dict[str, tuple[str, str]] = {}
+    for service in ("backend", "mediamtx"):
+        container_id = compose_container_id(service)
+        output = _host_command(
+            (
+                "docker",
+                "stats",
+                "--no-stream",
+                "--format",
+                "{{.CPUPerc}}|{{.MemUsage}}",
+                container_id,
+            ),
+            timeout=30,
+        )
+        cpu, separator, memory = output.partition("|")
+        if (
+            separator != "|"
+            or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?%", cpu)
+            or not re.fullmatch(
+                r"[0-9]+(?:\.[0-9]+)?[KMGT]?i?B / [0-9]+(?:\.[0-9]+)?[KMGT]?i?B",
+                memory,
+            )
+        ):
+            raise SmokeFailure("Docker runtime usage returned an invalid sample")
+        usage[service] = (cpu, memory)
+    return usage
+
+
+def _public_preview_path(reference: str) -> str:
+    parsed = urlsplit(reference)
+    if parsed.scheme or parsed.netloc or parsed.fragment:
+        raise SmokeFailure("preview playlist exposed a non-local media reference")
+    if "%" in parsed.path:
+        raise SmokeFailure("preview playlist exposed an encoded media path")
+
+    path = unquote(parsed.path)
+    prefix = "/api/ingest/preview/"
+    if path.startswith(prefix):
+        asset = path.removeprefix(prefix)
+    elif path.startswith("/") or "/" in path or "\\" in path:
+        raise SmokeFailure("preview playlist exposed an invalid media path")
+    else:
+        asset = path
+    if not _HLS_ASSET.fullmatch(asset):
+        raise SmokeFailure("preview playlist exposed an unsupported media asset")
+
+    query_items = parse_qsl(parsed.query, keep_blank_values=True)
+    if any(
+        key not in _SAFE_HLS_QUERY or len(value) > 32 or not re.fullmatch(r"[A-Za-z0-9.+-]*", value)
+        for key, value in query_items
+    ):
+        raise SmokeFailure("preview playlist exposed an unsafe media query")
+    query = f"?{parsed.query}" if parsed.query else ""
+    return f"{prefix}{asset}{query}"
+
+
+def _playlist_references(body: bytes) -> tuple[list[str], list[str]]:
+    try:
+        text = body.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise SmokeFailure("preview playlist was not UTF-8") from exc
+    if not text.lstrip().startswith("#EXTM3U"):
+        raise SmokeFailure("preview response was not an HLS playlist")
+
+    playlists: list[str] = []
+    media: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        references: list[str]
+        if not line.startswith("#"):
+            references = [line]
+        elif line.startswith(("#EXT-X-PART:", "#EXT-X-MEDIA:", "#EXT-X-RENDITION-REPORT:")):
+            references = _HLS_URI.findall(line)
+        else:
+            continue
+        for reference in references:
+            safe_path = _public_preview_path(reference)
+            collection = playlists if urlsplit(safe_path).path.endswith(".m3u8") else media
+            if safe_path not in collection:
+                collection.append(safe_path)
+    return playlists, media
+
+
+def fetch_preview_segment(
+    client: APIClient, ingest_key: str, *, timeout: float = 35
+) -> PreviewProbe:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        playlist_path = PREVIEW_INDEX
+        visited: set[str] = set()
+        playlist_bytes = 0
+        for _ in range(4):
+            if playlist_path in visited:
+                break
+            visited.add(playlist_path)
+            playlist = client.raw_request(
+                playlist_path,
+                expected=(200, 404, 409, 502, 503, 504),
+                headers={"Accept": "application/vnd.apple.mpegurl"},
+                max_bytes=MAX_PLAYLIST_BYTES,
+            )
+            if playlist.status != 200:
+                break
+            content_type = playlist.headers.get("content-type", "").lower()
+            if "mpegurl" not in content_type:
+                raise SmokeFailure("preview playlist returned an invalid content type")
+            playlist_bytes += len(playlist.body)
+            lower_body = playlist.body.lower()
+            if (
+                ingest_key.encode() in playlist.body
+                or b"mediamtx" in lower_body
+                or b"cookiecheck=" in lower_body
+                or re.search(rb"(?:^|[?&])session=", lower_body)
+            ):
+                raise SmokeFailure("preview playlist exposed private upstream data")
+
+            nested, media = _playlist_references(playlist.body)
+            for segment_path in media:
+                try:
+                    segment = client.raw_request(
+                        segment_path,
+                        expected=(200, 206),
+                        headers={"Accept": "video/mp4, video/mp2t"},
+                        max_bytes=MAX_SEGMENT_BYTES,
+                    )
+                except SmokeFailure:
+                    continue
+                segment_type = segment.headers.get("content-type", "").lower()
+                if segment.body and segment_type.startswith(("video/mp4", "video/mp2t")):
+                    return PreviewProbe(
+                        playlist_bytes=playlist_bytes,
+                        segment_bytes=len(segment.body),
+                        media_playlist_path=playlist_path,
+                    )
+
+            next_playlist = next(
+                (candidate for candidate in nested if candidate not in visited),
+                None,
+            )
+            if next_playlist is None:
+                break
+            playlist_path = next_playlist
+        time.sleep(0.5)
+    raise SmokeFailure("timed out waiting for an authenticated HLS media segment")
+
+
+def fetch_preview_media_cycle(client: APIClient, playlist_path: str) -> int:
+    """Fetch a current media playlist and one non-empty media object."""
+
+    playlist = client.raw_request(
+        playlist_path,
+        expected=(200,),
+        headers={"Accept": "application/vnd.apple.mpegurl"},
+        max_bytes=MAX_PLAYLIST_BYTES,
+    )
+    nested, media = _playlist_references(playlist.body)
+    if nested or not media:
+        raise SmokeFailure("preview media playlist did not contain a media object")
+    for segment_path in media:
+        segment = client.raw_request(
+            segment_path,
+            expected=(200, 206, 404),
+            headers={"Accept": "video/mp4, video/mp2t"},
+            max_bytes=MAX_SEGMENT_BYTES,
+        )
+        if segment.status not in {200, 206}:
+            continue
+        segment_type = segment.headers.get("content-type", "").lower()
+        if segment.body and segment_type.startswith(("video/mp4", "video/mp2t")):
+            return len(segment.body)
+    raise SmokeFailure("preview media playlist did not yield a current media object")
+
+
+def sample_active_preview_usage(
+    client: APIClient, media_playlist_path: str
+) -> tuple[dict[str, tuple[str, str]], int]:
+    """Measure backend/MediaMTX while authenticated preview requests remain active."""
+
+    stop = threading.Event()
+    first_cycle = threading.Event()
+    failures: list[Exception] = []
+    cycles = 0
+
+    def consume() -> None:
+        nonlocal cycles
+        try:
+            while not stop.is_set():
+                fetch_preview_media_cycle(client, media_playlist_path)
+                cycles += 1
+                first_cycle.set()
+                stop.wait(0.1)
+        except Exception as exc:  # noqa: BLE001 - converted to one secret-safe failure below
+            failures.append(exc)
+            first_cycle.set()
+
+    consumer = threading.Thread(target=consume, name="ci-preview-consumer", daemon=True)
+    consumer.start()
+    if not first_cycle.wait(timeout=10):
+        stop.set()
+        raise SmokeFailure("preview traffic did not start before runtime sampling")
+    if failures:
+        stop.set()
+        raise SmokeFailure("preview traffic failed before runtime sampling") from None
+    try:
+        usage = runtime_usage_sample()
+    finally:
+        stop.set()
+        consumer.join(timeout=10)
+    if consumer.is_alive():
+        raise SmokeFailure("preview traffic did not stop after runtime sampling")
+    if failures or cycles < 1:
+        raise SmokeFailure("preview traffic failed during runtime sampling") from None
+    return usage, cycles
 
 
 def destination(client: APIClient, destination_id: int) -> dict[str, Any] | None:
@@ -211,6 +537,7 @@ exec ffmpeg -nostdin -hide_banner -loglevel error -re \\
 """
     compose_exec(
         ("sh", "-ec", script),
+        service=PUBLISHER_SERVICE,
         detach=True,
         environment={"CI_INGEST_KEY": ingest_key},
     )
@@ -258,7 +585,7 @@ def probe_received_media() -> tuple[int, int]:
     return video_packets, audio_packets
 
 
-def process_snapshot() -> dict[str, Any]:
+def process_snapshot(*, service: str = "backend") -> dict[str, Any]:
     source = f"""
 import json
 from pathlib import Path
@@ -275,7 +602,7 @@ for entry in Path('/proc').iterdir():
         pass
 print(json.dumps({{'publisher': publisher, 'ffmpeg': sorted(ffmpeg)}}))
 """
-    payload = json.loads(compose_exec(("python", "-c", source)))
+    payload = json.loads(compose_exec(("python", "-c", source), service=service))
     if not isinstance(payload, dict):
         raise SmokeFailure("process inspection returned an invalid document")
     return cast(dict[str, Any], payload)
@@ -294,7 +621,7 @@ if path.exists():
         pass
 """
     with suppress(SmokeFailure):
-        compose_exec(("python", "-c", source))
+        compose_exec(("python", "-c", source), service=PUBLISHER_SERVICE)
 
 
 def remove_test_files() -> None:
@@ -304,7 +631,7 @@ for name in ({PUBLISHER_PID_FILE!r}, '/tmp/ci-e2e-publisher.log'):
     Path(name).unlink(missing_ok=True)
 """
     with suppress(SmokeFailure):
-        compose_exec(("python", "-c", source))
+        compose_exec(("python", "-c", source), service=PUBLISHER_SERVICE)
 
 
 def main() -> int:
@@ -319,6 +646,64 @@ def main() -> int:
         ingest_key = str(ingest.get("stream_key", ""))
         if not ingest_key:
             raise SmokeFailure("ingest configuration did not include a stream key")
+
+        assert_hls_port_is_internal()
+        anonymous = APIClient()
+        anonymous.raw_request(
+            PREVIEW_INDEX,
+            expected=(401,),
+            max_bytes=64 * 1024,
+        )
+        print("E2E: preview rejected an unauthenticated request and port 8888 stayed internal")
+
+        launch_publisher(ingest_key)
+        initial_status = wait_for(
+            "active H.264/AAC ingest with received bytes",
+            lambda: client.request("GET", "/api/ingest/status"),
+            lambda item: (
+                item.get("state") == "live" and int(item.get("bytes_received", 0) or 0) > 0
+            ),
+        )
+        initial_bytes = int(initial_status.get("bytes_received", 0) or 0)
+        measured_status = wait_for(
+            "growing ingest bytes and calculated bitrate",
+            lambda: client.request("GET", "/api/ingest/status"),
+            lambda item: (
+                item.get("state") == "live"
+                and int(item.get("bytes_received", 0) or 0) > initial_bytes
+                and int(item.get("bitrate_bps", 0) or 0) > 0
+            ),
+            timeout=25,
+            interval=1,
+        )
+        measured_bytes = int(measured_status.get("bytes_received", 0) or 0)
+        measured_bitrate = int(measured_status.get("bitrate_bps", 0) or 0)
+        metadata = measured_status.get("metadata", {})
+        if not isinstance(metadata, dict):
+            raise SmokeFailure("ingest status returned invalid metadata")
+        video_codec = str(measured_status.get("video_codec") or metadata.get("video_codec") or "")
+        audio_codec = str(measured_status.get("audio_codec") or metadata.get("audio_codec") or "")
+        if video_codec.lower() != "h264" or audio_codec.lower() != "aac":
+            raise SmokeFailure("ingest status did not identify H.264/AAC")
+        if metadata.get("bitrate_bps") != measured_status.get("bitrate_bps"):
+            raise SmokeFailure("ingest bitrate fields were inconsistent")
+        print(
+            "E2E: ingest status confirmed H.264/AAC, growing bytes, and rolling bitrate "
+            f"(bytes={measured_bytes}, bitrate_bps={measured_bitrate})"
+        )
+
+        preview = fetch_preview_segment(client, ingest_key)
+        usage, preview_cycles = sample_active_preview_usage(client, preview.media_playlist_path)
+        print(
+            "E2E: authenticated preview returned playlist and media bytes "
+            f"(playlist_bytes={preview.playlist_bytes}, segment_bytes={preview.segment_bytes})"
+        )
+        print(
+            "E2E: isolated active-preview runtime usage "
+            f"preview_cycles={preview_cycles}; "
+            f"backend_cpu={usage['backend'][0]} backend_memory={usage['backend'][1]}; "
+            f"mediamtx_cpu={usage['mediamtx'][0]} mediamtx_memory={usage['mediamtx'][1]}"
+        )
 
         created = client.request(
             "POST",
@@ -336,13 +721,6 @@ def main() -> int:
         destination_id = created_id
         client.request("POST", f"/api/destinations/{created_id}/start", csrf=True)
         print("E2E: created and started the isolated destination through the HTTP API")
-
-        launch_publisher(ingest_key)
-        wait_for(
-            "active H.264/AAC ingest",
-            lambda: client.request("GET", "/api/ingest/status"),
-            lambda item: item.get("state") == "live",
-        )
         try:
             live = wait_for(
                 "destination state live",
@@ -422,16 +800,40 @@ def main() -> int:
         )
         wait_for("receiver sink path removal", receiver_path, lambda item: item is None)
 
-        snapshot = process_snapshot()
-        if snapshot.get("publisher") is None or snapshot.get("ffmpeg") != [snapshot["publisher"]]:
+        backend_snapshot = process_snapshot()
+        publisher_snapshot = process_snapshot(service=PUBLISHER_SERVICE)
+        if backend_snapshot.get("ffmpeg"):
             raise SmokeFailure("worker FFmpeg or child process remained after stop")
+        if publisher_snapshot.get("publisher") is None or publisher_snapshot.get("ffmpeg") != [
+            publisher_snapshot["publisher"]
+        ]:
+            raise SmokeFailure("synthetic publisher process state was inconsistent")
 
         stop_publisher()
         wait_for(
             "synthetic publisher termination",
-            process_snapshot,
+            lambda: process_snapshot(service=PUBLISHER_SERVICE),
             lambda item: not item.get("ffmpeg"),
         )
+        offline = wait_for(
+            "offline ingest with reset bitrate",
+            lambda: client.request("GET", "/api/ingest/status"),
+            lambda item: item.get("state") == "offline" and item.get("bitrate_bps") is None,
+            timeout=30,
+            interval=1,
+        )
+        offline_metadata = offline.get("metadata", {})
+        if (
+            not isinstance(offline_metadata, dict)
+            or offline_metadata.get("bitrate_bps") is not None
+        ):
+            raise SmokeFailure("offline ingest retained a metadata bitrate")
+        client.raw_request(
+            PREVIEW_INDEX,
+            expected=(404, 409),
+            max_bytes=64 * 1024,
+        )
+        print("E2E: publisher stop reset bitrate and made the authenticated preview offline")
 
         client.request(
             "DELETE",
@@ -462,8 +864,15 @@ def main() -> int:
         stop_publisher()
         with suppress(Exception):
             wait_for(
-                "FFmpeg cleanup",
+                "worker FFmpeg cleanup",
                 process_snapshot,
+                lambda item: not item.get("ffmpeg"),
+                timeout=8,
+            )
+        with suppress(Exception):
+            wait_for(
+                "publisher FFmpeg cleanup",
+                lambda: process_snapshot(service=PUBLISHER_SERVICE),
                 lambda item: not item.get("ffmpeg"),
                 timeout=8,
             )

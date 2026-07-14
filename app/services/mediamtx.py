@@ -253,12 +253,16 @@ def _stream_items(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
 
 
 def _track_items(payload: Mapping[str, Any]) -> list[object]:
-    candidates: list[Any] = [payload.get("tracks")]
+    candidates: list[Any] = [payload.get("tracks2"), payload.get("tracks")]
     metadata = payload.get("metadata")
     if isinstance(metadata, Mapping):
-        candidates.append(metadata.get("tracks"))
+        candidates.extend((metadata.get("tracks2"), metadata.get("tracks")))
     for candidate in candidates:
-        if isinstance(candidate, Sequence) and not isinstance(candidate, (str, bytes)):
+        if (
+            isinstance(candidate, Sequence)
+            and not isinstance(candidate, (str, bytes))
+            and candidate
+        ):
             return list(candidate)
     return []
 
@@ -319,9 +323,23 @@ def normalize_stream_metadata(payload: Mapping[str, Any] | None) -> StreamMetada
             codec = normalize_codec(_first(track, "codec", "codec_name", "name", "type"))
             kind_value = _first(track, "media_type", "codec_type", "kind")
             kind = str(kind_value).strip().lower() if kind_value is not None else None
-            width = width or _positive_int(track.get("width"))
-            height = height or _positive_int(track.get("height"))
-            fps = fps or _positive_float(_first(track, "fps", "frameRate"))
+            codec_props_value = track.get("codecProps")
+            codec_props = codec_props_value if isinstance(codec_props_value, Mapping) else {}
+            width = (
+                width
+                or _positive_int(_first(codec_props, "width", "videoWidth"))
+                or _positive_int(track.get("width"))
+            )
+            height = (
+                height
+                or _positive_int(_first(codec_props, "height", "videoHeight"))
+                or _positive_int(track.get("height"))
+            )
+            fps = (
+                fps
+                or _positive_float(_first(codec_props, "fps", "frameRate", "frame_rate"))
+                or _positive_float(_first(track, "fps", "frameRate", "frame_rate"))
+            )
         else:
             codec = normalize_codec(track)
             kind = None
@@ -391,8 +409,8 @@ def map_ingest_status(payload: Mapping[str, Any] | None) -> IngestStatus:
     explicit_value = _first(path, "state", "status", "connectionState")
     explicit = str(explicit_value).strip().lower() if explicit_value is not None else ""
     has_error = bool(_first(path, "error", "lastError"))
-    ready = _truthy(_first(path, "ready", "isReady", "online"))
-    unstable = _truthy(_first(path, "unstable", "degraded"))
+    ready = any(_truthy(path.get(key)) for key in ("available", "ready", "isReady", "online"))
+    unstable = any(_truthy(path.get(key)) for key in ("unstable", "degraded"))
     source = path.get("source")
     has_source = bool(source) and not (
         isinstance(source, str) and source.lower() in {"none", "offline"}
@@ -417,9 +435,27 @@ def map_ingest_status(payload: Mapping[str, Any] | None) -> IngestStatus:
     return IngestStatus(
         state=state,
         metadata=normalize_stream_metadata(path),
-        since=_parse_datetime(_first(path, "readyTime", "ready_time", "since")),
+        since=_parse_datetime(
+            _first(
+                path,
+                "availableTime",
+                "available_time",
+                "readyTime",
+                "ready_time",
+                "onlineTime",
+                "online_time",
+                "since",
+            )
+        ),
         bytes_received=_positive_int(
-            _first(path, "bytesReceived", "bytes_received", "receivedBytes")
+            _first(
+                path,
+                "inboundBytes",
+                "inbound_bytes",
+                "bytesReceived",
+                "bytes_received",
+                "receivedBytes",
+            )
         ),
         message=message,
     )
