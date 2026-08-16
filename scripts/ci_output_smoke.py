@@ -580,11 +580,12 @@ set -eu
 start_ticks="$(awk '{{print $22}}' /proc/$$/stat)"
 printf '%s %s\\n' "$$" "$start_ticks" > {PUBLISHER_PID_FILE}
 exec ffmpeg -nostdin -hide_banner -loglevel error -re \\
+  -filter_threads 1 -filter_complex_threads 1 \\
   -f lavfi -i testsrc=size=320x180:rate=15 \\
   -f lavfi -i sine=frequency=440:sample_rate=44100 \\
-  -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p \\
+  -c:v libx264 -threads:v 1 -preset ultrafast -tune zerolatency -pix_fmt yuv420p \\
   -g 30 -keyint_min 30 -sc_threshold 0 \\
-  -c:a aac -f flv \\
+  -c:a aac -threads:a 1 -f flv \\
   "rtmp://mediamtx:1935/live/${{CI_INGEST_KEY}}" \\
   >/tmp/ci-e2e-publisher.log 2>&1
 """
@@ -746,6 +747,46 @@ def publisher_alive_predicate(
     return lambda snapshot: publisher_is_alive(snapshot, expected)
 
 
+def publisher_log_category() -> str:
+    """Return an allowlisted failure category without exporting FFmpeg logs."""
+
+    source = r"""
+from pathlib import Path
+path = Path('/tmp/ci-e2e-publisher.log')
+data = path.read_bytes()[:65536].lower() if path.exists() else b''
+if not data:
+    category = 'empty'
+elif any(marker in data for marker in (
+    b'pthread_create', b'resource temporarily unavailable', b'failed to create thread'
+)):
+    category = 'resource_limit'
+elif b'connection refused' in data:
+    category = 'connection_refused'
+elif b'server error' in data and (b'401' in data or b'403' in data):
+    category = 'auth_rejected'
+elif b'input/output error' in data:
+    category = 'io_error'
+elif b'broken pipe' in data or b'connection reset' in data:
+    category = 'connection_closed'
+else:
+    category = 'other'
+print(category)
+"""
+    category = compose_exec(("python", "-c", source), service=PUBLISHER_SERVICE)
+    allowed = {
+        "empty",
+        "resource_limit",
+        "connection_refused",
+        "auth_rejected",
+        "io_error",
+        "connection_closed",
+        "other",
+    }
+    if category not in allowed:
+        raise SmokeFailure("publisher diagnostic returned an invalid category")
+    return category
+
+
 def launch_accepted_publisher(
     ingest_key: str,
     *,
@@ -760,6 +801,7 @@ def launch_accepted_publisher(
     absent before the single retry. Persistent failure remains a hard gate.
     """
 
+    failure_categories: list[str] = []
     for attempt in (1, 2):
         identity = launch_publisher(ingest_key)
         if identity in seen_identities:
@@ -775,6 +817,10 @@ def launch_accepted_publisher(
             )
             return identity
         except SmokeFailure:
+            try:
+                failure_categories.append(publisher_log_category())
+            except SmokeFailure:
+                failure_categories.append("diagnostic_unavailable")
             stop_publisher()
             try:
                 wait_for(
@@ -792,7 +838,10 @@ def launch_accepted_publisher(
             if attempt == 2:
                 break
             time.sleep(1)
-    raise SmokeFailure(f"{description} failed after two independent attempts")
+    categories = ",".join(failure_categories)
+    raise SmokeFailure(
+        f"{description} failed after two independent attempts (categories={categories})"
+    )
 
 
 def assert_publisher_rejected(

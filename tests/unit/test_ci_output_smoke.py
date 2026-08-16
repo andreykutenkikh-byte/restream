@@ -84,6 +84,7 @@ def test_accepted_publisher_uses_one_clean_independent_retry(
 
     monkeypatch.setattr(ci_output_smoke, "launch_publisher", lambda _key: next(launched))
     monkeypatch.setattr(ci_output_smoke, "stop_publisher", lambda: stopped.append(True))
+    monkeypatch.setattr(ci_output_smoke, "publisher_log_category", lambda: "resource_limit")
     monkeypatch.setattr(
         ci_output_smoke, "remove_test_files", lambda **_kwargs: removed.append(True)
     )
@@ -126,6 +127,7 @@ def test_accepted_publisher_fails_after_two_clean_attempts(
 
     monkeypatch.setattr(ci_output_smoke, "launch_publisher", lambda _key: next(identities))
     monkeypatch.setattr(ci_output_smoke, "stop_publisher", lambda: None)
+    monkeypatch.setattr(ci_output_smoke, "publisher_log_category", lambda: "resource_limit")
     monkeypatch.setattr(ci_output_smoke, "remove_test_files", lambda **_kwargs: None)
     monkeypatch.setattr(time, "sleep", lambda _seconds: None)
 
@@ -140,7 +142,10 @@ def test_accepted_publisher_fails_after_two_clean_attempts(
 
     with pytest.raises(
         ci_output_smoke.SmokeFailure,
-        match="replacement publisher failed after two independent attempts",
+        match=(
+            "replacement publisher failed after two independent attempts "
+            r"\(categories=resource_limit,resource_limit\)"
+        ),
     ):
         ci_output_smoke.launch_accepted_publisher(
             "synthetic-key",
@@ -149,3 +154,13 @@ def test_accepted_publisher_fails_after_two_clean_attempts(
         )
 
     assert attempt_waits == 4
+
+
+def test_publisher_encoder_threads_are_bounded_by_policy() -> None:
+    source = ci_output_smoke.launch_publisher.__code__.co_consts
+    script = next(value for value in source if isinstance(value, str) and "exec ffmpeg" in value)
+
+    assert "-filter_threads 1" in script
+    assert "-filter_complex_threads 1" in script
+    assert "-threads:v 1" in script
+    assert "-threads:a 1" in script
