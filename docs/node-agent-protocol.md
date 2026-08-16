@@ -150,6 +150,11 @@ executable, argument, URL, or script field. It acknowledges delivery with an emp
 - `data_writable`;
 - `no_inbound_ports`.
 
+`no_inbound_ports` reads the agent's Linux network namespace and fails on every non-loopback TCP
+listener, including wildcard and bridge-address listeners. Loopback-only listeners such as Docker's
+embedded DNS resolver are not inbound exposure. Independently, the generated Compose model has no
+`ports` and does not use host networking; repository policy tests enforce both constraints.
+
 `control_https` is a real, bounded, credential-free request to the fixed command endpoint. It must
 reach the control application and receive its expected unauthenticated `401`; TLS certificate and
 hostname validation are enabled in production. Development and isolated test agents may make the

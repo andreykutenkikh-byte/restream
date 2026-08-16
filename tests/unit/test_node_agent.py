@@ -17,7 +17,12 @@ import pytest
 from app.schemas import NodeCommandCompleteRequest, NodeEnrollmentRequest, NodeHeartbeatRequest
 from node_agent.__main__ import _run_agent
 from node_agent.client import NodeAPIClient
-from node_agent.commands import CommandJournal, CommandProcessor, LocalSelfTestProbe
+from node_agent.commands import (
+    CommandJournal,
+    CommandProcessor,
+    LocalSelfTestProbe,
+    _proc_listener_is_loopback,
+)
 from node_agent.credentials import CredentialStore, SensitiveToken
 from node_agent.errors import (
     AgentError,
@@ -258,6 +263,45 @@ def test_control_https_self_test_fails_closed_on_transport_or_insecure_scheme(
         ).control_https()
         is False
     )
+
+
+@pytest.mark.parametrize(
+    ("local_address", "expected"),
+    [
+        ("0100007F:1F90", True),
+        ("0B00007F:8C6B", True),
+        ("00000000:1F90", False),
+        ("020011AC:1F90", False),
+        ("00000000000000000000000001000000:1F90", True),
+        ("00000000000000000000000000000000:1F90", False),
+        ("malformed", False),
+        ("0100007F:not-port", False),
+    ],
+)
+def test_proc_listener_classification_allows_only_loopback(
+    local_address: str, expected: bool
+) -> None:
+    assert _proc_listener_is_loopback(local_address) is expected
+
+
+def test_no_inbound_ports_ignores_docker_loopback_dns_and_rejects_bridge_listener(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    tables = {
+        "/proc/net/tcp": "header\n0: 0B00007F:8C6B 00000000:0000 0A\n",
+        "/proc/net/tcp6": "header\n",
+    }
+
+    def read_table(path: Path, *, encoding: str) -> str:
+        assert encoding == "ascii"
+        return tables[path.as_posix()]
+
+    monkeypatch.setattr(Path, "read_text", read_table)
+    probe = LocalSelfTestProbe("https://control.test", tmp_path)
+    assert probe.no_inbound_ports() is True
+
+    tables["/proc/net/tcp"] = "header\n0: 020011AC:1F90 00000000:0000 0A\n"
+    assert probe.no_inbound_ports() is False
     assert (
         LocalSelfTestProbe(
             "http://control.test",

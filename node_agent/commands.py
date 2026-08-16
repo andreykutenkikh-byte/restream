@@ -10,6 +10,7 @@ import tempfile
 import threading
 from collections import OrderedDict
 from collections.abc import Callable
+from ipaddress import IPv4Address, IPv6Address
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlsplit
@@ -130,9 +131,31 @@ class LocalSelfTestProbe:
             inspected_table = True
             for line in lines:
                 fields = line.split()
-                if len(fields) >= 4 and fields[3] == "0A":
+                if len(fields) < 4:
+                    return False
+                if fields[3] == "0A" and not _proc_listener_is_loopback(fields[1]):
                     return False
         return inspected_table
+
+
+def _proc_listener_is_loopback(local_address: str) -> bool:
+    encoded_host, separator, encoded_port = local_address.partition(":")
+    if separator != ":" or len(encoded_port) != 4:
+        return False
+    try:
+        int(encoded_port, 16)
+        packed = bytes.fromhex(encoded_host)
+        address: IPv4Address | IPv6Address
+        if len(packed) == 4:
+            address = IPv4Address(packed[::-1])
+        elif len(packed) == 16:
+            native_words = (packed[index : index + 4] for index in range(0, 16, 4))
+            address = IPv6Address(b"".join(word[::-1] for word in native_words))
+        else:
+            return False
+    except ValueError:
+        return False
+    return address.is_loopback
 
 
 class CommandJournal:
