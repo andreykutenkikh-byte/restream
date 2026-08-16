@@ -8,6 +8,7 @@ and key lifecycle decisions to the caller.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import secrets
 from typing import Final
 
@@ -203,6 +204,32 @@ def digest_opaque_token(token: str) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def generate_enrollment_token(nbytes: int = DEFAULT_TOKEN_BYTES) -> str:
+    """Generate a one-time node enrollment token with at least 256-bit entropy."""
+
+    return _token_urlsafe(nbytes)
+
+
+def generate_node_token(node_id: str, nbytes: int = DEFAULT_TOKEN_BYTES) -> str:
+    """Generate a routable permanent node token without weakening its secret part."""
+
+    identifier = _require_text(node_id, "node_id")
+    if "_" in identifier:
+        raise ValueError("node_id must not contain underscores")
+    return f"node_{identifier}_{_token_urlsafe(nbytes)}"
+
+
+def verify_opaque_token_digest(token: str | None, expected_digest: str | None) -> bool:
+    """Authenticate a high-entropy opaque token with a constant-time digest comparison."""
+
+    if not isinstance(token, str) or not isinstance(expected_digest, str):
+        return False
+    if not token or len(expected_digest) != 64:
+        return False
+    provided_digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return hmac.compare_digest(provided_digest, expected_digest)
+
+
 __all__ = [
     "DEFAULT_TOKEN_BYTES",
     "InvalidMasterKeyError",
@@ -211,8 +238,10 @@ __all__ = [
     "digest_opaque_token",
     "encrypt_destination_key",
     "generate_csrf_token",
+    "generate_enrollment_token",
     "generate_ingest_key",
     "generate_master_key",
+    "generate_node_token",
     "generate_session_id",
     "generate_stream_key",
     "hash_password",
@@ -220,5 +249,6 @@ __all__ = [
     "rotate_ingest_key",
     "rotate_stream_key",
     "verify_csrf_token",
+    "verify_opaque_token_digest",
     "verify_password",
 ]
