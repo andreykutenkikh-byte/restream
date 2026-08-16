@@ -436,6 +436,11 @@ def test_ci_ssh_target_emulates_only_exact_docker_package_queries() -> None:
     key_cleanup = dockerfile.index("rm -f /etc/ssh/ssh_host_ed25519_key")
     key_generation = dockerfile.index("ssh-keygen -q -t ed25519")
     assert key_cleanup < key_generation
+    runtime_dir = "install -d -m 0755 /run/sshd"
+    sshd_exec = "exec /usr/sbin/sshd -D -e"
+    assert runtime_dir in dockerfile
+    assert sshd_exec in dockerfile
+    assert dockerfile.index(runtime_dir) < dockerfile.index(sshd_exec)
     assert "docker-ce docker-ce-cli containerd.io docker-compose-plugin" in source
     assert "docker.io containerd runc podman-docker" in source
     assert "exit 64" in source
@@ -587,6 +592,9 @@ def test_ci_runtime_always_uses_test_override_and_cleans_up() -> None:
     )
     assert "generate-bootstrap-worker-secret" in workflow
     assert "printf '%s' \"$BOOTSTRAP_WORKER_SECRET\" > .bootstrap-worker-secret.ci" in workflow
+    assert "sudo chown 10001:10001 .bootstrap-worker-secret.ci" in workflow
+    assert "chmod 0600 .bootstrap-worker-secret.ci" in workflow
+    assert "600:10001:10001" in workflow
     assert "BOOTSTRAP_WORKER_SECRET_FILE=.bootstrap-worker-secret.ci" in workflow
     assert "if: always()" in workflow
     assert "down --remove-orphans --volumes" in workflow

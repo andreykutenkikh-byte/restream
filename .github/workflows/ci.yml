@@ -37,7 +37,9 @@ jobs:
           MASTER_KEY="$(uv run --locked python -m app.cli generate-master-key)"
           ADMIN_HASH="$(uv run --locked python -c 'from app.core.security import hash_password; print(hash_password("ci-only-password"))')"
           printf '%s' "$BOOTSTRAP_WORKER_SECRET" > .bootstrap-worker-secret.ci
+          sudo chown 10001:10001 .bootstrap-worker-secret.ci
           chmod 0600 .bootstrap-worker-secret.ci
+          test "$(stat -c '%a:%u:%g' .bootstrap-worker-secret.ci)" = '600:10001:10001'
           {
             echo 'RTMP_BIND_ADDRESS=127.0.0.1'
             echo 'ADMIN_LOGIN=ci-admin'

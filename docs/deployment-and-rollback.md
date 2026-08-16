@@ -29,10 +29,10 @@ The override is fail-closed: its effective values include `ENVIRONMENT=productio
 
 The production `.env` must provide independent `SESSION_SECRET`, `WORKER_AUTH_PASSWORD`, and
 `BOOTSTRAP_WORKER_SECRET` values, plus the existing Fernet/admin settings. It must also provide
-`BOOTSTRAP_WORKER_SECRET_FILE`, pointing to a root/deployment-owned mode-`0600` file containing
-exactly the same generated bootstrap secret and no diagnostic output. Keep that file outside Git
-and the Docker build context. The backend reads the `.env` value while Compose mounts the file
-read-only into the bootstrap worker; authenticated readiness fails when they differ. It must also provide
+`BOOTSTRAP_WORKER_SECRET_FILE`, pointing to a mode-`0600` file owned by UID/GID `10001:10001` and
+containing exactly the same generated bootstrap secret with no diagnostic output. Keep that file
+outside Git and the Docker build context. The backend reads the `.env` value while Compose mounts
+the file read-only into the fixed non-root bootstrap worker; authenticated readiness fails when they differ. It must also provide
 `NODE_AGENT_IMAGE` as an immutable amd64 registry reference ending in
 `@sha256:<64 lowercase hexadecimal characters>`. Do not use a mutable tag, locally built image ID,
 or CI-only `adojapan-restream-node:ci` value. The separate **Node Agent image** workflow publishes
@@ -68,9 +68,10 @@ SSH. Validate these safe fields with a structured parser; never print the resolv
 ## Control-plane deployment
 
 1. Install the reviewed repository under `/opt/adojapan-restream` with a root/deployment-owned
-   production `.env` and bootstrap secret file excluded from Git, both mode `0600`. Generate the
-   three trust-domain secrets independently, then write the bootstrap value identically to its
-   `.env` entry and dedicated file.
+   production `.env` and a bootstrap secret file excluded from Git, both mode `0600`. The dedicated
+   bootstrap file must be owned by UID/GID `10001:10001`, while `.env` remains deployment-owned.
+   Generate the three trust-domain secrets independently, then write the bootstrap value identically
+   to its `.env` entry and dedicated file.
 2. Back up the project SQLite database and only the reverse-proxy site file scheduled to change.
 3. Validate the production model using the explicit project name and file order.
 4. Build and start only this project:

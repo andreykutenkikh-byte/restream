@@ -102,10 +102,11 @@ services to satisfy these values.
 4. Put the outputs into `.env`. `SESSION_SECRET`, `WORKER_AUTH_PASSWORD`, and
    `BOOTSTRAP_WORKER_SECRET` protect independent trust domains and must be three different random
    values. Write the exact bootstrap secret, without a trailing diagnostic line, to the mode-`0600`
-   file named by `BOOTSTRAP_WORKER_SECRET_FILE`; this file is mounted read-only into the bootstrap
-   worker because its root filesystem is read-only. Both copies must come from the same generated
-   value. Keep the Argon2id hash single-quoted so its dollar signs remain literal. For local HTTP,
-   leave `COOKIE_SECURE=false`. Production requires HTTPS and `COOKIE_SECURE=true`.
+   file named by `BOOTSTRAP_WORKER_SECRET_FILE`. On a Linux host, set its owner to the bootstrap
+   worker's fixed UID/GID `10001:10001`; the non-root worker receives that file read-only because its
+   root filesystem is read-only. Both copies must come from the same generated value. Keep the
+   Argon2id hash single-quoted so its dollar signs remain literal. For local HTTP, leave
+   `COOKIE_SECURE=false`. Production requires HTTPS and `COOKIE_SECURE=true`.
 
 5. Validate and start only this project:
 
@@ -303,8 +304,9 @@ This project has one defined public identity, so fixing it in the override remov
 or switch the profile back to development. `SESSION_SECRET`, `WORKER_AUTH_PASSWORD`, and
 `BOOTSTRAP_WORKER_SECRET` remain separate required secrets and must contain independent values.
 The backend receives its value from `.env`; the read-only bootstrap worker receives the exact same
-value through the mode-`0600` file selected by `BOOTSTRAP_WORKER_SECRET_FILE`. The file is excluded
-from Git and Docker build contexts.
+value through the mode-`0600` file selected by `BOOTSTRAP_WORKER_SECRET_FILE`. On Linux this source
+file is owned by UID/GID `10001:10001`, matching the worker's fixed non-root identity. The file is
+excluded from Git and Docker build contexts.
 `PUBLIC_CONTROL_URL` is fixed to `https://restream.adojapan.ru`, `NODE_PROTOCOL_VERSION` is fixed
 to `1`, and `NODE_AGENT_IMAGE` must be supplied as an immutable SHA-256 digest reference.
 

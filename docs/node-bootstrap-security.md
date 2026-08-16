@@ -32,9 +32,9 @@ the named volume has the same ownership regardless of which container Docker cre
 
 Every UDS request carries an independent `BOOTSTRAP_WORKER_SECRET`. Compose injects it into the
 worker from `/run/secrets/bootstrap_worker_secret`, not in the worker environment. The Compose
-secret uses the mode-`0600` file selected by `BOOTSTRAP_WORKER_SECRET_FILE`, which is excluded from
-Git and the Docker build context; its contents must exactly match the backend's independently named
-`BOOTSTRAP_WORKER_SECRET` environment value. A mismatched value fails authenticated worker
+secret uses the mode-`0600` file selected by `BOOTSTRAP_WORKER_SECRET_FILE`, owned on Linux by the
+worker's fixed UID/GID `10001:10001` and excluded from Git and the Docker build context; its contents
+must exactly match the backend's independently named `BOOTSTRAP_WORKER_SECRET` environment value. A mismatched value fails authenticated worker
 readiness. Production startup and validation require the session secret, MediaMTX worker password,
 and bootstrap worker secret to be present and mutually independent.
 
@@ -220,7 +220,7 @@ interrupted by an early container `SIGKILL`.
 internal to `bootstrap-egress`; the real test agent uses a CI node-data volume and has no inbound
 port. Both are absent from the effective production configuration. CI credentials and enrollment
 data are disposable test values, never production secrets. CI creates its worker secret source as
-a temporary mode-`0600` file and removes it in the unconditional project cleanup.
+a temporary mode-`0600`, UID/GID-`10001:10001` file and removes it in the unconditional project cleanup.
 
 Stage 4A bootstrap does not support SSH keys, configure sshd, issue direct firewall-management
 commands, expose an agent port, use host networking, send video, publish to YouTube, hot-switch

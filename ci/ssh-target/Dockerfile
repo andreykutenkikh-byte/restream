@@ -37,4 +37,4 @@ EXPOSE 22
 
 STOPSIGNAL SIGTERM
 
-CMD ["/usr/sbin/sshd", "-D", "-e"]
+CMD ["sh", "-c", "install -d -m 0755 /run/sshd && exec /usr/sbin/sshd -D -e"]
