@@ -120,6 +120,7 @@ def find_mount(service: dict[str, Any], name: str, target: str) -> dict[str, Any
 def validate(model: dict[str, Any]) -> None:
     services = as_mapping(model.get("services"), "services_shape")
     networks = as_mapping(model.get("networks"), "networks_shape")
+    secrets = as_mapping(model.get("secrets"), "secrets_shape")
     require(set(services) == {"backend", "mediamtx", "bootstrap"}, "production_service_set")
     backend = as_mapping(services.get("backend"), "backend_shape")
     mediamtx = as_mapping(services.get("mediamtx"), "mediamtx_shape")
@@ -181,6 +182,15 @@ def validate(model: dict[str, Any]) -> None:
     require(
         str(bootstrap_secret_mount.get("source", "")) == "bootstrap_worker_secret",
         "bootstrap_secret_source",
+    )
+    require(set(secrets) == {"bootstrap_worker_secret"}, "production_secret_set")
+    bootstrap_secret_definition = as_mapping(
+        secrets.get("bootstrap_worker_secret"), "bootstrap_secret_definition"
+    )
+    require(bool(str(bootstrap_secret_definition.get("file", ""))), "bootstrap_secret_file_source")
+    require(
+        "environment" not in bootstrap_secret_definition,
+        "bootstrap_secret_environment_source",
     )
 
     total_cpu = Decimal(0)

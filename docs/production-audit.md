@@ -60,7 +60,9 @@ values are `ENVIRONMENT=production`, `COOKIE_SECURE=true`, `MAX_DESTINATIONS=1`,
 `NODE_PROTOCOL_VERSION=1`. These fixed values are appropriate because this project has one defined
 public identity; a production `.env` cannot replace them with development mode, insecure cookies,
 or `localhost`. `SESSION_SECRET`, `WORKER_AUTH_PASSWORD`, and `BOOTSTRAP_WORKER_SECRET` remain
-independently supplied secrets and must all differ.
+independently supplied secrets and must all differ. `BOOTSTRAP_WORKER_SECRET_FILE` must name a
+Git-excluded, mode-`0600` file containing exactly the backend bootstrap-secret value; Compose mounts
+that file read-only into the bootstrap worker instead of placing the secret in its environment.
 
 Production must also supply `NODE_AGENT_IMAGE` as an immutable amd64 registry reference ending in
 `@sha256:<64 lowercase hexadecimal characters>`. Record the digest, reviewed source commit, build

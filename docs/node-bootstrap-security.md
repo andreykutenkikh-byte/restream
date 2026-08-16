@@ -31,9 +31,12 @@ reach that network. Both images seed the mount point as UID/GID `10001:10001`, m
 the named volume has the same ownership regardless of which container Docker creates first.
 
 Every UDS request carries an independent `BOOTSTRAP_WORKER_SECRET`. Compose injects it into the
-worker from `/run/secrets/bootstrap_worker_secret`, not in the worker environment. Production
-startup and validation require the session secret, MediaMTX worker password, and bootstrap worker
-secret to be present and mutually independent.
+worker from `/run/secrets/bootstrap_worker_secret`, not in the worker environment. The Compose
+secret uses the mode-`0600` file selected by `BOOTSTRAP_WORKER_SECRET_FILE`, which is excluded from
+Git and the Docker build context; its contents must exactly match the backend's independently named
+`BOOTSTRAP_WORKER_SECRET` environment value. A mismatched value fails authenticated worker
+readiness. Production startup and validation require the session secret, MediaMTX worker password,
+and bootstrap worker secret to be present and mutually independent.
 
 The worker container runs as fixed non-root UID/GID `10001:10001`, is read-only except for its UDS
 volume and `/tmp`, drops all capabilities, enables `no-new-privileges`, has no published/exposed
@@ -216,7 +219,8 @@ interrupted by an early container `SIGKILL`.
 `ci-ssh-target` and `ci-node-agent` are CI-only fixtures. The SSH fixture is exact-allowlisted and
 internal to `bootstrap-egress`; the real test agent uses a CI node-data volume and has no inbound
 port. Both are absent from the effective production configuration. CI credentials and enrollment
-data are disposable test values, never production secrets.
+data are disposable test values, never production secrets. CI creates its worker secret source as
+a temporary mode-`0600` file and removes it in the unconditional project cleanup.
 
 Stage 4A bootstrap does not support SSH keys, configure sshd, issue direct firewall-management
 commands, expose an agent port, use host networking, send video, publish to YouTube, hot-switch

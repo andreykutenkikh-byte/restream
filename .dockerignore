@@ -3,6 +3,8 @@
 .env
 .env.*
 !.env.example
+.bootstrap-worker-secret.*
+secrets
 .venv
 __pycache__
 .pytest_cache

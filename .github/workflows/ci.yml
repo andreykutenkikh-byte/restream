@@ -36,6 +36,8 @@ jobs:
           BOOTSTRAP_WORKER_SECRET="$(uv run --locked python -m app.cli generate-bootstrap-worker-secret)"
           MASTER_KEY="$(uv run --locked python -m app.cli generate-master-key)"
           ADMIN_HASH="$(uv run --locked python -c 'from app.core.security import hash_password; print(hash_password("ci-only-password"))')"
+          printf '%s' "$BOOTSTRAP_WORKER_SECRET" > .bootstrap-worker-secret.ci
+          chmod 0600 .bootstrap-worker-secret.ci
           {
             echo 'RTMP_BIND_ADDRESS=127.0.0.1'
             echo 'ADMIN_LOGIN=ci-admin'
@@ -43,6 +45,7 @@ jobs:
             printf 'SESSION_SECRET=%s\n' "$SESSION_SECRET"
             printf 'WORKER_AUTH_PASSWORD=%s\n' "$WORKER_AUTH_PASSWORD"
             printf 'BOOTSTRAP_WORKER_SECRET=%s\n' "$BOOTSTRAP_WORKER_SECRET"
+            echo 'BOOTSTRAP_WORKER_SECRET_FILE=.bootstrap-worker-secret.ci'
             printf 'MASTER_ENCRYPTION_KEY=%s\n' "$MASTER_KEY"
             printf "ADMIN_PASSWORD_HASH='%s'\n" "$ADMIN_HASH"
             printf 'NODE_AGENT_IMAGE=%s\n' 'ghcr.io/adojapan/ci-node-agent@sha256:1111111111111111111111111111111111111111111111111111111111111111'
@@ -137,10 +140,11 @@ jobs:
       - name: Stop CI project
         if: always()
         run: |
+          set +e
+          cleanup_status=0
           if [ -f .env.ci ]; then
-            set +e
             docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml down --remove-orphans --volumes
             cleanup_status=$?
-            rm -f .env.ci
-            exit "$cleanup_status"
           fi
+          rm -f .env.ci .bootstrap-worker-secret.ci
+          exit "$cleanup_status"

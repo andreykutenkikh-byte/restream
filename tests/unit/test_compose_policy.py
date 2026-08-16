@@ -74,6 +74,7 @@ def resolved_production_model() -> dict[str, Any]:
     model["services"]["bootstrap"]["secrets"] = [
         {"source": "bootstrap_worker_secret", "target": "bootstrap_worker_secret"}
     ]
+    model["secrets"]["bootstrap_worker_secret"] = {"file": "/run/adojapan-bootstrap-secret-source"}
     return model
 
 
@@ -108,7 +109,9 @@ def test_compose_project_is_isolated_and_bounded() -> None:
     assert compose["networks"]["bootstrap-egress"] == {"driver": "bridge"}
     assert set(compose["volumes"]) == {"database", "logs", "backups", "bootstrap_socket"}
     assert compose["secrets"] == {
-        "bootstrap_worker_secret": {"environment": "BOOTSTRAP_WORKER_SECRET"}
+        "bootstrap_worker_secret": {
+            "file": "${BOOTSTRAP_WORKER_SECRET_FILE:?BOOTSTRAP_WORKER_SECRET_FILE is required}"
+        }
     }
 
 
@@ -266,6 +269,12 @@ def test_resolved_production_policy_accepts_only_the_exact_bootstrap_boundary() 
     extra_service["services"]["unexpected"] = deepcopy(extra_service["services"]["bootstrap"])
     mutations.append(extra_service)
 
+    environment_secret = resolved_production_model()
+    environment_secret["secrets"]["bootstrap_worker_secret"] = {
+        "environment": "BOOTSTRAP_WORKER_SECRET"
+    }
+    mutations.append(environment_secret)
+
     for model in mutations:
         with pytest.raises(PolicyViolation):
             validate(model)
@@ -292,6 +301,7 @@ def test_worker_auth_password_is_a_separate_required_compose_secret() -> None:
     }
     assert "WORKER_AUTH_PASSWORD=REQUIRED_INDEPENDENT_RANDOM_VALUE" in template
     assert "BOOTSTRAP_WORKER_SECRET=REQUIRED_THIRD_RANDOM_VALUE" in template
+    assert "BOOTSTRAP_WORKER_SECRET_FILE=./secrets/bootstrap_worker_secret" in template
     assert "NODE_AGENT_IMAGE=" in template
     assert "@sha256:" in template
     assert "PUBLIC_CONTROL_URL=" in template
@@ -576,11 +586,13 @@ def test_ci_runtime_always_uses_test_override_and_cleans_up() -> None:
         "Post-onboarding runtime limits"
     )
     assert "generate-bootstrap-worker-secret" in workflow
+    assert "printf '%s' \"$BOOTSTRAP_WORKER_SECRET\" > .bootstrap-worker-secret.ci" in workflow
+    assert "BOOTSTRAP_WORKER_SECRET_FILE=.bootstrap-worker-secret.ci" in workflow
     assert "if: always()" in workflow
     assert "down --remove-orphans --volumes" in workflow
     assert "cleanup_status=$?" in workflow
     assert 'exit "$cleanup_status"' in workflow
-    assert "rm -f .env.ci" in workflow
+    assert "rm -f .env.ci .bootstrap-worker-secret.ci" in workflow
 
 
 def test_ci_runtime_limits_and_destination_limit_are_exercised() -> None:

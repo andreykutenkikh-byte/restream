@@ -165,4 +165,4 @@ volumes:
 
 secrets:
   bootstrap_worker_secret:
-    environment: BOOTSTRAP_WORKER_SECRET
+    file: ${BOOTSTRAP_WORKER_SECRET_FILE:?BOOTSTRAP_WORKER_SECRET_FILE is required}

@@ -101,7 +101,10 @@ services to satisfy these values.
 
 4. Put the outputs into `.env`. `SESSION_SECRET`, `WORKER_AUTH_PASSWORD`, and
    `BOOTSTRAP_WORKER_SECRET` protect independent trust domains and must be three different random
-   values. Keep the Argon2id hash single-quoted so its dollar signs remain literal. For local HTTP,
+   values. Write the exact bootstrap secret, without a trailing diagnostic line, to the mode-`0600`
+   file named by `BOOTSTRAP_WORKER_SECRET_FILE`; this file is mounted read-only into the bootstrap
+   worker because its root filesystem is read-only. Both copies must come from the same generated
+   value. Keep the Argon2id hash single-quoted so its dollar signs remain literal. For local HTTP,
    leave `COOKIE_SECURE=false`. Production requires HTTPS and `COOKIE_SECURE=true`.
 
 5. Validate and start only this project:
@@ -135,8 +138,8 @@ docker compose -p adojapan-restream -f compose.yml stop
 `.env.example` documents every supported variable:
 
 - environment, public web domain, public RTMP host/port, and local bind addresses;
-- required, independent session, MediaMTX worker, and bootstrap-worker secrets, Fernet master key,
-  admin login, and Argon2id password hash;
+- required, independent session, MediaMTX worker, and bootstrap-worker secrets, the ignored
+  bootstrap-worker secret-file path, Fernet master key, admin login, and Argon2id password hash;
 - project SQLite path and internal MediaMTX API/RTMP/HLS URLs;
 - the bootstrap UDS path, node protocol version, public control origin, and Node Agent image;
 - destination limit and bounded reconnect timings;
@@ -299,6 +302,9 @@ This project has one defined public identity, so fixing it in the override remov
 `localhost` fallback and operator drift. Production `.env` values cannot disable secure cookies
 or switch the profile back to development. `SESSION_SECRET`, `WORKER_AUTH_PASSWORD`, and
 `BOOTSTRAP_WORKER_SECRET` remain separate required secrets and must contain independent values.
+The backend receives its value from `.env`; the read-only bootstrap worker receives the exact same
+value through the mode-`0600` file selected by `BOOTSTRAP_WORKER_SECRET_FILE`. The file is excluded
+from Git and Docker build contexts.
 `PUBLIC_CONTROL_URL` is fixed to `https://restream.adojapan.ru`, `NODE_PROTOCOL_VERSION` is fixed
 to `1`, and `NODE_AGENT_IMAGE` must be supplied as an immutable SHA-256 digest reference.
 
