@@ -73,9 +73,11 @@ SMOKE_STAGES = frozenset(
         "login",
         "node_ready",
         "password_non_persistence",
+        "ping",
         "remote_lifecycle",
         "revoke",
         "revoke_quiescence",
+        "self_test",
         "startup",
     }
 )
@@ -255,12 +257,21 @@ def complete_command(client: APIClient, node_id: str, command_name: str) -> Mapp
         require(isinstance(raw, dict), f"{command_name} result response is invalid")
         state = str(raw.get("state", ""))
         if state == "failed":
+            result = raw.get("safe_result")
+            code = result.get("code") if isinstance(result, Mapping) else None
+            safe_code = code if code in {"command_expired", "command_failed"} else "unknown"
+            print(f"{command_name} terminal safe code: {safe_code}")
             raise SmokeFailure(f"{command_name} command failed")
         return raw if state == "completed" else None
 
     completed = wait_for(f"{command_name} completion", COMMAND_TIMEOUT_SECONDS, probe)
     result = completed.get("safe_result")
     if not isinstance(result, dict) or result.get("status") != "ok":
+        if command_name == "SELF_TEST" and isinstance(result, Mapping):
+            checks = result.get("checks")
+            if isinstance(checks, Mapping) and set(checks) == SELF_TEST_CHECKS:
+                failed = sorted(name for name in SELF_TEST_CHECKS if checks.get(name) is not True)
+                print(f"SELF_TEST failed safe checks: {','.join(failed) or 'unknown'}")
         raise SmokeFailure(f"{command_name} failed")
     if command_name == "SELF_TEST":
         checks = result.get("checks")
@@ -514,8 +525,9 @@ def main() -> None:
     require(node.get("host_key_trust_mode") == "tofu", "TOFU was not persisted")
     require(bool(node.get("resolved_ip")), "resolved SSH target IP was not persisted")
 
-    set_smoke_stage("commands")
+    set_smoke_stage("ping")
     complete_command(client, node_id, "PING")
+    set_smoke_stage("self_test")
     complete_command(client, node_id, "SELF_TEST")
     set_smoke_stage("remote_lifecycle")
     verify_remote_lifecycle()
