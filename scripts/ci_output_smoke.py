@@ -209,7 +209,7 @@ def compose_exec(
         raise SmokeFailure("Docker Compose command did not complete") from exc
     if result.returncode != 0:
         # stdout/stderr can contain private RTMP URLs. Never add them to the exception.
-        raise SmokeFailure("command inside the backend container failed")
+        raise SmokeFailure(f"command inside the {service} container failed")
     return result.stdout.strip()
 
 
@@ -666,7 +666,7 @@ if pid_file.exists():
         publisher_text, start_text = pid_file.read_text().split()
         publisher = int(publisher_text)
         publisher_start_ticks = int(start_text)
-    except (OSError, ValueError):
+    except (OSError, UnicodeError, ValueError):
         pass
 ffmpeg = []
 for entry in Path('/proc').iterdir():
@@ -675,7 +675,7 @@ for entry in Path('/proc').iterdir():
     try:
         if (entry / 'comm').read_text().strip() == 'ffmpeg':
             ffmpeg.append(int(entry.name))
-    except (FileNotFoundError, PermissionError, ProcessLookupError):
+    except (OSError, UnicodeError):
         pass
 publisher_exists = False
 publisher_alive = False
@@ -688,7 +688,7 @@ if publisher is not None and publisher_start_ticks is not None:
             publisher_exists
             and (process_path / 'comm').read_text().strip() == 'ffmpeg'
         )
-    except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError, IndexError):
+    except (OSError, UnicodeError, ValueError, IndexError):
         pass
 print(json.dumps({{
     'publisher': publisher,
@@ -698,10 +698,19 @@ print(json.dumps({{
     'ffmpeg': sorted(ffmpeg),
 }}))
 """
-    payload = json.loads(compose_exec(("python", "-c", source), service=service))
-    if not isinstance(payload, dict):
-        raise SmokeFailure("process inspection returned an invalid document")
-    return cast(dict[str, Any], payload)
+    # A process can disappear between /proc enumeration and file reads, and a
+    # Docker exec can briefly race a just-terminated FFmpeg child. Retry only
+    # this read-only inspection; a persistent failure remains a hard CI error.
+    for attempt in range(3):
+        try:
+            payload = json.loads(compose_exec(("python", "-c", source), service=service))
+            if isinstance(payload, dict):
+                return cast(dict[str, Any], payload)
+        except (SmokeFailure, json.JSONDecodeError):
+            pass
+        if attempt < 2:
+            time.sleep(0.1)
+    raise SmokeFailure(f"{service} process inspection failed after bounded retries")
 
 
 def publisher_is_alive(snapshot: Mapping[str, Any], expected: PublisherIdentity) -> bool:
