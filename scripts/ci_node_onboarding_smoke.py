@@ -32,6 +32,54 @@ SELF_TEST_CHECKS = {
     "data_writable",
     "no_inbound_ports",
 }
+SAFE_BOOTSTRAP_DIAGNOSTIC_CODES = frozenset(
+    {
+        "agent_enrollment_failed",
+        "agent_install_failed",
+        "bootstrap_failed",
+        "bootstrap_rejected",
+        "bootstrap_unavailable",
+        "bootstrap_worker_restarted",
+        "cancelled",
+        "credential_rotation_unavailable",
+        "insufficient_cpu",
+        "insufficient_disk",
+        "insufficient_memory",
+        "invalid_job_state",
+        "invalid_target",
+        "job_conflict",
+        "job_not_found",
+        "outbound_https_unavailable",
+        "overall_timeout",
+        "remote_command_failed",
+        "remote_directory_conflict",
+        "remote_upload_failed",
+        "ssh_authentication_failed",
+        "ssh_connection_failed",
+        "ssh_host_key_changed",
+        "ssh_host_key_unsupported",
+        "sudo_password_invalid",
+        "target_resolution_changed",
+        "unsupported_docker_installation",
+        "unsupported_operating_system",
+    }
+)
+SMOKE_STAGES = frozenset(
+    {
+        "bootstrap_job",
+        "commands",
+        "create_job",
+        "host_fingerprint",
+        "login",
+        "node_ready",
+        "password_non_persistence",
+        "remote_lifecycle",
+        "revoke",
+        "revoke_quiescence",
+        "startup",
+    }
+)
+_current_stage = "startup"
 
 
 def require(condition: bool, message: str) -> None:
@@ -51,6 +99,23 @@ def require_marker_absent(payload: bytes, location: str) -> None:
 def safe_api_payload[T](value: T, location: str) -> T:
     require_marker_absent(encoded(value), location)
     return value
+
+
+def safe_bootstrap_diagnostic_code(payload: Mapping[str, Any]) -> str:
+    error = payload.get("safe_error")
+    if not isinstance(error, Mapping):
+        return "unknown"
+    code = error.get("code")
+    if isinstance(code, str) and code in SAFE_BOOTSTRAP_DIAGNOSTIC_CODES:
+        return code
+    return "unknown"
+
+
+def set_smoke_stage(stage: str) -> None:
+    global _current_stage  # noqa: PLW0603 - single-process diagnostic state
+    if stage not in SMOKE_STAGES:
+        raise ValueError("unsupported smoke diagnostic stage")
+    _current_stage = stage
 
 
 def ci_host_fingerprint() -> str:
@@ -114,6 +179,7 @@ def poll_job(client: APIClient, job_id: str) -> Mapping[str, Any]:
         require(isinstance(raw, dict), "bootstrap job response is invalid")
         state = str(raw.get("state", ""))
         if state in {"failed", "cancelled"}:
+            print(f"Bootstrap terminal safe code: {safe_bootstrap_diagnostic_code(raw)}")
             raise SmokeFailure("bootstrap job reached a non-success terminal state")
         return raw if state == "completed" else None
 
@@ -408,8 +474,10 @@ def verify_remote_lifecycle() -> None:
 
 
 def main() -> None:
+    set_smoke_stage("host_fingerprint")
     expected_host_fingerprint = ci_host_fingerprint()
     client = APIClient()
+    set_smoke_stage("login")
     client.login()
     request_payload: dict[str, Any] = {
         "address": "ci-ssh-target",
@@ -418,6 +486,7 @@ def main() -> None:
         "password": PASSWORD_MARKER,
         "expected_host_fingerprint": None,
     }
+    set_smoke_stage("create_job")
     try:
         accepted = safe_api_payload(
             client.request(
@@ -435,7 +504,9 @@ def main() -> None:
     job_id = str(accepted.get("job_id", ""))
     require(bool(job_id) and accepted.get("state") == "queued", "bootstrap job was not queued")
 
+    set_smoke_stage("bootstrap_job")
     poll_job(client, job_id)
+    set_smoke_stage("node_ready")
     node = ready_node(client)
     node_id = str(node.get("id", ""))
     require(bool(node_id), "ready node did not have an id")
@@ -443,14 +514,17 @@ def main() -> None:
     require(node.get("host_key_trust_mode") == "tofu", "TOFU was not persisted")
     require(bool(node.get("resolved_ip")), "resolved SSH target IP was not persisted")
 
+    set_smoke_stage("commands")
     complete_command(client, node_id, "PING")
     complete_command(client, node_id, "SELF_TEST")
+    set_smoke_stage("remote_lifecycle")
     verify_remote_lifecycle()
 
     identifier, status, restart_count, oom_killed = agent_container_state()
     require(status == "running", "Node Agent was not running before revoke")
     require(not oom_killed, "Node Agent was OOM-killed before revoke")
 
+    set_smoke_stage("revoke")
     revoked = safe_api_payload(
         client.request(
             "POST",
@@ -461,8 +535,10 @@ def main() -> None:
         "node revoke API",
     )
     require(isinstance(revoked, dict) and revoked.get("status") == "revoked", "revoke failed")
+    set_smoke_stage("revoke_quiescence")
     require_agent_quiescent_after_revoke(identifier, restart_count)
     require_revoked_heartbeat_is_rejected()
+    set_smoke_stage("password_non_persistence")
     scan_password_non_persistence()
 
     print("SSH bootstrap E2E verified")
@@ -474,5 +550,5 @@ if __name__ == "__main__":
     try:
         main()
     except SmokeFailure:
-        print("Node onboarding smoke failed safely")
+        print(f"Node onboarding smoke failed safely at stage: {_current_stage}")
         raise SystemExit(1) from None
