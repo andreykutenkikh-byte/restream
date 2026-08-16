@@ -25,7 +25,18 @@ class FakeMediaMTX:
 
     async def kick_publishers(self, path_name: str) -> int:
         self.kicked.append(path_name)
-        return 1
+        return int(self.kicked.count(path_name) == 1)
+
+
+class FakeRotationClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def __call__(self) -> float:
+        return self.value
+
+    async def sleep(self, seconds: float) -> None:
+        self.value += seconds
 
 
 class FailingKickMediaMTX(FakeMediaMTX):
@@ -67,11 +78,14 @@ def wait_for_state(client: TestClient, destination_id: int, state: str) -> None:
 
 def test_full_administrative_smoke_flow(settings: Settings, admin_password: str) -> None:
     media = FakeMediaMTX()
+    rotation_clock = FakeRotationClock()
     app = create_app(
         settings,
         mediamtx=media,  # type: ignore[arg-type]
         url_validator=allow_test_destination,
     )
+    app.state.runtime._monotonic = rotation_clock
+    app.state.runtime._sleep = rotation_clock.sleep
     with TestClient(app) as client:
         live = client.get("/health/live")
         assert live.json() == {"status": "ok"}
@@ -203,7 +217,8 @@ def test_full_administrative_smoke_flow(settings: Settings, admin_password: str)
         assert rotated.status_code == 200
         replacement_key = rotated.json()["stream_key"]
         assert replacement_key != initial_key
-        assert media.kicked == [f"live/{initial_key}"]
+        assert len(media.kicked) > 2
+        assert set(media.kicked) == {f"live/{initial_key}"}
         assert client.post("/internal/mediamtx/auth", json=auth_payload).status_code == 401
         assert (
             client.post(

@@ -97,7 +97,7 @@ jobs:
       - name: Effective runtime limits
         run: sh scripts/check_runtime_limits.sh
 
-      - name: Real RTMP output end-to-end smoke
+      - name: Real RTMP rotation and output end-to-end smoke
         run: uv run --locked python scripts/ci_output_smoke.py
 
       - name: Post-preview runtime limits

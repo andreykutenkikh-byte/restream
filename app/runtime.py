@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import hmac
-from collections.abc import Callable
+import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlencode
@@ -29,6 +30,17 @@ from app.services.workers import (
 )
 
 URLValidator = Callable[[str], ValidatedDestinationURL]
+MonotonicClock = Callable[[], float]
+AsyncSleeper = Callable[[float], Awaitable[None]]
+
+# MediaMTX v1.19.2 bounds an HTTP auth exchange by the configured 10-second
+# readTimeout. Keep an additional scheduling margin, then require two quiet
+# control-API observations before reporting that an old publish key is revoked.
+MEDIAMTX_AUTH_TIMEOUT_SECONDS = 10.0
+PUBLISH_AUTH_SETTLE_MARGIN_SECONDS = 0.5
+PUBLISH_DRAIN_INTERVAL_SECONDS = 0.25
+PUBLISH_DRAIN_GRACE_SECONDS = 1.0
+PUBLISH_DRAIN_QUIET_SAMPLES = 2
 
 
 class ApplicationRuntime:
@@ -43,6 +55,8 @@ class ApplicationRuntime:
         bitrate_sampler: IngestBitrateSampler | None = None,
         url_validator: URLValidator = validate_destination_url,
         worker_launcher: Any | None = None,
+        monotonic: MonotonicClock = time.monotonic,
+        sleeper: AsyncSleeper = asyncio.sleep,
     ) -> None:
         self.settings = settings
         self.database = database
@@ -63,6 +77,9 @@ class ApplicationRuntime:
             status_callback=self._persist_worker_status,
         )
         self._rotation_lock = asyncio.Lock()
+        self._monotonic = monotonic
+        self._sleep = sleeper
+        self._last_publish_authorization: tuple[str, float] | None = None
 
     def initialize_ingest(self) -> None:
         encrypted = self.database.get_ingest_encrypted()
@@ -109,7 +126,7 @@ class ApplicationRuntime:
             new_encrypted = encrypt_destination_key(new_key, self.settings.master_encryption_key)
             self.database.set_ingest_encrypted(new_encrypted)
             try:
-                await self.mediamtx.kick_publishers(old_path)
+                await self._drain_old_publishers(old_path)
             except (Exception, asyncio.CancelledError):
                 # A reported rotation must also revoke the active publisher. If
                 # MediaMTX cannot be reached, restore the still-working key.
@@ -120,12 +137,59 @@ class ApplicationRuntime:
             self.database.add_audit_event("ingest.rotated")
             return new_key
 
+    async def _drain_old_publishers(self, old_path: str) -> None:
+        """Revoke active and recently authorized publishers on ``old_path``.
+
+        A successful HTTP auth response can be accepted immediately before the
+        database switches keys yet become visible in MediaMTX only after an
+        initial path lookup. The last successful publish authorization sets a
+        bounded horizon derived from MediaMTX's configured auth timeout. Until
+        that horizon has elapsed, keep probing and kicking the old path. Two
+        consecutive quiet observations after it are the success postcondition.
+        """
+
+        now = self._monotonic()
+        not_before = now
+        last_authorization = self._last_publish_authorization
+        if last_authorization is not None:
+            authorized_path, accepted_at = last_authorization
+            if hmac.compare_digest(authorized_path, old_path):
+                not_before = max(
+                    not_before,
+                    accepted_at
+                    + MEDIAMTX_AUTH_TIMEOUT_SECONDS
+                    + PUBLISH_AUTH_SETTLE_MARGIN_SECONDS,
+                )
+        deadline = not_before + PUBLISH_DRAIN_GRACE_SECONDS
+        quiet_samples = 0
+
+        while True:
+            kicked = await self.mediamtx.kick_publishers(old_path)
+            now = self._monotonic()
+            if kicked:
+                quiet_samples = 0
+            elif now >= not_before:
+                quiet_samples += 1
+                if quiet_samples >= PUBLISH_DRAIN_QUIET_SAMPLES:
+                    return
+            else:
+                quiet_samples = 0
+
+            if now >= deadline:
+                raise RuntimeError("MediaMTX publisher revocation did not become stable")
+            await self._sleep(min(PUBLISH_DRAIN_INTERVAL_SECONDS, deadline - now))
+
     def authorize_mediamtx(
         self, *, action: str, protocol: str, path: str, user: str, password: str
     ) -> bool:
         expected_path = self.ingest_path()
         if action == "publish":
-            return protocol == "rtmp" and hmac.compare_digest(path, expected_path)
+            allowed = protocol == "rtmp" and hmac.compare_digest(path, expected_path)
+            if allowed:
+                # Retain only the in-memory path and monotonic acceptance time.
+                # Rejected probes must not extend the rotation horizon.
+                self._last_publish_authorization = (path, self._monotonic())
+            return allowed
         if action == "read":
             return (
                 protocol in {"rtmp", "hls"}

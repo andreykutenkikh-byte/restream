@@ -72,10 +72,12 @@ class HttpxJsonTransport:
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 response = await client.request(method, url)
-        except httpx.HTTPError as exc:
+        except httpx.HTTPError:
             # Do not include ``exc`` in the message: the URL path can be a
             # stream key and therefore must never reach logs/UI diagnostics.
-            raise MediaMTXTransportError("MediaMTX API is unavailable") from exc
+            # Suppress the cause too: httpx request exceptions render the full
+            # request URL when the application logs a traceback.
+            raise MediaMTXTransportError("MediaMTX API is unavailable") from None
 
         if response.status_code == 404:
             raise MediaMTXNotFound("MediaMTX path is offline")
@@ -85,8 +87,11 @@ class HttpxJsonTransport:
             if not response.content:
                 return {}
             payload = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            raise MediaMTXTransportError("MediaMTX returned an invalid response") from exc
+        except (httpx.HTTPError, ValueError):
+            # HTTPStatusError also embeds the complete request URL. Keeping it
+            # as a chained cause would bypass the safe public message above in
+            # exception logs and expose the ingest key from the path.
+            raise MediaMTXTransportError("MediaMTX returned an invalid response") from None
 
         if not isinstance(payload, Mapping):
             raise MediaMTXTransportError("MediaMTX returned an invalid response")
@@ -396,6 +401,19 @@ def _unwrap_path(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     return payload
 
 
+def _rtmp_source_id(payload: Mapping[str, Any] | None) -> str | None:
+    if not payload:
+        return None
+    source = _unwrap_path(payload).get("source")
+    if not isinstance(source, Mapping):
+        return None
+    source_type = str(_first(source, "type", "sourceType") or "").lower()
+    if source_type.replace("_", "") not in {"rtmpconn", "rtmpconnection"}:
+        return None
+    source_id = _first(source, "id", "sourceId")
+    return str(source_id) if source_id is not None and str(source_id) else None
+
+
 def map_ingest_status(payload: Mapping[str, Any] | None) -> IngestStatus:
     """Map API-specific path data onto the Stage 1 ingest state machine."""
 
@@ -544,18 +562,24 @@ class MediaMTXClient:
             return 0
         if not payload:
             return 0
-        path = _unwrap_path(payload)
-        source = path.get("source")
-        if not isinstance(source, Mapping):
+        source_id = _rtmp_source_id(payload)
+        if source_id is None:
             return 0
-        source_type = str(_first(source, "type", "sourceType") or "").lower()
-        source_id = _first(source, "id", "sourceId")
-        if source_type.replace("_", "") not in {"rtmpconn", "rtmpconnection"}:
+        encoded_id = quote(source_id, safe="")
+        try:
+            await self._post_json(f"{self._api_prefix}/rtmpconns/kick/{encoded_id}")
+        except MediaMTXNotFound:
+            # The publisher can disconnect after the path lookup but before
+            # the kick request. Re-read the path so an unsupported endpoint
+            # or a stale invalid ID cannot silently leave any RTMP publisher
+            # active on the revoked path while committing the new ingest key.
+            try:
+                current = await self.get_path(path_name)
+            except MediaMTXNotFound:
+                return 0
+            if _rtmp_source_id(current) is not None:
+                raise
             return 0
-        if source_id is None or not str(source_id):
-            return 0
-        encoded_id = quote(str(source_id), safe="")
-        await self._post_json(f"{self._api_prefix}/rtmpconns/kick/{encoded_id}")
         return 1
 
 
