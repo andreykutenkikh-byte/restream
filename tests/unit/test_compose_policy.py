@@ -594,6 +594,9 @@ def test_ci_runtime_always_uses_test_override_and_cleans_up() -> None:
     assert "printf '%s' \"$BOOTSTRAP_WORKER_SECRET\" > .bootstrap-worker-secret.ci" in workflow
     assert "sudo chown 10001:10001 .bootstrap-worker-secret.ci" in workflow
     assert "chmod 0600 .bootstrap-worker-secret.ci" in workflow
+    assert workflow.index("chmod 0600 .bootstrap-worker-secret.ci") < workflow.index(
+        "sudo chown 10001:10001 .bootstrap-worker-secret.ci"
+    )
     assert "600:10001:10001" in workflow
     assert "BOOTSTRAP_WORKER_SECRET_FILE=.bootstrap-worker-secret.ci" in workflow
     assert "if: always()" in workflow
