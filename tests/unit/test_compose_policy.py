@@ -423,6 +423,9 @@ def test_ci_ssh_target_emulates_only_exact_docker_package_queries() -> None:
     assert "COPY ci/ssh-target/fake-dpkg-query /usr/local/bin/dpkg-query" in dockerfile
     assert 'ENV PATH="/usr/local/bin:${PATH}"' in dockerfile
     assert "/usr/local/bin/dpkg-query" in dockerfile
+    key_cleanup = dockerfile.index("rm -f /etc/ssh/ssh_host_ed25519_key")
+    key_generation = dockerfile.index("ssh-keygen -q -t ed25519")
+    assert key_cleanup < key_generation
     assert "docker-ce docker-ce-cli containerd.io docker-compose-plugin" in source
     assert "docker.io containerd runc podman-docker" in source
     assert "exit 64" in source

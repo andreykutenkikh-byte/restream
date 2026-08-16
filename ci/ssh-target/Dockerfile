@@ -23,7 +23,8 @@ COPY ci/ssh-target/validate-node-compose.py /usr/local/lib/adojapan-ci/validate-
 
 ENV PATH="/usr/local/bin:${PATH}"
 
-RUN ssh-keygen -q -t ed25519 -N '' -C ci-ephemeral-host-key \
+RUN rm -f /etc/ssh/ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key.pub \
+    && ssh-keygen -q -t ed25519 -N '' -C ci-ephemeral-host-key \
         -f /etc/ssh/ssh_host_ed25519_key \
     && chmod 0600 /etc/ssh/ssh_host_ed25519_key \
     && chmod 0644 /etc/ssh/ssh_host_ed25519_key.pub /etc/ssh/sshd_config \
