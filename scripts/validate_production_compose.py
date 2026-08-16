@@ -63,6 +63,7 @@ def validate_service_security(service: dict[str, Any], name: str) -> None:
     require(service.get("network_mode") != "host", f"{name}_host_network")
     require(service.get("privileged") is not True, f"{name}_privileged")
     require(service.get("read_only") is True, f"{name}_read_only")
+    require(service.get("restart") == "unless-stopped", f"{name}_restart_policy")
     require(service.get("cap_drop") == ["ALL"], f"{name}_cap_drop")
     security_opt = service.get("security_opt", [])
     require("no-new-privileges:true" in security_opt, f"{name}_no_new_privileges")

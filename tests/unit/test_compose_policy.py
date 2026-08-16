@@ -2,7 +2,11 @@ import re
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
 import yaml
+
+from app.runtime import MEDIAMTX_AUTH_TIMEOUT_SECONDS
+from scripts.validate_production_compose import PolicyViolation, validate_service_security
 
 
 def load_compose() -> dict[str, object]:
@@ -65,12 +69,13 @@ def test_shared_host_production_override_is_minimal_and_bounded() -> None:
 
     backend = override["services"]["backend"]
     mediamtx = override["services"]["mediamtx"]
-    assert set(backend) == {"cpus", "mem_limit", "pids_limit", "environment"}
-    assert set(mediamtx) == {"cpus", "mem_limit", "pids_limit"}
+    assert set(backend) == {"cpus", "mem_limit", "pids_limit", "restart", "environment"}
+    assert set(mediamtx) == {"cpus", "mem_limit", "pids_limit", "restart"}
     assert backend == {
         "cpus": "0.40",
         "mem_limit": "384m",
         "pids_limit": 96,
+        "restart": "unless-stopped",
         "environment": {
             "ENVIRONMENT": "production",
             "COOKIE_SECURE": "true",
@@ -80,12 +85,34 @@ def test_shared_host_production_override_is_minimal_and_bounded() -> None:
             "PUBLIC_RTMP_PORT": "1935",
         },
     }
-    assert mediamtx == {"cpus": "0.20", "mem_limit": "192m", "pids_limit": 64}
+    assert mediamtx == {
+        "cpus": "0.20",
+        "mem_limit": "192m",
+        "pids_limit": 64,
+        "restart": "unless-stopped",
+    }
 
     services = override["services"].values()
     assert sum(Decimal(service["cpus"]) for service in services) <= Decimal("0.60")
     assert sum(int(service["mem_limit"].removesuffix("m")) for service in services) <= 576
     assert sum(service["pids_limit"] for service in services) == 160
+
+
+def test_production_validator_rejects_restart_policy_drift() -> None:
+    service = {
+        "read_only": True,
+        "restart": "unless-stopped",
+        "cap_drop": ["ALL"],
+        "security_opt": ["no-new-privileges:true"],
+        "healthcheck": {},
+        "logging": {},
+        "volumes": [],
+    }
+
+    validate_service_security(service, "backend")
+    for invalid in (None, "no", "always", "on-failure:5"):
+        with pytest.raises(PolicyViolation, match="backend_restart_policy"):
+            validate_service_security({**service, "restart": invalid}, "backend")
 
 
 def test_production_override_cannot_weaken_isolation_or_publish_extra_ports() -> None:
@@ -132,6 +159,7 @@ def test_mediamtx_control_api_stays_internal_and_auth_is_delegated() -> None:
     root = Path(__file__).resolve().parents[2]
     config = yaml.safe_load((root / "mediamtx" / "mediamtx.yml").read_text(encoding="utf-8"))
     assert config["logLevel"] == "error"
+    assert config["readTimeout"] == f"{int(MEDIAMTX_AUTH_TIMEOUT_SECONDS)}s"
     assert config["authMethod"] == "http"
     assert config["authHTTPAddress"] == "http://backend:8000/internal/mediamtx/auth"
     assert config["api"] is True
@@ -170,6 +198,7 @@ def test_ci_media_helpers_are_absent_from_production_and_strictly_isolated() -> 
     assert receiver["cap_drop"] == ["ALL"]
     assert "no-new-privileges:true" in receiver["security_opt"]
     assert receiver["cpus"] and receiver["mem_limit"] and receiver["pids_limit"]
+    assert receiver["restart"] == "no"
     assert receiver["logging"]["options"] == {"max-size": "10m", "max-file": "3"}
 
     publisher = override["services"]["ci-rtmp-publisher"]
@@ -184,6 +213,9 @@ def test_ci_media_helpers_are_absent_from_production_and_strictly_isolated() -> 
     assert publisher["logging"]["options"] == {"max-size": "10m", "max-file": "3"}
 
     backend = override["services"]["backend"]
+    mediamtx = override["services"]["mediamtx"]
+    assert backend["restart"] == "no"
+    assert mediamtx == {"restart": "no"}
     assert backend["environment"] == {
         "ENVIRONMENT": "test",
         "COOKIE_SECURE": "false",
@@ -279,7 +311,7 @@ def test_ci_runtime_always_uses_test_override_and_cleans_up() -> None:
     assert "node --check app/static/app.js" in workflow
     assert "node --check app/static/preview-player.js" in workflow
     assert "node --test tests/frontend/preview-player.test.js" in workflow
-    assert "Real RTMP output end-to-end smoke" in workflow
+    assert "Real RTMP rotation and output end-to-end smoke" in workflow
     assert "python scripts/ci_output_smoke.py" in workflow
     assert "if: always()" in workflow
     assert "down --remove-orphans --volumes" in workflow
@@ -300,13 +332,17 @@ def test_ci_runtime_limits_and_destination_limit_are_exercised() -> None:
         ".HostConfig.NanoCpus",
         ".HostConfig.Memory",
         ".HostConfig.PidsLimit",
+        ".HostConfig.RestartPolicy.Name",
         ".State.Status",
         ".State.Health.Status",
+        ".RestartCount",
+        ".State.OOMKilled",
     ):
         assert field in runtime_check
     assert ".Config.Env" not in runtime_check
     assert "400000000 402653184 96" in runtime_check
     assert "200000000 201326592 64" in runtime_check
+    assert 'expected="$2 $3 $4 no running healthy 0 false"' in runtime_check
 
     compose_definition = smoke.split("COMPOSE = (", maxsplit=1)[1].split(")", maxsplit=1)[0]
     assert compose_definition.count('"compose.yml"') == 1
@@ -328,6 +364,12 @@ def test_ci_runtime_limits_and_destination_limit_are_exercised() -> None:
     assert "expected=(404, 409)" in smoke
     assert "{{.CPUPerc}}|{{.MemUsage}}" in smoke
     assert 'item.get("bitrate_bps") is None' in smoke
+    assert smoke.count("rotate_and_confirm_ingest_key(") == 3
+    assert '"/api/ingest/rotate"' in smoke
+    assert "active publisher termination after key rotation" in smoke
+    assert "publisher rejection with the rotated ingest key" in smoke
+    assert "publisher process with the replacement ingest key" in smoke
+    assert "publisher_is_absent" in smoke
 
 
 def test_production_scripts_always_use_shared_host_override() -> None:
