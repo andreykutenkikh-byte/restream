@@ -36,6 +36,11 @@ _NORMALIZED_SENSITIVE_KEYS = frozenset(
         "sessioncookie",
         "sessionid",
         "signature",
+        "sshpassword",
+        "sudopassword",
+        "enrollmenttoken",
+        "nodetoken",
+        "bootstrapsecret",
         "streamkey",
         "key",
         "token",
@@ -52,15 +57,16 @@ _SENSITIVE_SUFFIXES = (
 )
 _URL_IN_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\"']+")
 _BEARER_TOKEN = re.compile(r"(?i)(\b(?:authorization\s*[:=]\s*)?bearer\s+)[^\s,;]+")
-_UNQUOTED_ASSIGNMENT = re.compile(
-    r"(?i)(\b(?:password|passwd|pwd|secret|token|access[_-]?token|api[_-]?key|"
-    r"stream[_-]?key|session(?:[_-]?id)?|csrf(?:[_-]?token)?|signature)\b\s*=\s*)"
-    r"[^\s,;&]+"
+_SENSITIVE_TEXT_KEY_PATTERN = (
+    r"password|passwd|pwd|secret|token|access[_-]?token|api[_-]?key|"
+    r"stream[_-]?key|session(?:[_-]?id)?|csrf(?:[_-]?token)?|signature|"
+    r"ssh[_-]?password|sudo[_-]?password|enrollment[_-]?token|"
+    r"node[_-]?token|bootstrap[_-]?secret"
 )
+_UNQUOTED_ASSIGNMENT = re.compile(rf"(?i)(\b(?:{_SENSITIVE_TEXT_KEY_PATTERN})\b\s*=\s*)[^\s,;&]+")
 _QUOTED_ASSIGNMENT = re.compile(
-    r"(?i)((?:[\"']?)(?:password|passwd|pwd|secret|token|access[_-]?token|"
-    r"api[_-]?key|stream[_-]?key|session(?:[_-]?id)?|csrf(?:[_-]?token)?|"
-    r"signature)(?:[\"']?)\s*:\s*)([\"'])(.*?)(\2)"
+    rf"(?i)((?:[\"']?)(?:{_SENSITIVE_TEXT_KEY_PATTERN})(?:[\"']?)\s*:\s*)"
+    r"([\"'])(.*?)(\2)"
 )
 
 

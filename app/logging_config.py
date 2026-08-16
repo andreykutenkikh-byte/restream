@@ -35,3 +35,4 @@ def configure_logging(level: str) -> None:
     # the ingest key, so transport access logs must never inherit INFO/DEBUG.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("asyncssh").setLevel(logging.WARNING)

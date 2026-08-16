@@ -28,3 +28,4 @@ def test_http_transport_access_logs_are_never_verbose() -> None:
 
     assert logging.getLogger("httpx").getEffectiveLevel() == logging.WARNING
     assert logging.getLogger("httpcore").getEffectiveLevel() == logging.WARNING
+    assert logging.getLogger("asyncssh").getEffectiveLevel() == logging.WARNING
