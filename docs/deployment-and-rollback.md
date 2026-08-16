@@ -1,67 +1,73 @@
 # Future deployment and rollback
 
-Production deployment is intentionally outside Stage 1. The following procedure is a gated
-plan for a separately approved change window.
+Production deployment and remote-node onboarding require separate, explicitly approved change
+windows. This document is a gated plan only. Preparing Stage 4A did not deploy the application,
+connect to a production server, change DNS/firewalls/reverse proxy, restart an existing service,
+or create production credentials.
 
-No deployment, DNS update, firewall change, Nginx change, or existing-service restart was
-performed while preparing this plan. The planned shared host is `147.45.231.225`.
+The planned shared host is `147.45.231.225`. An attached restream node is a different host and
+must pass the onboarding gates in [Node onboarding](node-onboarding.md).
 
 ## Required production profile
 
-Every production Compose command must load exactly `compose.yml` followed by
-`compose.production.yml`. The CI-only `compose.ci.yml` and `TEST_DESTINATION_ALLOWLIST` must never
-enter the production lifecycle. The production override restricts the backend to 0.40 CPU,
-384 MiB RAM, 96 PIDs, and one destination; it restricts MediaMTX to 0.20 CPU, 192 MiB RAM, and
-64 PIDs. The aggregate ceiling is 0.60 CPU, 576 MiB RAM, and 160 PIDs. It also sets both `backend`
-and `mediamtx` to `restart: unless-stopped`. The base profile keeps the bounded
-`restart: on-failure:5`, while the final CI override sets both services to `restart: "no"` so a
-retry cannot hide a test failure.
+Every control-plane production command must load exactly `compose.yml` followed by
+`compose.production.yml`. Never load `compose.ci.yml`, `TEST_DESTINATION_ALLOWLIST`, or
+`TEST_SSH_TARGET_ALLOWLIST` in a production lifecycle. The effective service set is exactly
+`backend`, `bootstrap`, and `mediamtx`:
 
-In production, `unless-stopped` restores either service after a process, Docker daemon, or host
-restart, including a clean exit that `on-failure` would not recover. A deliberate
-`docker compose -p adojapan-restream stop` remains deliberate across a daemon restart. Because a persistent crash can
-therefore retry indefinitely, the operator must monitor readiness, restart-count changes, and OOM
-state and investigate a loop rather than repeatedly restarting the Docker daemon.
+| Service | CPU | RAM | PIDs | Production purpose |
+| --- | ---: | ---: | ---: | --- |
+| backend + one copy worker | 0.40 | 384 MiB | 96 | web/API and one destination |
+| bootstrap worker | 0.10 | 128 MiB | 64 | authenticated UDS and bounded SSH egress |
+| MediaMTX | 0.20 | 192 MiB | 64 | RTMP ingest and internal HLS |
+| **Total** | **0.70** | **704 MiB** | **224** | one destination |
 
-The override is fail-closed: its effective values are `ENVIRONMENT=production`,
+The override is fail-closed: its effective values include `ENVIRONMENT=production`,
 `COOKIE_SECURE=true`, `MAX_DESTINATIONS=1`, `PUBLIC_DOMAIN=restream.adojapan.ru`,
-`PUBLIC_RTMP_HOST=restream.adojapan.ru`, and `PUBLIC_RTMP_PORT=1935`. This repository has one
-defined public identity, so these fixed values prevent a production `.env` from selecting
-development mode, insecure cookies, or `localhost`. The `.env` must still provide independent
-`SESSION_SECRET` and `WORKER_AUTH_PASSWORD` values.
+`PUBLIC_RTMP_HOST=restream.adojapan.ru`, `PUBLIC_RTMP_PORT=1935`,
+`PUBLIC_CONTROL_URL=https://restream.adojapan.ru`, and `NODE_PROTOCOL_VERSION=1`.
 
-The base Compose file fixes the HTTP host address to loopback, keeping HTTP on
-`127.0.0.1:8088` without an environment override. The public RTMP identity is
-`restream.adojapan.ru:1935`; the host-side bind remains separately configurable through the
-approved `RTMP_BIND_ADDRESS`, with reviewed target `147.45.231.225:1935`. Confirm both effective
-mappings with a parser that emits only these safe fields before any build or start; never print
-the resolved production environment.
+The production `.env` must provide independent `SESSION_SECRET`, `WORKER_AUTH_PASSWORD`, and
+`BOOTSTRAP_WORKER_SECRET` values, plus the existing Fernet/admin settings. It must also provide
+`NODE_AGENT_IMAGE` as an immutable amd64 registry reference ending in
+`@sha256:<64 lowercase hexadecimal characters>`. Do not use a mutable tag, locally built image ID,
+or CI-only `adojapan-restream-node:ci` value. The separate **Node Agent image** workflow publishes
+`linux/amd64` images on an explicit `node-v*` tag or manual dispatch and reports the resulting
+registry digest. Record that digest, build provenance, reviewed commit, and vulnerability review
+without printing credentials; publishing an image is not deployment authorization.
 
-A successful GitHub Actions run for the exact reviewed commit must first exercise the shared-host
-limits with `compose.yml`, `compose.production.yml`, and the CI-only `compose.ci.yml` in that order,
-confirm the actual Docker resource limits and CI restart policy `no`, exercise offline and active
-key rotation against the real pinned MediaMTX, reject the previous key, and reject a second
-destination with `409 destination_limit_reached`. That synthetic evidence is not deployment
-authorization. The DNS-owner and host/provider firewall gates in the production audit remain
-NO-GO until separately approved.
+The base Compose file fixes HTTP to `127.0.0.1:8088`. The reviewed public RTMP identity is
+`restream.adojapan.ru:1935`, while its host bind remains separately controlled by the approved
+`RTMP_BIND_ADDRESS` (planned `147.45.231.225:1935`). The bootstrap worker publishes no port: the
+backend reaches it only through the named UDS volume, and it uses a separate egress network for
+SSH. Validate these safe fields with a structured parser; never print the resolved environment.
 
-## Deployment
+## Evidence required before deployment
 
-1. Complete `docs/production-audit.md` and record a go decision.
-2. Install the repository under `/opt/adojapan-restream` with a production `.env` owned by the
-   deployment account and excluded from Git. Generate and store independent values for
-   `SESSION_SECRET` and `WORKER_AUTH_PASSWORD`; production startup rejects reuse between them.
-3. Back up the project SQLite database and the one reverse-proxy site file to be changed.
-4. Validate configuration with the explicit project name, environment file, base file, and
-   shared-host production override. Pipe the resolved model through the secret-safe policy validator;
-   it must confirm `unless-stopped` for both services without printing environment values:
+1. Complete every gate in [Production audit](production-audit.md) and record a go decision.
+2. Require a successful CI run for the exact reviewed commit. CI must load the files in order
+   `compose.yml`, `compose.production.yml`, `compose.ci.yml`, exercise the CI-only
+   `ci-ssh-target` and `ci-node-agent`, and prove that neither fixture has a host port or appears in
+   the effective production service set.
+3. Verify the effective limits are 0.40/384 MiB/96 PIDs for backend, 0.10/128 MiB/64 PIDs for
+   bootstrap, and 0.20/192 MiB/64 PIDs for MediaMTX.
+4. Verify the bootstrap worker has only its UDS volume and `bootstrap-egress`, the backend UDS
+   mount is read-only, MediaMTX has no bootstrap network, and no service mounts the Docker socket.
+5. Verify all three effective production restart policies are `unless-stopped` and the bootstrap
+   worker has a 90-second stop grace; changed Compose settings require container recreation and a
+    post-start `docker inspect`, not merely `docker compose -p adojapan-restream restart`.
+6. Resolve and approve the exact `NODE_AGENT_IMAGE` digest. The control-plane rollout must not
+   implicitly build, retag, or push the remote image.
+7. Keep DNS ownership, host/provider firewall, reverse-proxy, port, resource/OOM, backup, and
+   existing-service checks at GO. CI evidence never closes those operational gates.
 
-   ```bash
-   docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml config --format json \
-     | python3 scripts/validate_production_compose.py
-   ```
+## Control-plane deployment
 
-5. Build and start only this project:
+1. Install the reviewed repository under `/opt/adojapan-restream` with a root/deployment-owned
+   production `.env` excluded from Git. Generate and store all secrets independently.
+2. Back up the project SQLite database and only the reverse-proxy site file scheduled to change.
+3. Validate the production model using the explicit project name and file order.
+4. Build and start only this project:
 
    ```bash
    docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml config --quiet
@@ -70,86 +76,74 @@ NO-GO until separately approved.
    docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml ps
    ```
 
-6. Add only the dedicated `restream.adojapan.ru` site to the existing reverse proxy, validate
-   its configuration, and safely reload it.
-7. Resolve the exact `backend` and `mediamtx` container IDs through this Compose project, then use
-   a constrained `docker inspect` format to confirm `RestartPolicy.Name=unless-stopped`, running and
-   healthy state, resource limits, restart counts, OOM state, IDs, and start times. Do not inspect or
-   print the container environment.
+5. Add only the dedicated `restream.adojapan.ru` site to the existing proxy, validate its
+   configuration, and safely reload it.
+6. Run the post-start audit and compare before/after snapshots. Verify the bootstrap healthcheck
+   without exposing its secret or socket externally.
 
-   ```bash
-   backend_container_id="$(docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml ps -q backend)"
-   mediamtx_container_id="$(docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml ps -q mediamtx)"
-   test -n "$backend_container_id" && test -n "$mediamtx_container_id"
-   docker inspect --format '{{.Id}} {{.State.StartedAt}} {{.HostConfig.RestartPolicy.Name}} {{.HostConfig.NanoCpus}} {{.HostConfig.Memory}} {{.HostConfig.PidsLimit}} {{.RestartCount}} {{.State.OOMKilled}} {{.State.Status}} {{.State.Health.Status}}' \
-     "$backend_container_id" "$mediamtx_container_id"
-   ```
+Do not combine first control-plane rollout, DNS/firewall cutover, and first real SSH onboarding
+unless one reviewed change plan explicitly authorizes and sequences all three. Stage 4A nodes do
+not carry video, so onboarding one does not validate a media path.
 
-8. Run the post-start checks in the audit runbook and compare the saved before/after snapshots.
-   Require several consecutive successful `/health/ready` samples. Do not use a raw MediaMTX `ERR`
-   count as a gate and never copy authenticated paths, stream keys, URLs, cookies, or credentials
-   into logs or reports.
+## Control-plane rollback
 
-## Restart-policy-only rollout
-
-Changing the Compose file and running `docker compose -p adojapan-restream restart` is not a rollout: `restart` does not
-apply changed service configuration. In a separately approved production window, the normal
-`docker compose -p adojapan-restream ... up -d` path may recreate the affected project containers and must therefore use
-the full preflight, maintenance, and post-start gates above.
-
-When avoiding an immediate container restart is an explicit requirement, an approved operator may
-instead resolve the exact two project container IDs and update only their runtime policies:
-
-```bash
-compose=(docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml)
-backend_container_id="$("${compose[@]}" ps -q backend)"
-mediamtx_container_id="$("${compose[@]}" ps -q mediamtx)"
-test -n "$backend_container_id"
-test -n "$mediamtx_container_id"
-test "$backend_container_id" != "$mediamtx_container_id"
-docker update --restart unless-stopped "$backend_container_id" "$mediamtx_container_id"
-```
-
-This command is an option only inside the approved window, after the matching reviewed Compose files
-are present. Verify the same IDs and start times, the new runtime policy, unchanged restart/OOM state,
-and consecutive readiness success afterward. This no-restart option can leave the existing Compose
-configuration hash on the containers, so a later normal `docker compose -p adojapan-restream ... up -d` can still recreate
-them; schedule and verify that convergence rather than treating it as unexpected drift.
-
-## Rollback
-
-Stop and remove only this Compose project while preserving its persistent volumes:
+Stop and remove only this Compose project while preserving persistent volumes:
 
 ```bash
 docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml down --remove-orphans
 ```
 
-Restore the dedicated reverse-proxy site backup and safely reload the existing proxy. If a
-database rollback is explicitly approved, keep the backend stopped and restore only a backup
-named `adojapan-restream-*.db`:
+Restore only the dedicated reverse-proxy site backup and safely reload the existing proxy. If a
+database rollback is explicitly approved, keep the backend stopped and restore only a selected
+project backup:
 
 ```bash
 python scripts/restore.py backups/adojapan-restream-YYYYMMDDTHHMMSSZ.db \
   --database data/restream.db --confirm RESTORE_ADOJAPAN_RESTREAM
 ```
 
-Persistent volumes are never deleted by ordinary rollback. Volume deletion requires a separate
-reviewed command and explicit human confirmation.
+Ordinary rollback never deletes persistent volumes. Volume deletion requires a separate reviewed
+command and explicit human confirmation. Do not stop Docker itself or another Compose project.
 
-If only the runtime restart-policy change must be reversed during the same approved window, target
-the exact two project container IDs and restore the previous bounded policy without restarting them:
+## Remote-node rollback and revocation
 
-```bash
-compose=(docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml)
-backend_container_id="$("${compose[@]}" ps -q backend)"
-mediamtx_container_id="$("${compose[@]}" ps -q mediamtx)"
-test -n "$backend_container_id"
-test -n "$mediamtx_container_id"
-test "$backend_container_id" != "$mediamtx_container_id"
-docker update --restart on-failure:5 "$backend_container_id" "$mediamtx_container_id"
-```
+During bootstrap, automatic rollback is constrained by
+`/opt/adojapan-restream-node/.managed-by-adojapan` with exact value
+`adojapan-restream-node:v1`:
 
-Re-validate IDs, start times, runtime policy, restart/OOM state, and readiness. This restores the old
-reboot exposure and is not a permanent remediation; also restore the previously reviewed repository
-configuration before the next Compose lifecycle operation. Do not restart Docker or any unrelated
-service as part of either rollout or rollback.
+- before enrollment, a failed new install brings down only Compose project
+  `adojapan-restream-node` and removes only the correctly marked managed directory;
+- a failed managed update can restore its saved previous Compose/credential/process state under
+  the exact marker-and-node-ID guard, including after enrollment;
+- after enrollment, a failed new install can stop its exact Compose project but retains its managed
+  directory and current evidence;
+- rollback never removes Docker, prunes Docker state, directly edits SSH/firewall configuration, or touches
+  a foreign directory/service.
+
+The remote installer never invokes firewall tools, edits existing user rules, or changes Docker
+daemon/firewall configuration. “No firewall change by AdoJapan” does not mean byte-for-byte static
+netfilter state: installing/starting an absent Docker Engine or creating its project-scoped bridge
+can add Docker-managed rules required for bridge networking, NAT, and isolation. Those standard
+Docker-managed rules are explicitly permitted. An already supported Docker daemon is not
+reconfigured or restarted, and the Node Agent has neither host-published ports nor host networking.
+
+Managed updates keep root-owned mode-`0600` rollback copies under the marker-owned directory:
+`.compose.rollback-<job UUID>` and, when credentials are involved,
+`.enrollment.rollback-<job UUID>` or `.node-token.rollback-<job UUID>`. A successful commit or a
+verified successful restore removes those temporary copies, even when the restore follows
+enrollment. An incomplete restore retains the copies, marker, node ID, configuration, and
+credential evidence for a separately reviewed recovery; do not improvise deletion.
+
+Enrollment is the filesystem-deletion boundary for a **new** install. Before it, exact
+marker/node-ID rollback may remove the owned scope after successful Compose shutdown. After it,
+cancellation/failure may still stop that exact fresh project and the backend revokes the issued
+token, but automatic rollback retains its managed root and current evidence. Existing managed
+installs are different: their exact guarded rollback may restore the saved prior state after
+enrollment and then remove the temporary rollback copies after verified success. The final
+container check and completed workflow transition must succeed before rollback is fully disarmed.
+
+After that commit, the administrator may revoke the node token, which blocks heartbeat/commands and
+cancels in-flight control commands, but revocation does not SSH to the node or remove its
+container/files. Stage 4A has no remote uninstall operation. Any manual cleanup must be designed,
+reviewed, and authorized as a later node-specific change; do not improvise `rm -rf`, Docker prune,
+or host-wide package removal.

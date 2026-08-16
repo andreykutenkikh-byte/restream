@@ -1,11 +1,12 @@
 # AdoJapan Restream
 
 AdoJapan Restream is a small, self-hosted service that accepts one authenticated RTMP stream
-from OBS and copies it to manually configured RTMP/RTMPS destinations. Stage 1 is optimized for
-a modest host shared with other services: no transcoding, no recording, and no heavy frontend
-toolchain.
+from OBS and copies it to manually configured RTMP/RTMPS destinations. Its media path is optimized
+for a modest host shared with other services: no transcoding, no recording, and no heavy frontend
+toolchain. Stage 4A adds password-based SSH onboarding and outbound-only health agents for future
+restream nodes; those nodes do not carry media yet.
 
-Production domain: `restream.adojapan.ru`. Stage 1 prepares deployment assets but does not
+Production domain: `restream.adojapan.ru`. Repository changes do not authorize deployment or
 change production.
 
 ## Branch and release workflow
@@ -29,15 +30,29 @@ OBS -- RTMP /live/<ingest-key> --> MediaMTX
          browser preview              |                |
                                       v                v
                                   destination 1    destination 2
+
+administrator --> FastAPI -- authenticated UDS --> isolated bootstrap worker
+                                                    |
+                                                    +-- bounded SSH --> remote server
+
+remote Node Agent -- outbound HTTPS protocol v1 --> FastAPI node API
 ```
 
 - **MediaMTX 1.19.2** accepts RTMP, remuxes the incoming H.264/AAC stream to HLS without
   transcoding, and exposes its control and HLS listeners only on the private project network.
   Every publish/read request is authorized by the backend.
 - **FastAPI** serves the Russian UI and JSON API, holds server-side sessions, queries MediaMTX,
-  proxies HLS to the authenticated same-origin browser, and owns FFmpeg child processes.
+  proxies HLS to the authenticated same-origin browser, owns FFmpeg child processes, and exposes
+  the authenticated node control API.
+- **Bootstrap worker** accepts one fixed installation job at a time over an authenticated
+  Unix-domain socket. It has its own egress network and no database, media network, Docker socket,
+  or inbound port.
+- **Node Agent** runs on an attached server as fixed UID/GID `10001:10001`, publishes no ports,
+  enrolls once, sends five-second heartbeats, and accepts only `PING` and `SELF_TEST`.
 - **SQLite** persists the encrypted ingest configuration, encrypted destination keys,
-  destination intent/state metadata, hashed sessions, schema version, and a bounded audit tail.
+  destination intent/state metadata, hashed sessions, digests of node credentials, safe node/job
+  state, schema version, and bounded audit/event tails. Raw node tokens and SSH passwords are not
+  stored.
 - **One FFmpeg supervisor per destination** uses an argument array with no shell and `-c copy`.
   A failed destination cannot stop another destination.
 - **Server templates, CSS, small JavaScript, and local hls.js 1.6.16** require no runtime CDN
@@ -49,8 +64,8 @@ in-memory process manager; stale PIDs are never trusted after restart.
 ## Requirements
 
 - Docker Engine with the Compose v2 plugin
-- roughly 768 MiB RAM, 0.70 CPU, and 160 PIDs available for the base local profile
-- at least 576 MiB RAM, 0.60 CPU, and 160 PIDs available for the shared-host production profile
+- roughly 896 MiB RAM, 0.80 CPU, and 224 PIDs available for the base local profile
+- at least 704 MiB RAM, 0.70 CPU, and 224 PIDs available for the shared-host production profile
 - an available local HTTP port (default `127.0.0.1:8088`)
 - an available RTMP port (local default `127.0.0.1:1935`)
 
@@ -79,14 +94,15 @@ services to satisfy these values.
    ```bash
    uv run --locked --no-dev python -m app.cli generate-session-secret
    uv run --locked --no-dev python -m app.cli generate-worker-auth-password
+   uv run --locked --no-dev python -m app.cli generate-bootstrap-worker-secret
    uv run --locked --no-dev python -m app.cli generate-master-key
    uv run --locked --no-dev python -m app.cli hash-password
    ```
 
-4. Put the outputs into `.env`. `SESSION_SECRET` and `WORKER_AUTH_PASSWORD` protect independent
-   trust domains and must be different random values. Keep the Argon2id hash single-quoted so
-   its dollar signs remain literal. For local HTTP, leave `COOKIE_SECURE=false`. Production
-   requires HTTPS and `COOKIE_SECURE=true`.
+4. Put the outputs into `.env`. `SESSION_SECRET`, `WORKER_AUTH_PASSWORD`, and
+   `BOOTSTRAP_WORKER_SECRET` protect independent trust domains and must be three different random
+   values. Keep the Argon2id hash single-quoted so its dollar signs remain literal. For local HTTP,
+   leave `COOKIE_SECURE=false`. Production requires HTTPS and `COOKIE_SECURE=true`.
 
 5. Validate and start only this project:
 
@@ -105,7 +121,7 @@ services to satisfy these values.
 7. Follow service logs without printing environment values:
 
    ```bash
-   docker compose -p adojapan-restream -f compose.yml logs --tail=100 backend mediamtx
+   docker compose -p adojapan-restream -f compose.yml logs --tail=100 backend bootstrap mediamtx
    ```
 
 Stop containers while preserving data:
@@ -119,18 +135,21 @@ docker compose -p adojapan-restream -f compose.yml stop
 `.env.example` documents every supported variable:
 
 - environment, public web domain, public RTMP host/port, and local bind addresses;
-- required, independent session and MediaMTX worker secrets, Fernet master key, admin login,
-  and Argon2id password hash;
+- required, independent session, MediaMTX worker, and bootstrap-worker secrets, Fernet master key,
+  admin login, and Argon2id password hash;
 - project SQLite path and internal MediaMTX API/RTMP/HLS URLs;
+- the bootstrap UDS path, node protocol version, public control origin, and Node Agent image;
 - destination limit and bounded reconnect timings;
 - log level, trusted proxy addresses, session lifetime, and secure-cookie mode.
 
 There are no fallback values for cryptographic secrets or admin credentials. Startup fails with
-a clear configuration error when they are missing or malformed. `WORKER_AUTH_PASSWORD` must be
-at least 32 characters; production also rejects it when it equals `SESSION_SECRET`. Never replace
-the master key without an explicit key-rotation/migration procedure: existing destination secrets
-would become unreadable. `TRUSTED_PROXIES` accepts explicit IP/CIDR entries only; determine the
-production Docker bridge source during the audit and never use a trust-all wildcard.
+a clear configuration error when they are missing or malformed. `WORKER_AUTH_PASSWORD` and
+`BOOTSTRAP_WORKER_SECRET` must each be at least 32 characters; production requires all three trust
+secrets to differ. Production also requires `NODE_AGENT_IMAGE` to be an immutable registry
+reference pinned by SHA-256 digest. Never replace the master key without an explicit
+key-rotation/migration procedure: existing destination secrets would become unreadable.
+`TRUSTED_PROXIES` accepts explicit IP/CIDR entries only; determine the production Docker bridge
+source during the audit and never use a trust-all wildcard.
 
 ## Login and sessions
 
@@ -141,6 +160,37 @@ token protects every mutating operation. Production marks both cookies `Secure`.
 
 Repeated failed login attempts receive a small in-memory rate limit. Logout deletes the
 server-side session and both browser cookies.
+
+## Server onboarding (Stage 4A)
+
+The authenticated **Servers** page accepts a public server address, SSH port, username, password,
+and optional expected SHA-256 host-key fingerprint. The backend sends the job over an authenticated
+Unix-domain socket to the isolated bootstrap worker. The password exists only for that in-memory
+job: it is not stored in SQLite, rendered back to the browser, placed in environment variables or
+arguments, or included in logs. A worker or backend-coordinator restart requires password
+re-entry.
+
+Bootstrap supports Ubuntu 22.04/24.04 and Debian 12 on amd64, checks public-target/SSRF and
+DNS-rebinding policy, verifies or TOFU-pins the SSH host key, verifies resources and sudo, and
+installs only the marker-owned `adojapan-restream-node` project. The Node Agent then uses a
+single-use enrollment file to obtain a permanent file-only token atomically and connects outward
+to protocol v1. Revocation stops future control-plane authentication but deliberately does not SSH
+back to the server or uninstall it.
+
+The bootstrap installer never invokes host firewall tools, edits existing firewall rules, or
+writes Docker daemon/firewall configuration. A supported Docker installation is inspected without
+reconfiguration or daemon restart. If Docker is absent, installing and starting Docker Engine and
+creating the project-scoped bridge may create Docker-managed `iptables`/`nftables` rules for
+bridge networking, NAT, and isolation. Those standard Docker-managed rules are an expected system
+effect and are distinct from direct firewall management by AdoJapan. The Node Agent publishes no
+host ports and never uses host networking.
+
+- [Node onboarding and operator flow](docs/node-onboarding.md)
+- [Node Agent protocol v1](docs/node-agent-protocol.md)
+- [Bootstrap security boundaries](docs/node-bootstrap-security.md)
+
+Stage 4A is control-plane groundwork only: connected nodes do not receive real video, publish to
+YouTube, or hot-switch streams. SSH-key onboarding and remote uninstall are future work.
 
 ## Ingest and destination states
 
@@ -205,38 +255,32 @@ is absent from the production Compose definition.
 
 ## Isolation and resources
 
-Compose creates project-scoped database, log, and backup volumes; an internal backend/MediaMTX
-network; a dedicated MediaMTX ingest bridge for its published RTMP port; and a separate backend
-egress network. MediaMTX's API and HLS port `8888` are not published. The backend reaches HLS only
-through the internal network. The web port binds to loopback for the existing reverse proxy, and
-local RTMP also binds to loopback until an audited production change explicitly selects the
-external address. The MediaMTX auth hook accepts only direct private/loopback clients, rejects
-forwarded requests, and the proxy example blocks `/internal/` outright.
+Compose creates project-scoped database, log, backup, and bootstrap-socket volumes; an internal
+backend/MediaMTX network; a dedicated MediaMTX ingest bridge for its published RTMP port; a backend
+egress network; and a separate bootstrap-only egress network. The backend mounts the bootstrap UDS
+volume read-only, while the worker mounts only that volume read-write. MediaMTX's API and HLS port
+`8888` are not published. The backend reaches HLS only through the internal network. The web port
+binds to loopback for the existing reverse proxy, and local RTMP also binds to loopback until an
+audited production change explicitly selects the external address. The MediaMTX auth hook accepts
+only direct private/loopback clients, rejects forwarded requests, and the proxy example blocks
+`/internal/` outright.
 
-Both containers drop Linux capabilities, prevent privilege escalation, use read-only root filesystems,
-have PID/CPU/RAM limits, bounded JSON log rotation, healthchecks, and graceful stop periods. No
-Docker socket or directories from other projects are mounted. Scripts guard the repository root
-and fixed project name before acting.
-
-Restart behavior is profile-specific for both `backend` and `mediamtx`:
-
-| Effective profile | Restart policy | Behavior |
-| --- | --- | --- |
-| base `compose.yml` | `on-failure:5` | bounded retries after a non-zero process exit |
-| base + `compose.production.yml` | `unless-stopped` | recovery after a process, Docker daemon, or host restart unless an operator explicitly stopped the container |
-| base + production + `compose.ci.yml` | `no` | deterministic CI failures with no automatic retry |
-
-An intentional `docker compose -p adojapan-restream stop` therefore remains effective across a Docker daemon restart in
-production. Conversely, a persistently failing process can keep retrying under `unless-stopped`;
-production monitoring must alert on sustained readiness failure, restart-count growth, and OOM state
-so an operator can diagnose the project instead of allowing an unnoticed restart loop.
+All three local containers drop Linux capabilities, prevent privilege escalation, use read-only
+root filesystems, have PID/CPU/RAM limits, bounded JSON log rotation, healthchecks, and graceful
+stop periods. Development keeps bounded `on-failure:5` restarts, production overrides all three
+core services to `unless-stopped`, and CI explicitly disables restarts. The bootstrap worker gets
+a 90-second shutdown grace so its bounded SSH cleanup can finish. It has no published port,
+database/media network, or application storage. No Docker socket or directories from other
+projects are mounted. Scripts guard the repository root and fixed project name before acting.
 
 Committed starting limits:
 
 | Service | CPU | RAM | PIDs | Published ports |
 | --- | ---: | ---: | ---: | --- |
 | backend + up to 2 copy workers | 0.45 | 512 MiB | 96 | `127.0.0.1:8088 → 8000` |
+| bootstrap worker | 0.10 | 128 MiB | 64 | none (UDS only) |
 | MediaMTX | 0.25 | 256 MiB | 64 | `127.0.0.1:1935 → 1935` |
+| **Total** | **0.80** | **896 MiB** | **224** | HTTP/RTMP only |
 
 The prepared shared-host production profile is the fail-closed override
 `compose.production.yml`. It must always be loaded after `compose.yml`; it tightens resource and
@@ -253,14 +297,17 @@ production `.env`:
 
 This project has one defined public identity, so fixing it in the override removes both the
 `localhost` fallback and operator drift. Production `.env` values cannot disable secure cookies
-or switch the profile back to development. `SESSION_SECRET` and `WORKER_AUTH_PASSWORD` remain
-separate required secrets and must contain independent values.
+or switch the profile back to development. `SESSION_SECRET`, `WORKER_AUTH_PASSWORD`, and
+`BOOTSTRAP_WORKER_SECRET` remain separate required secrets and must contain independent values.
+`PUBLIC_CONTROL_URL` is fixed to `https://restream.adojapan.ru`, `NODE_PROTOCOL_VERSION` is fixed
+to `1`, and `NODE_AGENT_IMAGE` must be supplied as an immutable SHA-256 digest reference.
 
 | Service | CPU | RAM | PIDs | Production setting |
 | --- | ---: | ---: | ---: | --- |
 | backend + one copy worker | 0.40 | 384 MiB | 96 | `MAX_DESTINATIONS=1` |
+| bootstrap worker | 0.10 | 128 MiB | 64 | UDS only, one active job |
 | MediaMTX | 0.20 | 192 MiB | 64 | no additional published port |
-| **Total** | **0.60** | **576 MiB** | **160** | one destination |
+| **Total** | **0.70** | **704 MiB** | **224** | one destination |
 
 The public RTMP identity is `restream.adojapan.ru:1935`; it is distinct from the host-side bind.
 The planned server is `147.45.231.225`. The base Compose file hard-codes the HTTP host address to
@@ -269,9 +316,11 @@ an environment override. The RTMP bind address remains controlled by the separat
 `RTMP_BIND_ADDRESS`; the reviewed host mapping is `147.45.231.225:1935`. These values describe a
 future deployment and do not authorize one.
 
-The backend's internet-capable network is required only for user-configured destinations.
-MediaMTX shares only the private control network with the backend and joins a separate ingress
-bridge solely so Docker can publish its single RTMP port.
+The backend's internet-capable network is required only for user-configured destinations; remote
+nodes initiate their HTTPS requests through the public reverse proxy. The bootstrap worker uses a
+different egress network for its bounded SSH workflow. MediaMTX shares only the private control
+network with the backend and joins a separate ingress bridge solely so Docker can publish its
+single RTMP port.
 
 ## Health and diagnostics
 
@@ -282,13 +331,6 @@ bridge solely so Docker can publish its single RTMP port.
 
 Compose liveness does not call an external platform. Docker log files rotate at 10 MiB with three
 files per container.
-
-Production monitoring should treat consecutive non-200 responses from `/health/ready` as the
-dependency-availability signal and correlate them with this project's container state, health,
-restart-count changes, and OOM state. Do not alert on a raw count of MediaMTX `ERR` lines: an expected
-offline or absent ingest path can use that severity. Classify fixed message categories on the server
-and export only category, count, and timestamps; never export or quote an authenticated path, stream
-key, destination URL, cookie, or credential.
 
 ## Backup and restore
 
@@ -316,12 +358,14 @@ uv sync --locked
 uv lock --check
 uv run --locked ruff format --check .
 uv run --locked ruff check .
-uv run --locked mypy app scripts
+uv run --locked mypy app bootstrap_worker node_agent scripts
 uv run --locked pytest
 uv run --locked python scripts/check_repository.py
 node --check app/static/app.js
 node --check app/static/preview-player.js
+node --check app/static/servers.js
 node --test tests/frontend/preview-player.test.js
+node --test tests/frontend/servers.test.js
 git diff --check
 ```
 
@@ -329,9 +373,9 @@ git diff --check
 dependencies only in `pyproject.toml`, regenerate the lock with `uv lock`, and commit both files.
 CI rejects a stale lock before running the rest of the checks. Docker installs its production
 subset from this same lock with `uv sync --locked --no-dev --no-editable`.
-The Python and MediaMTX base images use exact version tags. Digest pinning is intentionally
-deferred until the production audit records the target architecture and the reviewed security
-update procedure; changing a digest will then be an explicit dependency update.
+The Python and MediaMTX base images use exact version tags. Independently, the remotely deployed
+Node Agent image is required to use a registry digest in production. Resolve and record that digest
+for the reviewed amd64 release; changing it is an explicit dependency/deployment update.
 
 Validate the container definition with populated non-production test values:
 
@@ -350,36 +394,36 @@ not as authorization to execute them:
 
 ```bash
 docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml config --quiet
-docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml config --format json \
-  | python3 scripts/validate_production_compose.py
 docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml build
 docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml up -d
 docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml ps
-docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml logs --tail=100 backend mediamtx
+docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml logs --tail=100 backend bootstrap mediamtx
 docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml stop
 docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.production.yml down --remove-orphans
 ```
 
 Tests cover cryptography, password verification, URL/SSRF rules, private and loopback addresses,
 log redaction, codec compatibility, stream-key rotation, session/CSRF enforcement, destination
-limits, MediaMTX status mapping, worker transitions/backoff/termination, and the complete API
-smoke flow. Tests never call a real streaming platform or use real keys.
+limits, MediaMTX status mapping, copy-worker transitions/backoff/termination, bootstrap target and
+host-key policy, sudo/timeout/rollback behavior, node credential promotion, heartbeat metrics, and
+idempotent fixed commands. Tests never call a real streaming platform or use real keys.
 
 The GitHub Actions runtime smoke must use the same file order for configuration, build, startup,
 logs, and cleanup: `compose.yml`, then `compose.production.yml`, then `compose.ci.yml`. Loaded last,
 the CI-only override switches the synthetic runtime to `ENVIRONMENT=test` and
-`COOKIE_SECURE=false`, adds the exact test destination allowlist plus isolated receiver and
-publisher helpers, and is never part of a production lifecycle command.
+`COOKIE_SECURE=false`, adds the exact test destination and SSH allowlists plus isolated receiver,
+publisher, `ci-ssh-target`, and `ci-node-agent` helpers, and is never part of a production lifecycle
+command. The SSH target is internal to the bootstrap egress network, the agent shares only its CI
+node-data volume, neither publishes a host port, and both are absent from production.
 
 A successful run for the reviewed commit is required to establish evidence that this effective
 model enforces the shared-host limits. It must inspect only `NanoCpus`, `Memory`, `PidsLimit`,
-`RestartPolicy.Name`, status, and health, confirming restart policy `no`, backend limits of 0.40
-CPU, 384 MiB, and 96 PIDs, and MediaMTX limits of 0.20 CPU, 192 MiB, and 64 PIDs. A separately
+status, and health, confirming backend limits of 0.40 CPU, 384 MiB, and 96 PIDs and MediaMTX limits
+of 0.20 CPU, 192 MiB, and 64 PIDs, plus bootstrap limits of 0.10 CPU, 128 MiB, and 64 PIDs. The
+production service aggregate is therefore 0.70 CPU, 704 MiB, and 224 PIDs. A separately
 constrained, internal-only CI publisher generates
 synthetic H.264/AAC so encoder work cannot contaminate backend measurements. Through the public API
-the run rotates the key once while ingest is offline and again with an active publisher, confirms
-the active publisher is kicked, rejects the previous key, accepts the replacement key, then confirms
-received-byte growth and calculated bitrate, rejects unauthenticated preview,
+the run confirms received-byte growth and calculated bitrate, rejects unauthenticated preview,
 fetches an authenticated HLS playlist and media segment, verifies port `8888` has no host binding,
 keeps authenticated preview requests active, and prints sanitized backend/MediaMTX CPU and RAM
 usage. It then creates and starts the first destination, rejects a second with `409
@@ -401,6 +445,9 @@ in the production audit.
 
 - [Production audit and go/no-go checklist](docs/production-audit.md)
 - [Controlled deployment and project-only rollback](docs/deployment-and-rollback.md)
+- [Node onboarding and remote rollback](docs/node-onboarding.md)
+- [Node Agent protocol v1](docs/node-agent-protocol.md)
+- [Bootstrap security model](docs/node-bootstrap-security.md)
 
 If TCP 1935 is occupied, keep the owning service running, choose an approved alternative (for
 example 1936), and update both `PUBLIC_RTMP_PORT` and the displayed documentation. Production
@@ -409,15 +456,13 @@ deployment stops if CPU, RAM, swap, disk, or port headroom is insufficient.
 ## Troubleshooting
 
 **The backend exits immediately.** Read only the short error and check that all required secret
-variables exist, `SESSION_SECRET` and `WORKER_AUTH_PASSWORD` are independent, the password hash
-is Argon2id, and the Fernet key was generated by the helper. Do not paste `.env` into logs or
-support requests.
+variables exist, the session, MediaMTX worker, and bootstrap worker secrets are independent, the
+password hash is Argon2id, and the Fernet key was generated by the helper. In production, also
+check that `NODE_AGENT_IMAGE` is digest-pinned. Do not paste `.env` into logs or support requests.
 
-**OBS cannot publish.** Confirm OBS uses the displayed server and separate current key. After a
-recent successful publish authorization, rotation can take about 11 seconds while the backend
-drains MediaMTX's bounded HTTP-auth horizon and verifies the old path is quiet twice; do not retry
-the action while it is pending. A successful response means the previous key has been revoked.
-Check that the configured public RTMP port matches the safe host mapping.
+**OBS cannot publish.** Confirm OBS uses the displayed server and separate current key. Rotation
+invalidates the old path immediately. Check that the configured public RTMP port matches the safe
+host mapping.
 
 **A destination stays in “Waiting for input”.** Start OBS first and confirm ingest is `live`.
 FFmpeg is intentionally not launched without input.
@@ -433,9 +478,15 @@ will not silently transcode, change resolution, or change FPS.
 Internal or local destinations are server configuration, never user input.
 
 **Readiness is unavailable while liveness is healthy.** Check only this project's MediaMTX and
-backend state, health, restart count, OOM state, and secret-safe log categories; do not restart the
-Docker daemon or unrelated services. A raw MediaMTX `ERR` count is not a health verdict, and
-authenticated paths, stream keys, and URLs must never be copied into an alert or support report.
+backend logs; do not restart the Docker daemon or unrelated services.
+
+**Server onboarding fails before SSH.** The address must resolve only to public IPs and the
+optional host fingerprint must use OpenSSH `SHA256:` format. Check the safe job code; never paste
+the SSH password or raw `.env` into a support request.
+
+**A node is degraded or offline.** Heartbeats become degraded after 15 seconds and offline after
+30 seconds. Check outbound HTTPS, the marker-owned remote agent project, and its bounded safe logs.
+Do not expose an inbound agent port or run a command supplied through the UI.
 
 ## Stage 1 limitations
 
@@ -447,8 +498,20 @@ authenticated paths, stream keys, and URLs must never be copied into an alert or
 - no persisted bitrate history or synthetic browser speed test;
 - no production deployment in this stage.
 
-## Stage 2
+## Stage 4A limitations
 
-The next stage can add browser upload-speed measurement, OBS bitrate/resolution/FPS
-recommendations, actual bitrate history, richer monitoring, and later multiple users. Stage 1
-deliberately does not simulate a speed test or expose MediaMTX preview ports.
+- attached nodes do not carry real video;
+- nodes do not publish to YouTube or another platform;
+- there is no hot switching or migration of an active stream;
+- onboarding uses SSH passwords only, not SSH keys;
+- revocation does not uninstall the remote project or Docker; uninstall comes later;
+- a lost successful enrollment response before the permanent token is persisted requires a fresh
+  bootstrap attempt; Stage 4A has no enrollment credential-recovery handshake;
+- `ci-ssh-target` and `ci-node-agent` are CI-only fixtures and never production services.
+
+## Future stages
+
+Future stages can add browser upload-speed measurement, OBS bitrate/resolution/FPS recommendations,
+actual bitrate history, richer monitoring, multiple users, SSH-key onboarding, explicit remote
+uninstall, and a reviewed media-placement/switching design. The current implementation deliberately
+does not simulate a speed test or expose MediaMTX preview or Node Agent ports.

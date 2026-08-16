@@ -4,10 +4,106 @@ services:
     environment:
       ENVIRONMENT: test
       COOKIE_SECURE: "false"
+      NODE_AGENT_IMAGE: ghcr.io/adojapan/ci-node-agent@sha256:1111111111111111111111111111111111111111111111111111111111111111
+      PUBLIC_CONTROL_URL: http://backend:8000
       TEST_DESTINATION_ALLOWLIST: rtmp://ci-rtmp-receiver:1935/ci-output
     depends_on:
       ci-rtmp-receiver:
         condition: service_healthy
+    restart: "no"
+
+  mediamtx:
+    restart: "no"
+
+  bootstrap:
+    environment:
+      ENVIRONMENT: test
+      TEST_SSH_TARGET_ALLOWLIST: ci-ssh-target:22
+    restart: "no"
+
+  ci-ssh-target:
+    build:
+      context: .
+      dockerfile: ci/ssh-target/Dockerfile
+    networks:
+      - bootstrap-egress
+    volumes:
+      - ci_node_data:/opt/adojapan-restream-node
+    init: true
+    read_only: true
+    tmpfs:
+      - /run:size=16m,mode=0755
+      - /tmp:size=32m,mode=1777
+    cpus: "0.10"
+    mem_limit: 256m
+    pids_limit: 64
+    stop_grace_period: 10s
+    restart: "no"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pgrep -x sshd >/dev/null
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 3s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  ci-node-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    image: adojapan-restream-node:ci
+    command:
+      - sh
+      - -c
+      - >-
+        while [ ! -s /mnt/node/data/enrollment.token ] ||
+        ! grep -q '^compose_up$'
+        /mnt/node/fake-docker-calls.log 2>/dev/null; do
+          sleep 0.2;
+        done;
+        exec python -m node_agent
+    environment:
+      NODE_AGENT_ENVIRONMENT: test
+      NODE_CONTROL_URL: http://backend:8000
+      NODE_DATA_DIR: /mnt/node/data
+      NODE_COMMAND_WAIT_SECONDS: "2"
+    networks:
+      - internal
+    volumes:
+      - ci_node_data:/mnt/node
+    depends_on:
+      backend:
+        condition: service_healthy
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cpus: "0.25"
+    mem_limit: 256m
+    pids_limit: 128
+    stop_grace_period: 10s
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "python", "--version"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   mediamtx:
     restart: "no"
@@ -74,3 +170,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  ci_node_data:

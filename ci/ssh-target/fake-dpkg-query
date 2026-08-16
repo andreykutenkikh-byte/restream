@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+
+# The SSH fixture emulates only the two package-ownership probes issued by
+# DockerBootstrap.inspect(). Any broader dpkg-query use is a fixture bug and
+# must fail closed instead of pretending that the host has arbitrary packages.
+if [ "$#" -ne 6 ] || [ "$1" != "-W" ] \
+  || [ "$2" != '-f=${db:Status-Abbrev}\n' ]; then
+  exit 64
+fi
+shift 2
+
+case "$*" in
+  "docker-ce docker-ce-cli containerd.io docker-compose-plugin")
+    printf '%s\n' 'ii ' 'ii ' 'ii ' 'ii '
+    exit 0
+    ;;
+  "docker.io containerd runc podman-docker")
+    exit 1
+    ;;
+esac
+
+exit 64

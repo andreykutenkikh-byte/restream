@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -eq 3 ] && [ "$1" = "is-active" ] && [ "$2" = "--quiet" ] && [ "$3" = "docker" ]; then
+  exit 0
+fi
+
+exit 2
