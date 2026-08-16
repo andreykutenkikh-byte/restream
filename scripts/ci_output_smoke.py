@@ -740,6 +740,61 @@ def publisher_is_absent(snapshot: Mapping[str, Any]) -> bool:
     )
 
 
+def publisher_alive_predicate(
+    expected: PublisherIdentity,
+) -> Callable[[Mapping[str, Any]], bool]:
+    return lambda snapshot: publisher_is_alive(snapshot, expected)
+
+
+def launch_accepted_publisher(
+    ingest_key: str,
+    *,
+    description: str,
+    seen_identities: set[PublisherIdentity],
+) -> PublisherIdentity:
+    """Require a stable positive-control publisher, with one clean retry.
+
+    Repeated rejected RTMP handshakes can leave a short-lived Docker exec or
+    encoder startup race in the constrained CI helper. Each attempt must use a
+    new PID/start-time identity, and cleanup must prove the previous attempt is
+    absent before the single retry. Persistent failure remains a hard gate.
+    """
+
+    for attempt in (1, 2):
+        identity = launch_publisher(ingest_key)
+        if identity in seen_identities:
+            raise SmokeFailure("accepted publisher reused a prior process identity")
+        seen_identities.add(identity)
+        try:
+            wait_for(
+                f"{description} (attempt {attempt})",
+                lambda: process_snapshot(service=PUBLISHER_SERVICE),
+                publisher_alive_predicate(identity),
+                timeout=10,
+                interval=0.1,
+            )
+            return identity
+        except SmokeFailure:
+            stop_publisher()
+            try:
+                wait_for(
+                    "failed positive-control publisher cleanup",
+                    lambda: process_snapshot(service=PUBLISHER_SERVICE),
+                    publisher_is_absent,
+                    timeout=8,
+                    interval=0.1,
+                )
+                remove_test_files()
+            except SmokeFailure:
+                raise SmokeFailure(
+                    "failed positive-control publisher could not be cleaned up"
+                ) from None
+            if attempt == 2:
+                break
+            time.sleep(1)
+    raise SmokeFailure(f"{description} failed after two independent attempts")
+
+
 def assert_publisher_rejected(
     client: APIClient,
     ingest_key: str,
@@ -848,14 +903,11 @@ def main() -> int:
         )
         print("E2E: preview rejected an unauthenticated request and port 8888 stayed internal")
 
-        first_publisher_identity = launch_publisher(current_ingest_key)
-        seen_publisher_identities = {first_publisher_identity}
-        wait_for(
-            "publisher process with the offline-rotated key",
-            lambda: process_snapshot(service=PUBLISHER_SERVICE),
-            lambda item: publisher_is_alive(item, first_publisher_identity),
-            timeout=10,
-            interval=0.1,
+        seen_publisher_identities: set[PublisherIdentity] = set()
+        first_publisher_identity = launch_accepted_publisher(
+            current_ingest_key,
+            description="publisher process with the offline-rotated key",
+            seen_identities=seen_publisher_identities,
         )
         wait_for(
             "active ingest before live key rotation",
@@ -895,16 +947,10 @@ def main() -> int:
         print("E2E: two independent publishers using the previous key were rejected")
 
         current_ingest_key = replacement_key
-        replacement_publisher_identity = launch_publisher(current_ingest_key)
-        if replacement_publisher_identity in seen_publisher_identities:
-            raise SmokeFailure("replacement publisher reused a prior process identity")
-        seen_publisher_identities.add(replacement_publisher_identity)
-        wait_for(
-            "publisher process with the replacement ingest key",
-            lambda: process_snapshot(service=PUBLISHER_SERVICE),
-            lambda item: publisher_is_alive(item, replacement_publisher_identity),
-            timeout=10,
-            interval=0.1,
+        replacement_publisher_identity = launch_accepted_publisher(
+            current_ingest_key,
+            description="publisher process with the replacement ingest key",
+            seen_identities=seen_publisher_identities,
         )
         initial_status = wait_for(
             "active H.264/AAC ingest with received bytes",

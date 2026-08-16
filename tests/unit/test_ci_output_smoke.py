@@ -69,3 +69,83 @@ def test_process_snapshot_fails_after_bounded_retries(
 
     assert calls == 3
     assert delays == [0.1, 0.1]
+
+
+def test_accepted_publisher_uses_one_clean_independent_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = ci_output_smoke.PublisherIdentity(101, 1001)
+    second = ci_output_smoke.PublisherIdentity(202, 2002)
+    launched = iter((first, second))
+    wait_calls = 0
+    stopped: list[bool] = []
+    removed: list[bool] = []
+    delays: list[float] = []
+
+    monkeypatch.setattr(ci_output_smoke, "launch_publisher", lambda _key: next(launched))
+    monkeypatch.setattr(ci_output_smoke, "stop_publisher", lambda: stopped.append(True))
+    monkeypatch.setattr(
+        ci_output_smoke, "remove_test_files", lambda **_kwargs: removed.append(True)
+    )
+    monkeypatch.setattr(time, "sleep", delays.append)
+
+    def fake_wait_for(*_: object, **__: object) -> object:
+        nonlocal wait_calls
+        wait_calls += 1
+        if wait_calls == 1:
+            raise ci_output_smoke.SmokeFailure("first publisher exited")
+        return {}
+
+    monkeypatch.setattr(ci_output_smoke, "wait_for", fake_wait_for)
+    seen: set[ci_output_smoke.PublisherIdentity] = set()
+
+    accepted = ci_output_smoke.launch_accepted_publisher(
+        "synthetic-key",
+        description="replacement publisher",
+        seen_identities=seen,
+    )
+
+    assert accepted == second
+    assert seen == {first, second}
+    assert wait_calls == 3  # first attempt, its cleanup, second attempt
+    assert stopped == [True]
+    assert removed == [True]
+    assert delays == [1]
+
+
+def test_accepted_publisher_fails_after_two_clean_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identities = iter(
+        (
+            ci_output_smoke.PublisherIdentity(101, 1001),
+            ci_output_smoke.PublisherIdentity(202, 2002),
+        )
+    )
+    attempt_waits = 0
+
+    monkeypatch.setattr(ci_output_smoke, "launch_publisher", lambda _key: next(identities))
+    monkeypatch.setattr(ci_output_smoke, "stop_publisher", lambda: None)
+    monkeypatch.setattr(ci_output_smoke, "remove_test_files", lambda **_kwargs: None)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    def failed_attempt_or_cleanup(*_: object, **__: object) -> object:
+        nonlocal attempt_waits
+        attempt_waits += 1
+        if attempt_waits in {1, 3}:
+            raise ci_output_smoke.SmokeFailure("publisher exited")
+        return {}
+
+    monkeypatch.setattr(ci_output_smoke, "wait_for", failed_attempt_or_cleanup)
+
+    with pytest.raises(
+        ci_output_smoke.SmokeFailure,
+        match="replacement publisher failed after two independent attempts",
+    ):
+        ci_output_smoke.launch_accepted_publisher(
+            "synthetic-key",
+            description="replacement publisher",
+            seen_identities=set(),
+        )
+
+    assert attempt_waits == 4
