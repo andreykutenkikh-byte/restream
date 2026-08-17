@@ -75,6 +75,12 @@ def safe_failure(code: str) -> BootstrapError:
         "docker_repository_key_invalid": (
             "Ключ подписи официального репозитория Docker не прошёл проверку."
         ),
+        "docker_repository_incomplete": (
+            "В выбранном официальном репозитории Docker отсутствует необходимый пакет."
+        ),
+        "docker_failed_install_recovery_unsafe": (
+            "Незавершённую установку Docker нельзя безопасно восстановить автоматически."
+        ),
         "docker_install_failed": "Не удалось безопасно установить Docker Engine.",
         "remote_directory_conflict": (
             "Каталог установки уже существует и не принадлежит AdoJapan Restream."
