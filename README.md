@@ -426,12 +426,16 @@ node-data volume, neither publishes a host port, and both are absent from produc
 
 A successful run for the reviewed commit is required to establish evidence that this effective
 model enforces the shared-host limits. It must inspect only `NanoCpus`, `Memory`, `PidsLimit`,
-status, and health, confirming backend limits of 0.40 CPU, 384 MiB, and 96 PIDs and MediaMTX limits
-of 0.20 CPU, 192 MiB, and 64 PIDs, plus bootstrap limits of 0.10 CPU, 128 MiB, and 64 PIDs. The
-production service aggregate is therefore 0.70 CPU, 704 MiB, and 224 PIDs. A separately
+`RestartPolicy.Name`, status, health, restart count, and OOM state, confirming CI restart policy
+`no`, backend limits of 0.40 CPU, 384 MiB, and 96 PIDs, MediaMTX limits of 0.20 CPU, 192 MiB, and
+64 PIDs, plus bootstrap limits of 0.10 CPU, 128 MiB, and 64 PIDs. The production service aggregate
+is therefore 0.70 CPU, 704 MiB, and 224 PIDs. A separately
 constrained, internal-only CI publisher generates
 synthetic H.264/AAC so encoder work cannot contaminate backend measurements. Through the public API
-the run confirms received-byte growth and calculated bitrate, rejects unauthenticated preview,
+the run rotates the ingest key once while offline and once with an active publisher, waits through
+the bounded MediaMTX authorization horizon, confirms the active publisher is terminated, rejects
+the previous key, accepts the replacement key, confirms received-byte growth and calculated bitrate,
+rejects unauthenticated preview,
 fetches an authenticated HLS playlist and media segment, verifies port `8888` has no host binding,
 keeps authenticated preview requests active, and prints sanitized backend/MediaMTX CPU and RAM
 usage. It then creates and starts the first destination, rejects a second with `409

@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 import yaml
 
+from app.runtime import MEDIAMTX_AUTH_TIMEOUT_SECONDS
 from scripts.validate_production_compose import PolicyViolation, validate
 
 
@@ -311,6 +312,7 @@ def test_mediamtx_control_api_stays_internal_and_auth_is_delegated() -> None:
     root = Path(__file__).resolve().parents[2]
     config = yaml.safe_load((root / "mediamtx" / "mediamtx.yml").read_text(encoding="utf-8"))
     assert config["logLevel"] == "error"
+    assert config["readTimeout"] == f"{int(MEDIAMTX_AUTH_TIMEOUT_SECONDS)}s"
     assert config["authMethod"] == "http"
     assert config["authHTTPAddress"] == "http://backend:8000/internal/mediamtx/auth"
     assert config["api"] is True
@@ -581,7 +583,7 @@ def test_ci_runtime_always_uses_test_override_and_cleans_up() -> None:
     assert "node --check app/static/preview-player.js" in workflow
     assert "node --check app/static/servers.js" in workflow
     assert "tests/frontend/preview-player.test.js tests/frontend/servers.test.js" in workflow
-    assert "Real RTMP output end-to-end smoke" in workflow
+    assert "Real RTMP rotation and output end-to-end smoke" in workflow
     assert "python scripts/ci_output_smoke.py" in workflow
     assert "SSH bootstrap and Node Agent end-to-end smoke" in workflow
     assert "python scripts/ci_node_onboarding_smoke.py" in workflow
@@ -632,6 +634,7 @@ def test_ci_runtime_limits_and_destination_limit_are_exercised() -> None:
     assert "250000000 268435456 128" in runtime_check
     assert "check_limits bootstrap" in runtime_check
     assert "check_limits ci-node-agent" in runtime_check
+    assert 'expected="$2 $3 $4 no running healthy 0 false"' in runtime_check
 
     compose_definition = smoke.split("COMPOSE = (", maxsplit=1)[1].split(")", maxsplit=1)[0]
     assert compose_definition.count('"compose.yml"') == 1

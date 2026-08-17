@@ -46,12 +46,12 @@ future change window:
 Production must load `compose.production.yml` after `compose.yml` for validation and every
 lifecycle command. The effective limits must be exactly:
 
-| Service | CPU | RAM | PIDs | Destinations |
-| --- | ---: | ---: | ---: | ---: |
-| backend | 0.40 | 384 MiB | 96 | 1 |
-| bootstrap | 0.10 | 128 MiB | 64 | n/a |
-| MediaMTX | 0.20 | 192 MiB | 64 | n/a |
-| **Total** | **0.70** | **704 MiB** | **224** | **1** |
+| Service | CPU | RAM | PIDs | Destinations | Restart policy |
+| --- | ---: | ---: | ---: | ---: | --- |
+| backend | 0.40 | 384 MiB | 96 | 1 | `unless-stopped` |
+| bootstrap | 0.10 | 128 MiB | 64 | n/a | `unless-stopped` |
+| MediaMTX | 0.20 | 192 MiB | 64 | n/a | `unless-stopped` |
+| **Total** | **0.70** | **704 MiB** | **224** | **1** | all required |
 
 The override must also make the security mode and public identity fail-closed. Its effective
 values are `ENVIRONMENT=production`, `COOKIE_SECURE=true`, `MAX_DESTINATIONS=1`,
@@ -112,9 +112,12 @@ enter a production lifecycle command. The SSH target must be internal to `bootst
 no host port. The agent may share only its CI node-data volume and must have no inbound port. Both
 fixtures must be absent when only the base and production files are rendered.
 
-The run must safely confirm the actual backend limits of 0.40 CPU, 384 MiB, and 96 PIDs and the
-bootstrap limits of 0.10 CPU, 128 MiB, and 64 PIDs and the MediaMTX limits of 0.20 CPU, 192 MiB, and
-64 PIDs without printing container environments. Stage 4A CI must prove bounded password-only SSH
+The run must safely confirm the actual backend limits of 0.40 CPU, 384 MiB, and 96 PIDs, the
+bootstrap limits of 0.10 CPU, 128 MiB, and 64 PIDs, and the MediaMTX limits of 0.20 CPU, 192 MiB,
+and 64 PIDs, plus runtime `RestartPolicy.Name=no`, zero unexpected restarts, and no OOM event,
+without printing container environments. It must rotate ingest once offline and once with an
+active publisher, terminate the previous publisher, reject the previous key, and accept the
+replacement key. Stage 4A CI must prove bounded password-only SSH
 bootstrap against the exact allowlisted fixture, host-key validation, single-use enrollment-file
 promotion, five-second heartbeat, fixed `PING`/`SELF_TEST`, revocation, no inbound Node Agent port,
 and marker-scoped rollback. The media API test must keep the first destination active while a
@@ -269,17 +272,18 @@ Record an owner and evidence for every item before proceeding:
     public-address receiver, without a real platform key; do not set
     `TEST_DESTINATION_ALLOWLIST` in production.
 22. Capture CPU and RAM during the media test.
-23. Confirm no OOM event occurred.
-24. Stop only this project and confirm other services remain healthy.
-25. Record the reviewed rollback command and responsible operator.
-26. Confirm the effective total is exactly 0.70 CPU, 704 MiB RAM, and 224 PIDs, including
+23. Confirm no OOM event or unexpected restart occurred.
+24. Configure readiness/restart/OOM monitoring without raw sensitive log matching.
+25. Stop only this project and confirm other services remain healthy.
+26. Record the reviewed rollout and rollback commands and responsible operator.
+27. Confirm the effective total is exactly 0.70 CPU, 704 MiB RAM, and 224 PIDs, including
     bootstrap.
-27. Confirm the bootstrap UDS mounts, separate egress network, no ports, no Docker socket, and
+28. Confirm the bootstrap UDS mounts, separate egress network, no ports, no Docker socket, and
     independent secret match the reviewed model.
-28. Record and verify the immutable `NODE_AGENT_IMAGE` digest, build provenance, and successful
+29. Record and verify the immutable `NODE_AGENT_IMAGE` digest, build provenance, and successful
     fresh-runner anonymous pull of that exact digest without registry credentials.
-29. Confirm `ci-ssh-target`, `ci-node-agent`, and both test allowlists are absent from production.
-30. Confirm node onboarding remains a separately authorized operation and that Stage 4A has no
+30. Confirm `ci-ssh-target`, `ci-node-agent`, and both test allowlists are absent from production.
+31. Confirm node onboarding remains a separately authorized operation and that Stage 4A has no
     real video, YouTube output, hot switching, SSH-key onboarding, or remote uninstall.
 
 Any failed or undocumented item is a no-go.

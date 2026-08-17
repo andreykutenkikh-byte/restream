@@ -22,6 +22,13 @@ Every control-plane production command must load exactly `compose.yml` followed 
 | MediaMTX | 0.20 | 192 MiB | 64 | RTMP ingest and internal HLS |
 | **Total** | **0.70** | **704 MiB** | **224** | one destination |
 
+Production overrides all three core services to `restart: unless-stopped`; development retains
+bounded `on-failure:5`, while the final CI override sets each service to `restart: "no"`. A
+deliberate project-scoped Compose stop remains effective across a Docker daemon restart. Because
+`unless-stopped` can retry a persistent crash indefinitely, production monitoring must alert on
+readiness failure, restart-count growth, and OOM state rather than restarting Docker or unrelated
+services.
+
 The override is fail-closed: its effective values include `ENVIRONMENT=production`,
 `COOKIE_SECURE=true`, `MAX_DESTINATIONS=1`, `PUBLIC_DOMAIN=restream.adojapan.ru`,
 `PUBLIC_RTMP_HOST=restream.adojapan.ru`, `PUBLIC_RTMP_PORT=1935`,
@@ -61,7 +68,9 @@ SSH. Validate these safe fields with a structured parser; never print the resolv
 2. Require a successful CI run for the exact reviewed commit. CI must load the files in order
    `compose.yml`, `compose.production.yml`, `compose.ci.yml`, exercise the CI-only
    `ci-ssh-target` and `ci-node-agent`, and prove that neither fixture has a host port or appears in
-   the effective production service set.
+   the effective production service set. The same run must exercise offline and active ingest-key
+   rotation against the pinned MediaMTX, reject the previous key, accept the replacement, and show
+   zero unexpected restarts or OOM events.
 3. Verify the effective limits are 0.40/384 MiB/96 PIDs for backend, 0.10/128 MiB/64 PIDs for
    bootstrap, and 0.20/192 MiB/64 PIDs for MediaMTX.
 4. Verify the bootstrap worker has only its UDS volume and `bootstrap-egress`, the backend UDS
@@ -96,8 +105,9 @@ SSH. Validate these safe fields with a structured parser; never print the resolv
 
 5. Add only the dedicated `restream.adojapan.ru` site to the existing proxy, validate its
    configuration, and safely reload it.
-6. Run the post-start audit and compare before/after snapshots. Verify the bootstrap healthcheck
-   without exposing its secret or socket externally.
+6. Run the post-start audit and compare before/after snapshots. Verify all three container IDs,
+   start times, `RestartPolicy.Name=unless-stopped`, restart counts, OOM state, resource limits,
+   readiness, and the bootstrap healthcheck without exposing secrets or the UDS externally.
 
 Do not combine first control-plane rollout, DNS/firewall cutover, and first real SSH onboarding
 unless one reviewed change plan explicitly authorizes and sequences all three. Stage 4A nodes do
