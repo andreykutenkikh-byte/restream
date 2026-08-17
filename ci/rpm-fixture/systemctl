@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+case "$*" in
+  "list-unit-files docker.service --no-legend")
+    exit 0
+    ;;
+  "is-active --quiet docker"|"enable --now docker")
+    exit 0
+    ;;
+esac
+
+exit 64

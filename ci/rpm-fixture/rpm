@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 2 ] || [ "$1" != "-q" ]; then
+  exit 64
+fi
+
+mode=${ADOJAPAN_RPM_FIXTURE_MODE:-ready}
+package=$2
+case "$package" in
+  docker-ce|docker-ce-cli|containerd.io|docker-buildx-plugin|docker-compose-plugin)
+    [ "$mode" = ready ] && exit 0
+    exit 1
+    ;;
+  docker|docker-client|docker-common|docker-engine|podman-docker|containerd|runc)
+    [ "$mode" = conflict ] && [ "$package" = podman-docker ] && exit 0
+    exit 1
+    ;;
+esac
+
+exit 64

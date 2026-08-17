@@ -58,13 +58,21 @@ class FakeSession:
         if command == "sudo -S -p '' true":
             accepted = stdin is not None and stdin.get_secret_value() == "correct-sudo"
             return RemoteResult(0 if accepted else 1)
-        if "printf 'os_id='" in command:
+        if "printf 'os_id=%s\\n'" in command:
             return RemoteResult(
                 0,
                 """hostname=edge-node-01
 os_id=ubuntu
 os_version=24.04
+id_like=debian
+version_codename=noble
 architecture=x86_64
+apt_get_available=1
+dpkg_query_available=1
+dnf_available=0
+rpm_available=0
+systemctl_available=1
+selinux_mode=disabled
 cpu_count=2
 memory_total_bytes=4294967296
 memory_available_bytes=2147483648

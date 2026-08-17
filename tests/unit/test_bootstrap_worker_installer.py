@@ -14,6 +14,8 @@ from bootstrap_worker.installer import (
     COMPOSE_PROJECT,
     DOCKER_COMPOSE,
     AgentProcessState,
+    AptDockerAdapter,
+    DnfDockerAdapter,
     DockerBootstrap,
     InstallReceipt,
     PrivilegeContext,
@@ -30,7 +32,10 @@ from bootstrap_worker.models import (
     BootstrapRequest,
     DockerDisposition,
     InstallOwnership,
+    PackageManager,
+    PlatformFamily,
     PrivilegeMode,
+    SELinuxMode,
     SystemFacts,
     TimeoutPolicy,
 )
@@ -92,8 +97,20 @@ def facts(**updates: object) -> SystemFacts:
     values: dict[str, object] = {
         "hostname": "edge-node-01",
         "os_name": "ubuntu",
+        "os_id": "ubuntu",
         "os_version": "24.04",
+        "os_major_version": "24",
+        "id_like": ("debian",),
+        "version_codename": "noble",
         "architecture": "amd64",
+        "platform_family": PlatformFamily.DEBIAN,
+        "package_manager": PackageManager.APT,
+        "selinux_mode": SELinuxMode.DISABLED,
+        "apt_get_available": True,
+        "dpkg_query_available": True,
+        "dnf_available": True,
+        "rpm_available": True,
+        "systemctl_available": True,
         "cpu_count": 2,
         "memory_total_bytes": 4 * 1024**3,
         "memory_available_bytes": 2 * 1024**3,
@@ -101,7 +118,30 @@ def facts(**updates: object) -> SystemFacts:
         "disk_free_bytes": 20 * 1024**3,
     }
     values.update(updates)
+    if "os_name" in updates and "os_id" not in updates:
+        values["os_id"] = values["os_name"]
+    if "os_id" in updates and "os_name" not in updates:
+        values["os_name"] = values["os_id"]
+    if "os_version" in updates and "os_major_version" not in updates:
+        values["os_major_version"] = str(values["os_version"]).split(".", 1)[0]
     return SystemFacts.model_validate(values)
+
+
+def detected_facts(os_id: str, os_version: str) -> SystemFacts:
+    rhel_family = os_id in {"almalinux", "rocky", "rhel", "centos"}
+    return validate_operating_system(
+        facts(
+            os_name=os_id,
+            os_version=os_version,
+            id_like=("rhel", "centos", "fedora") if rhel_family else ("debian",),
+            version_codename=None if rhel_family else "fixture",
+            apt_get_available=not rhel_family,
+            dpkg_query_available=not rhel_family,
+            dnf_available=rhel_family,
+            rpm_available=rhel_family,
+            selinux_mode=SELinuxMode.ENFORCING if rhel_family else SELinuxMode.DISABLED,
+        )
+    )
 
 
 def test_bootstrap_image_runs_non_root_and_owns_only_uds_directory() -> None:
@@ -158,7 +198,15 @@ def test_system_probe_parser_and_supported_resource_gates() -> None:
     output = """hostname=edge-node-01
 os_id=ubuntu
 os_version=22.04
+id_like=debian
+version_codename=jammy
 architecture=x86_64
+apt_get_available=1
+dpkg_query_available=1
+dnf_available=0
+rpm_available=0
+systemctl_available=1
+selinux_mode=disabled
 cpu_count=2
 memory_total_bytes=2147483648
 memory_available_bytes=1073741824
@@ -188,11 +236,174 @@ disk_free_bytes=17179869184
         facts(hostname="edge node")
 
 
+@pytest.mark.parametrize(
+    ("os_id", "version", "family", "manager"),
+    [
+        ("ubuntu", "22.04", PlatformFamily.DEBIAN, PackageManager.APT),
+        ("ubuntu", "24.04", PlatformFamily.DEBIAN, PackageManager.APT),
+        ("ubuntu", "26.04", PlatformFamily.DEBIAN, PackageManager.APT),
+        ("debian", "12", PlatformFamily.DEBIAN, PackageManager.APT),
+        ("debian", "13", PlatformFamily.DEBIAN, PackageManager.APT),
+        ("almalinux", "8.10", PlatformFamily.RHEL, PackageManager.DNF),
+        ("almalinux", "9.6", PlatformFamily.RHEL, PackageManager.DNF),
+        ("rocky", "8.10", PlatformFamily.RHEL, PackageManager.DNF),
+        ("rocky", "9.6", PlatformFamily.RHEL, PackageManager.DNF),
+        ("rhel", "8.10", PlatformFamily.RHEL, PackageManager.DNF),
+        ("rhel", "9.6", PlatformFamily.RHEL, PackageManager.DNF),
+        ("centos", "9", PlatformFamily.RHEL, PackageManager.DNF),
+    ],
+)
+def test_supported_platform_matrix_is_auto_detected_without_operator_input(
+    os_id: str,
+    version: str,
+    family: PlatformFamily,
+    manager: PackageManager,
+) -> None:
+    detected = detected_facts(os_id, version)
+    assert detected.os_id == os_id
+    assert detected.os_name == os_id
+    assert detected.os_version == version
+    assert detected.platform_family is family
+    assert detected.package_manager is manager
+    assert detected.architecture == "amd64"
+
+
+@pytest.mark.parametrize(
+    ("os_id", "version", "architecture"),
+    [
+        ("alpine", "3.21", "amd64"),
+        ("arch", "rolling", "amd64"),
+        ("unknown", "1", "amd64"),
+        ("ubuntu", "20.04", "amd64"),
+        ("debian", "11", "amd64"),
+        ("almalinux", "7.9", "amd64"),
+        ("rocky", "10.0", "amd64"),
+        ("ubuntu", "24.04", "aarch64"),
+    ],
+)
+def test_unsupported_platforms_fail_closed(
+    os_id: str,
+    version: str,
+    architecture: str,
+) -> None:
+    with pytest.raises(BootstrapError) as captured:
+        validate_operating_system(
+            facts(os_name=os_id, os_version=version, architecture=architecture)
+        )
+    assert captured.value.code == "unsupported_operating_system"
+
+
+@pytest.mark.parametrize(
+    ("os_id", "version", "missing"),
+    [
+        ("debian", "13", "dpkg_query_available"),
+        ("rocky", "9.6", "rpm_available"),
+        ("rhel", "9.6", "systemctl_available"),
+    ],
+)
+def test_known_platform_without_required_capability_has_specific_safe_error(
+    os_id: str,
+    version: str,
+    missing: str,
+) -> None:
+    capabilities = {
+        "apt_get_available": True,
+        "dpkg_query_available": True,
+        "dnf_available": True,
+        "rpm_available": True,
+        "systemctl_available": True,
+    }
+    capabilities[missing] = False
+    candidate = facts(os_name=os_id, os_version=version, **capabilities)
+    with pytest.raises(BootstrapError) as captured:
+        validate_operating_system(candidate)
+    assert captured.value.code == "unsupported_package_manager"
+
+
+@pytest.mark.parametrize(
+    ("os_id", "version", "missing"),
+    [
+        ("ubuntu", "24.04", "apt_get_available"),
+        ("almalinux", "8.10", "dnf_available"),
+    ],
+)
+async def test_install_manager_is_required_only_when_docker_is_absent(
+    os_id: str,
+    version: str,
+    missing: str,
+) -> None:
+    candidate = detected_facts(os_id, version).model_copy(update={missing: False})
+    existing = FakeSession(lambda command, stdin: RemoteResult(0))
+    assert (
+        await DockerBootstrap().inspect(
+            existing,
+            PrivilegeContext(PrivilegeMode.ROOT),
+            candidate,
+            timeout=60,
+        )
+        is DockerDisposition.READY
+    )
+
+    def absent_responder(command: str, stdin: SecretStr | None) -> RemoteResult:
+        del stdin
+        if command == "command -v docker >/dev/null 2>&1":
+            return RemoteResult(1)
+        return RemoteResult(0)
+
+    with pytest.raises(BootstrapError) as captured:
+        await DockerBootstrap().inspect(
+            FakeSession(absent_responder),
+            PrivilegeContext(PrivilegeMode.ROOT),
+            candidate,
+            timeout=60,
+        )
+    assert captured.value.code == "unsupported_package_manager"
+
+
+def test_almalinux_8_10_probe_preserves_actual_identity_and_selinux() -> None:
+    output = """hostname=alma-edge
+os_id=almalinux
+os_version=8.10
+id_like=rhel centos fedora
+version_codename=
+architecture=x86_64
+apt_get_available=0
+dpkg_query_available=0
+dnf_available=1
+rpm_available=1
+systemctl_available=1
+selinux_mode=enforcing
+cpu_count=2
+memory_total_bytes=3221225472
+memory_available_bytes=2147483648
+disk_total_bytes=34359738368
+disk_free_bytes=17179869184
+"""
+    detected = validate_operating_system(parse_system_facts(output))
+    assert detected.os_id == "almalinux"
+    assert detected.os_name == "almalinux"
+    assert detected.os_version == "8.10"
+    assert detected.os_major_version == "8"
+    assert detected.id_like == ("rhel", "centos", "fedora")
+    assert detected.platform_family is PlatformFamily.RHEL
+    assert detected.package_manager is PackageManager.DNF
+    assert detected.selinux_mode is SELinuxMode.ENFORCING
+    assert detected.architecture == "amd64"
+
+
 async def test_system_probe_requires_no_preinstalled_downloader_or_docker_repository() -> None:
     output = """hostname=minimal-node
 os_id=debian
 os_version=12
+id_like=
+version_codename=bookworm
 architecture=x86_64
+apt_get_available=1
+dpkg_query_available=1
+dnf_available=0
+rpm_available=0
+systemctl_available=1
+selinux_mode=disabled
 cpu_count=1
 memory_total_bytes=2147483648
 memory_available_bytes=1073741824
@@ -217,7 +428,9 @@ disk_free_bytes=17179869184
     [
         ("ubuntu", "22.04", "download.docker.com/linux/ubuntu jammy stable"),
         ("ubuntu", "24.04", "download.docker.com/linux/ubuntu noble stable"),
+        ("ubuntu", "26.04", "download.docker.com/linux/ubuntu resolute stable"),
         ("debian", "12", "download.docker.com/linux/debian bookworm stable"),
+        ("debian", "13", "download.docker.com/linux/debian trixie stable"),
     ],
 )
 def test_docker_plan_uses_official_apt_repository_without_convenience_script(
@@ -226,7 +439,7 @@ def test_docker_plan_uses_official_apt_repository_without_convenience_script(
     repository: str,
 ) -> None:
     plan = DockerBootstrap().install_plan(facts(os_name=os_name, os_version=version))
-    commands = "\n".join(command for command, _ in plan)
+    commands = "\n".join(step.command for step in plan)
     assert repository in commands
     assert "docker-ce" in commands
     assert "docker-compose-plugin" in commands
@@ -236,8 +449,10 @@ def test_docker_plan_uses_official_apt_repository_without_convenience_script(
     assert "dist-upgrade" not in commands
     assert "docker prune" not in commands
     assert "remove docker" not in commands
-    steps = [command for command, _ in plan]
-    prerequisite = steps.index("apt-get install -y --no-install-recommends ca-certificates curl")
+    steps = [step.command for step in plan]
+    prerequisite = steps.index(
+        "apt-get install -y --no-install-recommends ca-certificates curl gnupg"
+    )
     repository_probe = next(
         index for index, command in enumerate(steps) if "--output /dev/null" in command
     )
@@ -248,12 +463,74 @@ def test_docker_plan_uses_official_apt_repository_without_convenience_script(
     )
     assert prerequisite < repository_probe < key_download
     assert "--connect-timeout 10 --max-time 20" in steps[repository_probe]
+    assert "--location" not in commands
+    assert "gpgcheck=0" not in commands
+    assert "060A61C51B558A7F742B77AAC52FEB6B621E9F35" in commands
+
+
+@pytest.mark.parametrize(
+    ("os_id", "version", "repository_distribution"),
+    [
+        ("almalinux", "8.10", "centos"),
+        ("almalinux", "9.6", "centos"),
+        ("rocky", "8.10", "rocky"),
+        ("rocky", "9.6", "rocky"),
+        ("rhel", "8.10", "rhel"),
+        ("rhel", "9.6", "rhel"),
+        ("centos", "9", "centos"),
+    ],
+)
+def test_dnf_adapter_uses_only_allowlisted_official_rpm_path(
+    os_id: str,
+    version: str,
+    repository_distribution: str,
+) -> None:
+    platform = detected_facts(os_id, version)
+    plan = DnfDockerAdapter().install_plan(platform)
+    commands = "\n".join(step.command for step in plan)
+    assert f"download.docker.com/linux/{repository_distribution}" in commands
+    assert "docker-ce docker-ce-cli containerd.io docker-buildx-plugin" in commands
+    assert "docker-compose-plugin" in commands
+    assert "gpgcheck=1" in commands
+    assert "gpgcheck=0" not in commands
+    assert "060A61C51B558A7F742B77AAC52FEB6B621E9F35" in commands
+    assert "apt-get" not in commands
+    assert "dpkg-query" not in commands
+    assert "get.docker.com" not in commands
+    assert "| sh" not in commands
+    assert "dnf update" not in commands
+    assert "dnf upgrade" not in commands
+    assert "dnf remove" not in commands
+    assert "dnf erase" not in commands
+
+
+def test_family_specific_absence_checks_do_not_cross_package_managers() -> None:
+    apt_commands = "\n".join(
+        (
+            AptDockerAdapter().conflicting_runtime_check(),
+            AptDockerAdapter().clean_absence_check(),
+            AptDockerAdapter().supported_packages_check(),
+        )
+    )
+    rpm_commands = "\n".join(
+        (
+            DnfDockerAdapter().conflicting_runtime_check(),
+            DnfDockerAdapter().clean_absence_check(),
+            DnfDockerAdapter().supported_packages_check(),
+        )
+    )
+    assert "dpkg-query" in apt_commands
+    assert " rpm " not in f" {apt_commands} "
+    assert "/etc/yum.repos.d" not in apt_commands
+    assert "rpm -q" in rpm_commands
+    assert "dpkg-query" not in rpm_commands
+    assert "/etc/apt" not in rpm_commands
 
 
 def test_docker_plan_never_manages_firewall_or_daemon_configuration() -> None:
     commands = "\n".join(
-        command
-        for command, _ in DockerBootstrap().install_plan(facts(os_name="debian", os_version="12"))
+        step.command
+        for step in DockerBootstrap().install_plan(facts(os_name="debian", os_version="12"))
     ).lower()
     forbidden = (
         "uf" + "w",
@@ -284,12 +561,12 @@ async def test_docker_absent_reports_safe_egress_error_after_installing_download
             facts(os_name="debian", os_version="12"),
             timeouts=TimeoutPolicy(),
         )
-    assert captured.value.code == "outbound_https_unavailable"
+    assert captured.value.code == "docker_repository_unavailable"
     commands = [command for command, _, _ in session.commands]
     prerequisite = next(
         index
         for index, command in enumerate(commands)
-        if "apt-get install -y --no-install-recommends ca-certificates curl" in command
+        if "apt-get install -y --no-install-recommends ca-certificates curl gnupg" in command
     )
     repository_probe = next(
         index for index, command in enumerate(commands) if "--output /dev/null" in command
@@ -310,6 +587,7 @@ async def test_docker_ready_inspection_has_no_docker_repository_dependency() -> 
     disposition = await DockerBootstrap().inspect(
         session,
         PrivilegeContext(PrivilegeMode.ROOT),
+        facts(),
         timeout=60,
     )
     assert disposition is DockerDisposition.READY
@@ -321,9 +599,149 @@ async def test_docker_ready_inspection_has_no_docker_repository_dependency() -> 
     assert all("/etc/docker/" + "daemon.json" not in command for command in commands)
 
 
+@pytest.mark.parametrize(
+    ("os_id", "version", "expected_tool", "forbidden_tool"),
+    [
+        ("ubuntu", "24.04", "dpkg-query", "rpm -q"),
+        ("almalinux", "8.10", "rpm -q", "dpkg-query"),
+    ],
+)
+async def test_supported_existing_docker_is_read_only_for_each_family(
+    os_id: str,
+    version: str,
+    expected_tool: str,
+    forbidden_tool: str,
+) -> None:
+    session = FakeSession(lambda command, stdin: RemoteResult(0))
+    disposition = await DockerBootstrap().inspect(
+        session,
+        PrivilegeContext(PrivilegeMode.ROOT),
+        detected_facts(os_id, version),
+        timeout=60,
+    )
+    assert disposition is DockerDisposition.READY
+    commands = "\n".join(command for command, _, _ in session.commands)
+    assert expected_tool in commands
+    assert forbidden_tool not in commands
+    assert "download.docker.com" not in commands
+    assert "apt-get" not in commands
+    assert "dnf " not in commands
+    assert "systemctl enable" not in commands
+    assert "systemctl restart" not in commands
+
+
+@pytest.mark.parametrize(
+    ("os_id", "version"),
+    [("debian", "13"), ("almalinux", "8.10")],
+)
+async def test_partial_existing_docker_is_unsupported_without_mutation(
+    os_id: str,
+    version: str,
+) -> None:
+    def responder(command: str, stdin: SecretStr | None) -> RemoteResult:
+        del stdin
+        if command == "command -v docker >/dev/null 2>&1":
+            return RemoteResult(0)
+        if "for package in docker-ce docker-ce-cli" in command:
+            return RemoteResult(1)
+        return RemoteResult(0)
+
+    session = FakeSession(responder)
+    disposition = await DockerBootstrap().inspect(
+        session,
+        PrivilegeContext(PrivilegeMode.ROOT),
+        detected_facts(os_id, version),
+        timeout=60,
+    )
+    assert disposition is DockerDisposition.UNSUPPORTED
+    commands = "\n".join(command for command, _, _ in session.commands)
+    assert "apt-get" not in commands
+    assert "dnf " not in commands
+    assert "systemctl enable" not in commands
+
+
+@pytest.mark.parametrize(
+    ("os_id", "version"),
+    [("ubuntu", "26.04"), ("rocky", "9.6")],
+)
+async def test_conflicting_runtime_has_specific_error_and_no_mutation(
+    os_id: str,
+    version: str,
+) -> None:
+    session = FakeSession(lambda command, stdin: RemoteResult(1))
+    with pytest.raises(BootstrapError) as captured:
+        await DockerBootstrap().inspect(
+            session,
+            PrivilegeContext(PrivilegeMode.ROOT),
+            detected_facts(os_id, version),
+            timeout=60,
+        )
+    assert captured.value.code == "conflicting_container_runtime"
+    assert len(session.commands) == 1
+    assert "apt-get" not in session.commands[0][0]
+    assert "dnf " not in session.commands[0][0]
+
+
+@pytest.mark.parametrize(
+    ("os_id", "version", "expected_tool", "forbidden_tool"),
+    [
+        ("debian", "12", "dpkg-query", "rpm -q"),
+        ("almalinux", "8.10", "rpm -q", "dpkg-query"),
+    ],
+)
+async def test_clean_absence_uses_only_family_package_query(
+    os_id: str,
+    version: str,
+    expected_tool: str,
+    forbidden_tool: str,
+) -> None:
+    def responder(command: str, stdin: SecretStr | None) -> RemoteResult:
+        del stdin
+        if command == "command -v docker >/dev/null 2>&1":
+            return RemoteResult(1)
+        return RemoteResult(0)
+
+    session = FakeSession(responder)
+    disposition = await DockerBootstrap().inspect(
+        session,
+        PrivilegeContext(PrivilegeMode.ROOT),
+        detected_facts(os_id, version),
+        timeout=60,
+    )
+    assert disposition is DockerDisposition.ABSENT
+    commands = "\n".join(command for command, _, _ in session.commands)
+    assert expected_tool in commands
+    assert forbidden_tool not in commands
+
+
+async def test_dnf_signing_key_failure_is_safe_and_stops_before_repository_write() -> None:
+    def responder(command: str, stdin: SecretStr | None) -> RemoteResult:
+        del stdin
+        if "fingerprints=$(gpg2" in command:
+            return RemoteResult(1)
+        return RemoteResult(0)
+
+    session = FakeSession(responder)
+    with pytest.raises(BootstrapError) as captured:
+        await DockerBootstrap().install(
+            session,
+            PrivilegeContext(PrivilegeMode.ROOT),
+            detected_facts("almalinux", "8.10"),
+            timeouts=TimeoutPolicy(),
+        )
+    assert captured.value.code == "docker_repository_key_invalid"
+    commands = [command for command, _, _ in session.commands]
+    assert not any(
+        "printf '%s\\n'" in command and "/etc/yum.repos.d/docker-ce.repo" in command
+        for command in commands
+    )
+
+
 async def test_docker_absence_detection_fails_closed_on_existing_installation_state() -> None:
     def clean_responder(command: str, stdin: SecretStr | None) -> RemoteResult:
         del stdin
+        if "/var/lib/docker" not in command and "dpkg-query" in command:
+            return RemoteResult(0)
         if command == "command -v docker >/dev/null 2>&1":
             return RemoteResult(1)
         assert "dpkg-query" in command
@@ -335,18 +753,24 @@ async def test_docker_absence_detection_fails_closed_on_existing_installation_st
     disposition = await DockerBootstrap().inspect(
         clean,
         PrivilegeContext(PrivilegeMode.ROOT),
+        facts(),
         timeout=60,
     )
     assert disposition is DockerDisposition.ABSENT
 
-    collision = FakeSession(
-        lambda command, stdin: RemoteResult(
-            1 if command == "command -v docker >/dev/null 2>&1" else 9
-        )
-    )
+    def collision_responder(command: str, stdin: SecretStr | None) -> RemoteResult:
+        del stdin
+        if "/var/lib/docker" not in command and "dpkg-query" in command:
+            return RemoteResult(0)
+        if command == "command -v docker >/dev/null 2>&1":
+            return RemoteResult(1)
+        return RemoteResult(9)
+
+    collision = FakeSession(collision_responder)
     disposition = await DockerBootstrap().inspect(
         collision,
         PrivilegeContext(PrivilegeMode.ROOT),
+        facts(),
         timeout=60,
     )
     assert disposition is DockerDisposition.UNSUPPORTED
@@ -355,6 +779,8 @@ async def test_docker_absence_detection_fails_closed_on_existing_installation_st
 async def test_functional_non_official_docker_installation_is_unsupported() -> None:
     def responder(command: str, stdin: SecretStr | None) -> RemoteResult:
         del stdin
+        if "for package in docker.io" in command:
+            return RemoteResult(0)
         if command == "command -v docker >/dev/null 2>&1":
             return RemoteResult(0)
         assert "dpkg-query" in command
@@ -363,13 +789,16 @@ async def test_functional_non_official_docker_installation_is_unsupported() -> N
     disposition = await DockerBootstrap().inspect(
         FakeSession(responder),
         PrivilegeContext(PrivilegeMode.ROOT),
+        facts(),
         timeout=60,
     )
     assert disposition is DockerDisposition.UNSUPPORTED
 
 
 async def test_docker_install_rechecks_absence_before_any_package_change() -> None:
-    session = FakeSession(lambda command, stdin: RemoteResult(7))
+    session = FakeSession(
+        lambda command, stdin: RemoteResult(0 if "docker.io containerd" in command else 7)
+    )
     with pytest.raises(BootstrapError) as captured:
         await DockerBootstrap().install(
             session,
@@ -378,9 +807,9 @@ async def test_docker_install_rechecks_absence_before_any_package_change() -> No
             timeouts=TimeoutPolicy(),
         )
     assert captured.value.code == "unsupported_docker_installation"
-    assert len(session.commands) == 1
-    assert "dpkg-query" in session.commands[0][0]
-    assert "apt-get" not in session.commands[0][0]
+    assert len(session.commands) == 2
+    assert "dpkg-query" in session.commands[1][0]
+    assert "apt-get" not in session.commands[1][0]
 
 
 def test_agent_compose_is_secret_free_and_isolated() -> None:
@@ -399,6 +828,8 @@ def test_agent_compose_is_secret_free_and_isolated() -> None:
     assert "read_only: true" in rendered
     assert "no-new-privileges:true" in rendered
     assert "cap_drop:\n      - ALL" in rendered
+    assert "create_host_path: false" in rendered
+    assert "selinux: Z" in rendered
     assert "privileged:" not in rendered
     assert "network_mode:" not in rendered
     assert "/var/run/" + "docker.sock" not in rendered

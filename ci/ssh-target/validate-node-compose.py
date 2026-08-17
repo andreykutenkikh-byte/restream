@@ -69,6 +69,7 @@ def validate_document(value: Any) -> None:
                 "type": "bind",
                 "source": "./data",
                 "target": "/var/lib/adojapan-node",
+                "bind": {"create_host_path": False, "selinux": "Z"},
             }
         ]
     )

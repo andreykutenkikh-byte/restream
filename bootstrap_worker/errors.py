@@ -56,6 +56,9 @@ def safe_failure(code: str) -> BootstrapError:
         "ssh_authentication_failed": "SSH-аутентификация не выполнена.",
         "sudo_password_invalid": "Пароль sudo не подошёл.",
         "unsupported_operating_system": "Операционная система сервера не поддерживается.",
+        "unsupported_package_manager": (
+            "На сервере отсутствует поддерживаемый системный менеджер пакетов."
+        ),
         "insufficient_cpu": "На сервере недостаточно процессорных ядер.",
         "insufficient_memory": "На сервере недостаточно свободной памяти.",
         "insufficient_disk": "На сервере недостаточно свободного места.",
@@ -63,6 +66,16 @@ def safe_failure(code: str) -> BootstrapError:
         "unsupported_docker_installation": (
             "Обнаружена неподдерживаемая установка Docker. Изменения не выполнялись."
         ),
+        "conflicting_container_runtime": (
+            "Обнаружен конфликтующий контейнерный runtime. Изменения не выполнялись."
+        ),
+        "docker_repository_unavailable": (
+            "Официальный репозиторий Docker временно недоступен с сервера."
+        ),
+        "docker_repository_key_invalid": (
+            "Ключ подписи официального репозитория Docker не прошёл проверку."
+        ),
+        "docker_install_failed": "Не удалось безопасно установить Docker Engine.",
         "remote_directory_conflict": (
             "Каталог установки уже существует и не принадлежит AdoJapan Restream."
         ),

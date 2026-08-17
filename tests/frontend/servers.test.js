@@ -22,6 +22,19 @@ const template = fs.readFileSync(path.join(root, "app/templates/servers.html"), 
 const source = fs.readFileSync(path.join(root, "app/static/servers.js"), "utf8");
 const styles = fs.readFileSync(path.join(root, "app/static/styles.css"), "utf8");
 
+test("server onboarding has no operator-selected OS or package manager", () => {
+  const dialog = template.match(/<dialog[\s\S]*?<\/dialog>/)?.[0] || "";
+  const inputNames = [...dialog.matchAll(/<input name="([^"]+)"/g)].map((match) => match[1]);
+  assert.deepEqual(inputNames, [
+    "address",
+    "username",
+    "password",
+    "port",
+    "expected_host_fingerprint",
+  ]);
+  assert.doesNotMatch(dialog, /<select|name="(?:os|distribution|package_manager|docker_mode)"/i);
+});
+
 test("bootstrap payload accepts only a bounded numeric SSH port", () => {
   assert.deepEqual(
     buildBootstrapPayload({

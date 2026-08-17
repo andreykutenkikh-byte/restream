@@ -79,6 +79,23 @@ class DockerDisposition(StrEnum):
     UNSUPPORTED = "unsupported"
 
 
+class PlatformFamily(StrEnum):
+    DEBIAN = "debian"
+    RHEL = "rhel"
+
+
+class PackageManager(StrEnum):
+    APT = "apt"
+    DNF = "dnf"
+
+
+class SELinuxMode(StrEnum):
+    ENFORCING = "enforcing"
+    PERMISSIVE = "permissive"
+    DISABLED = "disabled"
+    UNKNOWN = "unknown"
+
+
 class InstallOwnership(StrEnum):
     ABSENT = "absent"
     MANAGED = "managed"
@@ -216,8 +233,20 @@ class SystemFacts(BaseModel):
 
     hostname: str = Field(min_length=1, max_length=253)
     os_name: str = Field(min_length=1, max_length=64)
+    os_id: str = Field(min_length=1, max_length=64)
     os_version: str = Field(min_length=1, max_length=32)
+    os_major_version: str = Field(min_length=1, max_length=16)
+    id_like: tuple[str, ...] = Field(default=(), max_length=16)
+    version_codename: str | None = Field(default=None, min_length=1, max_length=64)
     architecture: str = Field(min_length=1, max_length=32)
+    platform_family: PlatformFamily | None = None
+    package_manager: PackageManager | None = None
+    selinux_mode: SELinuxMode = SELinuxMode.UNKNOWN
+    apt_get_available: bool
+    dpkg_query_available: bool
+    dnf_available: bool
+    rpm_available: bool
+    systemctl_available: bool
     cpu_count: int = Field(ge=0, le=4096)
     memory_total_bytes: int = Field(gt=0, le=2**63 - 1)
     memory_available_bytes: int = Field(ge=0, le=2**63 - 1)
@@ -233,19 +262,38 @@ class SystemFacts(BaseModel):
             raise ValueError("hostname is invalid")
         return value
 
+    @field_validator("os_name", "os_id", "os_major_version", "version_codename")
+    @classmethod
+    def validate_os_identity(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if value != value.strip() or any(
+            character.isspace() or not character.isprintable() for character in value
+        ):
+            raise ValueError("operating-system identity is invalid")
+        return value
+
+    @field_validator("id_like")
+    @classmethod
+    def validate_id_like(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(
+            not item
+            or item != item.strip()
+            or any(character.isspace() or not character.isprintable() for character in item)
+            for item in value
+        ):
+            raise ValueError("ID_LIKE is invalid")
+        return value
+
     @model_validator(mode="after")
     def validate_capacities(self) -> SystemFacts:
+        if self.os_name != self.os_id:
+            raise ValueError("operating-system identifiers are inconsistent")
         if self.memory_available_bytes > self.memory_total_bytes:
             raise ValueError("memory values are inconsistent")
         if self.disk_free_bytes > self.disk_total_bytes:
             raise ValueError("disk values are inconsistent")
         return self
-
-    @property
-    def os_id(self) -> str:
-        """Compatibility name used by the Docker repository selector."""
-
-        return self.os_name
 
 
 class SafeError(BaseModel):
@@ -316,7 +364,10 @@ __all__ = [
     "JobAccepted",
     "JobState",
     "JobView",
+    "PackageManager",
+    "PlatformFamily",
     "PrivilegeMode",
+    "SELinuxMode",
     "SafeError",
     "StepState",
     "StepView",

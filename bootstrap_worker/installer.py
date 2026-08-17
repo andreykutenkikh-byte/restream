@@ -7,6 +7,7 @@ import shlex
 from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Protocol
 from uuid import UUID
 
 from pydantic import SecretStr
@@ -16,7 +17,10 @@ from bootstrap_worker.models import (
     BootstrapRequest,
     DockerDisposition,
     InstallOwnership,
+    PackageManager,
+    PlatformFamily,
     PrivilegeMode,
+    SELinuxMode,
     SystemFacts,
     TimeoutPolicy,
 )
@@ -38,12 +42,39 @@ NODE_UID = 10_001
 MIN_CPU_COUNT = 1
 MIN_AVAILABLE_MEMORY_BYTES = 700 * 1024 * 1024
 MIN_FREE_DISK_BYTES = 8 * 1024 * 1024 * 1024
+DOCKER_GPG_FINGERPRINT = "060A61C51B558A7F742B77AAC52FEB6B621E9F35"
 
 _SYSTEM_PROBE = r"""set -eu
+test -r /etc/os-release
 printf 'hostname='; hostname
-printf 'os_id='; sed -n 's/^ID=//p' /etc/os-release | head -n 1 | tr -d '"'
-printf 'os_version='; sed -n 's/^VERSION_ID=//p' /etc/os-release | head -n 1 | tr -d '"'
+os_id=$(sed -n 's/^ID=//p' /etc/os-release | head -n 1 | tr -d '"')
+os_version=$(sed -n 's/^VERSION_ID=//p' /etc/os-release | head -n 1 | tr -d '"')
+id_like=$(sed -n 's/^ID_LIKE=//p' /etc/os-release | head -n 1 | tr -d '"')
+version_codename=$(sed -n 's/^VERSION_CODENAME=//p' /etc/os-release | head -n 1 | tr -d '"')
+printf 'os_id=%s\n' "$os_id"
+printf 'os_version=%s\n' "$os_version"
+printf 'id_like=%s\n' "$id_like"
+printf 'version_codename=%s\n' "$version_codename"
 printf 'architecture='; uname -m
+for capability in apt-get dpkg-query dnf rpm systemctl; do
+  key=$(printf '%s' "$capability" | tr '-' '_')
+  if command -v "$capability" >/dev/null 2>&1; then
+    printf '%s_available=1\n' "$key"
+  else
+    printf '%s_available=0\n' "$key"
+  fi
+done
+if command -v getenforce >/dev/null 2>&1; then
+  printf 'selinux_mode='; getenforce | tr '[:upper:]' '[:lower:]'
+elif [ -r /sys/fs/selinux/enforce ]; then
+  if [ "$(cat /sys/fs/selinux/enforce)" = 1 ]; then
+    printf 'selinux_mode=enforcing\n'
+  else
+    printf 'selinux_mode=permissive\n'
+  fi
+else
+  printf 'selinux_mode=disabled\n'
+fi
 printf 'cpu_count='; getconf _NPROCESSORS_ONLN
 printf 'memory_total_bytes='; awk '/^MemTotal:/ {printf "%.0f\n", $2 * 1024}' /proc/meminfo
 printf 'memory_available_bytes='; awk '/^MemAvailable:/ {printf "%.0f\n", $2 * 1024}' /proc/meminfo
@@ -51,21 +82,22 @@ printf 'disk_total_bytes='; df -PB1 / | awk 'NR == 2 {print $2}'
 printf 'disk_free_bytes='; df -PB1 / | awk 'NR == 2 {print $4}'
 """
 
-_DOCKER_ABSENCE_CHECK = (
-    "if dpkg-query -W -f='${db:Status-Abbrev}\\n' "
-    "docker-ce docker-ce-cli containerd.io docker-buildx-plugin "
-    "docker-compose-plugin docker.io containerd runc podman-docker "
-    "2>/dev/null | grep -q '^ii '; then exit 1; fi; "
-    "if grep -Rqs 'download.docker.com' /etc/apt/sources.list "
-    "/etc/apt/sources.list.d 2>/dev/null; then exit 1; fi; "
+_COMMON_DOCKER_ABSENCE_CHECK = (
+    "if command -v docker >/dev/null 2>&1; then exit 1; fi; "
     "if systemctl list-unit-files docker.service --no-legend 2>/dev/null "
     "| grep -q '^docker.service'; then exit 1; fi; "
     "test ! -e /etc/docker && test ! -e /var/lib/docker && "
     "test ! -e /etc/containerd && test ! -e /var/lib/containerd && "
-    "test ! -e /run/docker.sock && "
-    "test ! -e /etc/apt/sources.list.d/docker.list && "
-    "test ! -e /etc/apt/keyrings/docker.asc && "
-    "test ! -e /etc/apt/keyrings/docker.asc.adojapan-tmp"
+    "test ! -e /run/docker.sock"
+)
+
+_APT_OFFICIAL_PACKAGES = (
+    "docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
+)
+_APT_CONFLICTING_PACKAGES = "docker.io containerd runc podman-docker"
+_RPM_OFFICIAL_PACKAGES = _APT_OFFICIAL_PACKAGES
+_RPM_CONFLICTING_PACKAGES = (
+    "docker docker-client docker-common docker-engine podman-docker containerd runc"
 )
 
 
@@ -153,7 +185,15 @@ def parse_system_facts(output: str) -> SystemFacts:
             "hostname",
             "os_id",
             "os_version",
+            "id_like",
+            "version_codename",
             "architecture",
+            "apt_get_available",
+            "dpkg_query_available",
+            "dnf_available",
+            "rpm_available",
+            "systemctl_available",
+            "selinux_mode",
             "cpu_count",
             "memory_total_bytes",
             "memory_available_bytes",
@@ -162,11 +202,31 @@ def parse_system_facts(output: str) -> SystemFacts:
         }:
             values[key] = value.strip()
     try:
+        os_id = values["os_id"].lower()
+        os_version = values["os_version"]
+        os_major_version = os_version.split(".", 1)[0]
+        selinux_value = values.get("selinux_mode", SELinuxMode.UNKNOWN.value).lower()
+        try:
+            selinux_mode = SELinuxMode(selinux_value)
+        except ValueError:
+            selinux_mode = SELinuxMode.UNKNOWN
         return SystemFacts(
             hostname=values["hostname"],
-            os_name=values["os_id"].lower(),
-            os_version=values["os_version"],
+            os_name=os_id,
+            os_id=os_id,
+            os_version=os_version,
+            os_major_version=os_major_version,
+            id_like=tuple(item.lower() for item in values.get("id_like", "").split()),
+            version_codename=values.get("version_codename") or None,
             architecture=values["architecture"].lower(),
+            platform_family=None,
+            package_manager=None,
+            selinux_mode=selinux_mode,
+            apt_get_available=values["apt_get_available"] == "1",
+            dpkg_query_available=values["dpkg_query_available"] == "1",
+            dnf_available=values["dnf_available"] == "1",
+            rpm_available=values["rpm_available"] == "1",
+            systemctl_available=values["systemctl_available"] == "1",
             cpu_count=int(values["cpu_count"]),
             memory_total_bytes=int(values["memory_total_bytes"]),
             memory_available_bytes=int(values["memory_available_bytes"]),
@@ -185,12 +245,48 @@ async def probe_system(session: RemoteSession, *, timeout: float) -> SystemFacts
 
 
 def validate_operating_system(facts: SystemFacts) -> SystemFacts:
-    supported = (facts.os_id == "ubuntu" and facts.os_version in {"22.04", "24.04"}) or (
-        facts.os_id == "debian" and facts.os_version == "12"
-    )
-    if not supported or facts.architecture not in {"x86_64", "amd64"}:
+    supported_exact_versions = {
+        "ubuntu": {"22.04", "24.04", "26.04"},
+        "debian": {"12", "13"},
+    }
+    supported_major_versions = {
+        "almalinux": {"8", "9"},
+        "rocky": {"8", "9"},
+        "rhel": {"8", "9"},
+        "centos": {"9"},
+    }
+    if (
+        (
+            facts.os_id in supported_exact_versions
+            and facts.os_version not in supported_exact_versions[facts.os_id]
+        )
+        or (
+            facts.os_id in supported_major_versions
+            and facts.os_major_version not in supported_major_versions[facts.os_id]
+        )
+        or facts.os_id not in supported_exact_versions | supported_major_versions
+        or facts.architecture not in {"x86_64", "amd64"}
+    ):
         raise safe_failure("unsupported_operating_system")
-    return facts.model_copy(update={"architecture": "amd64"})
+
+    if facts.os_id in {"ubuntu", "debian"}:
+        if not (facts.dpkg_query_available and facts.systemctl_available):
+            raise safe_failure("unsupported_package_manager")
+        platform_family = PlatformFamily.DEBIAN
+        package_manager = PackageManager.APT
+    else:
+        if not (facts.rpm_available and facts.systemctl_available):
+            raise safe_failure("unsupported_package_manager")
+        platform_family = PlatformFamily.RHEL
+        package_manager = PackageManager.DNF
+
+    return facts.model_copy(
+        update={
+            "architecture": "amd64",
+            "platform_family": platform_family,
+            "package_manager": package_manager,
+        }
+    )
 
 
 def validate_resources(facts: SystemFacts) -> SystemFacts:
@@ -217,37 +313,329 @@ def validate_supported_system(facts: SystemFacts) -> SystemFacts:
     return validate_resources(validate_operating_system(facts))
 
 
-class DockerBootstrap:
-    """Inspect Docker read-only or install it from Docker's official apt repository.
+@dataclass(frozen=True, slots=True)
+class DockerInstallStep:
+    command: str
+    package_operation: bool = False
+    failure_code: str = "docker_install_failed"
 
-    An existing supported daemon is never configured or restarted. The absent-Docker
-    branch installs and starts the daemon but deliberately contains no firewall tooling
-    or Docker daemon-configuration writes; repository policy enforces that boundary.
-    """
+
+class DockerPlatformAdapter(Protocol):
+    platform_family: PlatformFamily
+    package_manager: PackageManager
+
+    def conflicting_runtime_check(self) -> str: ...
+
+    def clean_absence_check(self) -> str: ...
+
+    def supported_packages_check(self) -> str: ...
+
+    def repository_probe_command(self, facts: SystemFacts) -> str: ...
+
+    def install_plan(self, facts: SystemFacts) -> tuple[DockerInstallStep, ...]: ...
+
+
+class AptDockerAdapter:
+    platform_family = PlatformFamily.DEBIAN
+    package_manager = PackageManager.APT
+
+    @staticmethod
+    def conflicting_runtime_check() -> str:
+        return (
+            f"for package in {_APT_CONFLICTING_PACKAGES}; do "
+            "if dpkg-query -W -f='${db:Status-Abbrev}\\n' \"$package\" 2>/dev/null "
+            "| grep -q '^ii '; then exit 1; fi; done"
+        )
+
+    @staticmethod
+    def clean_absence_check() -> str:
+        return (
+            f"for package in {_APT_OFFICIAL_PACKAGES}; do "
+            "if dpkg-query -W -f='${db:Status-Abbrev}\\n' \"$package\" 2>/dev/null "
+            "| grep -q '^ii '; then exit 1; fi; done; "
+            "if grep -Rqs 'download.docker.com' /etc/apt/sources.list "
+            "/etc/apt/sources.list.d 2>/dev/null; then exit 1; fi; "
+            "if find /etc/apt/sources.list.d -maxdepth 1 -type f "
+            "-iname '*docker*.list' -print -quit 2>/dev/null | grep -q .; then exit 1; fi; "
+            f"{_COMMON_DOCKER_ABSENCE_CHECK} && "
+            "test ! -e /etc/apt/sources.list.d/docker.list && "
+            "test ! -e /etc/apt/keyrings/docker.asc && "
+            "test ! -e /etc/apt/keyrings/docker.asc.adojapan-tmp"
+        )
+
+    @staticmethod
+    def supported_packages_check() -> str:
+        return (
+            f"for package in {_APT_OFFICIAL_PACKAGES}; do "
+            "dpkg-query -W -f='${db:Status-Abbrev}\\n' \"$package\" 2>/dev/null "
+            "| grep -q '^ii ' || exit 1; done"
+        )
+
+    @staticmethod
+    def _repository_coordinates(facts: SystemFacts) -> tuple[str, str]:
+        codename_by_release = {
+            ("ubuntu", "22.04"): "jammy",
+            ("ubuntu", "24.04"): "noble",
+            ("ubuntu", "26.04"): "resolute",
+            ("debian", "12"): "bookworm",
+            ("debian", "13"): "trixie",
+        }
+        try:
+            codename = codename_by_release[(facts.os_id, facts.os_version)]
+        except KeyError as exc:
+            raise safe_failure("unsupported_operating_system") from exc
+        return facts.os_id, codename
+
+    def repository_probe_command(self, facts: SystemFacts) -> str:
+        distribution, _ = self._repository_coordinates(facts)
+        gpg_url = f"https://download.docker.com/linux/{distribution}/gpg"
+        return (
+            "curl --fail --silent --show-error --proto '=https' --tlsv1.2 "
+            "--connect-timeout 10 --max-time 20 "
+            f"{shlex.quote(gpg_url)} --output /dev/null"
+        )
+
+    def install_plan(self, facts: SystemFacts) -> tuple[DockerInstallStep, ...]:
+        distribution, codename = self._repository_coordinates(facts)
+        gpg_url = f"https://download.docker.com/linux/{distribution}/gpg"
+        repository = (
+            "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] "
+            f"https://download.docker.com/linux/{distribution} {codename} stable"
+        )
+        temporary_key = "/etc/apt/keyrings/docker.asc.adojapan-tmp"
+        verify_key = (
+            f"fingerprints=$(gpg --batch --with-colons --show-keys {temporary_key} "
+            '2>/dev/null | awk -F: \'$1 == "pub" {primary=1; next} '
+            'primary && $1 == "fpr" {print $10; primary=0}\') && '
+            f'if [ "$fingerprints" = {DOCKER_GPG_FINGERPRINT} ]; then '
+            f"install -m 0644 {temporary_key} /etc/apt/keyrings/docker.asc && "
+            f"rm -f {temporary_key}; else rm -f {temporary_key}; exit 1; fi"
+        )
+        return (
+            DockerInstallStep("apt-get update", package_operation=True),
+            DockerInstallStep(
+                "apt-get install -y --no-install-recommends ca-certificates curl gnupg",
+                package_operation=True,
+            ),
+            DockerInstallStep(
+                self.repository_probe_command(facts),
+                failure_code="docker_repository_unavailable",
+            ),
+            DockerInstallStep("install -d -m 0755 /etc/apt/keyrings"),
+            DockerInstallStep(
+                f"rm -f {temporary_key} && "
+                "curl --fail --silent --show-error --proto '=https' --tlsv1.2 "
+                "--connect-timeout 10 --max-time 20 "
+                f"{shlex.quote(gpg_url)} --output {temporary_key}",
+                failure_code="docker_repository_unavailable",
+            ),
+            DockerInstallStep(verify_key, failure_code="docker_repository_key_invalid"),
+            DockerInstallStep(
+                f"printf '%s\\n' {shlex.quote(repository)} > /etc/apt/sources.list.d/docker.list"
+            ),
+            DockerInstallStep("apt-get update", package_operation=True),
+            DockerInstallStep(
+                "apt-get install -y --no-install-recommends docker-ce docker-ce-cli "
+                "containerd.io docker-buildx-plugin docker-compose-plugin",
+                package_operation=True,
+            ),
+            *DockerBootstrap.daemon_activation_steps(),
+        )
+
+
+class DnfDockerAdapter:
+    platform_family = PlatformFamily.RHEL
+    package_manager = PackageManager.DNF
+
+    @staticmethod
+    def conflicting_runtime_check() -> str:
+        return (
+            f"for package in {_RPM_CONFLICTING_PACKAGES}; do "
+            'if rpm -q "$package" >/dev/null 2>&1; then exit 1; fi; done'
+        )
+
+    @staticmethod
+    def clean_absence_check() -> str:
+        return (
+            f"for package in {_RPM_OFFICIAL_PACKAGES}; do "
+            'if rpm -q "$package" >/dev/null 2>&1; then exit 1; fi; done; '
+            "if grep -Rqs 'download.docker.com' /etc/yum.repos.d 2>/dev/null; "
+            "then exit 1; fi; "
+            "if find /etc/yum.repos.d -maxdepth 1 -type f "
+            "-iname '*docker*.repo' -print -quit 2>/dev/null | grep -q .; then exit 1; fi; "
+            f"{_COMMON_DOCKER_ABSENCE_CHECK} && "
+            "test ! -e /etc/yum.repos.d/docker-ce.repo && "
+            "test ! -e /etc/pki/rpm-gpg/docker-ce.asc && "
+            "test ! -e /etc/pki/rpm-gpg/docker-ce.asc.adojapan-tmp"
+        )
+
+    @staticmethod
+    def supported_packages_check() -> str:
+        return (
+            f"for package in {_RPM_OFFICIAL_PACKAGES}; do "
+            'rpm -q "$package" >/dev/null 2>&1 || exit 1; done'
+        )
+
+    @staticmethod
+    def _repository_distribution(facts: SystemFacts) -> str:
+        distribution_by_os = {
+            "almalinux": "centos",
+            "rocky": "rocky",
+            "rhel": "rhel",
+            "centos": "centos",
+        }
+        try:
+            return distribution_by_os[facts.os_id]
+        except KeyError as exc:
+            raise safe_failure("unsupported_operating_system") from exc
+
+    def repository_probe_command(self, facts: SystemFacts) -> str:
+        distribution = self._repository_distribution(facts)
+        repository_url = f"https://download.docker.com/linux/{distribution}/docker-ce.repo"
+        return (
+            "curl --fail --silent --show-error --proto '=https' --tlsv1.2 "
+            "--connect-timeout 10 --max-time 20 "
+            f"{repository_url} --output /dev/null"
+        )
+
+    def install_plan(self, facts: SystemFacts) -> tuple[DockerInstallStep, ...]:
+        if facts.platform_family is not PlatformFamily.RHEL:
+            raise safe_failure("unsupported_operating_system")
+        distribution = self._repository_distribution(facts)
+        gpg_url = f"https://download.docker.com/linux/{distribution}/gpg"
+        repository = "\n".join(
+            (
+                "[docker-ce-stable]",
+                "name=Docker CE Stable",
+                f"baseurl=https://download.docker.com/linux/{distribution}/"
+                "$releasever/$basearch/stable",
+                "enabled=1",
+                "gpgcheck=1",
+                "gpgkey=file:///etc/pki/rpm-gpg/docker-ce.asc",
+            )
+        )
+        temporary_key = "/etc/pki/rpm-gpg/docker-ce.asc.adojapan-tmp"
+        verify_key = (
+            f"fingerprints=$(gpg2 --batch --with-colons --show-keys {temporary_key} "
+            '2>/dev/null | awk -F: \'$1 == "pub" {primary=1; next} '
+            'primary && $1 == "fpr" {print $10; primary=0}\') && '
+            f'if [ "$fingerprints" = {DOCKER_GPG_FINGERPRINT} ]; then '
+            f"install -m 0644 {temporary_key} /etc/pki/rpm-gpg/docker-ce.asc && "
+            f"rm -f {temporary_key}; else rm -f {temporary_key}; exit 1; fi"
+        )
+        return (
+            DockerInstallStep(
+                "dnf -y --setopt=install_weak_deps=False install ca-certificates curl gnupg2",
+                package_operation=True,
+            ),
+            DockerInstallStep(
+                self.repository_probe_command(facts),
+                failure_code="docker_repository_unavailable",
+            ),
+            DockerInstallStep("install -d -m 0755 /etc/pki/rpm-gpg"),
+            DockerInstallStep(
+                f"rm -f {temporary_key} && "
+                "curl --fail --silent --show-error --proto '=https' --tlsv1.2 "
+                "--connect-timeout 10 --max-time 20 "
+                f"{gpg_url} --output {temporary_key}",
+                failure_code="docker_repository_unavailable",
+            ),
+            DockerInstallStep(verify_key, failure_code="docker_repository_key_invalid"),
+            DockerInstallStep(
+                f"printf '%s\\n' {shlex.quote(repository)} > /etc/yum.repos.d/docker-ce.repo"
+            ),
+            DockerInstallStep(
+                "dnf -q --disablerepo='*' --enablerepo=docker-ce-stable makecache",
+                package_operation=True,
+                failure_code="docker_repository_unavailable",
+            ),
+            DockerInstallStep(
+                "dnf -y --setopt=install_weak_deps=False install docker-ce docker-ce-cli "
+                "containerd.io docker-buildx-plugin docker-compose-plugin",
+                package_operation=True,
+            ),
+            *DockerBootstrap.daemon_activation_steps(),
+        )
+
+
+class DockerBootstrap:
+    """Select a strict platform adapter, inspect read-only, or install official Docker."""
+
+    _adapters: dict[tuple[PlatformFamily, PackageManager], DockerPlatformAdapter] = {
+        (PlatformFamily.DEBIAN, PackageManager.APT): AptDockerAdapter(),
+        (PlatformFamily.RHEL, PackageManager.DNF): DnfDockerAdapter(),
+    }
+
+    @staticmethod
+    def daemon_activation_steps() -> tuple[DockerInstallStep, ...]:
+        return (
+            DockerInstallStep("systemctl enable --now docker"),
+            DockerInstallStep("docker version --format '{{.Server.Version}}' >/dev/null"),
+            DockerInstallStep(f"{DOCKER_COMPOSE} version --short >/dev/null"),
+            DockerInstallStep("systemctl is-active --quiet docker"),
+        )
+
+    def adapter_for(self, facts: SystemFacts) -> DockerPlatformAdapter:
+        if facts.platform_family is None or facts.package_manager is None:
+            raise safe_failure("unsupported_package_manager")
+        try:
+            return self._adapters[(facts.platform_family, facts.package_manager)]
+        except KeyError as exc:
+            raise safe_failure("unsupported_package_manager") from exc
+
+    @staticmethod
+    def assert_install_manager_available(facts: SystemFacts) -> None:
+        availability = {
+            PackageManager.APT: facts.apt_get_available,
+            PackageManager.DNF: facts.dnf_available,
+        }
+        if facts.package_manager is None or not availability.get(facts.package_manager, False):
+            raise safe_failure("unsupported_package_manager")
+
+    async def _assert_no_conflicting_runtime(
+        self,
+        session: RemoteSession,
+        privilege: PrivilegeContext,
+        adapter: DockerPlatformAdapter,
+        *,
+        timeout: float,
+    ) -> None:
+        result = await privilege.run(
+            session,
+            adapter.conflicting_runtime_check(),
+            timeout=timeout,
+        )
+        if result.exit_status != 0:
+            raise safe_failure("conflicting_container_runtime")
 
     async def inspect(
         self,
         session: RemoteSession,
         privilege: PrivilegeContext,
+        facts: SystemFacts,
         *,
         timeout: float,
     ) -> DockerDisposition:
+        adapter = self.adapter_for(facts)
+        await self._assert_no_conflicting_runtime(
+            session,
+            privilege,
+            adapter,
+            timeout=timeout,
+        )
         present = await session.run("command -v docker >/dev/null 2>&1", timeout=timeout)
         if present.exit_status != 0:
             absence = await privilege.run(
                 session,
-                _DOCKER_ABSENCE_CHECK,
+                adapter.clean_absence_check(),
                 timeout=timeout,
             )
             if absence.exit_status != 0:
                 return DockerDisposition.UNSUPPORTED
+            self.assert_install_manager_available(facts)
             return DockerDisposition.ABSENT
         checks = (
-            "test \"$(dpkg-query -W -f='${db:Status-Abbrev}\\n' docker-ce "
-            "docker-ce-cli containerd.io docker-compose-plugin 2>/dev/null "
-            "| grep -c '^ii ')\" -eq 4 && "
-            "! dpkg-query -W -f='${db:Status-Abbrev}\\n' docker.io containerd runc "
-            "podman-docker 2>/dev/null | grep -q '^ii '",
+            adapter.supported_packages_check(),
             "docker version --format '{{.Server.Version}}' >/dev/null",
             f"{DOCKER_COMPOSE} version --short >/dev/null",
             "systemctl is-active --quiet docker",
@@ -258,66 +646,11 @@ class DockerBootstrap:
                 return DockerDisposition.UNSUPPORTED
         return DockerDisposition.READY
 
-    @staticmethod
-    def _repository_coordinates(facts: SystemFacts) -> tuple[str, str]:
-        distribution = facts.os_id
-        codename_by_release = {
-            ("ubuntu", "22.04"): "jammy",
-            ("ubuntu", "24.04"): "noble",
-            ("debian", "12"): "bookworm",
-        }
-        try:
-            codename = codename_by_release[(distribution, facts.os_version)]
-        except KeyError as exc:
-            raise safe_failure("unsupported_operating_system") from exc
-        return distribution, codename
-
     def repository_probe_command(self, facts: SystemFacts) -> str:
-        distribution, _ = self._repository_coordinates(facts)
-        gpg_url = f"https://download.docker.com/linux/{distribution}/gpg"
-        return (
-            "curl --fail --silent --show-error --location "
-            "--connect-timeout 10 --max-time 20 "
-            f"{shlex.quote(gpg_url)} --output /dev/null"
-        )
+        return self.adapter_for(facts).repository_probe_command(facts)
 
-    def install_plan(self, facts: SystemFacts) -> tuple[tuple[str, bool], ...]:
-        distribution, codename = self._repository_coordinates(facts)
-        repository = (
-            "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] "
-            f"https://download.docker.com/linux/{distribution} {codename} stable"
-        )
-        return (
-            ("apt-get update", True),
-            ("apt-get install -y --no-install-recommends ca-certificates curl", True),
-            (self.repository_probe_command(facts), False),
-            ("install -d -m 0755 /etc/apt/keyrings", False),
-            (
-                "rm -f /etc/apt/keyrings/docker.asc.adojapan-tmp && "
-                "curl --fail --silent --show-error --location "
-                "--connect-timeout 10 --max-time 20 "
-                f"https://download.docker.com/linux/{distribution}/gpg "
-                "--output /etc/apt/keyrings/docker.asc.adojapan-tmp && "
-                "install -m 0644 /etc/apt/keyrings/docker.asc.adojapan-tmp "
-                "/etc/apt/keyrings/docker.asc && "
-                "rm -f /etc/apt/keyrings/docker.asc.adojapan-tmp",
-                False,
-            ),
-            (
-                f"printf '%s\\n' {shlex.quote(repository)} > /etc/apt/sources.list.d/docker.list",
-                False,
-            ),
-            ("apt-get update", True),
-            (
-                "apt-get install -y --no-install-recommends docker-ce docker-ce-cli "
-                "containerd.io docker-buildx-plugin docker-compose-plugin",
-                True,
-            ),
-            ("systemctl enable --now docker", False),
-            ("docker version --format '{{.Server.Version}}' >/dev/null", False),
-            (f"{DOCKER_COMPOSE} version --short >/dev/null", False),
-            ("systemctl is-active --quiet docker", False),
-        )
+    def install_plan(self, facts: SystemFacts) -> tuple[DockerInstallStep, ...]:
+        return self.adapter_for(facts).install_plan(facts)
 
     async def install(
         self,
@@ -327,21 +660,28 @@ class DockerBootstrap:
         *,
         timeouts: TimeoutPolicy,
     ) -> None:
+        adapter = self.adapter_for(facts)
+        self.assert_install_manager_available(facts)
+        await self._assert_no_conflicting_runtime(
+            session,
+            privilege,
+            adapter,
+            timeout=timeouts.command_seconds,
+        )
         absence = await privilege.run(
             session,
-            _DOCKER_ABSENCE_CHECK,
+            adapter.clean_absence_check(),
             timeout=timeouts.command_seconds,
         )
         if absence.exit_status != 0:
             raise safe_failure("unsupported_docker_installation")
-        repository_probe = self.repository_probe_command(facts)
-        for command, package_operation in self.install_plan(facts):
-            timeout = timeouts.package_seconds if package_operation else timeouts.command_seconds
-            result = await privilege.run(session, command, timeout=timeout)
+        for step in adapter.install_plan(facts):
+            timeout = (
+                timeouts.package_seconds if step.package_operation else timeouts.command_seconds
+            )
+            result = await privilege.run(session, step.command, timeout=timeout)
             if result.exit_status != 0:
-                if command == repository_probe:
-                    raise safe_failure("outbound_https_unavailable")
-                raise safe_failure("remote_command_failed")
+                raise safe_failure(step.failure_code)
 
 
 @dataclass(slots=True)
@@ -404,6 +744,9 @@ def render_agent_compose(request: BootstrapRequest, facts: SystemFacts) -> str:
       - type: bind
         source: ./data
         target: /var/lib/adojapan-node
+        bind:
+          create_host_path: false
+          selinux: Z
     tmpfs:
       - /tmp:size=32m,mode=1777
     security_opt:
@@ -1181,11 +1524,15 @@ class RemoteNodeInstaller:
 
 
 __all__ = [
+    "AptDockerAdapter",
     "COMPOSE_PATH",
     "COMPOSE_PROJECT",
     "DATA_ROOT",
     "DOCKER_COMPOSE",
+    "DOCKER_GPG_FINGERPRINT",
+    "DnfDockerAdapter",
     "DockerBootstrap",
+    "DockerInstallStep",
     "ENROLLMENT_TOKEN_PATH",
     "InstallReceipt",
     "AgentProcessState",
