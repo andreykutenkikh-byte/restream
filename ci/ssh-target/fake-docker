@@ -1,0 +1,58 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -eq 3 ] && [ "$1" = "version" ] && [ "$2" = "--format" ] \
+  && [ "$3" = '{{.Server.Version}}' ]; then
+  printf '%s\n' '27.4.1'
+  exit 0
+fi
+
+if [ "${1:-}" != "compose" ]; then
+  case "$*" in
+    "ps -aq --filter label=com.docker.compose.project=adojapan-restream-node"|\
+    "network ls -q --filter label=com.docker.compose.project=adojapan-restream-node"|\
+    "volume ls -q --filter label=com.docker.compose.project=adojapan-restream-node"|\
+    "ps -aq --filter name=^/adojapan-restream-node-agent-1$")
+      exit 0
+      ;;
+    "network inspect adojapan-restream-node_default"|\
+    "volume inspect adojapan-restream-node_data")
+      exit 1
+      ;;
+  esac
+  exit 2
+fi
+shift
+
+if [ "$#" -eq 2 ] && [ "$1" = "version" ] && [ "$2" = "--short" ]; then
+  printf '%s\n' '2.32.4'
+  exit 0
+fi
+
+prefix='-p adojapan-restream-node -f /opt/adojapan-restream-node/compose.yml'
+validator='/usr/local/lib/adojapan-ci/validate-node-compose.py'
+
+case "$*" in
+  "$prefix config --quiet")
+    python3 "$validator" /opt/adojapan-restream-node/compose.yml
+    exit 0
+    ;;
+  "$prefix up -d agent"|"$prefix up -d --force-recreate agent")
+    python3 "$validator" /opt/adojapan-restream-node/compose.yml
+    printf '%s\n' 'compose_up' >> /opt/adojapan-restream-node/fake-docker-calls.log
+    exit 0
+    ;;
+  "$prefix down")
+    if [ -d /opt/adojapan-restream-node ]; then
+      printf '%s\n' 'compose_down' >> /opt/adojapan-restream-node/fake-docker-calls.log
+    fi
+    exit 0
+    ;;
+  "$prefix ps --status running --quiet agent")
+    python3 "$validator" /opt/adojapan-restream-node/compose.yml
+    printf '%s\n' 'ci-node-agent'
+    exit 0
+    ;;
+esac
+
+exit 2

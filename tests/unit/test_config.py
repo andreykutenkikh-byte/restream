@@ -12,6 +12,11 @@ from app.core.security import generate_master_key, hash_password
 def valid_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SESSION_SECRET", "x" * 32)
     monkeypatch.setenv("WORKER_AUTH_PASSWORD", "w" * 32)
+    monkeypatch.setenv("BOOTSTRAP_WORKER_SECRET", "b" * 32)
+    monkeypatch.setenv(
+        "NODE_AGENT_IMAGE",
+        "ghcr.io/andreykutenkikh-byte/restream-node@sha256:" + "1" * 64,
+    )
     monkeypatch.setenv("MASTER_ENCRYPTION_KEY", generate_master_key())
     monkeypatch.setenv("ADMIN_LOGIN", "admin")
     monkeypatch.setenv("ADMIN_PASSWORD_HASH", hash_password("a strong password"))
@@ -56,6 +61,18 @@ def test_cli_generates_strong_worker_auth_password(
     generated = capsys.readouterr().out.strip()
     assert len(generated) >= 32
     assert generated != "x" * 32
+
+
+def test_cli_generates_independent_bootstrap_worker_secret(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["adojapan-restream", "generate-bootstrap-worker-secret"])
+
+    cli_main()
+
+    generated = capsys.readouterr().out.strip()
+    assert len(generated) >= 32
+    assert generated not in {"x" * 32, "w" * 32}
 
 
 def test_public_rtmp_url_omits_default_port(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -124,6 +141,39 @@ def test_destination_allowlist_can_only_be_configured_in_test(
 
     monkeypatch.setenv("ENVIRONMENT", "production")
     with pytest.raises(ConfigurationError, match="only when ENVIRONMENT=test"):
+        Settings.from_env()
+
+
+def test_ssh_target_allowlist_can_only_be_configured_in_test(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    valid_environment(monkeypatch)
+    target = "ci-ssh-target:22"
+    monkeypatch.setenv("TEST_SSH_TARGET_ALLOWLIST", target)
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    assert Settings.from_env().test_ssh_target_allowlist == (target,)
+
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    with pytest.raises(ConfigurationError, match="only when ENVIRONMENT=test"):
+        Settings.from_env()
+
+
+@pytest.mark.parametrize(
+    "image",
+    (
+        "ghcr.io/andreykutenkikh-byte/restream-node:latest",
+        "ghcr.io/andreykutenkikh-byte/restream-node:main",
+        "restream-node@sha256:short",
+    ),
+)
+def test_production_node_agent_image_requires_digest(
+    monkeypatch: pytest.MonkeyPatch, image: str
+) -> None:
+    valid_environment(monkeypatch)
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("NODE_AGENT_IMAGE", image)
+
+    with pytest.raises(ConfigurationError, match="immutable sha256 digest"):
         Settings.from_env()
 
 

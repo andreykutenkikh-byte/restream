@@ -20,3 +20,5 @@ check_limits() {
 
 check_limits backend 400000000 402653184 96
 check_limits mediamtx 200000000 201326592 64
+check_limits bootstrap 100000000 134217728 64
+check_limits ci-node-agent 250000000 268435456 128

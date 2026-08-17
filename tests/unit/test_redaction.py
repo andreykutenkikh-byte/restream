@@ -85,6 +85,24 @@ def test_redact_text_masks_quoted_structured_values() -> None:
     assert '"event": "login"' in redacted
 
 
+def test_redact_text_masks_node_onboarding_secret_keys() -> None:
+    markers = {
+        "ssh_password": "ssh-password-marker",
+        "sudo_password": "sudo-password-marker",
+        "enrollment_token": "enrollment-token-marker",
+        "node_token": "node-token-marker",
+        "bootstrap_secret": "bootstrap-secret-marker",
+    }
+    structured = redact_text(repr(markers))
+    assignments = redact_text(" ".join(f"{key}={value}" for key, value in markers.items()))
+
+    for secret in markers.values():
+        assert secret not in structured
+        assert secret not in assignments
+    assert structured.count(REDACTION_MARKER) == len(markers)
+    assert assignments.count(REDACTION_MARKER) == len(markers)
+
+
 def test_redact_mapping_recurses_and_preserves_non_secret_data() -> None:
     source = {
         "event": "destination_started",
@@ -131,5 +149,10 @@ def test_mask_secret_may_expose_only_an_explicit_short_tail() -> None:
 def test_sensitive_key_detection_avoids_unrelated_key_suffixes() -> None:
     assert is_sensitive_key("master_encryption_key")
     assert is_sensitive_key("csrf-token")
+    assert is_sensitive_key("ssh_password")
+    assert is_sensitive_key("sudo_password")
+    assert is_sensitive_key("enrollment_token")
+    assert is_sensitive_key("node_token")
+    assert is_sensitive_key("bootstrap_secret")
     assert not is_sensitive_key("monkey")
     assert not is_sensitive_key("destination_name")

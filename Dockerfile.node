@@ -1,0 +1,35 @@
+FROM python:3.12.11-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    NODE_DATA_DIR=/var/lib/adojapan-node
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ca-certificates ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip install --only-binary=:all: \
+        "anyio==4.14.2" \
+        "certifi==2026.6.17" \
+        "h11==0.16.0" \
+        "httpcore==1.0.9" \
+        "httpx==0.28.1" \
+        "idna==3.18" \
+        "typing-extensions==4.16.0" \
+    && python -m pip check \
+    && groupadd --gid 10001 adojapan-node \
+    && useradd --uid 10001 --gid 10001 --home-dir /opt/adojapan-node-agent \
+        --shell /usr/sbin/nologin adojapan-node \
+    && mkdir -p /opt/adojapan-node-agent /var/lib/adojapan-node \
+    && chown -R 10001:10001 /opt/adojapan-node-agent /var/lib/adojapan-node
+
+WORKDIR /opt/adojapan-node-agent
+
+COPY --chown=10001:10001 node_agent ./node_agent
+
+USER 10001:10001
+
+STOPSIGNAL SIGTERM
+
+CMD ["python", "-m", "node_agent"]

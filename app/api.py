@@ -54,6 +54,10 @@ def _templates(request: Request) -> Jinja2Templates:
     return cast(Jinja2Templates, request.app.state.templates)
 
 
+def _bootstrap(request: Request) -> Any:
+    return request.app.state.bootstrap
+
+
 def _fail(http_status: int, code: str, message: str) -> NoReturn:
     raise HTTPException(status_code=http_status, detail={"code": code, "message": message})
 
@@ -143,10 +147,12 @@ async def readiness(request: Request) -> JSONResponse:
     database_ready = _database(request).ready()
     ingest = await _runtime(request).ingest_status()
     media_ready = ingest.state.value != "error"
+    bootstrap_ready = await _bootstrap(request).healthy()
     payload = {
         "status": "ready" if database_ready and media_ready else "not_ready",
         "database": "ready" if database_ready else "unavailable",
         "media": "ready" if media_ready else "unavailable",
+        "bootstrap": "ready" if bootstrap_ready else "unavailable",
     }
     return JSONResponse(payload, status_code=200 if database_ready and media_ready else 503)
 
@@ -178,6 +184,35 @@ async def dashboard_page(request: Request) -> Response:
             "current_user": {"login": runtime.settings.admin_login},
             "ingest": ingest,
             "destinations": runtime.list_destination_views(),
+        },
+    )
+    if request.cookies.get(CSRF_COOKIE) != csrf_token:
+        response.set_cookie(
+            CSRF_COOKIE,
+            csrf_token,
+            max_age=runtime.settings.session_ttl_seconds,
+            httponly=False,
+            secure=runtime.settings.cookie_secure,
+            samesite="lax",
+            path="/",
+        )
+    return response
+
+
+@router.get("/servers", response_class=HTMLResponse)
+async def servers_page(request: Request) -> Response:
+    session_token = request.cookies.get(SESSION_COOKIE)
+    if _sessions(request).get(session_token) is None or not session_token:
+        return RedirectResponse("/login", status_code=status.HTTP_303_SEE_OTHER)
+    csrf_token = _sessions(request).ensure_csrf(session_token, request.cookies.get(CSRF_COOKIE))
+    runtime = _runtime(request)
+    response = _templates(request).TemplateResponse(
+        request=request,
+        name="servers.html",
+        context={
+            "csrf_token": csrf_token,
+            "current_user": {"login": runtime.settings.admin_login},
+            "bootstrap_available": await _bootstrap(request).healthy(),
         },
     )
     if request.cookies.get(CSRF_COOKIE) != csrf_token:

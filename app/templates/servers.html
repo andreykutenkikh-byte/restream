@@ -1,0 +1,211 @@
+{% extends "base.html" %}
+
+{% block title %}Серверы · AdoJapan Restream{% endblock %}
+{% block body_class %}servers-page{% endblock %}
+
+{% block header %}
+  <header class="site-header">
+    <div class="shell site-header__inner">
+      <a class="brand" href="/" aria-label="AdoJapan Restream — панель управления">
+        <span class="brand-mark" aria-hidden="true">
+          <span class="brand-mark__sun"></span>
+          <span class="brand-mark__wave"></span>
+        </span>
+        <span class="brand-copy">
+          <strong>AdoJapan</strong>
+          <span>Restream</span>
+        </span>
+      </a>
+
+      <nav class="primary-nav" aria-label="Основные разделы">
+        <a class="primary-nav__link" href="/">Трансляция</a>
+        <a class="primary-nav__link" href="/servers" aria-current="page">Серверы</a>
+      </nav>
+
+      <div class="header-actions">
+        <span class="header-user">
+          {{ current_user.login if current_user is defined and current_user.login is defined else 'Администратор' }}
+        </span>
+        <form method="post" action="/api/auth/logout" data-logout-form>
+          <input type="hidden" name="csrf_token" value="{{ csrf_token|default('', true) }}">
+          <button class="button button--quiet button--small" type="submit">Выйти</button>
+        </form>
+      </div>
+    </div>
+  </header>
+{% endblock %}
+
+{% block content %}
+  <div
+    class="shell servers"
+    data-servers-page
+    data-bootstrap-available="{{ 'true' if bootstrap_available|default(false) else 'false' }}"
+  >
+    <div class="page-heading servers__heading">
+      <div>
+        <p class="eyebrow">Инфраструктура</p>
+        <h1>Серверы для рестриминга</h1>
+        <p class="page-heading__lead">
+          Подключите дополнительный сервер, чтобы в дальнейшем передавать эфир
+          через другой IP и использовать резервный маршрут.
+        </p>
+      </div>
+      <button class="button button--primary" type="button" data-open-server-dialog>
+        <span aria-hidden="true">＋</span>
+        Подключить сервер
+      </button>
+    </div>
+
+    <div class="inline-alert inline-alert--notice" data-bootstrap-unavailable hidden role="status">
+      <div>
+        <strong>Установка серверов временно недоступна</strong>
+        <span>Текущая трансляция продолжает работать. Повторите попытку позднее.</span>
+      </div>
+    </div>
+
+    <div class="loading-state" data-servers-loading aria-live="polite">
+      <span class="spinner" aria-hidden="true"></span>
+      Загружаем серверы…
+    </div>
+
+    <div class="inline-alert" data-servers-error role="alert" hidden>
+      <div>
+        <strong>Не удалось загрузить серверы</strong>
+        <span>Проверьте соединение и попробуйте ещё раз.</span>
+      </div>
+      <button class="button button--secondary button--small" type="button" data-retry-servers>
+        Повторить
+      </button>
+    </div>
+
+    <div class="server-grid" data-server-list aria-live="polite"></div>
+
+    <section class="empty-state servers-empty" data-servers-empty hidden>
+      <div class="server-empty__art" aria-hidden="true"><span></span></div>
+      <h2>Серверов пока нет</h2>
+      <p>
+        Подключите дополнительный сервер, чтобы подготовить резервный маршрут.
+        На этом этапе реальный видеопоток на него ещё не передаётся.
+      </p>
+      <button class="button button--primary" type="button" data-open-server-dialog>
+        Подключить сервер
+      </button>
+    </section>
+
+    <noscript>
+      <p class="inline-alert inline-alert--notice">
+        Для подключения и проверки серверов включите JavaScript.
+      </p>
+    </noscript>
+  </div>
+
+  <dialog class="modal server-dialog" id="server-dialog" data-server-dialog>
+    <form class="modal__form" data-server-form>
+      <header class="modal__header">
+        <div>
+          <p class="eyebrow">Новый узел</p>
+          <h2>Подключение сервера</h2>
+        </div>
+        <button class="icon-button icon-button--plain" type="button" data-close-dialog aria-label="Закрыть">×</button>
+      </header>
+
+      <div class="modal__body server-form">
+        <label class="form-field">
+          <span>Адрес сервера</span>
+          <input name="address" type="text" maxlength="253" placeholder="185.123.45.67" autocomplete="off" spellcheck="false" required>
+        </label>
+        <label class="form-field">
+          <span>SSH-логин</span>
+          <input name="username" type="text" maxlength="64" value="root" autocomplete="username" spellcheck="false" required>
+        </label>
+        <label class="form-field">
+          <span>SSH-пароль</span>
+          <input name="password" type="password" maxlength="1024" autocomplete="new-password" spellcheck="false" required data-ssh-password>
+        </label>
+
+        <details class="setup-guide server-form__advanced">
+          <summary>Дополнительные настройки</summary>
+          <div class="server-form__advanced-fields">
+            <label class="form-field">
+              <span>SSH-порт</span>
+              <input name="port" type="number" min="1" max="65535" value="22" inputmode="numeric" required>
+            </label>
+            <label class="form-field">
+              <span>Ожидаемый SSH fingerprint</span>
+              <input name="expected_host_fingerprint" type="text" maxlength="128" placeholder="SHA256:…" autocomplete="off" spellcheck="false">
+            </label>
+          </div>
+        </details>
+
+        <p class="form-help">
+          Пароль используется только для текущего подключения и не сохраняется.
+          Без указанного fingerprint применяется TOFU: первый ключ сервера будет закреплён.
+        </p>
+        <p class="field-error" data-server-form-error hidden role="alert"></p>
+      </div>
+
+      <footer class="modal__footer">
+        <button class="button button--quiet" type="button" data-close-dialog>Отмена</button>
+        <button class="button button--primary" type="submit">Проверить и подключить</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog class="modal server-progress-dialog" id="server-progress-dialog" data-server-progress-dialog>
+    <div class="modal__form">
+      <header class="modal__header">
+        <div>
+          <p class="eyebrow">Безопасная установка</p>
+          <h2>Подключение сервера</h2>
+        </div>
+      </header>
+      <div class="modal__body">
+        <div class="install-progress" data-install-progress aria-live="polite">
+          <div class="install-progress__summary">
+            <strong data-job-state-label>Подготавливаем задачу</strong>
+            <span data-job-progress-label>0%</span>
+          </div>
+          <progress data-job-progress max="100" value="0">0%</progress>
+          <ol class="install-steps" data-install-steps></ol>
+        </div>
+
+        <form class="sudo-form" data-sudo-form hidden>
+          <div class="inline-alert inline-alert--notice">
+            <div>
+              <strong>Для продолжения требуется пароль sudo</strong>
+              <span>Он также используется только текущей in-memory задачей.</span>
+            </div>
+          </div>
+          <label class="form-field">
+            <span>Пароль sudo</span>
+            <input name="sudo_password" type="password" maxlength="1024" autocomplete="new-password" spellcheck="false" required data-sudo-password>
+          </label>
+          <button class="button button--primary" type="submit">Продолжить установку</button>
+        </form>
+
+        <p class="field-error" data-job-error hidden role="alert"></p>
+      </div>
+      <footer class="modal__footer">
+        <button class="button button--danger-soft" type="button" data-cancel-job>Отменить установку</button>
+        <button class="button button--primary" type="button" data-close-progress hidden>Готово</button>
+      </footer>
+    </div>
+  </dialog>
+
+  <dialog class="modal modal--confirm" id="revoke-node-dialog" data-revoke-dialog>
+    <div class="confirm-icon" aria-hidden="true">!</div>
+    <h2>Отозвать доступ?</h2>
+    <p>
+      Агент потеряет доступ к панели. Для физического удаления агента с сервера
+      позднее потребуется повторное SSH-подключение.
+    </p>
+    <div class="modal__footer">
+      <button class="button button--quiet" type="button" data-close-dialog>Отмена</button>
+      <button class="button button--danger" type="button" data-confirm-revoke>Отозвать доступ</button>
+    </div>
+  </dialog>
+{% endblock %}
+
+{% block scripts %}
+  <script src="/static/servers.js" defer></script>
+{% endblock %}

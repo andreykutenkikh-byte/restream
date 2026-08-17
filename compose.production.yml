@@ -3,7 +3,6 @@ services:
     cpus: "0.40"
     mem_limit: 384m
     pids_limit: 96
-    restart: unless-stopped
     environment:
       ENVIRONMENT: production
       COOKIE_SECURE: "true"
@@ -11,9 +10,21 @@ services:
       PUBLIC_DOMAIN: restream.adojapan.ru
       PUBLIC_RTMP_HOST: restream.adojapan.ru
       PUBLIC_RTMP_PORT: "1935"
+      PUBLIC_CONTROL_URL: https://restream.adojapan.ru
+      NODE_AGENT_IMAGE: ${NODE_AGENT_IMAGE:?NODE_AGENT_IMAGE is required in production}
+      NODE_PROTOCOL_VERSION: "1"
+    restart: unless-stopped
 
   mediamtx:
     cpus: "0.20"
     mem_limit: 192m
     pids_limit: 64
+    restart: unless-stopped
+
+  bootstrap:
+    cpus: "0.10"
+    mem_limit: 128m
+    pids_limit: 64
+    environment:
+      ENVIRONMENT: production
     restart: unless-stopped

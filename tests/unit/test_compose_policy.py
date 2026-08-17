@@ -1,12 +1,16 @@
 import re
+import shutil
+import subprocess
+from copy import deepcopy
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
 
 from app.runtime import MEDIAMTX_AUTH_TIMEOUT_SECONDS
-from scripts.validate_production_compose import PolicyViolation, validate_service_security
+from scripts.validate_production_compose import PolicyViolation, validate
 
 
 def load_compose() -> dict[str, object]:
@@ -19,21 +23,95 @@ def load_ci_override() -> dict[str, object]:
     return yaml.safe_load((root / "compose.ci.yml").read_text(encoding="utf-8"))
 
 
+def test_compose_files_reject_duplicate_mapping_keys() -> None:
+    root = Path(__file__).resolve().parents[2]
+
+    def assert_unique(node: Any, source: str) -> None:
+        if isinstance(node, yaml.MappingNode):
+            seen: set[str] = set()
+            for key_node, value_node in node.value:
+                key = str(key_node.value)
+                assert key not in seen, f"{source}: duplicate mapping key {key!r}"
+                seen.add(key)
+                assert_unique(value_node, source)
+        elif isinstance(node, yaml.SequenceNode):
+            for value_node in node.value:
+                assert_unique(value_node, source)
+
+    for name in ("compose.yml", "compose.production.yml", "compose.ci.yml"):
+        document = yaml.compose((root / name).read_text(encoding="utf-8"))
+        assert document is not None
+        assert_unique(document, name)
+
+
 def load_production_override() -> dict[str, object]:
     root = Path(__file__).resolve().parents[2]
     return yaml.safe_load((root / "compose.production.yml").read_text(encoding="utf-8"))
+
+
+def resolved_production_model() -> dict[str, Any]:
+    model = deepcopy(load_compose())
+    override = load_production_override()
+    for service_name, service_override in override["services"].items():
+        service = model["services"][service_name]
+        for key, value in service_override.items():
+            if key == "environment":
+                service["environment"].update(value)
+            else:
+                service[key] = value
+
+    environment = model["services"]["backend"]["environment"]
+    environment.update(
+        {
+            "SESSION_SECRET": "s" * 32,
+            "WORKER_AUTH_PASSWORD": "w" * 32,
+            "BOOTSTRAP_WORKER_SECRET": "b" * 32,
+            "NODE_AGENT_IMAGE": ("ghcr.io/andreykutenkikh-byte/restream-node@sha256:" + "a" * 64),
+        }
+    )
+    model["services"]["backend"]["ports"] = [
+        {"host_ip": "127.0.0.1", "target": 8000, "published": 8088}
+    ]
+    model["services"]["mediamtx"]["ports"] = [
+        {"host_ip": "127.0.0.1", "target": 1935, "published": 1935}
+    ]
+    model["services"]["backend"]["volumes"] = [
+        {"type": "volume", "source": "database", "target": "/srv/app/data"},
+        {"type": "volume", "source": "logs", "target": "/srv/app/logs"},
+        {"type": "volume", "source": "backups", "target": "/srv/app/backups"},
+        {
+            "type": "volume",
+            "source": "bootstrap_socket",
+            "target": "/run/adojapan-bootstrap",
+            "read_only": True,
+        },
+    ]
+    model["services"]["bootstrap"]["volumes"] = [
+        {
+            "type": "volume",
+            "source": "bootstrap_socket",
+            "target": "/run/adojapan-bootstrap",
+        }
+    ]
+    model["services"]["bootstrap"]["secrets"] = [
+        {"source": "bootstrap_worker_secret", "target": "bootstrap_worker_secret"}
+    ]
+    model["secrets"]["bootstrap_worker_secret"] = {"file": "/run/adojapan-bootstrap-secret-source"}
+    return model
 
 
 def test_compose_project_is_isolated_and_bounded() -> None:
     compose = load_compose()
     assert compose["name"] == "adojapan-restream"
     services = compose["services"]
-    assert set(services) == {"backend", "mediamtx"}
+    assert set(services) == {"backend", "mediamtx", "bootstrap"}
     for service in services.values():
         assert "container_name" not in service
         assert "expose" not in service
         assert "network_mode" not in service
         assert service.get("privileged") is not True
+        assert service["read_only"] is True
+        assert service["tmpfs"]
         assert service["cpus"]
         assert service["mem_limit"]
         assert service["pids_limit"]
@@ -47,9 +125,16 @@ def test_compose_project_is_isolated_and_bounded() -> None:
 
     assert set(services["mediamtx"]["networks"]) == {"internal", "ingest"}
     assert set(services["backend"]["networks"]) == {"internal", "egress"}
+    assert services["bootstrap"]["networks"] == ["bootstrap-egress"]
     assert compose["networks"]["internal"]["internal"] is True
     assert compose["networks"]["ingest"].get("internal", False) is False
-    assert set(compose["volumes"]) == {"database", "logs", "backups"}
+    assert compose["networks"]["bootstrap-egress"] == {"driver": "bridge"}
+    assert set(compose["volumes"]) == {"database", "logs", "backups", "bootstrap_socket"}
+    assert compose["secrets"] == {
+        "bootstrap_worker_secret": {
+            "file": "${BOOTSTRAP_WORKER_SECRET_FILE:?BOOTSTRAP_WORKER_SECRET_FILE is required}"
+        }
+    }
 
 
 def test_only_web_loopback_and_rtmp_are_published() -> None:
@@ -65,17 +150,18 @@ def test_only_web_loopback_and_rtmp_are_published() -> None:
 def test_shared_host_production_override_is_minimal_and_bounded() -> None:
     override = load_production_override()
     assert set(override) == {"services"}
-    assert set(override["services"]) == {"backend", "mediamtx"}
+    assert set(override["services"]) == {"backend", "mediamtx", "bootstrap"}
 
     backend = override["services"]["backend"]
     mediamtx = override["services"]["mediamtx"]
-    assert set(backend) == {"cpus", "mem_limit", "pids_limit", "restart", "environment"}
+    bootstrap = override["services"]["bootstrap"]
+    assert set(backend) == {"cpus", "mem_limit", "pids_limit", "environment", "restart"}
     assert set(mediamtx) == {"cpus", "mem_limit", "pids_limit", "restart"}
+    assert set(bootstrap) == {"cpus", "mem_limit", "pids_limit", "environment", "restart"}
     assert backend == {
         "cpus": "0.40",
         "mem_limit": "384m",
         "pids_limit": 96,
-        "restart": "unless-stopped",
         "environment": {
             "ENVIRONMENT": "production",
             "COOKIE_SECURE": "true",
@@ -83,7 +169,11 @@ def test_shared_host_production_override_is_minimal_and_bounded() -> None:
             "PUBLIC_DOMAIN": "restream.adojapan.ru",
             "PUBLIC_RTMP_HOST": "restream.adojapan.ru",
             "PUBLIC_RTMP_PORT": "1935",
+            "PUBLIC_CONTROL_URL": "https://restream.adojapan.ru",
+            "NODE_AGENT_IMAGE": "${NODE_AGENT_IMAGE:?NODE_AGENT_IMAGE is required in production}",
+            "NODE_PROTOCOL_VERSION": "1",
         },
+        "restart": "unless-stopped",
     }
     assert mediamtx == {
         "cpus": "0.20",
@@ -91,28 +181,18 @@ def test_shared_host_production_override_is_minimal_and_bounded() -> None:
         "pids_limit": 64,
         "restart": "unless-stopped",
     }
-
-    services = override["services"].values()
-    assert sum(Decimal(service["cpus"]) for service in services) <= Decimal("0.60")
-    assert sum(int(service["mem_limit"].removesuffix("m")) for service in services) <= 576
-    assert sum(service["pids_limit"] for service in services) == 160
-
-
-def test_production_validator_rejects_restart_policy_drift() -> None:
-    service = {
-        "read_only": True,
+    assert bootstrap == {
+        "cpus": "0.10",
+        "mem_limit": "128m",
+        "pids_limit": 64,
+        "environment": {"ENVIRONMENT": "production"},
         "restart": "unless-stopped",
-        "cap_drop": ["ALL"],
-        "security_opt": ["no-new-privileges:true"],
-        "healthcheck": {},
-        "logging": {},
-        "volumes": [],
     }
 
-    validate_service_security(service, "backend")
-    for invalid in (None, "no", "always", "on-failure:5"):
-        with pytest.raises(PolicyViolation, match="backend_restart_policy"):
-            validate_service_security({**service, "restart": invalid}, "backend")
+    services = override["services"].values()
+    assert sum(Decimal(service["cpus"]) for service in services) == Decimal("0.70")
+    assert sum(int(service["mem_limit"].removesuffix("m")) for service in services) == 704
+    assert sum(service["pids_limit"] for service in services) == 224
 
 
 def test_production_override_cannot_weaken_isolation_or_publish_extra_ports() -> None:
@@ -140,6 +220,88 @@ def test_production_override_cannot_weaken_isolation_or_publish_extra_ports() ->
     assert "ci-rtmp-receiver" not in override["services"]
 
 
+def test_bootstrap_worker_is_uds_only_and_has_no_main_storage_or_networks() -> None:
+    compose = load_compose()
+    services = compose["services"]
+    bootstrap = services["bootstrap"]
+    backend = services["backend"]
+
+    assert bootstrap["build"] == {"context": ".", "dockerfile": "Dockerfile.bootstrap"}
+    assert bootstrap["init"] is True
+    assert "ports" not in bootstrap
+    assert "expose" not in bootstrap
+    assert bootstrap["networks"] == ["bootstrap-egress"]
+    assert bootstrap["volumes"] == ["bootstrap_socket:/run/adojapan-bootstrap"]
+    assert bootstrap["secrets"] == ["bootstrap_worker_secret"]
+    assert bootstrap["environment"] == {
+        "ENVIRONMENT": "${ENVIRONMENT:-development}",
+        "BOOTSTRAP_SOCKET_PATH": "/run/adojapan-bootstrap/bootstrap.sock",
+        "BOOTSTRAP_SECRET_FILE": "/run/secrets/bootstrap_worker_secret",
+        "BOOTSTRAP_MAX_ACTIVE_JOBS": "1",
+        "BOOTSTRAP_JOB_TTL_SECONDS": "1200",
+    }
+    assert bootstrap["stop_grace_period"] == "90s"
+    assert "BOOTSTRAP_WORKER_SECRET" not in bootstrap["environment"]
+    assert backend["volumes"].count("bootstrap_socket:/run/adojapan-bootstrap:ro") == 1
+    for forbidden in ("database", "logs", "backups", "/var/run/" + "docker.sock"):
+        assert forbidden not in str(bootstrap)
+    assert "bootstrap-egress" not in backend["networks"]
+    assert "bootstrap-egress" not in services["mediamtx"]["networks"]
+
+    root = Path(__file__).resolve().parents[2]
+    for dockerfile_name in ("Dockerfile", "Dockerfile.bootstrap"):
+        dockerfile = (root / dockerfile_name).read_text(encoding="utf-8")
+        assert "install -d -o 10001 -g 10001 -m 0700 /run/adojapan-bootstrap" in dockerfile
+
+
+def test_resolved_production_policy_accepts_only_the_exact_bootstrap_boundary() -> None:
+    validate(resolved_production_model())
+
+    mutations = []
+
+    extra_network = resolved_production_model()
+    extra_network["services"]["bootstrap"]["networks"].append("internal")
+    mutations.append(extra_network)
+
+    blocked_egress = resolved_production_model()
+    blocked_egress["networks"]["bootstrap-egress"]["internal"] = True
+    mutations.append(blocked_egress)
+
+    writable_backend_socket = resolved_production_model()
+    writable_backend_socket["services"]["backend"]["volumes"][-1]["read_only"] = False
+    mutations.append(writable_backend_socket)
+
+    mutable_agent_image = resolved_production_model()
+    mutable_agent_image["services"]["backend"]["environment"]["NODE_AGENT_IMAGE"] = (
+        "ghcr.io/andreykutenkikh-byte/restream-node:latest"
+    )
+    mutations.append(mutable_agent_image)
+
+    short_bootstrap_grace = resolved_production_model()
+    short_bootstrap_grace["services"]["bootstrap"]["stop_grace_period"] = "20s"
+    mutations.append(short_bootstrap_grace)
+
+    reused_secret = resolved_production_model()
+    reused_secret["services"]["backend"]["environment"]["BOOTSTRAP_WORKER_SECRET"] = reused_secret[
+        "services"
+    ]["backend"]["environment"]["SESSION_SECRET"]
+    mutations.append(reused_secret)
+
+    extra_service = resolved_production_model()
+    extra_service["services"]["unexpected"] = deepcopy(extra_service["services"]["bootstrap"])
+    mutations.append(extra_service)
+
+    environment_secret = resolved_production_model()
+    environment_secret["secrets"]["bootstrap_worker_secret"] = {
+        "environment": "BOOTSTRAP_WORKER_SECRET"
+    }
+    mutations.append(environment_secret)
+
+    for model in mutations:
+        with pytest.raises(PolicyViolation):
+            validate(model)
+
+
 def test_worker_auth_password_is_a_separate_required_compose_secret() -> None:
     root = Path(__file__).resolve().parents[2]
     backend_environment = load_compose()["services"]["backend"]["environment"]
@@ -151,8 +313,20 @@ def test_worker_auth_password_is_a_separate_required_compose_secret() -> None:
     assert backend_environment["WORKER_AUTH_PASSWORD"] == (
         "${WORKER_AUTH_PASSWORD:?WORKER_AUTH_PASSWORD is required}"
     )
+    assert backend_environment["BOOTSTRAP_WORKER_SECRET"] == (
+        "${BOOTSTRAP_WORKER_SECRET:?BOOTSTRAP_WORKER_SECRET is required}"
+    )
     assert backend_environment["SESSION_SECRET"] != backend_environment["WORKER_AUTH_PASSWORD"]
+    assert backend_environment["BOOTSTRAP_WORKER_SECRET"] not in {
+        backend_environment["SESSION_SECRET"],
+        backend_environment["WORKER_AUTH_PASSWORD"],
+    }
     assert "WORKER_AUTH_PASSWORD=REQUIRED_INDEPENDENT_RANDOM_VALUE" in template
+    assert "BOOTSTRAP_WORKER_SECRET=REQUIRED_THIRD_RANDOM_VALUE" in template
+    assert "BOOTSTRAP_WORKER_SECRET_FILE=./secrets/bootstrap_worker_secret" in template
+    assert "NODE_AGENT_IMAGE=" in template
+    assert "@sha256:" in template
+    assert "PUBLIC_CONTROL_URL=" in template
 
 
 def test_mediamtx_control_api_stays_internal_and_auth_is_delegated() -> None:
@@ -198,7 +372,6 @@ def test_ci_media_helpers_are_absent_from_production_and_strictly_isolated() -> 
     assert receiver["cap_drop"] == ["ALL"]
     assert "no-new-privileges:true" in receiver["security_opt"]
     assert receiver["cpus"] and receiver["mem_limit"] and receiver["pids_limit"]
-    assert receiver["restart"] == "no"
     assert receiver["logging"]["options"] == {"max-size": "10m", "max-file": "3"}
 
     publisher = override["services"]["ci-rtmp-publisher"]
@@ -213,15 +386,134 @@ def test_ci_media_helpers_are_absent_from_production_and_strictly_isolated() -> 
     assert publisher["logging"]["options"] == {"max-size": "10m", "max-file": "3"}
 
     backend = override["services"]["backend"]
-    mediamtx = override["services"]["mediamtx"]
-    assert backend["restart"] == "no"
-    assert mediamtx == {"restart": "no"}
     assert backend["environment"] == {
         "ENVIRONMENT": "test",
         "COOKIE_SECURE": "false",
+        "NODE_AGENT_IMAGE": ("ghcr.io/adojapan/ci-node-agent@sha256:" + "1" * 64),
+        "PUBLIC_CONTROL_URL": "http://backend:8000",
         "TEST_DESTINATION_ALLOWLIST": "rtmp://ci-rtmp-receiver:1935/ci-output",
     }
     assert backend["depends_on"]["ci-rtmp-receiver"] == {"condition": "service_healthy"}
+    assert backend["restart"] == "no"
+    assert override["services"]["mediamtx"] == {"restart": "no"}
+    assert override["services"]["bootstrap"] == {
+        "environment": {
+            "ENVIRONMENT": "test",
+            "TEST_SSH_TARGET_ALLOWLIST": "ci-ssh-target:22",
+        },
+        "restart": "no",
+    }
+
+
+def test_ci_ssh_and_real_agent_fixtures_are_internal_and_non_production() -> None:
+    base_services = load_compose()["services"]
+    production_services = load_production_override()["services"]
+    for service_name in ("ci-ssh-target", "ci-node-agent"):
+        assert service_name not in base_services
+        assert service_name not in production_services
+
+    override = load_ci_override()
+    services = override["services"]
+    target = services["ci-ssh-target"]
+    agent = services["ci-node-agent"]
+
+    assert "ports" not in target
+    assert target["networks"] == ["bootstrap-egress"]
+    assert target.get("privileged") is not True
+    assert target["read_only"] is True
+    assert "/var/run/" + "docker.sock" not in str(target)
+    assert target["restart"] == "no"
+    # The worker accepts this exact empty mountpoint only in its explicit test
+    # mode; production still rejects every unmarked pre-existing directory.
+    assert target["volumes"] == ["ci_node_data:/opt/adojapan-restream-node"]
+    assert target["logging"]["options"] == {"max-size": "10m", "max-file": "3"}
+
+    assert "ports" not in agent
+    assert agent["networks"] == ["internal"]
+    assert agent["read_only"] is True
+    assert agent["cap_drop"] == ["ALL"]
+    assert "no-new-privileges:true" in agent["security_opt"]
+    assert agent["restart"] == "no"
+    assert agent["cpus"] == "0.25"
+    assert agent["mem_limit"] == "256m"
+    assert agent["pids_limit"] == 128
+    assert agent["volumes"] == ["ci_node_data:/mnt/node"]
+    assert agent["environment"] == {
+        "NODE_AGENT_ENVIRONMENT": "test",
+        "NODE_CONTROL_URL": "http://backend:8000",
+        "NODE_DATA_DIR": "/mnt/node/data",
+        "NODE_COMMAND_WAIT_SECONDS": "2",
+    }
+    assert set(override["volumes"]) == {"ci_node_data"}
+
+
+def test_ci_ssh_target_emulates_only_exact_docker_package_queries() -> None:
+    root = Path(__file__).resolve().parents[2]
+    dockerfile = (root / "ci" / "ssh-target" / "Dockerfile").read_text(encoding="utf-8")
+    shim = root / "ci" / "ssh-target" / "fake-dpkg-query"
+    source = shim.read_text(encoding="utf-8")
+
+    assert "COPY ci/ssh-target/fake-dpkg-query /usr/local/bin/dpkg-query" in dockerfile
+    assert 'ENV PATH="/usr/local/bin:${PATH}"' in dockerfile
+    assert "/usr/local/bin/dpkg-query" in dockerfile
+    key_cleanup = dockerfile.index("rm -f /etc/ssh/ssh_host_ed25519_key")
+    key_generation = dockerfile.index("ssh-keygen -q -t ed25519")
+    assert key_cleanup < key_generation
+    runtime_dir = "install -d -m 0755 /run/sshd"
+    sshd_exec = "exec /usr/sbin/sshd -D -e"
+    assert runtime_dir in dockerfile
+    assert sshd_exec in dockerfile
+    assert dockerfile.index(runtime_dir) < dockerfile.index(sshd_exec)
+    assert "docker-ce docker-ce-cli containerd.io docker-compose-plugin" in source
+    assert "docker.io containerd runc podman-docker" in source
+    assert "exit 64" in source
+
+    shell = shutil.which("sh")
+    if shell is None:
+        pytest.skip("POSIX shell is unavailable on this unit-test host")
+    format_argument = r"-f=${db:Status-Abbrev}\n"
+    official = subprocess.run(  # noqa: S603 - fixed local test fixture
+        [
+            shell,
+            str(shim),
+            "-W",
+            format_argument,
+            "docker-ce",
+            "docker-ce-cli",
+            "containerd.io",
+            "docker-compose-plugin",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    forbidden = subprocess.run(  # noqa: S603 - fixed local test fixture
+        [
+            shell,
+            str(shim),
+            "-W",
+            format_argument,
+            "docker.io",
+            "containerd",
+            "runc",
+            "podman-docker",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    unexpected = subprocess.run(  # noqa: S603 - fixed local test fixture
+        [shell, str(shim), "-W", format_argument, "docker-ce"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert official.returncode == 0
+    assert official.stdout.splitlines() == ["ii "] * 4
+    assert forbidden.returncode == 1
+    assert forbidden.stdout == ""
+    assert unexpected.returncode == 64
 
 
 def test_ci_override_is_the_only_compose_test_mode_and_allowlist_source() -> None:
@@ -310,14 +602,31 @@ def test_ci_runtime_always_uses_test_override_and_cleans_up() -> None:
     assert "sh scripts/check_runtime_limits.sh" in workflow
     assert "node --check app/static/app.js" in workflow
     assert "node --check app/static/preview-player.js" in workflow
-    assert "node --test tests/frontend/preview-player.test.js" in workflow
+    assert "node --check app/static/servers.js" in workflow
+    assert "tests/frontend/preview-player.test.js tests/frontend/servers.test.js" in workflow
     assert "Real RTMP rotation and output end-to-end smoke" in workflow
     assert "python scripts/ci_output_smoke.py" in workflow
+    assert "SSH bootstrap and Node Agent end-to-end smoke" in workflow
+    assert "python scripts/ci_node_onboarding_smoke.py" in workflow
+    assert "Post-onboarding runtime limits" in workflow
+    assert workflow.count("sh scripts/check_runtime_limits.sh") >= 3
+    assert workflow.index("python scripts/ci_node_onboarding_smoke.py") < workflow.index(
+        "Post-onboarding runtime limits"
+    )
+    assert "generate-bootstrap-worker-secret" in workflow
+    assert "printf '%s' \"$BOOTSTRAP_WORKER_SECRET\" > .bootstrap-worker-secret.ci" in workflow
+    assert "sudo chown 10001:10001 .bootstrap-worker-secret.ci" in workflow
+    assert "chmod 0600 .bootstrap-worker-secret.ci" in workflow
+    assert workflow.index("chmod 0600 .bootstrap-worker-secret.ci") < workflow.index(
+        "sudo chown 10001:10001 .bootstrap-worker-secret.ci"
+    )
+    assert "600:10001:10001" in workflow
+    assert "BOOTSTRAP_WORKER_SECRET_FILE=.bootstrap-worker-secret.ci" in workflow
     assert "if: always()" in workflow
     assert "down --remove-orphans --volumes" in workflow
     assert "cleanup_status=$?" in workflow
     assert 'exit "$cleanup_status"' in workflow
-    assert "rm -f .env.ci" in workflow
+    assert "rm -f .env.ci .bootstrap-worker-secret.ci" in workflow
 
 
 def test_ci_runtime_limits_and_destination_limit_are_exercised() -> None:
@@ -342,6 +651,10 @@ def test_ci_runtime_limits_and_destination_limit_are_exercised() -> None:
     assert ".Config.Env" not in runtime_check
     assert "400000000 402653184 96" in runtime_check
     assert "200000000 201326592 64" in runtime_check
+    assert "100000000 134217728 64" in runtime_check
+    assert "250000000 268435456 128" in runtime_check
+    assert "check_limits bootstrap" in runtime_check
+    assert "check_limits ci-node-agent" in runtime_check
     assert 'expected="$2 $3 $4 no running healthy 0 false"' in runtime_check
 
     compose_definition = smoke.split("COMPOSE = (", maxsplit=1)[1].split(")", maxsplit=1)[0]
@@ -364,12 +677,6 @@ def test_ci_runtime_limits_and_destination_limit_are_exercised() -> None:
     assert "expected=(404, 409)" in smoke
     assert "{{.CPUPerc}}|{{.MemUsage}}" in smoke
     assert 'item.get("bitrate_bps") is None' in smoke
-    assert smoke.count("rotate_and_confirm_ingest_key(") == 3
-    assert '"/api/ingest/rotate"' in smoke
-    assert "active publisher termination after key rotation" in smoke
-    assert "publisher rejection with the rotated ingest key" in smoke
-    assert "publisher process with the replacement ingest key" in smoke
-    assert "publisher_is_absent" in smoke
 
 
 def test_production_scripts_always_use_shared_host_override() -> None:

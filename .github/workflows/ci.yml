@@ -11,7 +11,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -33,17 +33,26 @@ jobs:
         run: |
           SESSION_SECRET="$(uv run --locked python -m app.cli generate-session-secret)"
           WORKER_AUTH_PASSWORD="$(uv run --locked python -m app.cli generate-worker-auth-password)"
+          BOOTSTRAP_WORKER_SECRET="$(uv run --locked python -m app.cli generate-bootstrap-worker-secret)"
           MASTER_KEY="$(uv run --locked python -m app.cli generate-master-key)"
           ADMIN_HASH="$(uv run --locked python -c 'from app.core.security import hash_password; print(hash_password("ci-only-password"))')"
+          printf '%s' "$BOOTSTRAP_WORKER_SECRET" > .bootstrap-worker-secret.ci
+          chmod 0600 .bootstrap-worker-secret.ci
+          sudo chown 10001:10001 .bootstrap-worker-secret.ci
+          test "$(stat -c '%a:%u:%g' .bootstrap-worker-secret.ci)" = '600:10001:10001'
           {
             echo 'RTMP_BIND_ADDRESS=127.0.0.1'
             echo 'ADMIN_LOGIN=ci-admin'
             echo 'TRUSTED_PROXIES=127.0.0.1,::1'
             printf 'SESSION_SECRET=%s\n' "$SESSION_SECRET"
             printf 'WORKER_AUTH_PASSWORD=%s\n' "$WORKER_AUTH_PASSWORD"
+            printf 'BOOTSTRAP_WORKER_SECRET=%s\n' "$BOOTSTRAP_WORKER_SECRET"
+            echo 'BOOTSTRAP_WORKER_SECRET_FILE=.bootstrap-worker-secret.ci'
             printf 'MASTER_ENCRYPTION_KEY=%s\n' "$MASTER_KEY"
             printf "ADMIN_PASSWORD_HASH='%s'\n" "$ADMIN_HASH"
+            printf 'NODE_AGENT_IMAGE=%s\n' 'ghcr.io/adojapan/ci-node-agent@sha256:1111111111111111111111111111111111111111111111111111111111111111'
           } > .env.ci
+          chmod 0600 .env.ci
 
       - name: Format
         run: uv run --locked ruff format --check .
@@ -52,7 +61,7 @@ jobs:
         run: uv run --locked ruff check .
 
       - name: Typecheck
-        run: uv run --locked mypy app scripts
+        run: uv run --locked mypy app bootstrap_worker node_agent scripts
 
       - name: Tests
         run: uv run --locked pytest
@@ -64,9 +73,10 @@ jobs:
         run: |
           node --check app/static/app.js
           node --check app/static/preview-player.js
+          node --check app/static/servers.js
 
       - name: JavaScript tests
-        run: node --test tests/frontend/preview-player.test.js
+        run: node --test tests/frontend/preview-player.test.js tests/frontend/servers.test.js
 
       - name: Shell syntax
         shell: bash
@@ -103,22 +113,40 @@ jobs:
       - name: Post-preview runtime limits
         run: sh scripts/check_runtime_limits.sh
 
+      - name: SSH bootstrap and Node Agent end-to-end smoke
+        run: uv run --locked python scripts/ci_node_onboarding_smoke.py
+
+      - name: Post-onboarding runtime limits
+        run: sh scripts/check_runtime_limits.sh
+
       - name: Safe diagnostic logs on failure
         if: failure()
+        shell: bash
         run: |
           if [ -f .env.ci ]; then
-            # MediaMTX paths contain the synthetic ingest key; keep even CI
-            # failure output limited to the application's redacted logs.
-            docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml logs --tail=100 backend || true
+            set +e
+            if docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml logs --tail=100 backend bootstrap 2>&1 \
+              | grep -Fq 'CI_SSH_PASSWORD_MUST_NEVER_PERSIST_9F3A'; then
+              echo 'Password persistence marker detected in bounded service logs'
+            else
+              echo 'Password persistence marker absent from bounded service logs'
+            fi
+            for service in backend bootstrap ci-ssh-target ci-node-agent; do
+              container_id="$(docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml ps -a -q "$service")"
+              if [ -n "$container_id" ]; then
+                docker inspect --format '{{.Name}} status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} restart={{.RestartCount}} oom={{.State.OOMKilled}}' "$container_id" || true
+              fi
+            done
           fi
 
       - name: Stop CI project
         if: always()
         run: |
+          set +e
+          cleanup_status=0
           if [ -f .env.ci ]; then
-            set +e
             docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml down --remove-orphans --volumes
             cleanup_status=$?
-            rm -f .env.ci
-            exit "$cleanup_status"
           fi
+          rm -f .env.ci .bootstrap-worker-secret.ci
+          exit "$cleanup_status"

@@ -22,6 +22,7 @@ RUN pip install "uv==0.11.28" \
     && uv sync --locked --no-dev --no-editable --compile-bytecode \
     && groupadd --gid 10001 adojapan \
     && useradd --uid 10001 --gid adojapan --home-dir /srv/app --shell /usr/sbin/nologin adojapan \
+    && install -d -o 10001 -g 10001 -m 0700 /run/adojapan-bootstrap \
     && mkdir -p /srv/app/data /srv/app/logs /srv/app/backups \
     && chown -R adojapan:adojapan /srv/app
 

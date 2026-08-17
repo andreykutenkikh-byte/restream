@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def utc_now() -> str:
@@ -83,11 +83,147 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_audit_events_created_at
                     ON audit_events(created_at DESC);
+                CREATE TABLE IF NOT EXISTS restream_nodes (
+                    id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    address TEXT NOT NULL,
+                    resolved_ip TEXT NOT NULL,
+                    ssh_port INTEGER NOT NULL CHECK (ssh_port BETWEEN 1 AND 65535),
+                    ssh_username TEXT NOT NULL,
+                    host_key_algorithm TEXT,
+                    host_key_fingerprint TEXT,
+                    host_key_trust_mode TEXT,
+                    status TEXT NOT NULL CHECK (
+                        status IN (
+                            'installing', 'connecting', 'ready', 'degraded',
+                            'offline', 'revoked', 'failed'
+                        )
+                    ),
+                    public_ip TEXT,
+                    hostname TEXT,
+                    os_name TEXT,
+                    os_version TEXT,
+                    architecture TEXT,
+                    cpu_count INTEGER,
+                    uptime_seconds REAL,
+                    load_1m REAL,
+                    cpu_percent REAL,
+                    memory_total_bytes INTEGER,
+                    memory_available_bytes INTEGER,
+                    disk_total_bytes INTEGER,
+                    disk_free_bytes INTEGER,
+                    ffmpeg_version TEXT,
+                    ffprobe_version TEXT,
+                    agent_version TEXT,
+                    protocol_version INTEGER,
+                    capabilities_json TEXT NOT NULL DEFAULT '[]',
+                    current_command_id TEXT,
+                    control_latency_ms REAL CHECK (
+                        control_latency_ms IS NULL OR
+                        control_latency_ms BETWEEN 0 AND 60000
+                    ),
+                    last_seen_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    revoked_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_restream_nodes_status
+                    ON restream_nodes(status);
+                CREATE INDEX IF NOT EXISTS idx_restream_nodes_last_seen
+                    ON restream_nodes(last_seen_at);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_restream_nodes_target
+                    ON restream_nodes(address, ssh_port);
+                CREATE TABLE IF NOT EXISTS node_install_jobs (
+                    id TEXT PRIMARY KEY,
+                    node_id TEXT NOT NULL REFERENCES restream_nodes(id) ON DELETE CASCADE,
+                    state TEXT NOT NULL,
+                    current_step TEXT NOT NULL,
+                    progress_percent INTEGER NOT NULL DEFAULT 0
+                        CHECK (progress_percent BETWEEN 0 AND 100),
+                    safe_error_code TEXT,
+                    safe_error_message TEXT,
+                    worker_job_id TEXT,
+                    docker_install_started INTEGER NOT NULL DEFAULT 0
+                        CHECK (docker_install_started IN (0, 1)),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    finished_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_node_install_jobs_node
+                    ON node_install_jobs(node_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_node_install_jobs_state
+                    ON node_install_jobs(state);
+                CREATE TABLE IF NOT EXISTS node_enrollment_tokens (
+                    id TEXT PRIMARY KEY,
+                    node_id TEXT NOT NULL REFERENCES restream_nodes(id) ON DELETE CASCADE,
+                    token_digest TEXT NOT NULL UNIQUE,
+                    expires_at TEXT NOT NULL,
+                    used_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_node_enrollment_tokens_node
+                    ON node_enrollment_tokens(node_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_node_enrollment_tokens_expiry
+                    ON node_enrollment_tokens(expires_at);
+                CREATE TABLE IF NOT EXISTS node_credentials (
+                    node_id TEXT PRIMARY KEY REFERENCES restream_nodes(id) ON DELETE CASCADE,
+                    token_digest TEXT NOT NULL UNIQUE,
+                    issued_at TEXT NOT NULL,
+                    last_rotated_at TEXT,
+                    revoked_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS node_commands (
+                    id TEXT PRIMARY KEY,
+                    node_id TEXT NOT NULL REFERENCES restream_nodes(id) ON DELETE CASCADE,
+                    command_type TEXT NOT NULL CHECK (command_type IN ('PING', 'SELF_TEST')),
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    state TEXT NOT NULL CHECK (
+                        state IN (
+                            'queued', 'leased', 'acknowledged', 'completed',
+                            'failed', 'cancelled'
+                        )
+                    ),
+                    lease_until TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+                    created_at TEXT NOT NULL,
+                    acknowledged_at TEXT,
+                    completed_at TEXT,
+                    safe_result_json TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_node_commands_delivery
+                    ON node_commands(node_id, state, lease_until, created_at);
+                CREATE TABLE IF NOT EXISTS node_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    node_id TEXT NOT NULL REFERENCES restream_nodes(id) ON DELETE CASCADE,
+                    event_type TEXT NOT NULL,
+                    safe_detail TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_node_events_node_created
+                    ON node_events(node_id, created_at DESC, id DESC);
                 INSERT OR IGNORE INTO schema_migrations(version, applied_at)
                     VALUES (1, CURRENT_TIMESTAMP);
+                INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+                    VALUES (2, CURRENT_TIMESTAMP);
                 COMMIT;
                 """
             )
+            node_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(restream_nodes)").fetchall()
+            }
+            if "control_latency_ms" not in node_columns:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    ALTER TABLE restream_nodes ADD COLUMN control_latency_ms REAL
+                    CHECK (
+                        control_latency_ms IS NULL OR
+                        control_latency_ms BETWEEN 0 AND 60000
+                    )
+                    """
+                )
+                connection.execute("COMMIT")
 
     def ready(self) -> bool:
         try:

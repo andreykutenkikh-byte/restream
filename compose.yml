@@ -12,6 +12,7 @@ services:
       PUBLIC_RTMP_PORT: ${PUBLIC_RTMP_PORT:-1935}
       SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET is required}
       WORKER_AUTH_PASSWORD: ${WORKER_AUTH_PASSWORD:?WORKER_AUTH_PASSWORD is required}
+      BOOTSTRAP_WORKER_SECRET: ${BOOTSTRAP_WORKER_SECRET:?BOOTSTRAP_WORKER_SECRET is required}
       MASTER_ENCRYPTION_KEY: ${MASTER_ENCRYPTION_KEY:?MASTER_ENCRYPTION_KEY is required}
       ADMIN_LOGIN: ${ADMIN_LOGIN:?ADMIN_LOGIN is required}
       ADMIN_PASSWORD_HASH: ${ADMIN_PASSWORD_HASH:?ADMIN_PASSWORD_HASH is required}
@@ -30,12 +31,17 @@ services:
       COOKIE_SECURE: ${COOKIE_SECURE:-true}
       SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-43200}
       WORKER_AUTH_USER: ${WORKER_AUTH_USER:-adojapan-worker}
+      BOOTSTRAP_SOCKET_PATH: /run/adojapan-bootstrap/bootstrap.sock
+      NODE_AGENT_IMAGE: ${NODE_AGENT_IMAGE:-adojapan-restream-node:development}
+      NODE_PROTOCOL_VERSION: ${NODE_PROTOCOL_VERSION:-1}
+      PUBLIC_CONTROL_URL: ${PUBLIC_CONTROL_URL:-http://localhost:8000}
     ports:
       - "127.0.0.1:${HTTP_PORT:-8088}:8000/tcp"
     volumes:
       - database:/srv/app/data
       - logs:/srv/app/logs
       - backups:/srv/app/backups
+      - bootstrap_socket:/run/adojapan-bootstrap:ro
     networks:
       - internal
       - egress
@@ -66,6 +72,49 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  bootstrap:
+    build:
+      context: .
+      dockerfile: Dockerfile.bootstrap
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      BOOTSTRAP_SOCKET_PATH: /run/adojapan-bootstrap/bootstrap.sock
+      BOOTSTRAP_SECRET_FILE: /run/secrets/bootstrap_worker_secret
+      BOOTSTRAP_MAX_ACTIVE_JOBS: "1"
+      BOOTSTRAP_JOB_TTL_SECONDS: "1200"
+    secrets:
+      - bootstrap_worker_secret
+    volumes:
+      - bootstrap_socket:/run/adojapan-bootstrap
+    networks:
+      - bootstrap-egress
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cpus: "0.10"
+    mem_limit: 128m
+    pids_limit: 64
+    stop_grace_period: 90s
+    restart: on-failure:5
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import socket; s=socket.socket(socket.AF_UNIX); s.settimeout(3);
+          s.connect('/run/adojapan-bootstrap/bootstrap.sock'); s.close()
+      interval: 15s
+      timeout: 4s
+      retries: 4
+      start_period: 15s
+    logging: *rotated-logs
 
   mediamtx:
     image: bluenviron/mediamtx:1.19.2
@@ -105,8 +154,15 @@ networks:
     driver: bridge
   ingest:
     driver: bridge
+  bootstrap-egress:
+    driver: bridge
 
 volumes:
   database:
   logs:
   backups:
+  bootstrap_socket:
+
+secrets:
+  bootstrap_worker_secret:
+    file: ${BOOTSTRAP_WORKER_SECRET_FILE:?BOOTSTRAP_WORKER_SECRET_FILE is required}

@@ -18,13 +18,23 @@ from fastapi.templating import Jinja2Templates
 
 from app import __version__
 from app.api import router
+from app.bootstrap_api import BootstrapRateLimiter
+from app.bootstrap_api import router as bootstrap_router
 from app.core.config import Settings
 from app.core.validation import destination_validator
 from app.db import Database
 from app.logging_config import configure_logging
 from app.login_limiter import LoginRateLimiter
+from app.node_api import NodeBodyLimitMiddleware, NodeCommandPollGate, NodeEnrollmentGate
+from app.node_api import router as node_router
 from app.runtime import ApplicationRuntime, URLValidator
+from app.services.bootstrap import (
+    BootstrapClient,
+    BootstrapCoordinator,
+    UnavailableBootstrapCoordinator,
+)
 from app.services.mediamtx import MediaMTXClient
+from app.services.nodes import NodeService
 from app.services.preview import PreviewService
 from app.session import SessionManager
 
@@ -39,6 +49,7 @@ def create_app(
     preview: PreviewService | None = None,
     url_validator: URLValidator | None = None,
     worker_launcher: Any | None = None,
+    bootstrap: Any | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     configure_logging(settings.log_level)
@@ -57,18 +68,66 @@ def create_app(
         username=settings.worker_auth_user,
         password=settings.worker_auth_password,
     )
+    nodes = NodeService(database)
+    if bootstrap is not None:
+        bootstrap_service = bootstrap
+    elif settings.bootstrap_worker_secret:
+        bootstrap_service = BootstrapCoordinator(
+            database,
+            nodes,
+            BootstrapClient(
+                settings.bootstrap_socket_path,
+                settings.bootstrap_worker_secret,
+            ),
+            control_url=settings.public_control_url,
+            node_agent_image=settings.node_agent_image,
+            node_agent_environment=settings.environment,
+        )
+    else:
+        bootstrap_service = UnavailableBootstrapCoordinator()
+    background_tasks: set[asyncio.Task[Any]] = set()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        async def maintain_node_state() -> None:
+            while True:
+                await asyncio.sleep(30)
+                try:
+                    nodes.prune_retention()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    LOGGER.exception("Node maintenance failed")
+
         database.migrate()
+        recover_interrupted = getattr(bootstrap_service, "recover_interrupted_jobs", None)
+        if recover_interrupted is not None:
+            await recover_interrupted()
+        nodes.prune_retention()
         await runtime.startup()
         try:
+            monitor_active = getattr(bootstrap_service, "monitor_active_jobs", None)
+            if monitor_active is not None:
+                monitor_task = asyncio.create_task(monitor_active())
+                background_tasks.add(monitor_task)
+                monitor_task.add_done_callback(background_tasks.discard)
+            maintenance_task = asyncio.create_task(maintain_node_state())
+            background_tasks.add(maintenance_task)
+            maintenance_task.add_done_callback(background_tasks.discard)
             yield
         finally:
             try:
                 await preview_service.close()
             finally:
-                await runtime.shutdown()
+                try:
+                    pending_background = tuple(background_tasks)
+                    for task in pending_background:
+                        task.cancel()
+                    if pending_background:
+                        await asyncio.gather(*pending_background, return_exceptions=True)
+                    await bootstrap_service.close()
+                finally:
+                    await runtime.shutdown()
 
     app = FastAPI(
         title="AdoJapan Restream",
@@ -86,6 +145,12 @@ def create_app(
         database, settings.session_secret, settings.session_ttl_seconds
     )
     app.state.login_limiter = LoginRateLimiter()
+    app.state.bootstrap_limiter = BootstrapRateLimiter()
+    app.state.nodes = nodes
+    app.state.bootstrap = bootstrap_service
+    app.state.background_tasks = background_tasks
+    app.state.node_enrollments = NodeEnrollmentGate()
+    app.state.node_command_polls = NodeCommandPollGate()
     app.state.destination_lock = asyncio.Lock()
     app.state.templates = Jinja2Templates(directory=PACKAGE_DIR / "templates")
 
@@ -96,8 +161,11 @@ def create_app(
         {settings.public_domain, "backend", "localhost", "127.0.0.1", "testserver"}
     )
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
+    app.add_middleware(NodeBodyLimitMiddleware)
     app.mount("/static", StaticFiles(directory=PACKAGE_DIR / "static"), name="static")
     app.include_router(router)
+    app.include_router(node_router)
+    app.include_router(bootstrap_router)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Callable[..., Any]) -> Any:
@@ -114,7 +182,11 @@ def create_app(
             "frame-ancestors 'none'; "
             "base-uri 'none'; form-action 'self'"
         )
-        if request.url.path.startswith("/api/") or request.url.path in {"/", "/login"}:
+        if request.url.path.startswith(("/api/", "/node-api/")) or request.url.path in {
+            "/",
+            "/login",
+            "/servers",
+        }:
             response.headers["Cache-Control"] = "no-store"
         if settings.environment == "production":
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
