@@ -479,7 +479,7 @@ class DnfDockerAdapter:
     @staticmethod
     def _repository_distribution(facts: SystemFacts) -> str:
         distribution_by_os = {
-            "almalinux": "centos",
+            "almalinux": "alma",
             "rocky": "rocky",
             "rhel": "rhel",
             "centos": "centos",

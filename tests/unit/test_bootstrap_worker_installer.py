@@ -13,6 +13,7 @@ from bootstrap_worker.errors import BootstrapError
 from bootstrap_worker.installer import (
     COMPOSE_PROJECT,
     DOCKER_COMPOSE,
+    DOCKER_GPG_FINGERPRINT,
     AgentProcessState,
     AptDockerAdapter,
     DnfDockerAdapter,
@@ -471,8 +472,8 @@ def test_docker_plan_uses_official_apt_repository_without_convenience_script(
 @pytest.mark.parametrize(
     ("os_id", "version", "repository_distribution"),
     [
-        ("almalinux", "8.10", "centos"),
-        ("almalinux", "9.6", "centos"),
+        ("almalinux", "8.10", "alma"),
+        ("almalinux", "9.6", "alma"),
         ("rocky", "8.10", "rocky"),
         ("rocky", "9.6", "rocky"),
         ("rhel", "8.10", "rhel"),
@@ -502,6 +503,17 @@ def test_dnf_adapter_uses_only_allowlisted_official_rpm_path(
     assert "dnf upgrade" not in commands
     assert "dnf remove" not in commands
     assert "dnf erase" not in commands
+
+
+@pytest.mark.parametrize("version", ["8.10", "9.6"])
+def test_almalinux_uses_dedicated_docker_repository(version: str) -> None:
+    plan = DnfDockerAdapter().install_plan(detected_facts("almalinux", version))
+    commands = "\n".join(step.command for step in plan)
+
+    assert "download.docker.com/linux/alma" in commands
+    assert "download.docker.com/linux/centos" not in commands
+    assert "gpgcheck=1" in commands
+    assert DOCKER_GPG_FINGERPRINT in commands
 
 
 def test_family_specific_absence_checks_do_not_cross_package_managers() -> None:
