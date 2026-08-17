@@ -70,7 +70,9 @@ SSH. Validate these safe fields with a structured parser; never print the resolv
    `ci-ssh-target` and `ci-node-agent`, and prove that neither fixture has a host port or appears in
    the effective production service set. The same run must exercise offline and active ingest-key
    rotation against the pinned MediaMTX, reject the previous key, accept the replacement, and show
-   zero unexpected restarts or OOM events.
+   zero unexpected restarts or OOM events. The same exact commit must pass the Debian/RHEL platform
+   matrix, strict fake rpm/dnf/systemd fixture, repository policy, and real Compose parsing of the
+   generated `create_host_path: false` + private-`Z` agent bind. CI stays unprivileged.
 3. Verify the effective limits are 0.40/384 MiB/96 PIDs for backend, 0.10/128 MiB/64 PIDs for
    bootstrap, and 0.20/192 MiB/64 PIDs for MediaMTX.
 4. Verify the bootstrap worker has only its UDS volume and `bootstrap-egress`, the backend UDS
@@ -84,6 +86,14 @@ SSH. Validate these safe fields with a structured parser; never print the resolv
    without anonymous-pull evidence as a released image.
 7. Keep DNS ownership, host/provider firewall, reverse-proxy, port, resource/OOM, backup, and
    existing-service checks at GO. CI evidence never closes those operational gates.
+
+After this code change is independently reviewed, merged, and deployed in a separately authorized
+window, the next real-host acceptance may use a disposable AlmaLinux 8.10 amd64 VPS. The operator
+must supply only the normal address/SSH credentials; seeing `almalinux` 8.10 classified as RHEL
+family + dnf is an observed result, never a UI selection. That later acceptance must confirm
+SELinux remains Enforcing, Docker is installed from the allowlisted official-compatible RPM path,
+the exact Node Agent digest is used, and no host port/host network/socket mount appears. This plan
+does not authorize contacting or modifying that VPS during the coding PR.
 
 ## Control-plane deployment
 
@@ -154,6 +164,8 @@ netfilter state: installing/starting an absent Docker Engine or creating its pro
 can add Docker-managed rules required for bridge networking, NAT, and isolation. Those standard
 Docker-managed rules are explicitly permitted. An already supported Docker daemon is not
 reconfigured or restarted, and the Node Agent has neither host-published ports nor host networking.
+On RHEL-family hosts, SELinux is not disabled or reconfigured; only the marker-owned data bind gets
+Compose's private `Z` relabel, with automatic host-path creation disabled.
 
 Managed updates keep root-owned mode-`0600` rollback copies under the marker-owned directory:
 `.compose.rollback-<job UUID>` and, when credentials are involved,

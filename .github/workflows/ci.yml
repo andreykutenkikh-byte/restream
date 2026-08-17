@@ -80,7 +80,10 @@ jobs:
 
       - name: Shell syntax
         shell: bash
-        run: for file in scripts/*.sh; do sh -n "$file"; done
+        run: |
+          for file in scripts/*.sh ci/rpm-fixture/* ci/ssh-target/fake-*; do
+            sh -n "$file"
+          done
 
       - name: Whitespace check
         run: git diff --check
@@ -94,6 +97,8 @@ jobs:
           docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml config --format json \
             | uv run --locked python scripts/validate_production_compose.py
           docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml config --quiet
+          uv run --locked python scripts/render_ci_node_compose.py \
+            | docker compose -p adojapan-restream-node-ci -f - config --quiet
 
       - name: Build images
         run: docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml build

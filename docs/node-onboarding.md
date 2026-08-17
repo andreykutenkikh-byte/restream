@@ -10,9 +10,26 @@ production server.
 
 ## Before adding a server
 
-The target must meet all of these requirements:
+The target must meet all of these requirements. Distribution and package manager are detected
+automatically; the administrator does not choose them in the UI.
 
-- Ubuntu 22.04, Ubuntu 24.04, or Debian 12 on `amd64`/`x86_64`;
+| Distribution | Supported releases | Auto-install adapter |
+| --- | --- | --- |
+| Ubuntu | 22.04, 24.04, 26.04 | Debian family / apt |
+| Debian | 12, 13 | Debian family / apt |
+| AlmaLinux | 8.x, 9.x | RHEL family / dnf |
+| Rocky Linux | 8.x, 9.x | RHEL family / dnf |
+| Red Hat Enterprise Linux | 8.x, 9.x | RHEL family / dnf |
+| CentOS Stream | 9 | RHEL family / dnf |
+
+Every supported release currently requires `amd64`/`x86_64`. Unknown distributions, Alpine,
+Arch, unsupported major releases, non-amd64 systems, or a mismatch between the detected family and
+its package database/systemd capabilities are refused without package changes. `apt-get` or `dnf`
+is required only for an absent-Docker auto-install; a supported existing Docker remains eligible
+for read-only inspection when that install command is unavailable.
+
+The remaining host requirements are:
+
 - at least 1 online CPU;
 - at least 700 MiB of currently available memory;
 - at least 8 GiB free on `/`;
@@ -38,7 +55,8 @@ other registry credential over SSH. It supplies only the approved exact image re
 ## Administrator flow
 
 1. Open **Servers** while signed in.
-2. Choose **Add server** and enter the address, SSH port, username, and SSH password. Supplying
+2. Choose **Add server** and enter the address, SSH port, username, and SSH password. There is no
+   distribution or package-manager field. Supplying
    the server's OpenSSH SHA-256 host-key fingerprint is strongly recommended. If it is omitted,
    the first presented key is accepted using TOFU and pinned to that node record.
 3. Submit the form. Mutating requests require the existing session and CSRF token. Bootstrap
@@ -94,12 +112,32 @@ image. It publishes no ports, drops all capabilities, enables `no-new-privileges
 root filesystem and a small `/tmp`, binds only its own data directory, and uses
 `restart: unless-stopped` with a 45-second stop grace period. It does not mount the Docker socket,
 SSH material, registry credentials, or another project's files. The production control plane does
-not build, retag, or replace this image on the target.
+not build, retag, or replace this image on the target. The data bind uses long Compose syntax with
+`create_host_path: false` and private SELinux relabel `Z`; the option is ignored on systems without
+SELinux. Bootstrap never disables SELinux, changes `/etc/selinux/config`, runs a manual relabel, or
+installs a host policy.
 
 If a supported target lacks Docker, bootstrap installs Docker Engine and the Compose plugin from
-Docker's official apt repository. An incompatible existing Docker installation fails closed; it is
-not replaced implicitly. A supported existing installation is inspected only: bootstrap does not
-change its daemon configuration or restart the daemon.
+Docker's official allowlisted repository through the apt adapter on Ubuntu/Debian or the dnf
+adapter on the supported RHEL-family matrix. Both adapters verify the fixed Docker signing-key
+fingerprint before configuring the repository, install only the required Docker CE packages, and
+never run a general system upgrade or uninstall a conflicting runtime. An incompatible, partial,
+or conflicting existing Docker installation fails closed; it is not replaced implicitly. A
+supported existing installation is inspected only: package ownership, server response, Compose v2,
+and active service are checked without repository access, package changes, daemon configuration, or
+daemon restart.
+
+The RPM repository mapping is a code allowlist, not SSH/browser input: AlmaLinux and CentOS Stream
+use Docker's CentOS-compatible endpoint, Rocky uses Docker's Rocky endpoint, and RHEL uses Docker's
+RHEL endpoint. Redirect following is disabled for repository/key fetches, HTTPS is mandatory, the
+downloaded key must match Docker's reviewed fingerprint, and the generated RPM repository keeps
+`gpgcheck=1`.
+
+The UI receives only stable localized failures. Platform/package/install failures are distinguished
+as `unsupported_operating_system`, `unsupported_package_manager`,
+`unsupported_docker_installation`, `conflicting_container_runtime`,
+`docker_repository_unavailable`, `docker_repository_key_invalid`, or `docker_install_failed`.
+Package-manager output, repository contents, remote commands, and credentials are never included.
 
 In this workflow, “the installer does not change the firewall” means that AdoJapan never invokes
 `ufw`, `iptables`, `ip6tables`, `nft`, or `firewall-cmd`; never edits existing user firewall rules;

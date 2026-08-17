@@ -339,6 +339,7 @@ class BootstrapExecutor:
             docker_state = await self._docker.inspect(
                 session,
                 privilege,
+                facts,
                 timeout=self.timeouts.command_seconds,
             )
             if docker_state is DockerDisposition.UNSUPPORTED:

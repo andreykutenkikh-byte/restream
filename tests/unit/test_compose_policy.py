@@ -1,3 +1,4 @@
+import os
 import re
 import shutil
 import subprocess
@@ -464,55 +465,54 @@ def test_ci_ssh_target_emulates_only_exact_docker_package_queries() -> None:
     assert runtime_dir in dockerfile
     assert sshd_exec in dockerfile
     assert dockerfile.index(runtime_dir) < dockerfile.index(sshd_exec)
-    assert "docker-ce docker-ce-cli containerd.io docker-compose-plugin" in source
-    assert "docker.io containerd runc podman-docker" in source
+    for package in (
+        "docker-ce",
+        "docker-ce-cli",
+        "containerd.io",
+        "docker-buildx-plugin",
+        "docker-compose-plugin",
+        "docker.io",
+        "containerd",
+        "runc",
+        "podman-docker",
+    ):
+        assert package in source
+    assert 'if [ "$#" -ne 3 ]' in source
     assert "exit 64" in source
 
     shell = shutil.which("sh")
-    if shell is None:
-        pytest.skip("POSIX shell is unavailable on this unit-test host")
+    if shell is None or os.name == "nt":
+        pytest.skip("exact argv fixture runs in Linux CI")
     format_argument = r"-f=${db:Status-Abbrev}\n"
-    official = subprocess.run(  # noqa: S603 - fixed local test fixture
-        [
-            shell,
-            str(shim),
-            "-W",
-            format_argument,
+
+    def query(package: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(  # noqa: S603 - fixed local test fixture
+            [shell, str(shim), "-W", format_argument, package],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    official = [
+        query(package)
+        for package in (
             "docker-ce",
             "docker-ce-cli",
             "containerd.io",
+            "docker-buildx-plugin",
             "docker-compose-plugin",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    forbidden = subprocess.run(  # noqa: S603 - fixed local test fixture
-        [
-            shell,
-            str(shim),
-            "-W",
-            format_argument,
-            "docker.io",
-            "containerd",
-            "runc",
-            "podman-docker",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+        )
+    ]
+    forbidden = [query(package) for package in ("docker.io", "containerd", "runc", "podman-docker")]
     unexpected = subprocess.run(  # noqa: S603 - fixed local test fixture
-        [shell, str(shim), "-W", format_argument, "docker-ce"],
+        [shell, str(shim), "-W", format_argument, "docker-ce", "docker-ce-cli"],
         check=False,
         capture_output=True,
         text=True,
     )
 
-    assert official.returncode == 0
-    assert official.stdout.splitlines() == ["ii "] * 4
-    assert forbidden.returncode == 1
-    assert forbidden.stdout == ""
+    assert all(result.returncode == 0 and result.stdout == "ii \n" for result in official)
+    assert all(result.returncode == 1 and result.stdout == "" for result in forbidden)
     assert unexpected.returncode == 64
 
 
@@ -566,7 +566,7 @@ def test_ci_runtime_always_uses_test_override_and_cleans_up() -> None:
     runtime_commands = [
         line.strip()
         for line in workflow.splitlines()
-        if "docker compose -p adojapan-restream" in line
+        if "docker compose -p adojapan-restream " in line
     ]
 
     assert runtime_commands
@@ -582,6 +582,8 @@ def test_ci_runtime_always_uses_test_override_and_cleans_up() -> None:
         "-f compose.production.yml config --format json"
     )
     runtime_files = "-f compose.yml -f compose.production.yml -f compose.ci.yml"
+    node_compose_validation = "| docker compose -p adojapan-restream-node-ci -f - config --quiet"
+    assert node_compose_validation in workflow
     assert base_validation in runtime_commands
     assert production_validation in runtime_commands
     assert all(

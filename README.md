@@ -167,16 +167,20 @@ server-side session and both browser cookies.
 
 ## Server onboarding (Stage 4A)
 
-The authenticated **Servers** page accepts a public server address, SSH port, username, password,
-and optional expected SHA-256 host-key fingerprint. The backend sends the job over an authenticated
+The authenticated **Servers** page accepts only a public server address, SSH port, username,
+password, and optional expected SHA-256 host-key fingerprint. There is no OS, package-manager, or
+Docker-install selector: the worker detects those properties from the server. The backend sends the job over an authenticated
 Unix-domain socket to the isolated bootstrap worker. The password exists only for that in-memory
 job: it is not stored in SQLite, rendered back to the browser, placed in environment variables or
 arguments, or included in logs. A worker or backend-coordinator restart requires password
 re-entry.
 
-Bootstrap supports Ubuntu 22.04/24.04 and Debian 12 on amd64, checks public-target/SSRF and
-DNS-rebinding policy, verifies or TOFU-pins the SSH host key, verifies resources and sudo, and
-installs only the marker-owned `adojapan-restream-node` project. The Node Agent then uses a
+Bootstrap supports Ubuntu 22.04/24.04/26.04, Debian 12/13, AlmaLinux 8/9, Rocky Linux 8/9,
+RHEL 8/9, and CentOS Stream 9 on amd64. It reads `/etc/os-release`, verifies the matching
+apt/dpkg or dnf/rpm capabilities, checks public-target/SSRF and DNS-rebinding policy, verifies or
+TOFU-pins the SSH host key, verifies resources and sudo, and installs only the marker-owned
+`adojapan-restream-node` project. Unknown distributions, unsupported releases, package-manager
+mismatches, and non-amd64 hosts fail closed. The Node Agent then uses a
 single-use enrollment file to obtain a permanent file-only token atomically and connects outward
 to protocol v1. Revocation stops future control-plane authentication but deliberately does not SSH
 back to the server or uninstall it.
@@ -187,7 +191,9 @@ reconfiguration or daemon restart. If Docker is absent, installing and starting 
 creating the project-scoped bridge may create Docker-managed `iptables`/`nftables` rules for
 bridge networking, NAT, and isolation. Those standard Docker-managed rules are an expected system
 effect and are distinct from direct firewall management by AdoJapan. The Node Agent publishes no
-host ports and never uses host networking.
+host ports and never uses host networking. On SELinux hosts, SELinux remains enabled; the single
+agent data bind uses Compose private relabel `Z` with `create_host_path: false` and no host policy
+or manual relabel command.
 
 - [Node onboarding and operator flow](docs/node-onboarding.md)
 - [Node Agent protocol v1](docs/node-agent-protocol.md)

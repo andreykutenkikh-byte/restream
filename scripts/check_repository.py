@@ -55,6 +55,10 @@ DIRECT_FIREWALL_TOOL = re.compile(
     r"(?<![A-Za-z0-9_-])(ufw|iptables|ip6tables|nft|firewall-cmd)(?![A-Za-z0-9_-])",
     re.IGNORECASE,
 )
+DIRECT_SELINUX_TOOL = re.compile(
+    r"(?<![A-Za-z0-9_-])(setenforce|chcon|restorecon)(?![A-Za-z0-9_-])",
+    re.IGNORECASE,
+)
 DOCKER_DAEMON_FIREWALL_MARKERS = {
     "/etc/docker/" + "daemon.json",
     "/etc/default/" + "docker",
@@ -64,6 +68,7 @@ DOCKER_DAEMON_FIREWALL_MARKERS = {
     "--ip" + "tables",
     "--ip6" + "tables",
 }
+SELINUX_CONFIGURATION_MARKERS = {"/etc/selinux/" + "config"}
 
 
 def _is_runtime_policy_path(path: Path) -> bool:
@@ -106,11 +111,15 @@ def check(root: Path) -> list[str]:
             for line_number, line in enumerate(text.splitlines(), start=1):
                 if DIRECT_FIREWALL_TOOL.search(line):
                     errors.append(f"{relative}:{line_number}: forbidden direct firewall management")
+                if DIRECT_SELINUX_TOOL.search(line):
+                    errors.append(f"{relative}:{line_number}: forbidden direct SELinux management")
                 lowered = line.lower()
                 if any(marker in lowered for marker in DOCKER_DAEMON_FIREWALL_MARKERS):
                     errors.append(
                         f"{relative}:{line_number}: forbidden Docker daemon/firewall configuration"
                     )
+                if any(marker in lowered for marker in SELINUX_CONFIGURATION_MARKERS):
+                    errors.append(f"{relative}:{line_number}: forbidden SELinux host configuration")
         if relative.as_posix() == "bootstrap_worker/installer.py":
             renderer = _function_source(text, "render_agent_compose")
             if re.search(r"(?m)^\s*ports\s*:", renderer):

@@ -114,13 +114,19 @@ Docker image. The backend supplies only a release-controlled, digest-pinned Node
 control origin. The command sequence is fixed in code:
 
 1. detect root/passwordless-sudo/password-sudo capability;
-2. collect `/etc/os-release`, architecture, CPU, available memory, and free root disk without
-   requiring a preinstalled HTTP client;
-3. permit only Ubuntu 22.04/24.04 or Debian 12 on amd64, at least 1 CPU, 700 MiB available memory,
-   and 8 GiB free disk;
-4. verify Docker Engine, Compose v2, and the Docker service; only when Docker is absent, install the
-   minimal HTTPS prerequisites, perform a bounded reachability check, and install Docker from its
-   official apt repository on those supported releases;
+2. collect `/etc/os-release`, architecture, package-manager/systemd capabilities, SELinux mode,
+   CPU, available memory, and free root disk without network access or a preinstalled HTTP client;
+3. classify an allowlisted OS ID/version as Debian family + apt or RHEL family + dnf only after
+   the matching package-database and systemd capabilities are present. The allowlist is Ubuntu 22.04/24.04/26.04,
+   Debian 12/13, AlmaLinux 8/9, Rocky Linux 8/9, RHEL 8/9, and CentOS Stream 9 on amd64. `ID_LIKE`
+   is recorded but is never sufficient to select an adapter. Unknown or mismatched systems fail
+   closed;
+4. verify official Docker package ownership, Engine server response, Compose v2, and the active
+   Docker service without repository access or daemon restart. Only when Docker is proven absent,
+   require the corresponding `apt-get` or `dnf` command, select that adapter, install minimal HTTPS/key tooling, perform a bounded fixed-host
+   repository probe, verify Docker's fixed signing-key fingerprint, install the five Docker CE
+   packages, and start the newly installed service. Partial/foreign/conflicting installations are
+   never repaired, upgraded, removed, or restarted;
 5. inspect marker and reserved Compose-project ownership, then stage files in a UUID-scoped
    mode-`0700` `/tmp` directory;
 6. request a just-in-time one-time credential and install the fixed Compose project with controlled
@@ -132,6 +138,16 @@ control origin. The command sequence is fixed in code:
 The installer never runs an arbitrary payload from the browser or node API. Shell snippets are
 repository-owned constants and all variable path/value insertions are quoted. Remote output is
 bounded where parsed and is not returned to the administrator.
+
+The dnf adapter writes only an allowlisted Docker repository with `gpgcheck=1`; it never disables
+TLS/signature checks, runs `dnf update`/`dnf upgrade`, or removes Podman/runc/another runtime. The
+apt adapter likewise uses Docker's fixed signed repository and no convenience script. Both adapters
+map repository reachability, signing-key, conflicting-runtime, unsupported-installation, and
+installation failures to distinct safe codes without attaching package-manager output.
+
+SELinux remains in the detected host mode, including Enforcing. The generated agent Compose uses a
+private `Z` relabel on only `./data` and disables automatic source-path creation. Bootstrap does not
+change SELinux configuration, mode, or host policy and does not run manual relabel tools.
 
 ## Ownership, idempotency, and rollback
 
@@ -221,6 +237,9 @@ internal to `bootstrap-egress`; the real test agent uses a CI node-data volume a
 port. Both are absent from the effective production configuration. CI credentials and enrollment
 data are disposable test values, never production secrets. CI creates its worker secret source as
 a temporary mode-`0600`, UID/GID-`10001:10001` file and removes it in the unconditional project cleanup.
+An additional unprivileged RPM fixture exposes only strict fake `rpm`, `dnf`, and `systemctl` argv;
+it proves the RHEL-family adapter contract without Docker-in-Docker or a privileged runner. CI also
+passes the generated SELinux-aware Node Agent document through the real Compose parser.
 
 Stage 4A bootstrap does not support SSH keys, configure sshd, issue direct firewall-management
 commands, expose an agent port, use host networking, send video, publish to YouTube, hot-switch
