@@ -23,6 +23,27 @@ def load_ci_override() -> dict[str, object]:
     return yaml.safe_load((root / "compose.ci.yml").read_text(encoding="utf-8"))
 
 
+def test_compose_files_reject_duplicate_mapping_keys() -> None:
+    root = Path(__file__).resolve().parents[2]
+
+    def assert_unique(node: Any, source: str) -> None:
+        if isinstance(node, yaml.MappingNode):
+            seen: set[str] = set()
+            for key_node, value_node in node.value:
+                key = str(key_node.value)
+                assert key not in seen, f"{source}: duplicate mapping key {key!r}"
+                seen.add(key)
+                assert_unique(value_node, source)
+        elif isinstance(node, yaml.SequenceNode):
+            for value_node in node.value:
+                assert_unique(value_node, source)
+
+    for name in ("compose.yml", "compose.production.yml", "compose.ci.yml"):
+        document = yaml.compose((root / name).read_text(encoding="utf-8"))
+        assert document is not None
+        assert_unique(document, name)
+
+
 def load_production_override() -> dict[str, object]:
     root = Path(__file__).resolve().parents[2]
     return yaml.safe_load((root / "compose.production.yml").read_text(encoding="utf-8"))
