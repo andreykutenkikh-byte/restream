@@ -25,7 +25,15 @@ The target must meet all of these requirements:
 
 The production control plane also requires `NODE_AGENT_IMAGE` to be an immutable registry
 reference ending in `@sha256:<64 lowercase hexadecimal characters>`. A mutable tag is rejected
-before production startup. Building or publishing that image is a separate release action.
+before production startup. Building or publishing that image is a separate release action, and the
+digest cannot be approved until the release workflow proves an anonymous pull of that exact
+reference from a fresh runner with an empty Docker configuration.
+
+For the first release, the package owner may need to publish once, manually set the GHCR
+`restream-node` package visibility to public, and rerun the failed anonymous-pull verification. Do
+not enable production onboarding until the complete workflow passes. The operator does not run
+`docker login ghcr.io` on the target VPS; bootstrap sends no PAT, registry token, Docker config, or
+other registry credential over SSH. It supplies only the approved exact image reference.
 
 ## Administrator flow
 
@@ -85,7 +93,8 @@ The generated Compose project starts exactly one agent container from the config
 image. It publishes no ports, drops all capabilities, enables `no-new-privileges`, uses a read-only
 root filesystem and a small `/tmp`, binds only its own data directory, and uses
 `restart: unless-stopped` with a 45-second stop grace period. It does not mount the Docker socket,
-SSH material, or another project's files.
+SSH material, registry credentials, or another project's files. The production control plane does
+not build, retag, or replace this image on the target.
 
 If a supported target lacks Docker, bootstrap installs Docker Engine and the Compose plugin from
 Docker's official apt repository. An incompatible existing Docker installation fails closed; it is

@@ -6,14 +6,17 @@ name: Node Agent image
     tags:
       - "node-v*"
 
-permissions:
-  contents: read
-  packages: write
+permissions: {}
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -32,7 +35,7 @@ jobs:
         id: metadata
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: ghcr.io/${{ github.repository_owner }}/restream-node
+          images: ghcr.io/andreykutenkikh-byte/restream-node
           flavor: latest=false
           tags: |
             type=ref,event=tag
@@ -57,15 +60,46 @@ jobs:
 
       - name: Report immutable image digest
         env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/restream-node
+          IMAGE: ghcr.io/andreykutenkikh-byte/restream-node
           DIGEST: ${{ steps.build.outputs.digest }}
         shell: bash
         run: |
           set -eu
           test -n "$DIGEST"
           printf 'Published Node Agent image: %s@%s\n' "$IMAGE" "$DIGEST"
+
+  verify-anonymous-pull:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: none
+    steps:
+      - name: Check out verifier only
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Verify anonymous exact-digest pull
+        env:
+          IMAGE_REFERENCE: ghcr.io/andreykutenkikh-byte/restream-node@${{ needs.publish.outputs.digest }}
+        shell: bash
+        run: |
+          set -eu
+          sh scripts/verify_node_agent_image_pull.sh "$IMAGE_REFERENCE"
           {
-            echo '### Published Node Agent image'
+            echo '### Verified public Node Agent image'
             echo
-            printf '`%s@%s`\n' "$IMAGE" "$DIGEST"
+            printf '`%s`\n' "$IMAGE_REFERENCE"
+            echo
+            echo 'Anonymous pull of the exact digest: passed.'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Explain public-package requirement
+        if: failure()
+        shell: bash
+        run: |
+          echo 'Anonymous exact-digest pull failed.'
+          echo 'If this is the first release, the package owner must set restream-node visibility to public and rerun this workflow.'
+          exit 1

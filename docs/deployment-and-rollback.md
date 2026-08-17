@@ -36,9 +36,18 @@ the file read-only into the fixed non-root bootstrap worker; authenticated readi
 `NODE_AGENT_IMAGE` as an immutable amd64 registry reference ending in
 `@sha256:<64 lowercase hexadecimal characters>`. Do not use a mutable tag, locally built image ID,
 or CI-only `adojapan-restream-node:ci` value. The separate **Node Agent image** workflow publishes
-`linux/amd64` images on an explicit `node-v*` tag or manual dispatch and reports the resulting
-registry digest. Record that digest, build provenance, reviewed commit, and vulnerability review
-without printing credentials; publishing an image is not deployment authorization.
+`linux/amd64` images only on an explicit `node-v*` tag or manual dispatch, exports the resulting
+registry digest, and then starts a separate fresh-runner job with no package permission or registry
+login. That job uses an empty temporary Docker configuration to pull
+`ghcr.io/andreykutenkikh-byte/restream-node@<digest>` and verifies the exact digest locally. Record
+the fully successful workflow, digest, build provenance, reviewed commit, and vulnerability review;
+publishing an image alone is not deployment authorization.
+
+The first package release may require one manual owner action: publish the first image, set the
+`restream-node` GHCR package visibility to **public**, and rerun the failed anonymous-pull job. Do not
+use the digest until the complete workflow is successful. Do not automate visibility with a PAT or
+privileged secret. Production operators must not run `docker login ghcr.io` on attached VPS hosts,
+and bootstrap never transfers registry credentials to them.
 
 The base Compose file fixes HTTP to `127.0.0.1:8088`. The reviewed public RTMP identity is
 `restream.adojapan.ru:1935`, while its host bind remains separately controlled by the approved
@@ -60,8 +69,10 @@ SSH. Validate these safe fields with a structured parser; never print the resolv
 5. Verify all three effective production restart policies are `unless-stopped` and the bootstrap
    worker has a 90-second stop grace; changed Compose settings require container recreation and a
     post-start `docker inspect`, not merely `docker compose -p adojapan-restream restart`.
-6. Resolve and approve the exact `NODE_AGENT_IMAGE` digest. The control-plane rollout must not
-   implicitly build, retag, or push the remote image.
+6. Resolve and approve the exact `NODE_AGENT_IMAGE` digest and retain a successful anonymous-pull
+   gate for that same reference. The control-plane rollout must not build the Node Agent in
+   production, retag it, substitute another digest, use a mutable tag, or treat publish success
+   without anonymous-pull evidence as a released image.
 7. Keep DNS ownership, host/provider firewall, reverse-proxy, port, resource/OOM, backup, and
    existing-service checks at GO. CI evidence never closes those operational gates.
 

@@ -67,7 +67,17 @@ instead of placing the secret in its environment.
 
 Production must also supply `NODE_AGENT_IMAGE` as an immutable amd64 registry reference ending in
 `@sha256:<64 lowercase hexadecimal characters>`. Record the digest, reviewed source commit, build
-provenance, and vulnerability review. A mutable tag, local-only image, or CI tag is a no-go.
+provenance, and vulnerability review. A mutable tag, local-only image, or CI tag is a no-go. A
+digest is necessary but not sufficient: the Node Agent release workflow must have pulled that exact
+`ghcr.io/andreykutenkikh-byte/restream-node@sha256:...` reference from a fresh runner with an empty
+Docker configuration, no registry login, and no package permission. Preserve the successful run as
+release evidence before the control-plane deployment and first real onboarding.
+
+GHCR packages can require a one-time manual visibility change after their first publication. If the
+anonymous job fails, the package owner must set `restream-node` to public and rerun the workflow;
+the failure remains a no-go until the complete run passes. Do not automate this action with a PAT or
+new privileged secret. Neither the production operator nor bootstrap may run `docker login ghcr.io`
+or transfer registry credentials to an attached VPS.
 
 The bootstrap worker must have no port/expose entry, Docker socket, database/application volume,
 or backend/media network. Its only volume is the writable UDS volume and its only network is
@@ -203,9 +213,11 @@ resulting address is intentional.
 Stop the deployment plan if CPU, RAM, swap, disk, or port headroom is insufficient. Before a
 go decision, preserve the pre-deployment lists and resource measurements. Review Compose
 limits against observed load; the committed values are conservative starting points, not a
-substitute for this audit. Also stop if the Node Agent image digest/provenance is unreviewed, any
-bootstrap trust-domain secret is reused, the UDS/network boundary differs from the committed
-model, or a CI-only SSH/agent fixture appears in the production service set.
+substitute for this audit. Also stop if the Node Agent image digest/provenance is unreviewed, the
+exact digest lacks successful anonymous-pull evidence, any bootstrap trust-domain secret is reused,
+the UDS/network boundary differs from the committed model, or a CI-only SSH/agent fixture appears
+in the production service set. The control plane must not build, retag, or substitute the Node Agent
+image during deployment.
 
 ## Controlled rollout
 
@@ -264,7 +276,8 @@ Record an owner and evidence for every item before proceeding:
     bootstrap.
 27. Confirm the bootstrap UDS mounts, separate egress network, no ports, no Docker socket, and
     independent secret match the reviewed model.
-28. Record and verify the immutable `NODE_AGENT_IMAGE` digest and build provenance.
+28. Record and verify the immutable `NODE_AGENT_IMAGE` digest, build provenance, and successful
+    fresh-runner anonymous pull of that exact digest without registry credentials.
 29. Confirm `ci-ssh-target`, `ci-node-agent`, and both test allowlists are absent from production.
 30. Confirm node onboarding remains a separately authorized operation and that Stage 4A has no
     real video, YouTube output, hot switching, SSH-key onboarding, or remote uninstall.
