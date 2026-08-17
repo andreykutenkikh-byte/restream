@@ -17,6 +17,7 @@ from bootstrap_worker.installer import (
     AgentProcessState,
     AptDockerAdapter,
     DnfDockerAdapter,
+    DnfRepositoryState,
     DockerBootstrap,
     InstallReceipt,
     PrivilegeContext,
@@ -143,6 +144,51 @@ def detected_facts(os_id: str, os_version: str) -> SystemFacts:
             selinux_mode=SELinuxMode.ENFORCING if rhel_family else SELinuxMode.DISABLED,
         )
     )
+
+
+def dnf_repository_evidence(
+    platform: SystemFacts,
+    state: DnfRepositoryState = DnfRepositoryState.CLEAN,
+    **updates: object,
+) -> str:
+    values: dict[str, object] = {
+        "repo_kind": "missing",
+        "repo_uid": -1,
+        "repo_sha256": "",
+        "key_kind": "missing",
+        "key_uid": -1,
+        "key_fingerprint": "",
+        "foreign_repository": 0,
+        "temporary_artifact": 0,
+    }
+    if state is DnfRepositoryState.MANAGED:
+        values.update(
+            {
+                "repo_kind": "regular",
+                "repo_uid": 0,
+                "repo_sha256": DnfDockerAdapter._content_sha256(
+                    DnfDockerAdapter.repository_content(platform)
+                ),
+                "key_kind": "regular",
+                "key_uid": 0,
+                "key_fingerprint": DOCKER_GPG_FINGERPRINT,
+            }
+        )
+    elif state is DnfRepositoryState.LEGACY_ADOJAPAN_FAILED_INSTALL:
+        legacy = DnfDockerAdapter.legacy_alma_repository_content(platform)
+        assert legacy is not None
+        values.update(
+            {
+                "repo_kind": "regular",
+                "repo_uid": 0,
+                "repo_sha256": DnfDockerAdapter._content_sha256(legacy),
+                "key_kind": "regular",
+                "key_uid": 0,
+                "key_fingerprint": DOCKER_GPG_FINGERPRINT,
+            }
+        )
+    values.update(updates)
+    return "".join(f"{key}={value}\n" for key, value in values.items())
 
 
 def test_bootstrap_image_runs_non_root_and_owns_only_uds_directory() -> None:
@@ -472,8 +518,8 @@ def test_docker_plan_uses_official_apt_repository_without_convenience_script(
 @pytest.mark.parametrize(
     ("os_id", "version", "repository_distribution"),
     [
-        ("almalinux", "8.10", "alma"),
-        ("almalinux", "9.6", "alma"),
+        ("almalinux", "8.10", "rhel"),
+        ("almalinux", "9.6", "rhel"),
         ("rocky", "8.10", "rocky"),
         ("rocky", "9.6", "rocky"),
         ("rhel", "8.10", "rhel"),
@@ -505,15 +551,151 @@ def test_dnf_adapter_uses_only_allowlisted_official_rpm_path(
     assert "dnf erase" not in commands
 
 
-@pytest.mark.parametrize("version", ["8.10", "9.6"])
-def test_almalinux_uses_dedicated_docker_repository(version: str) -> None:
-    plan = DnfDockerAdapter().install_plan(detected_facts("almalinux", version))
+@pytest.mark.parametrize(("version", "major"), [("8.10", "8"), ("9.6", "9")])
+def test_almalinux_uses_rhel_compatibility_repository(version: str, major: str) -> None:
+    platform = detected_facts("almalinux", version)
+    plan = DnfDockerAdapter().install_plan(platform)
     commands = "\n".join(step.command for step in plan)
 
-    assert "download.docker.com/linux/alma" in commands
+    assert platform.os_id == "almalinux"
+    assert platform.os_name == "almalinux"
+    assert f"download.docker.com/linux/rhel/{major}/$basearch/stable" in commands
+    assert "download.docker.com/linux/alma" not in commands
     assert "download.docker.com/linux/centos" not in commands
     assert "gpgcheck=1" in commands
     assert DOCKER_GPG_FINGERPRINT in commands
+
+
+@pytest.mark.parametrize(
+    ("os_id", "version", "distribution", "release"),
+    [
+        ("almalinux", "8.10", "rhel", "8"),
+        ("almalinux", "9.6", "rhel", "9"),
+        ("rhel", "8.10", "rhel", "8"),
+        ("rhel", "9.6", "rhel", "9"),
+        ("rocky", "8.10", "rocky", "$releasever"),
+        ("rocky", "9.6", "rocky", "$releasever"),
+        ("centos", "9", "centos", "$releasever"),
+    ],
+)
+def test_dnf_repository_profile_is_a_hardcoded_allowlist(
+    os_id: str,
+    version: str,
+    distribution: str,
+    release: str,
+) -> None:
+    profile = DnfDockerAdapter.repository_profile(detected_facts(os_id, version))
+    assert profile.distribution == distribution
+    assert profile.release == release
+
+
+def test_dnf_package_gate_checks_every_exact_package_only_in_selected_repository() -> None:
+    gate = DnfDockerAdapter.package_availability_gate()
+    assert "--disablerepo='*' --enablerepo=docker-ce-stable" in gate
+    assert 'list --available "$package"' in gate
+    assert ">/dev/null 2>&1" in gate
+    for package in (
+        "docker-ce",
+        "docker-ce-cli",
+        "containerd.io",
+        "docker-buildx-plugin",
+        "docker-compose-plugin",
+    ):
+        assert package in gate
+    assert "repoquery" not in gate
+    assert "grep" not in gate
+
+
+def test_legacy_alma_failed_install_is_recognized_without_changing_detected_os() -> None:
+    platform = detected_facts("almalinux", "8.10")
+    state = DnfDockerAdapter.classify_repository_evidence(
+        platform,
+        dnf_repository_evidence(
+            platform,
+            DnfRepositoryState.LEGACY_ADOJAPAN_FAILED_INSTALL,
+        ),
+    )
+    assert state is DnfRepositoryState.LEGACY_ADOJAPAN_FAILED_INSTALL
+    assert platform.os_id == "almalinux"
+    assert platform.os_name == "almalinux"
+
+    plan = DnfDockerAdapter().install_plan_for_state(platform, state)
+    commands = "\n".join(step.command for step in plan)
+    assert "download.docker.com/linux/rhel/8/$basearch/stable" in commands
+    assert "download.docker.com/linux/alma" not in commands
+    assert any(step.repository_commit for step in plan)
+
+
+@pytest.mark.parametrize(
+    ("name", "updates"),
+    [
+        ("modified_repo_content", {"repo_sha256": "0" * 64}),
+        ("symlink_repo", {"repo_kind": "symlink"}),
+        ("wrong_repo_owner", {"repo_uid": 1000}),
+        ("wrong_key_fingerprint", {"key_fingerprint": "1" * 40}),
+        ("foreign_repository", {"foreign_repository": 1}),
+        ("temporary_artifact", {"temporary_artifact": 1}),
+    ],
+)
+def test_legacy_failed_install_recovery_rejects_modified_or_foreign_artifacts(
+    name: str,
+    updates: dict[str, object],
+) -> None:
+    del name
+    platform = detected_facts("almalinux", "8.10")
+    evidence = dnf_repository_evidence(
+        platform,
+        DnfRepositoryState.LEGACY_ADOJAPAN_FAILED_INSTALL,
+        **updates,
+    )
+    assert (
+        DnfDockerAdapter.classify_repository_evidence(platform, evidence)
+        is DnfRepositoryState.UNSAFE
+    )
+
+
+async def test_unsafe_repository_evidence_is_rejected_without_mutation() -> None:
+    platform = detected_facts("almalinux", "8.10")
+    unsafe = dnf_repository_evidence(
+        platform,
+        DnfRepositoryState.LEGACY_ADOJAPAN_FAILED_INSTALL,
+        repo_sha256="0" * 64,
+    )
+
+    def responder(command: str, stdin: SecretStr | None) -> RemoteResult:
+        del stdin
+        if command == "command -v docker >/dev/null 2>&1":
+            return RemoteResult(1)
+        if "repo_kind=$(kind" in command:
+            return RemoteResult(0, unsafe)
+        return RemoteResult(0)
+
+    session = FakeSession(responder)
+    disposition = await DockerBootstrap().inspect(
+        session,
+        PrivilegeContext(PrivilegeMode.ROOT),
+        platform,
+        timeout=60,
+    )
+    assert disposition is DockerDisposition.UNSUPPORTED
+    commands = "\n".join(command for command, _, _ in session.commands)
+    assert "dnf -y" not in commands
+    assert "mv -f" not in commands
+    assert "rm -f -- /etc/yum.repos.d/docker-ce.repo" not in commands
+
+
+def test_repository_evidence_probe_is_bounded_and_never_returns_file_content() -> None:
+    command = DnfDockerAdapter.repository_evidence_probe_command()
+    assert "sha256sum" in command
+    assert "stat -c %u" in command
+    assert "repo_kind" in command
+    assert "-L" in command
+    assert "16384" in command
+    assert "262144" in command
+    assert DOCKER_GPG_FINGERPRINT not in command
+    assert "cat /etc/yum.repos.d/docker-ce.repo" not in command
+    assert "foreign_repository" in command
+    assert "temporary_artifact" in command
 
 
 def test_family_specific_absence_checks_do_not_cross_package_managers() -> None:
@@ -542,7 +724,11 @@ def test_family_specific_absence_checks_do_not_cross_package_managers() -> None:
 def test_docker_plan_never_manages_firewall_or_daemon_configuration() -> None:
     commands = "\n".join(
         step.command
-        for step in DockerBootstrap().install_plan(facts(os_name="debian", os_version="12"))
+        for platform in (
+            facts(os_name="debian", os_version="12"),
+            detected_facts("almalinux", "8.10"),
+        )
+        for step in DockerBootstrap().install_plan(platform)
     ).lower()
     forbidden = (
         "uf" + "w",
@@ -707,17 +893,23 @@ async def test_clean_absence_uses_only_family_package_query(
     expected_tool: str,
     forbidden_tool: str,
 ) -> None:
+    platform = detected_facts(os_id, version)
+
     def responder(command: str, stdin: SecretStr | None) -> RemoteResult:
         del stdin
+        if "for package in docker docker-client" in command:
+            return RemoteResult(0)
         if command == "command -v docker >/dev/null 2>&1":
             return RemoteResult(1)
+        if "repo_kind=$(kind" in command:
+            return RemoteResult(0, dnf_repository_evidence(platform))
         return RemoteResult(0)
 
     session = FakeSession(responder)
     disposition = await DockerBootstrap().inspect(
         session,
         PrivilegeContext(PrivilegeMode.ROOT),
-        detected_facts(os_id, version),
+        platform,
         timeout=60,
     )
     assert disposition is DockerDisposition.ABSENT
@@ -726,9 +918,182 @@ async def test_clean_absence_uses_only_family_package_query(
     assert forbidden_tool not in commands
 
 
-async def test_dnf_signing_key_failure_is_safe_and_stops_before_repository_write() -> None:
+async def test_legacy_failed_acceptance_is_read_only_recoverable_docker_absence() -> None:
+    platform = detected_facts("almalinux", "8.10")
+
     def responder(command: str, stdin: SecretStr | None) -> RemoteResult:
         del stdin
+        if command == "command -v docker >/dev/null 2>&1":
+            return RemoteResult(1)
+        if "repo_kind=$(kind" in command:
+            return RemoteResult(
+                0,
+                dnf_repository_evidence(
+                    platform,
+                    DnfRepositoryState.LEGACY_ADOJAPAN_FAILED_INSTALL,
+                ),
+            )
+        return RemoteResult(0)
+
+    session = FakeSession(responder)
+    disposition = await DockerBootstrap().inspect(
+        session,
+        PrivilegeContext(PrivilegeMode.ROOT),
+        platform,
+        timeout=60,
+    )
+    assert disposition is DockerDisposition.ABSENT
+    commands = "\n".join(command for command, _, _ in session.commands)
+    assert "dnf -y" not in commands
+    assert "mv -f" not in commands
+    assert "rm -f -- /etc/yum.repos.d/docker-ce.repo" not in commands
+
+
+async def test_legacy_failed_acceptance_retry_replaces_only_exact_repo_with_rhel_profile() -> None:
+    platform = detected_facts("almalinux", "8.10")
+
+    def responder(command: str, stdin: SecretStr | None) -> RemoteResult:
+        del stdin
+        if "repo_kind=$(kind" in command:
+            return RemoteResult(
+                0,
+                dnf_repository_evidence(
+                    platform,
+                    DnfRepositoryState.LEGACY_ADOJAPAN_FAILED_INSTALL,
+                ),
+            )
+        return RemoteResult(0)
+
+    session = FakeSession(responder)
+    await DockerBootstrap().install(
+        session,
+        PrivilegeContext(PrivilegeMode.ROOT),
+        platform,
+        timeouts=TimeoutPolicy(),
+    )
+    commands = "\n".join(command for command, _, _ in session.commands)
+    assert "download.docker.com/linux/rhel/8/$basearch/stable" in commands
+    assert "download.docker.com/linux/alma" not in commands
+    assert "mv -f -- /etc/yum.repos.d/docker-ce.repo.adojapan-tmp " in commands
+    assert (
+        "install docker-ce docker-ce-cli containerd.io docker-buildx-plugin "
+        "docker-compose-plugin" in commands
+    )
+    assert "rm -rf -- /etc/yum.repos.d" not in commands
+    assert "dnf remove" not in commands
+    assert "dnf erase" not in commands
+
+
+@pytest.mark.parametrize(
+    "unsafe_condition",
+    [
+        'rpm -q "$package"',
+        "/run/docker.sock",
+        "/etc/docker",
+        "/var/lib/docker",
+        "/etc/containerd",
+        "/var/lib/containerd",
+        "/opt/adojapan-restream-node",
+    ],
+)
+async def test_legacy_recovery_rejects_any_runtime_or_managed_root_residue(
+    unsafe_condition: str,
+) -> None:
+    platform = detected_facts("almalinux", "8.10")
+
+    def responder(command: str, stdin: SecretStr | None) -> RemoteResult:
+        del stdin
+        if "for package in docker docker-client" in command:
+            return RemoteResult(0)
+        if command == "command -v docker >/dev/null 2>&1":
+            return RemoteResult(1)
+        if "for package in docker-ce docker-ce-cli" in command:
+            assert unsafe_condition in command
+            return RemoteResult(1)
+        raise AssertionError("repository evidence must not be read after unsafe runtime state")
+
+    disposition = await DockerBootstrap().inspect(
+        FakeSession(responder),
+        PrivilegeContext(PrivilegeMode.ROOT),
+        platform,
+        timeout=60,
+    )
+    assert disposition is DockerDisposition.UNSUPPORTED
+
+
+async def test_incomplete_dnf_repository_stops_before_engine_package_install() -> None:
+    platform = detected_facts("almalinux", "8.10")
+
+    def responder(command: str, stdin: SecretStr | None) -> RemoteResult:
+        del stdin
+        if "repo_kind=$(kind" in command:
+            return RemoteResult(0, dnf_repository_evidence(platform))
+        if "list --available" in command:
+            return RemoteResult(1, "raw-dnf-output-must-not-surface")
+        return RemoteResult(0)
+
+    session = FakeSession(responder)
+    with pytest.raises(BootstrapError) as captured:
+        await DockerBootstrap().install(
+            session,
+            PrivilegeContext(PrivilegeMode.ROOT),
+            platform,
+            timeouts=TimeoutPolicy(),
+        )
+    assert captured.value.code == "docker_repository_incomplete"
+    assert "raw-dnf-output" not in captured.value.safe_message
+    commands = [command for command, _, _ in session.commands]
+    engine_install = (
+        "dnf -y --setopt=install_weak_deps=False install docker-ce docker-ce-cli "
+        "containerd.io docker-buildx-plugin docker-compose-plugin"
+    )
+    assert not any(engine_install in command for command in commands)
+    assert any("list --available" in command for command in commands)
+    assert any(
+        "rm -f -- /etc/yum.repos.d/docker-ce.repo /etc/pki/rpm-gpg/docker-ce.asc" in command
+        for command in commands
+    )
+
+
+async def test_partial_engine_package_install_is_never_uninstalled_or_cleaned_up() -> None:
+    platform = detected_facts("almalinux", "8.10")
+    engine_install = (
+        "dnf -y --setopt=install_weak_deps=False install docker-ce docker-ce-cli "
+        "containerd.io docker-buildx-plugin docker-compose-plugin"
+    )
+
+    def responder(command: str, stdin: SecretStr | None) -> RemoteResult:
+        del stdin
+        if "repo_kind=$(kind" in command:
+            return RemoteResult(0, dnf_repository_evidence(platform))
+        if engine_install in command:
+            return RemoteResult(1)
+        if "rm -f -- /etc/yum.repos.d/docker-ce.repo /etc/pki/rpm-gpg/docker-ce.asc" in command:
+            return RemoteResult(1)
+        return RemoteResult(0)
+
+    session = FakeSession(responder)
+    with pytest.raises(BootstrapError) as captured:
+        await DockerBootstrap().install(
+            session,
+            PrivilegeContext(PrivilegeMode.ROOT),
+            platform,
+            timeouts=TimeoutPolicy(),
+        )
+    assert captured.value.code == "docker_failed_install_recovery_unsafe"
+    commands = "\n".join(command for command, _, _ in session.commands)
+    assert "dnf remove" not in commands
+    assert "dnf erase" not in commands
+    assert "rpm -e" not in commands
+
+
+async def test_dnf_signing_key_failure_is_safe_and_stops_before_repository_write() -> None:
+    platform = detected_facts("almalinux", "8.10")
+
+    def responder(command: str, stdin: SecretStr | None) -> RemoteResult:
+        del stdin
+        if "repo_kind=$(kind" in command:
+            return RemoteResult(0, dnf_repository_evidence(platform))
         if "fingerprints=$(gpg2" in command:
             return RemoteResult(1)
         return RemoteResult(0)
@@ -738,7 +1103,7 @@ async def test_dnf_signing_key_failure_is_safe_and_stops_before_repository_write
         await DockerBootstrap().install(
             session,
             PrivilegeContext(PrivilegeMode.ROOT),
-            detected_facts("almalinux", "8.10"),
+            platform,
             timeouts=TimeoutPolicy(),
         )
     assert captured.value.code == "docker_repository_key_invalid"
