@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import traceback
 from collections.abc import Mapping
 from typing import Any
 
+import httpx
+import pytest
+
 from app.services.mediamtx import (
+    HttpxJsonTransport,
     IngestState,
     MediaMTXClient,
     MediaMTXNotFound,
+    MediaMTXTransportError,
     map_ingest_status,
     normalize_stream_metadata,
 )
@@ -26,6 +32,50 @@ class FakeTransport:
     async def post_json(self, path: str) -> Mapping[str, Any] | None:
         self.post_paths.append(path)
         return {}
+
+
+def test_http_transport_tracebacks_never_expose_ingest_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ingest_key = "TRACEBACK_STREAM_KEY_MUST_NOT_LEAK"
+    request = httpx.Request(
+        "GET",
+        f"http://mediamtx:9997/v3/paths/get/live%2F{ingest_key}",
+    )
+    outcomes: tuple[httpx.Response | httpx.HTTPError, ...] = (
+        httpx.ConnectError("connection failed", request=request),
+        httpx.Response(500, request=request, json={"error": ingest_key}),
+    )
+
+    class FakeAsyncClient:
+        def __init__(self, outcome: httpx.Response | httpx.HTTPError) -> None:
+            self.outcome = outcome
+
+        async def __aenter__(self) -> FakeAsyncClient:
+            return self
+
+        async def __aexit__(self, *_: Any) -> None:
+            return None
+
+        async def request(self, *_: Any) -> httpx.Response:
+            if isinstance(self.outcome, httpx.HTTPError):
+                raise self.outcome
+            return self.outcome
+
+    for outcome in outcomes:
+
+        def client_factory(*_: Any, _outcome: Any = outcome, **__: Any) -> FakeAsyncClient:
+            return FakeAsyncClient(_outcome)
+
+        monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+        transport = HttpxJsonTransport("http://mediamtx:9997")
+
+        with pytest.raises(MediaMTXTransportError) as captured:
+            asyncio.run(transport.get_json(f"/v3/paths/get/live%2F{ingest_key}"))
+
+        rendered = "".join(traceback.format_exception(captured.value))
+        assert ingest_key not in rendered
+        assert captured.value.__cause__ is None
 
 
 def test_normalizes_ffprobe_and_mediamtx_metadata() -> None:
@@ -159,3 +209,81 @@ def test_kick_publishers_is_noop_for_offline_path() -> None:
 
     assert asyncio.run(client.kick_publishers("live/key")) == 0
     assert transport.post_paths == []
+
+
+def test_kick_publishers_is_idempotent_when_publisher_disappears() -> None:
+    class DisconnectedTransport(FakeTransport):
+        async def get_json(self, path: str) -> Mapping[str, Any] | None:
+            self.get_paths.append(path)
+            if len(self.get_paths) == 1:
+                return self.payload
+            raise MediaMTXNotFound("publisher already disconnected")
+
+        async def post_json(self, path: str) -> Mapping[str, Any] | None:
+            self.post_paths.append(path)
+            raise MediaMTXNotFound("publisher already disconnected")
+
+    transport = DisconnectedTransport(
+        {
+            "name": "live/key",
+            "source": {"type": "rtmpConn", "id": "publisher-id"},
+            "ready": True,
+        }
+    )
+    client = MediaMTXClient("http://mediamtx:9997", transport=transport)
+
+    assert asyncio.run(client.kick_publishers("live/key")) == 0
+    assert transport.post_paths == ["/v3/rtmpconns/kick/publisher-id"]
+    assert transport.get_paths == ["/v3/paths/get/live%2Fkey"] * 2
+
+
+def test_kick_publishers_fails_closed_when_same_publisher_survives_kick_404() -> None:
+    class UnsupportedKickTransport(FakeTransport):
+        async def post_json(self, path: str) -> Mapping[str, Any] | None:
+            self.post_paths.append(path)
+            raise MediaMTXNotFound("kick route unavailable")
+
+    transport = UnsupportedKickTransport(
+        {
+            "name": "live/key",
+            "source": {"type": "rtmpConn", "id": "publisher-id"},
+            "ready": True,
+        }
+    )
+    client = MediaMTXClient("http://mediamtx:9997", transport=transport)
+
+    with pytest.raises(MediaMTXNotFound, match="kick route unavailable"):
+        asyncio.run(client.kick_publishers("live/key"))
+    assert transport.post_paths == ["/v3/rtmpconns/kick/publisher-id"]
+    assert transport.get_paths == ["/v3/paths/get/live%2Fkey"] * 2
+
+
+def test_kick_publishers_fails_closed_when_publisher_is_replaced_after_kick_404() -> None:
+    class ReplacedPublisherTransport(FakeTransport):
+        async def get_json(self, path: str) -> Mapping[str, Any] | None:
+            self.get_paths.append(path)
+            if len(self.get_paths) == 1:
+                return self.payload
+            return {
+                "name": "live/key",
+                "source": {"type": "rtmpConn", "id": "replacement-publisher-id"},
+                "ready": True,
+            }
+
+        async def post_json(self, path: str) -> Mapping[str, Any] | None:
+            self.post_paths.append(path)
+            raise MediaMTXNotFound("original publisher disappeared before kick")
+
+    transport = ReplacedPublisherTransport(
+        {
+            "name": "live/key",
+            "source": {"type": "rtmpConn", "id": "original-publisher-id"},
+            "ready": True,
+        }
+    )
+    client = MediaMTXClient("http://mediamtx:9997", transport=transport)
+
+    with pytest.raises(MediaMTXNotFound, match="original publisher disappeared before kick"):
+        asyncio.run(client.kick_publishers("live/key"))
+    assert transport.post_paths == ["/v3/rtmpconns/kick/original-publisher-id"]
+    assert transport.get_paths == ["/v3/paths/get/live%2Fkey"] * 2

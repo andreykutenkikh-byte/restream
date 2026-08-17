@@ -3,6 +3,7 @@ services:
     cpus: "0.40"
     mem_limit: 384m
     pids_limit: 96
+    restart: unless-stopped
     environment:
       ENVIRONMENT: production
       COOKIE_SECURE: "true"
@@ -15,3 +16,4 @@ services:
     cpus: "0.20"
     mem_limit: 192m
     pids_limit: 64
+    restart: unless-stopped

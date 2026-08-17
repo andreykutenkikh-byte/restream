@@ -8,6 +8,7 @@ cleanup on every exit path.
 
 from __future__ import annotations
 
+import hmac
 import http.cookiejar
 import json
 import re
@@ -76,6 +77,14 @@ class PreviewProbe:
     media_playlist_path: str
 
 
+@dataclass(frozen=True, slots=True)
+class PublisherIdentity:
+    """PID plus Linux start ticks, stable across PID reuse."""
+
+    pid: int
+    start_ticks: int
+
+
 class APIClient:
     def __init__(self) -> None:
         self._opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
@@ -101,7 +110,9 @@ class APIClient:
             BASE_URL + path, data=data, headers=headers, method=method
         )
         try:
-            response = self._opener.open(request, timeout=10)
+            # A live key rotation deliberately drains any successful publish
+            # authorization for MediaMTX's 10-second HTTP auth horizon.
+            response = self._opener.open(request, timeout=20)
         except HTTPError as exc:
             error_payload: Any = None
             with suppress(Exception):
@@ -198,7 +209,7 @@ def compose_exec(
         raise SmokeFailure("Docker Compose command did not complete") from exc
     if result.returncode != 0:
         # stdout/stderr can contain private RTMP URLs. Never add them to the exception.
-        raise SmokeFailure("command inside the backend container failed")
+        raise SmokeFailure(f"command inside the {service} container failed")
     return result.stdout.strip()
 
 
@@ -219,6 +230,37 @@ def wait_for(
                 return last
         time.sleep(interval)
     raise SmokeFailure(f"timed out waiting for {description}")
+
+
+def ingest_is_offline(payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    metadata = payload.get("metadata")
+    return (
+        payload.get("state") == "offline"
+        and payload.get("bitrate_bps") is None
+        and isinstance(metadata, dict)
+        and metadata.get("bitrate_bps") is None
+    )
+
+
+def rotate_and_confirm_ingest_key(client: APIClient, previous_key: str) -> str:
+    rotated = client.request("POST", "/api/ingest/rotate", csrf=True)
+    if not isinstance(rotated, dict):
+        raise SmokeFailure("ingest key rotation returned an invalid response")
+    replacement_key = rotated.get("stream_key")
+    if not isinstance(replacement_key, str) or not replacement_key:
+        raise SmokeFailure("ingest key rotation did not return a replacement key")
+    if hmac.compare_digest(replacement_key, previous_key):
+        raise SmokeFailure("ingest key rotation retained the previous key")
+
+    persisted = client.request("GET", "/api/ingest")
+    persisted_key = persisted.get("stream_key") if isinstance(persisted, dict) else None
+    if not isinstance(persisted_key, str) or not hmac.compare_digest(
+        replacement_key, persisted_key
+    ):
+        raise SmokeFailure("rotated ingest key was not persisted")
+    return replacement_key
 
 
 def _host_command(command: Sequence[str], *, timeout: float = 20) -> str:
@@ -347,8 +389,11 @@ def _playlist_references(body: bytes) -> tuple[list[str], list[str]]:
 
 
 def fetch_preview_segment(
-    client: APIClient, ingest_key: str, *, timeout: float = 35
+    client: APIClient, ingest_keys: Sequence[str], *, timeout: float = 35
 ) -> PreviewProbe:
+    private_keys = tuple(key.encode() for key in ingest_keys if key)
+    if not private_keys:
+        raise SmokeFailure("preview leak check did not receive any ingest keys")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         playlist_path = PREVIEW_INDEX
@@ -372,7 +417,7 @@ def fetch_preview_segment(
             playlist_bytes += len(playlist.body)
             lower_body = playlist.body.lower()
             if (
-                ingest_key.encode() in playlist.body
+                any(key in playlist.body for key in private_keys)
                 or b"mediamtx" in lower_body
                 or b"cookiecheck=" in lower_body
                 or re.search(rb"(?:^|[?&])session=", lower_body)
@@ -522,16 +567,25 @@ def receiver_bytes(payload: dict[str, Any] | None) -> int:
     return int(payload.get("inboundBytes", payload.get("bytesReceived", 0)) or 0)
 
 
-def launch_publisher(ingest_key: str) -> None:
+def _valid_pid(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def launch_publisher(ingest_key: str) -> PublisherIdentity:
+    remove_test_files()
+    if not publisher_is_absent(process_snapshot(service=PUBLISHER_SERVICE)):
+        raise SmokeFailure("publisher container was not clean before launch")
     script = f"""
 set -eu
-echo $$ > {PUBLISHER_PID_FILE}
+start_ticks="$(awk '{{print $22}}' /proc/$$/stat)"
+printf '%s %s\\n' "$$" "$start_ticks" > {PUBLISHER_PID_FILE}
 exec ffmpeg -nostdin -hide_banner -loglevel error -re \\
+  -filter_threads 1 -filter_complex_threads 1 \\
   -f lavfi -i testsrc=size=320x180:rate=15 \\
   -f lavfi -i sine=frequency=440:sample_rate=44100 \\
-  -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p \\
+  -c:v libx264 -threads:v 1 -preset ultrafast -tune zerolatency -pix_fmt yuv420p \\
   -g 30 -keyint_min 30 -sc_threshold 0 \\
-  -c:a aac -f flv \\
+  -c:a aac -threads:a 1 -f flv \\
   "rtmp://mediamtx:1935/live/${{CI_INGEST_KEY}}" \\
   >/tmp/ci-e2e-publisher.log 2>&1
 """
@@ -541,6 +595,22 @@ exec ffmpeg -nostdin -hide_banner -loglevel error -re \\
         detach=True,
         environment={"CI_INGEST_KEY": ingest_key},
     )
+    snapshot = wait_for(
+        "synthetic publisher attempt initialization",
+        lambda: process_snapshot(service=PUBLISHER_SERVICE),
+        lambda item: (
+            _valid_pid(item.get("publisher")) and _valid_pid(item.get("publisher_start_ticks"))
+        ),
+        timeout=5,
+        interval=0.1,
+    )
+    publisher_pid = snapshot.get("publisher")
+    publisher_start_ticks = snapshot.get("publisher_start_ticks")
+    if not _valid_pid(publisher_pid) or not _valid_pid(
+        publisher_start_ticks
+    ):  # pragma: no cover - guarded by wait_for
+        raise SmokeFailure("synthetic publisher did not record a valid process identity")
+    return PublisherIdentity(cast(int, publisher_pid), cast(int, publisher_start_ticks))
 
 
 def probe_received_media() -> tuple[int, int]:
@@ -590,7 +660,15 @@ def process_snapshot(*, service: str = "backend") -> dict[str, Any]:
 import json
 from pathlib import Path
 pid_file = Path({PUBLISHER_PID_FILE!r})
-publisher = int(pid_file.read_text().strip()) if pid_file.exists() else None
+publisher = None
+publisher_start_ticks = None
+if pid_file.exists():
+    try:
+        publisher_text, start_text = pid_file.read_text().split()
+        publisher = int(publisher_text)
+        publisher_start_ticks = int(start_text)
+    except (OSError, UnicodeError, ValueError):
+        pass
 ffmpeg = []
 for entry in Path('/proc').iterdir():
     if not entry.name.isdigit():
@@ -598,14 +676,203 @@ for entry in Path('/proc').iterdir():
     try:
         if (entry / 'comm').read_text().strip() == 'ffmpeg':
             ffmpeg.append(int(entry.name))
-    except (FileNotFoundError, PermissionError, ProcessLookupError):
+    except (OSError, UnicodeError):
         pass
-print(json.dumps({{'publisher': publisher, 'ffmpeg': sorted(ffmpeg)}}))
+publisher_exists = False
+publisher_alive = False
+if publisher is not None and publisher_start_ticks is not None:
+    process_path = Path('/proc') / str(publisher)
+    try:
+        current_start_ticks = int((process_path / 'stat').read_text().split()[21])
+        publisher_exists = current_start_ticks == publisher_start_ticks
+        publisher_alive = (
+            publisher_exists
+            and (process_path / 'comm').read_text().strip() == 'ffmpeg'
+        )
+    except (OSError, UnicodeError, ValueError, IndexError):
+        pass
+print(json.dumps({{
+    'publisher': publisher,
+    'publisher_start_ticks': publisher_start_ticks,
+    'publisher_exists': publisher_exists,
+    'publisher_alive': publisher_alive,
+    'ffmpeg': sorted(ffmpeg),
+}}))
 """
-    payload = json.loads(compose_exec(("python", "-c", source), service=service))
-    if not isinstance(payload, dict):
-        raise SmokeFailure("process inspection returned an invalid document")
-    return cast(dict[str, Any], payload)
+    # A process can disappear between /proc enumeration and file reads, and a
+    # Docker exec can briefly race a just-terminated FFmpeg child. Retry only
+    # this read-only inspection; a persistent failure remains a hard CI error.
+    for attempt in range(3):
+        try:
+            payload = json.loads(compose_exec(("python", "-c", source), service=service))
+            if isinstance(payload, dict):
+                return cast(dict[str, Any], payload)
+        except (SmokeFailure, json.JSONDecodeError):
+            pass
+        if attempt < 2:
+            time.sleep(0.1)
+    raise SmokeFailure(f"{service} process inspection failed after bounded retries")
+
+
+def publisher_is_alive(snapshot: Mapping[str, Any], expected: PublisherIdentity) -> bool:
+    return (
+        snapshot.get("publisher") == expected.pid
+        and snapshot.get("publisher_start_ticks") == expected.start_ticks
+        and snapshot.get("publisher_alive") is True
+        and snapshot.get("ffmpeg") == [expected.pid]
+    )
+
+
+def publisher_is_stopped(snapshot: Mapping[str, Any], expected: PublisherIdentity) -> bool:
+    return (
+        snapshot.get("publisher") == expected.pid
+        and snapshot.get("publisher_start_ticks") == expected.start_ticks
+        and snapshot.get("publisher_exists") is False
+        and snapshot.get("publisher_alive") is False
+        and not snapshot.get("ffmpeg")
+    )
+
+
+def publisher_is_absent(snapshot: Mapping[str, Any]) -> bool:
+    return (
+        snapshot.get("publisher_exists") is False
+        and snapshot.get("publisher_alive") is False
+        and not snapshot.get("ffmpeg")
+    )
+
+
+def publisher_alive_predicate(
+    expected: PublisherIdentity,
+) -> Callable[[Mapping[str, Any]], bool]:
+    return lambda snapshot: publisher_is_alive(snapshot, expected)
+
+
+def publisher_log_category() -> str:
+    """Return an allowlisted failure category without exporting FFmpeg logs."""
+
+    source = r"""
+from pathlib import Path
+path = Path('/tmp/ci-e2e-publisher.log')
+data = path.read_bytes()[:65536].lower() if path.exists() else b''
+if not data:
+    category = 'empty'
+elif any(marker in data for marker in (
+    b'pthread_create', b'resource temporarily unavailable', b'failed to create thread'
+)):
+    category = 'resource_limit'
+elif b'connection refused' in data:
+    category = 'connection_refused'
+elif b'server error' in data and (b'401' in data or b'403' in data):
+    category = 'auth_rejected'
+elif b'input/output error' in data:
+    category = 'io_error'
+elif b'broken pipe' in data or b'connection reset' in data:
+    category = 'connection_closed'
+else:
+    category = 'other'
+print(category)
+"""
+    category = compose_exec(("python", "-c", source), service=PUBLISHER_SERVICE)
+    allowed = {
+        "empty",
+        "resource_limit",
+        "connection_refused",
+        "auth_rejected",
+        "io_error",
+        "connection_closed",
+        "other",
+    }
+    if category not in allowed:
+        raise SmokeFailure("publisher diagnostic returned an invalid category")
+    return category
+
+
+def launch_accepted_publisher(
+    ingest_key: str,
+    *,
+    description: str,
+    seen_identities: set[PublisherIdentity],
+) -> PublisherIdentity:
+    """Require a stable positive-control publisher, with one clean retry.
+
+    Repeated rejected RTMP handshakes can leave a short-lived Docker exec or
+    encoder startup race in the constrained CI helper. Each attempt must use a
+    new PID/start-time identity, and cleanup must prove the previous attempt is
+    absent before the single retry. Persistent failure remains a hard gate.
+    """
+
+    failure_categories: list[str] = []
+    for attempt in (1, 2):
+        identity = launch_publisher(ingest_key)
+        if identity in seen_identities:
+            raise SmokeFailure("accepted publisher reused a prior process identity")
+        seen_identities.add(identity)
+        try:
+            wait_for(
+                f"{description} (attempt {attempt})",
+                lambda: process_snapshot(service=PUBLISHER_SERVICE),
+                publisher_alive_predicate(identity),
+                timeout=10,
+                interval=0.1,
+            )
+            return identity
+        except SmokeFailure:
+            try:
+                failure_categories.append(publisher_log_category())
+            except SmokeFailure:
+                failure_categories.append("diagnostic_unavailable")
+            stop_publisher()
+            try:
+                wait_for(
+                    "failed positive-control publisher cleanup",
+                    lambda: process_snapshot(service=PUBLISHER_SERVICE),
+                    publisher_is_absent,
+                    timeout=8,
+                    interval=0.1,
+                )
+                remove_test_files()
+            except SmokeFailure:
+                raise SmokeFailure(
+                    "failed positive-control publisher could not be cleaned up"
+                ) from None
+            if attempt == 2:
+                break
+            time.sleep(1)
+    categories = ",".join(failure_categories)
+    raise SmokeFailure(
+        f"{description} failed after two independent attempts (categories={categories})"
+    )
+
+
+def assert_publisher_rejected(
+    client: APIClient,
+    ingest_key: str,
+    *,
+    attempt: int,
+    seen_identities: set[PublisherIdentity],
+) -> PublisherIdentity:
+    identity = launch_publisher(ingest_key)
+    if identity in seen_identities:
+        raise SmokeFailure("publisher attempt reused a prior process identity")
+    seen_identities.add(identity)
+
+    # Allow the detached shell to exec FFmpeg (or receive MediaMTX's rejection)
+    # before accepting a stopped identity. This avoids matching the pre-exec race.
+    time.sleep(0.5)
+    wait_for(
+        f"publisher rejection with the rotated ingest key (attempt {attempt})",
+        lambda: process_snapshot(service=PUBLISHER_SERVICE),
+        lambda item: publisher_is_stopped(item, identity),
+        timeout=12,
+        interval=0.1,
+    )
+    time.sleep(0.5)
+    snapshot = process_snapshot(service=PUBLISHER_SERVICE)
+    if not publisher_is_stopped(snapshot, identity):
+        raise SmokeFailure("publisher using the rotated ingest key remained active")
+    if not ingest_is_offline(client.request("GET", "/api/ingest/status")):
+        raise SmokeFailure("publisher using the rotated ingest key changed ingest state")
+    return identity
 
 
 def stop_publisher() -> None:
@@ -616,22 +883,31 @@ from pathlib import Path
 path = Path({PUBLISHER_PID_FILE!r})
 if path.exists():
     try:
-        os.kill(int(path.read_text().strip()), signal.SIGTERM)
-    except (ProcessLookupError, ValueError):
+        pid_text, start_text = path.read_text().split()
+        pid = int(pid_text)
+        expected_start_ticks = int(start_text)
+        process_path = Path('/proc') / str(pid)
+        current_start_ticks = int((process_path / 'stat').read_text().split()[21])
+        if current_start_ticks == expected_start_ticks:
+            os.kill(pid, signal.SIGTERM)
+    except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError, IndexError):
         pass
 """
     with suppress(SmokeFailure):
         compose_exec(("python", "-c", source), service=PUBLISHER_SERVICE)
 
 
-def remove_test_files() -> None:
+def remove_test_files(*, best_effort: bool = False) -> None:
     source = f"""
 from pathlib import Path
 for name in ({PUBLISHER_PID_FILE!r}, '/tmp/ci-e2e-publisher.log'):
     Path(name).unlink(missing_ok=True)
 """
-    with suppress(SmokeFailure):
-        compose_exec(("python", "-c", source), service=PUBLISHER_SERVICE)
+    if best_effort:
+        with suppress(SmokeFailure):
+            compose_exec(("python", "-c", source), service=PUBLISHER_SERVICE)
+        return
+    compose_exec(("python", "-c", source), service=PUBLISHER_SERVICE)
 
 
 def main() -> int:
@@ -643,9 +919,29 @@ def main() -> int:
         print("E2E: authenticated through the HTTP API and obtained CSRF protection")
 
         ingest = client.request("GET", "/api/ingest")
-        ingest_key = str(ingest.get("stream_key", ""))
-        if not ingest_key:
+        current_ingest_key = str(ingest.get("stream_key", ""))
+        if not current_ingest_key:
             raise SmokeFailure("ingest configuration did not include a stream key")
+
+        initial_publisher = process_snapshot(service=PUBLISHER_SERVICE)
+        if not publisher_is_absent(initial_publisher):
+            raise SmokeFailure("synthetic publisher was unexpectedly active before rotation")
+        wait_for(
+            "initial offline ingest before key rotation",
+            lambda: client.request("GET", "/api/ingest/status"),
+            ingest_is_offline,
+            timeout=10,
+        )
+
+        initial_key = current_ingest_key
+        current_ingest_key = rotate_and_confirm_ingest_key(client, initial_key)
+        wait_for(
+            "offline ingest after key rotation",
+            lambda: client.request("GET", "/api/ingest/status"),
+            ingest_is_offline,
+            timeout=10,
+        )
+        print("E2E: offline ingest key rotation persisted while MediaMTX remained available")
 
         assert_hls_port_is_internal()
         anonymous = APIClient()
@@ -656,7 +952,55 @@ def main() -> int:
         )
         print("E2E: preview rejected an unauthenticated request and port 8888 stayed internal")
 
-        launch_publisher(ingest_key)
+        seen_publisher_identities: set[PublisherIdentity] = set()
+        first_publisher_identity = launch_accepted_publisher(
+            current_ingest_key,
+            description="publisher process with the offline-rotated key",
+            seen_identities=seen_publisher_identities,
+        )
+        wait_for(
+            "active ingest before live key rotation",
+            lambda: client.request("GET", "/api/ingest/status"),
+            lambda item: (
+                item.get("state") == "live" and int(item.get("bytes_received", 0) or 0) > 0
+            ),
+            timeout=25,
+        )
+
+        previous_live_key = current_ingest_key
+        replacement_key = rotate_and_confirm_ingest_key(client, previous_live_key)
+        if hmac.compare_digest(replacement_key, initial_key):
+            raise SmokeFailure("second ingest key rotation reused the initial key")
+        wait_for(
+            "active publisher termination after key rotation",
+            lambda: process_snapshot(service=PUBLISHER_SERVICE),
+            lambda item: publisher_is_stopped(item, first_publisher_identity),
+            timeout=12,
+            interval=0.1,
+        )
+        wait_for(
+            "offline ingest after active key rotation",
+            lambda: client.request("GET", "/api/ingest/status"),
+            ingest_is_offline,
+            timeout=12,
+        )
+        print("E2E: active ingest key rotation kicked the previous RTMP publisher")
+
+        for attempt in (1, 2):
+            assert_publisher_rejected(
+                client,
+                previous_live_key,
+                attempt=attempt,
+                seen_identities=seen_publisher_identities,
+            )
+        print("E2E: two independent publishers using the previous key were rejected")
+
+        current_ingest_key = replacement_key
+        replacement_publisher_identity = launch_accepted_publisher(
+            current_ingest_key,
+            description="publisher process with the replacement ingest key",
+            seen_identities=seen_publisher_identities,
+        )
         initial_status = wait_for(
             "active H.264/AAC ingest with received bytes",
             lambda: client.request("GET", "/api/ingest/status"),
@@ -692,6 +1036,11 @@ def main() -> int:
             f"(bytes={measured_bytes}, bitrate_bps={measured_bitrate})"
         )
 
+        ingest_key: Sequence[str] = (
+            initial_key,
+            previous_live_key,
+            current_ingest_key,
+        )
         preview = fetch_preview_segment(client, ingest_key)
         usage, preview_cycles = sample_active_preview_usage(client, preview.media_playlist_path)
         print(
@@ -804,16 +1153,14 @@ def main() -> int:
         publisher_snapshot = process_snapshot(service=PUBLISHER_SERVICE)
         if backend_snapshot.get("ffmpeg"):
             raise SmokeFailure("worker FFmpeg or child process remained after stop")
-        if publisher_snapshot.get("publisher") is None or publisher_snapshot.get("ffmpeg") != [
-            publisher_snapshot["publisher"]
-        ]:
+        if not publisher_is_alive(publisher_snapshot, replacement_publisher_identity):
             raise SmokeFailure("synthetic publisher process state was inconsistent")
 
         stop_publisher()
         wait_for(
             "synthetic publisher termination",
             lambda: process_snapshot(service=PUBLISHER_SERVICE),
-            lambda item: not item.get("ffmpeg"),
+            lambda item: publisher_is_stopped(item, replacement_publisher_identity),
         )
         offline = wait_for(
             "offline ingest with reset bitrate",
@@ -873,10 +1220,10 @@ def main() -> int:
             wait_for(
                 "publisher FFmpeg cleanup",
                 lambda: process_snapshot(service=PUBLISHER_SERVICE),
-                lambda item: not item.get("ffmpeg"),
+                publisher_is_absent,
                 timeout=8,
             )
-        remove_test_files()
+        remove_test_files(best_effort=True)
         if not completed:
             print("E2E: best-effort cleanup completed", file=sys.stderr)
 
