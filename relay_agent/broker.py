@@ -1290,7 +1290,7 @@ def _systemd_listener() -> socket.socket:
     if listen_pid != os.getpid() or listen_fds != 1:
         raise RelayAgentError("socket_activation_required")
     try:
-        unix_family = socket.AF_UNIX  # type: ignore[attr-defined]
+        unix_family = socket.__dict__["AF_UNIX"]
         listener = socket.fromfd(3, unix_family, socket.SOCK_STREAM)
     except OSError as exc:
         raise RelayAgentError("socket_activation_required") from exc

@@ -117,7 +117,7 @@ class BrokerClient:
         validate_broker_socket(self._path)
         body = bytearray()
         try:
-            unix_family = socket.AF_UNIX  # type: ignore[attr-defined]
+            unix_family = socket.__dict__["AF_UNIX"]
             with socket.socket(unix_family, socket.SOCK_STREAM) as connection:
                 connection.settimeout(self._remaining_seconds(deadline_ns))
                 connection.connect(os.fspath(self._path))
