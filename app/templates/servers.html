@@ -204,6 +204,172 @@
       <button class="button button--danger" type="button" data-confirm-revoke>Отозвать доступ</button>
     </div>
   </dialog>
+
+  <dialog class="modal relay-dialog" id="youtube-config-dialog" data-youtube-config-dialog aria-labelledby="youtube-config-title">
+    <form class="modal__form" data-youtube-config-form method="dialog" autocomplete="off">
+      <header class="modal__header">
+        <div>
+          <p class="eyebrow">Назначение потока</p>
+          <h2 id="youtube-config-title">Настроить YouTube</h2>
+        </div>
+        <button class="icon-button icon-button--plain" type="button" data-close-dialog aria-label="Закрыть">×</button>
+      </header>
+
+      <div class="modal__body relay-secret-form">
+        <p class="form-help">
+          Эти данные сохраняются на relay-сервере. В Moblin их вводить не нужно — приложение
+          отправляет видео только на SRT-адрес сервера.
+        </p>
+        <label class="form-field">
+          <span>YouTube RTMPS URL</span>
+          <input
+            name="url"
+            type="url"
+            maxlength="2048"
+            inputmode="url"
+            placeholder="rtmps://…/live2"
+            autocomplete="off"
+            autocapitalize="none"
+            spellcheck="false"
+            required
+          >
+        </label>
+        <label class="form-field">
+          <span>YouTube stream key</span>
+          <input
+            name="stream_key"
+            type="password"
+            maxlength="1024"
+            autocomplete="new-password"
+            autocapitalize="none"
+            spellcheck="false"
+            required
+            data-youtube-stream-key
+          >
+        </label>
+        <label class="form-field">
+          <span>Пароль администратора панели</span>
+          <input
+            name="admin_password"
+            type="password"
+            maxlength="1024"
+            autocomplete="new-password"
+            spellcheck="false"
+            required
+            data-youtube-admin-password
+          >
+        </label>
+        <p class="form-help">
+          Если ретранслятор активен, сначала завершите broadcast в YouTube и остановите relay.
+        </p>
+        <p class="field-error" data-youtube-config-error hidden role="alert"></p>
+      </div>
+
+      <footer class="modal__footer">
+        <button class="button button--quiet" type="button" data-close-dialog>Отмена</button>
+        <button class="button button--primary" type="submit">Сохранить безопасно</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog class="modal modal--confirm relay-clear-dialog" id="youtube-clear-dialog" data-youtube-clear-dialog aria-labelledby="youtube-clear-title">
+    <form data-youtube-clear-form method="dialog" autocomplete="off">
+      <div class="confirm-icon confirm-icon--danger" aria-hidden="true">!</div>
+      <h2 id="youtube-clear-title">Очистить настройки YouTube?</h2>
+      <p>
+        URL и stream key будут удалены с relay-сервера. После этого relay не запустится,
+        пока YouTube не будет настроен заново. Relay должен быть остановлен.
+      </p>
+      <label class="form-field relay-clear-dialog__password">
+        <span>Пароль администратора панели</span>
+        <input
+          name="admin_password"
+          type="password"
+          maxlength="1024"
+          autocomplete="new-password"
+          spellcheck="false"
+          required
+          data-youtube-clear-admin-password
+        >
+      </label>
+      <p class="field-error" data-youtube-clear-error hidden role="alert"></p>
+      <div class="modal__footer">
+        <button class="button button--quiet" type="button" data-close-dialog>Отмена</button>
+        <button class="button button--danger" type="submit">Удалить URL и ключ</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="modal relay-dialog" id="moblin-url-dialog" data-moblin-url-dialog aria-labelledby="moblin-url-title">
+    <form class="modal__form" data-moblin-url-form method="dialog" autocomplete="off">
+      <header class="modal__header">
+        <div>
+          <p class="eyebrow">Входящий поток</p>
+          <h2 id="moblin-url-title">SRT-адрес для Moblin</h2>
+        </div>
+        <button class="icon-button icon-button--plain" type="button" data-close-dialog aria-label="Закрыть">×</button>
+      </header>
+
+      <div class="modal__body relay-secret-form">
+        <p class="form-help">
+          В Moblin откройте: Settings → Streams → профиль → URL. Вставьте только SRT URL.
+          Если Moblin предложит заменить его прямым YouTube RTMP URL, нажмите No.
+        </p>
+        <p class="form-help">
+          Для комментариев отдельно укажите Video ID текущего broadcast:
+          Settings → Streams → профиль → Streaming platforms → YouTube → Manage streams / Video IDs.
+          Video ID и stream key — разные данные; RTMPS URL и stream key в Moblin не вводятся.
+        </p>
+
+        <div data-moblin-reauth>
+          <label class="form-field">
+            <span>Пароль администратора панели</span>
+            <input
+              name="admin_password"
+              type="password"
+              maxlength="1024"
+              autocomplete="new-password"
+              spellcheck="false"
+              required
+              data-moblin-admin-password
+            >
+          </label>
+          <p class="form-help">Адрес содержит секрет доступа, поэтому требуется повторное подтверждение.</p>
+        </div>
+
+        <div class="relay-url-results" data-moblin-url-results hidden aria-live="polite">
+          <div class="form-field relay-url-field" data-public-url-row hidden>
+            <label for="moblin-public-url">Публичный SRT URL</label>
+            <span class="relay-url-field__control">
+              <input id="moblin-public-url" type="text" readonly autocomplete="off" spellcheck="false" data-moblin-public-url data-sensitive-output>
+              <button class="button button--secondary button--small" type="button" data-copy-moblin-url="public">
+                Копировать
+              </button>
+            </span>
+          </div>
+          <div class="form-field relay-url-field" data-vpn-url-row hidden>
+            <label for="moblin-vpn-url">SRT URL через VPN</label>
+            <span class="relay-url-field__control">
+              <input id="moblin-vpn-url" type="text" readonly autocomplete="off" spellcheck="false" data-moblin-vpn-url data-sensitive-output>
+              <button class="button button--secondary button--small" type="button" data-copy-moblin-url="vpn">
+                Копировать
+              </button>
+            </span>
+          </div>
+          <p class="form-help">
+            Не отправляйте эти адреса посторонним: в них находится пароль входящего SRT-потока.
+          </p>
+        </div>
+
+        <p class="field-error" data-moblin-url-error hidden role="alert"></p>
+      </div>
+
+      <footer class="modal__footer">
+        <button class="button button--quiet" type="button" data-close-dialog>Закрыть</button>
+        <button class="button button--primary" type="submit" data-reveal-moblin-url>Показать SRT URL</button>
+      </footer>
+    </form>
+  </dialog>
 {% endblock %}
 
 {% block scripts %}

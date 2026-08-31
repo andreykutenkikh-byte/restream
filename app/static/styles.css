@@ -1733,6 +1733,147 @@ h3 {
   border-top: 1px solid var(--line);
 }
 
+.relay-panel {
+  display: grid;
+  gap: 16px;
+  padding: 18px;
+  border: 1px solid #cfded8;
+  border-radius: var(--radius-md);
+  background: #f7fbf9;
+}
+
+.relay-panel__heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 15px;
+}
+
+.relay-panel__heading h3 {
+  margin: 0 0 4px;
+  font-size: 1rem;
+}
+
+.relay-panel__heading p,
+.relay-panel__notice {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.relay-badge {
+  display: inline-flex;
+  min-height: 25px;
+  align-items: center;
+  padding: 4px 9px;
+  border-radius: 999px;
+  background: #e7e8e5;
+  color: var(--muted-strong);
+  font-size: 0.68rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.relay-badge--success {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.relay-badge--danger {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.relay-panel__notice {
+  padding: 10px 11px;
+  border-radius: 9px;
+  background: rgb(255 255 255 / 75%);
+  line-height: 1.45;
+}
+
+.relay-metrics {
+  display: grid;
+  margin: 0;
+  gap: 7px;
+}
+
+.relay-metrics > div {
+  display: grid;
+  align-items: baseline;
+  gap: 12px;
+  grid-template-columns: minmax(145px, 0.9fr) minmax(0, 1.1fr);
+}
+
+.relay-metrics dt {
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+.relay-metrics dd {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 0.73rem;
+  font-weight: 750;
+  overflow-wrap: anywhere;
+}
+
+.relay-panel__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  padding-top: 13px;
+  border-top: 1px solid #dbe6e1;
+}
+
+.relay-panel__actions .button:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.relay-dialog {
+  width: min(620px, calc(100% - 28px));
+}
+
+.relay-clear-dialog form {
+  display: grid;
+  gap: 17px;
+}
+
+.relay-clear-dialog form > p,
+.relay-clear-dialog form > h2 {
+  margin: 0;
+}
+
+.relay-clear-dialog__password {
+  text-align: left;
+}
+
+.relay-secret-form {
+  gap: 16px;
+}
+
+.relay-url-results {
+  display: grid;
+  gap: 16px;
+}
+
+.relay-url-field__control {
+  display: grid;
+  align-items: stretch;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.relay-url-field__control input {
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+}
+
+.relay-url-field__control .button {
+  min-height: 46px;
+}
+
 .server-dialog {
   width: min(590px, calc(100% - 28px));
 }
@@ -2314,6 +2455,31 @@ h3 {
 
   .server-card__actions .button {
     flex: 1 1 100%;
+  }
+
+  .relay-panel {
+    padding: 15px;
+  }
+
+  .relay-panel__heading,
+  .relay-metrics > div {
+    grid-template-columns: 1fr;
+  }
+
+  .relay-panel__heading {
+    display: grid;
+  }
+
+  .relay-badge {
+    justify-self: start;
+  }
+
+  .relay-panel__actions .button {
+    flex: 1 1 100%;
+  }
+
+  .relay-url-field__control {
+    grid-template-columns: 1fr;
   }
 }
 

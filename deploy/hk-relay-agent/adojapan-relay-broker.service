@@ -1,0 +1,38 @@
+[Unit]
+Description=AdoJapan HK relay privileged broker
+Requires=adojapan-relay-broker.socket
+After=adojapan-relay-broker.socket moblin-relay.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/python3 -Es /usr/local/lib/adojapan-relay-agent/broker-entry.py
+KillMode=control-group
+TasksMax=32
+LimitCORE=0
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+ReadWritePaths=/etc/moblin-relay -/run/lock/moblin-relay -/run/moblin-relay
+ReadOnlyPaths=/usr/local/sbin/relayctl /var/lib/moblin-relay/slate.mp4

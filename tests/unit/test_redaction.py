@@ -32,6 +32,18 @@ def test_destination_url_masks_final_stream_key_path_segment() -> None:
     assert redacted == f"rtmp://example.com/live/{REDACTION_MARKER}"
 
 
+def test_rtmps_mediamtx_fragment_stream_key_is_always_redacted() -> None:
+    marker = "FRAGMENT_STREAM_KEY_CANARY_95"
+    destination = f"rtmps://a.rtmps.youtube.com/live2#{marker}"
+
+    redacted_url = redact_url(destination)
+    redacted_text = redact_text(f"destination={destination}")
+
+    assert marker not in redacted_url
+    assert marker not in redacted_text
+    assert redacted_url == f"rtmps://a.rtmps.youtube.com/live2#{REDACTION_MARKER}"
+
+
 def test_destination_url_can_redact_exact_key_without_path_guessing() -> None:
     redacted = redact_destination_url(
         "rtmp://example.com/live?name=secret-value",

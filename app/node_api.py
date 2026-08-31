@@ -50,7 +50,7 @@ class NodeBodyLimitMiddleware:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if (
             scope["type"] != "http"
-            or not str(scope.get("path", "")).startswith("/node-api/")
+            or not str(scope.get("path", "")).startswith(("/node-api/", "/relay-agent/"))
             or str(scope.get("method", "")).upper() not in {"POST", "PUT", "PATCH"}
         ):
             await self.app(scope, receive, send)

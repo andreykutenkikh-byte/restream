@@ -10,11 +10,24 @@ const {
   MAX_POLL_ATTEMPTS,
   MAX_TRANSIENT_POLL_FAILURES,
   TERMINAL_JOB_STATES,
+  buildAdminPasswordPayload,
   buildBootstrapPayload,
+  buildYouTubeConfigPayload,
+  canRevokeNode,
+  clearSensitiveFields,
+  createRelayIdempotencyKey,
   createPollBudget,
+  hasMoblinRelayCapability,
+  isCurrentSecretRequest,
   normalizeNodeStatus,
+  normalizeRelayStatus,
+  relayCommandOutcome,
+  relayIsOperable,
+  relayIsSafelyStopped,
   safeDisplayString,
+  sanitizeSrtUrl,
   transientPollDelay,
+  wipeSecretObject,
 } = require("../../app/static/servers.js");
 
 const root = path.resolve(__dirname, "../..");
@@ -86,7 +99,7 @@ test("unknown node states fail closed and display strings remove controls", () =
 
 test("password fields use browser-safe attributes and are cleared after acceptance", () => {
   const passwordFields = template.match(/<input[^>]+type="password"[^>]*>/g) || [];
-  assert.equal(passwordFields.length, 2);
+  assert.equal(passwordFields.length, 6);
   for (const field of passwordFields) {
     assert.match(field, /autocomplete="new-password"/);
     assert.match(field, /spellcheck="false"/);
@@ -97,6 +110,127 @@ test("password fields use browser-safe attributes and are cleared after acceptan
   assert.match(source, /sudoPassword = ""/);
 });
 
+test("YouTube payload accepts only RTMPS and compacts accidental whitespace", () => {
+  assert.deepEqual(
+    buildYouTubeConfigPayload({
+      url: "  rtmps://example.test/live2\r\n",
+      stream_key: " abcd-efgh\n-ijkl ",
+      admin_password: "  operator password  ",
+    }),
+    {
+      url: "rtmps://example.test/live2",
+      stream_key: "abcd-efgh-ijkl",
+      admin_password: "  operator password  ",
+    },
+  );
+  assert.throws(
+    () => buildYouTubeConfigPayload({ url: "rtmp://example.test/live2", stream_key: "x", admin_password: "x" }),
+    TypeError,
+  );
+  assert.throws(
+    () => buildYouTubeConfigPayload({ url: "rtmps://example.test/live2#bad", stream_key: "x", admin_password: "x" }),
+    TypeError,
+  );
+  assert.throws(
+    () => buildYouTubeConfigPayload({ url: "rtmps://example.test/live2", stream_key: " \n", admin_password: "x" }),
+    TypeError,
+  );
+  assert.deepEqual(buildAdminPasswordPayload({ admin_password: "secret" }), { admin_password: "secret" });
+});
+
+test("relay status helpers fail closed and never accept injected SRT output", () => {
+  assert.equal(hasMoblinRelayCapability({ capabilities: ["ping", "moblin_relay"] }), true);
+  assert.equal(hasMoblinRelayCapability({ capabilities: ["ping"] }), false);
+  assert.equal(sanitizeSrtUrl("srt://relay.example:8890?streamid=publish:test"), "srt://relay.example:8890?streamid=publish:test");
+  assert.equal(sanitizeSrtUrl("javascript:alert(1)"), "");
+  assert.equal(sanitizeSrtUrl("srt://relay.example/\n<img src=x>"), "");
+  assert.deepEqual(
+    normalizeRelayStatus({
+      available: true,
+      status: {
+        service: "active",
+        source: "live",
+        youtube_url_configured: true,
+        youtube_key_configured: true,
+        portrait_profile: true,
+      },
+    }),
+    {
+      available: true,
+      service: "active",
+      enabled: false,
+      mainProcess: "unknown",
+      srtListener: "unknown",
+      source: "LIVE",
+      youtubeForward: "unknown",
+      overall: "unknown",
+      youtubeUrlConfigured: true,
+      youtubeKeyConfigured: true,
+      portraitProfile: true,
+      lastSeenAt: "",
+    },
+  );
+  assert.equal(normalizeRelayStatus({ available: true, status: { service: "<img>" } }).service, "unknown");
+  const stoppedRelay = normalizeRelayStatus({
+    available: true,
+    status: { service: "inactive", main_process: "stopped", overall: "offline" },
+  });
+  assert.equal(relayIsOperable(stoppedRelay), true);
+  assert.equal(relayIsSafelyStopped(stoppedRelay), true);
+  assert.equal(
+    relayIsSafelyStopped(normalizeRelayStatus({
+      available: true,
+      status: { service: "inactive", main_process: "running" },
+    })),
+    false,
+  );
+  assert.equal(
+    relayIsSafelyStopped(normalizeRelayStatus({
+      available: true,
+      status: { service: "unknown", main_process: "stopped" },
+    })),
+    false,
+  );
+  assert.equal(relayIsOperable(normalizeRelayStatus({ available: false, status: { overall: "healthy" } })), false);
+  assert.equal(relayCommandOutcome({ state: "completed", completion_status: "ok" }), "success");
+  assert.equal(relayCommandOutcome({ state: "completed", completion_status: "conflict" }), "conflict");
+  assert.equal(relayCommandOutcome({ state: "completed" }), "failed");
+  assert.equal(relayCommandOutcome({ state: "acknowledged" }), "pending");
+});
+
+test("relay secrets and revealed URLs have explicit cleanup helpers", () => {
+  const secretField = { value: "stream-secret" };
+  const outputField = { value: "srt://secret-url" };
+  clearSensitiveFields({ querySelectorAll: () => [secretField, outputField] });
+  assert.equal(secretField.value, "");
+  assert.equal(outputField.value, "");
+
+  const payload = {
+    url: "rtmps://safe-endpoint/live2",
+    stream_key: "stream-secret",
+    admin_password: "admin-secret",
+    public_url: "srt://public-secret",
+    vpn_url: "srt://vpn-secret",
+  };
+  wipeSecretObject(payload);
+  assert.deepEqual(payload, {
+    url: "rtmps://safe-endpoint/live2",
+    stream_key: "",
+    admin_password: "",
+    public_url: "",
+    vpn_url: "",
+  });
+});
+
+test("late secret responses are rejected after close, navigation, or node change", () => {
+  assert.equal(isCurrentSecretRequest("node-a", "node-a", 7, 7, true), true);
+  assert.equal(isCurrentSecretRequest("node-a", "node-a", 7, 8, true), false);
+  assert.equal(isCurrentSecretRequest("node-a", "node-b", 7, 7, true), false);
+  assert.equal(isCurrentSecretRequest("node-a", "node-a", 7, 7, false), false);
+  assert.equal(createRelayIdempotencyKey("reveal-moblin", "12345678-abcd"), "ui:reveal-moblin:12345678-abcd");
+  assert.equal(createRelayIdempotencyKey("BAD ACTION", "12345678-abcd"), null);
+});
+
 test("server rendering never uses HTML injection or browser persistence", () => {
   assert.doesNotMatch(source, /innerHTML/);
   assert.doesNotMatch(source, /localStorage/);
@@ -105,17 +239,66 @@ test("server rendering never uses HTML injection or browser persistence", () => 
   assert.match(source, /replaceChildren/);
 });
 
+test("relay UI never persists or displays YouTube secrets", () => {
+  assert.match(template, /data-youtube-config-form[^>]+method="dialog"/);
+  assert.match(template, /data-youtube-config-form[^>]+autocomplete="off"/);
+  assert.match(template, /name="stream_key"[\s\S]*?type="password"[\s\S]*?autocomplete="new-password"/);
+  assert.match(template, /name="admin_password"[\s\S]*?type="password"[\s\S]*?autocomplete="new-password"/);
+  assert.match(template, /data-sensitive-output/);
+  assert.match(template, /data-youtube-clear-form[^>]+autocomplete="off"/);
+  assert.match(template, /data-youtube-clear-form[^>]+method="dialog"/);
+  assert.match(template, /data-moblin-url-form[^>]+method="dialog"/);
+  assert.match(template, /data-youtube-config-dialog aria-labelledby="youtube-config-title"/);
+  assert.match(template, /data-youtube-clear-dialog aria-labelledby="youtube-clear-title"/);
+  assert.match(template, /data-moblin-url-dialog aria-labelledby="moblin-url-title"/);
+  assert.match(template, /Relay должен быть остановлен/);
+  assert.match(template, /Settings → Streams → профиль → URL/);
+  assert.match(template, /прямым YouTube RTMP URL, нажмите No/);
+  assert.doesNotMatch(source, /\.innerHTML\s*=/);
+  assert.doesNotMatch(source, /localStorage|sessionStorage|indexedDB/);
+  assert.match(source, /wipeSecretObject\(payload\)/);
+  assert.match(source, /wipeSecretObject\(response\)/);
+  assert.match(source, /window\.addEventListener\("pagehide"/);
+  assert.match(source, /if \(!requestIsCurrent\(\)\) return;/);
+  assert.match(source, /serverErrorCode\(payload\) !== "step_up_failed"/);
+  assert.doesNotMatch(source, /console\.(?:log|debug|info|warn|error)/);
+});
+
+test("relay controls use safe endpoints and explicit start-stop confirmation", () => {
+  assert.match(source, /\/relay\/configure-youtube/);
+  assert.match(source, /\/relay\/reveal-moblin-url/);
+  assert.match(source, /method: "DELETE"/);
+  assert.match(source, /\/relay\/youtube/);
+  assert.match(source, /\/relay\/\$\{encodeURIComponent\(action\)\}/);
+  assert.match(source, /\/relay\/commands\/\$\{encodeURIComponent\(commandId\)\}/);
+  assert.doesNotMatch(source, /waitForCommand\(nodeId, commandId\)[\s\S]{0,100}Relay/);
+  assert.match(source, /window\.confirm\(confirmations\[action\]\)/);
+  assert.match(source, /Это немедленно прервёт отправку потока/);
+  assert.match(source, /!publicUrl && !vpnUrl && typeof response\?\.command_id === "string"/);
+  assert.match(source, /createRelayIdempotencyKey\("reveal-moblin"\)/);
+  assert.match(source, /waitForRelayCommand\(nodeId, response\.command_id, \{ isCurrent: requestIsCurrent \}\)/);
+  assert.match(source, /`\$\{endpoint\}\?wait=0`/);
+  assert.match(source, /SRT URL готовится/);
+  assert.match(source, /youtubeUrlConfigured \? "Настроен" : "Не настроен"/);
+  assert.match(source, /youtubeKeyConfigured \? "Настроен" : "Не настроен"/);
+  assert.match(source, /if \(completed\) \{\s*showToast\("YouTube настроен"/);
+  assert.match(source, /if \(completed\) \{\s*showToast\("YouTube очищен"/);
+  assert.doesNotMatch(source, /setRelayMetric\([^\n]+stream[_ -]?key[^\n]+status\.stream/i);
+});
+
 test("self-test action is enabled only for operable node states", () => {
+  assert.match(source, /if \(!relayCapable\) \{[\s\S]{0,240}"Проверить сервер"/);
   assert.match(
     source,
     /selfTest\.disabled = !\["ready", "degraded", "offline"\]\.includes\(status\)/,
   );
   assert.match(source, /control_latency_ms/);
   assert.match(source, /metricRow\(metrics, "Связь с панелью", controlLatencyLabel\)/);
-  assert.match(
-    source,
-    /revoke\.disabled = !\["ready", "degraded", "offline"\]\.includes\(status\)/,
-  );
+  assert.equal(canRevokeNode("connecting", true), true);
+  assert.equal(canRevokeNode("connecting", false), false);
+  assert.equal(canRevokeNode("ready", false), true);
+  assert.equal(canRevokeNode("revoked", true), false);
+  assert.match(source, /revoke\.disabled = !canRevokeNode\(status, relayCapable\)/);
 });
 
 test("UI includes progress, sudo, revoke confirmation, and mobile layout", () => {

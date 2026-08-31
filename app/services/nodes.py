@@ -153,12 +153,14 @@ class NodeService:
         *,
         clock: Clock = _now,
         event_limit: int = 1000,
+        relay_payload_tombstone: str | None = None,
     ) -> None:
         if event_limit < 1:
             raise ValueError("event_limit must be positive")
         self.database = database
         self.clock = clock
         self.event_limit = event_limit
+        self._relay_payload_tombstone = relay_payload_tombstone
 
     def _time(self) -> datetime:
         return _as_utc(self.clock())
@@ -247,7 +249,7 @@ class NodeService:
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             node = connection.execute(
-                "SELECT status FROM restream_nodes WHERE id = ?", (node_id,)
+                "SELECT status, capabilities_json FROM restream_nodes WHERE id = ?", (node_id,)
             ).fetchone()
             if node is None:
                 connection.execute("ROLLBACK")
@@ -418,7 +420,7 @@ class NodeService:
             row = connection.execute(
                 """
                 SELECT credential.node_id, credential.token_digest, credential.revoked_at,
-                       node.status, node.protocol_version
+                       node.status, node.protocol_version, node.capabilities_json
                 FROM node_credentials AS credential
                 JOIN restream_nodes AS node ON node.id = credential.node_id
                 WHERE credential.node_id = ?
@@ -432,6 +434,15 @@ class NodeService:
             or row["revoked_at"] is not None
             or row["status"] == "revoked"
         ):
+            raise NodeAuthenticationError("node authentication failed")
+        try:
+            capabilities = json.loads(str(row["capabilities_json"]))
+        except (TypeError, ValueError):
+            capabilities = []
+        # Native relay credentials share the identity/credential tables so the
+        # server list has one node ID. They belong to a distinct protocol trust
+        # domain and must never authenticate to the generic Node Agent API.
+        if "moblin_relay" in capabilities:
             raise NodeAuthenticationError("node authentication failed")
         if require_supported_protocol and row["protocol_version"] != SUPPORTED_PROTOCOL_VERSION:
             raise UnsupportedProtocolError("unsupported node protocol version")
@@ -567,6 +578,7 @@ class NodeService:
             node = connection.execute(
                 """
                 SELECT node.status, node.protocol_version,
+                       node.capabilities_json,
                        credential.node_id AS credential_node_id,
                        credential.revoked_at AS credential_revoked_at
                 FROM restream_nodes AS node
@@ -584,6 +596,13 @@ class NodeService:
             if node["credential_node_id"] is None or node["status"] in {"installing", "failed"}:
                 connection.execute("ROLLBACK")
                 raise NodeUnavailableError("node is not ready for commands")
+            try:
+                capabilities = json.loads(str(node["capabilities_json"]))
+            except (TypeError, ValueError):
+                capabilities = []
+            if "moblin_relay" in capabilities:
+                connection.execute("ROLLBACK")
+                raise NodeUnavailableError("node does not support generic commands")
             if node["protocol_version"] != SUPPORTED_PROTOCOL_VERSION:
                 connection.execute("ROLLBACK")
                 raise UnsupportedProtocolError("unsupported node protocol version")
@@ -874,7 +893,8 @@ class NodeService:
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             node = connection.execute(
-                "SELECT status FROM restream_nodes WHERE id = ?", (node_id,)
+                "SELECT status, capabilities_json FROM restream_nodes WHERE id = ?",
+                (node_id,),
             ).fetchone()
             if node is None:
                 connection.execute("ROLLBACK")
@@ -890,13 +910,29 @@ class NodeService:
             if active_job is not None:
                 connection.execute("ROLLBACK")
                 raise NodeUnavailableError("node bootstrap must finish before revocation")
-            if node["status"] not in {"ready", "degraded", "offline", "revoked"}:
+            relay = connection.execute(
+                "SELECT 1 FROM relay_nodes WHERE node_id = ?",
+                (node_id,),
+            ).fetchone()
+            try:
+                capabilities = json.loads(str(node["capabilities_json"]))
+            except (TypeError, ValueError):
+                capabilities = []
+            is_relay = relay is not None and "moblin_relay" in capabilities
+            allowed_statuses = {"ready", "degraded", "offline", "revoked"}
+            if is_relay:
+                allowed_statuses.add("connecting")
+            if node["status"] not in allowed_statuses:
                 connection.execute("ROLLBACK")
                 raise NodeUnavailableError("node bootstrap must finish before revocation")
+            if relay is not None and not self._relay_payload_tombstone:
+                connection.execute("ROLLBACK")
+                raise NodeUnavailableError("relay revocation requires payload erasure support")
             connection.execute(
                 """
                 UPDATE restream_nodes
-                SET status = 'revoked', revoked_at = COALESCE(revoked_at, ?), updated_at = ?
+                SET status = 'revoked', revoked_at = COALESCE(revoked_at, ?),
+                    current_command_id = NULL, updated_at = ?
                 WHERE id = ?
                 """,
                 (now, now, node_id),
@@ -923,6 +959,39 @@ class NodeService:
                 """,
                 (now, node_id),
             )
+            if relay is not None:
+                connection.execute(
+                    """
+                    UPDATE relay_commands
+                    SET state = 'cancelled', lease_until = NULL, completed_at = ?,
+                        completion_status = 'failed',
+                        safe_result_json = ?, secret_result_encrypted = NULL,
+                        payload_encrypted = ?
+                    WHERE node_id = ? AND state IN ('queued', 'leased', 'acknowledged')
+                    """,
+                    (
+                        now,
+                        _json({"error_code": "internal_error"}),
+                        self._relay_payload_tombstone,
+                        node_id,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE relay_nodes SET current_command_id = NULL, updated_at = ?
+                    WHERE node_id = ?
+                    """,
+                    (now, node_id),
+                )
+                connection.execute(
+                    """
+                    UPDATE relay_commands
+                    SET secret_result_encrypted = NULL,
+                        secret_consumed_at = COALESCE(secret_consumed_at, ?)
+                    WHERE node_id = ? AND secret_result_encrypted IS NOT NULL
+                    """,
+                    (now, node_id),
+                )
             if node["status"] != "revoked":
                 self._add_event(connection, node_id, "node.revoked")
             connection.execute("COMMIT")

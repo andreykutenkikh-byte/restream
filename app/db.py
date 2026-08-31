@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utc_now() -> str:
@@ -201,10 +201,89 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_node_events_node_created
                     ON node_events(node_id, created_at DESC, id DESC);
+                CREATE TABLE IF NOT EXISTS relay_nodes (
+                    node_id TEXT PRIMARY KEY
+                        REFERENCES restream_nodes(id) ON DELETE CASCADE,
+                    service_state TEXT NOT NULL DEFAULT 'unknown' CHECK (
+                        service_state IN ('active', 'inactive', 'failed', 'unknown')
+                    ),
+                    service_enabled INTEGER NOT NULL DEFAULT 0 CHECK (
+                        service_enabled IN (0, 1)
+                    ),
+                    main_process TEXT NOT NULL DEFAULT 'unknown' CHECK (
+                        main_process IN ('running', 'stopped', 'failed', 'unknown')
+                    ),
+                    srt_listener TEXT NOT NULL DEFAULT 'unknown' CHECK (
+                        srt_listener IN ('listening', 'closed', 'failed', 'unknown')
+                    ),
+                    source TEXT NOT NULL DEFAULT 'UNKNOWN' CHECK (
+                        source IN ('SLATE', 'LIVE', 'NONE', 'UNKNOWN')
+                    ),
+                    youtube_forward TEXT NOT NULL DEFAULT 'unknown' CHECK (
+                        youtube_forward IN ('active', 'inactive', 'connecting', 'failed', 'unknown')
+                    ),
+                    overall TEXT NOT NULL DEFAULT 'unknown' CHECK (
+                        overall IN ('ok', 'healthy', 'degraded', 'failed', 'offline', 'unknown')
+                    ),
+                    youtube_url_configured INTEGER NOT NULL DEFAULT 0 CHECK (
+                        youtube_url_configured IN (0, 1)
+                    ),
+                    youtube_key_configured INTEGER NOT NULL DEFAULT 0 CHECK (
+                        youtube_key_configured IN (0, 1)
+                    ),
+                    healthy INTEGER NOT NULL DEFAULT 0 CHECK (healthy IN (0, 1)),
+                    portrait_profile INTEGER NOT NULL DEFAULT 0 CHECK (
+                        portrait_profile IN (0, 1)
+                    ),
+                    last_error_code TEXT,
+                    current_command_id TEXT,
+                    last_seen_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_relay_nodes_last_seen
+                    ON relay_nodes(last_seen_at);
+                CREATE TABLE IF NOT EXISTS relay_commands (
+                    id TEXT PRIMARY KEY,
+                    node_id TEXT NOT NULL REFERENCES relay_nodes(node_id) ON DELETE CASCADE,
+                    command_type TEXT NOT NULL CHECK (
+                        command_type IN (
+                            'STATUS', 'START', 'STOP', 'CONFIGURE_YOUTUBE',
+                            'REVEAL_MOBLIN_URL', 'CLEAR_YOUTUBE'
+                        )
+                    ),
+                    payload_encrypted TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (
+                        state IN (
+                            'queued', 'leased', 'acknowledged', 'completed',
+                            'failed', 'cancelled'
+                        )
+                    ),
+                    lease_until TEXT,
+                    expires_at TEXT NOT NULL,
+                    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+                    idempotency_key TEXT NOT NULL,
+                    request_fingerprint TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    acknowledged_at TEXT,
+                    completed_at TEXT,
+                    completion_status TEXT CHECK (
+                        completion_status IS NULL OR
+                        completion_status IN ('ok', 'failed', 'conflict')
+                    ),
+                    safe_result_json TEXT,
+                    secret_result_encrypted TEXT,
+                    secret_consumed_at TEXT,
+                    UNIQUE(node_id, idempotency_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_relay_commands_delivery
+                    ON relay_commands(node_id, state, lease_until, expires_at, created_at);
                 INSERT OR IGNORE INTO schema_migrations(version, applied_at)
                     VALUES (1, CURRENT_TIMESTAMP);
                 INSERT OR IGNORE INTO schema_migrations(version, applied_at)
                     VALUES (2, CURRENT_TIMESTAMP);
+                INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+                    VALUES (3, CURRENT_TIMESTAMP);
                 COMMIT;
                 """
             )
@@ -221,6 +300,19 @@ class Database:
                         control_latency_ms IS NULL OR
                         control_latency_ms BETWEEN 0 AND 60000
                     )
+                    """
+                )
+                connection.execute("COMMIT")
+            relay_command_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(relay_commands)").fetchall()
+            }
+            if "request_fingerprint" not in relay_command_columns:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    ALTER TABLE relay_commands
+                    ADD COLUMN request_fingerprint TEXT NOT NULL DEFAULT ''
                     """
                 )
                 connection.execute("COMMIT")

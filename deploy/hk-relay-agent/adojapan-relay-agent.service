@@ -1,0 +1,43 @@
+[Unit]
+Description=AdoJapan native HK relay control agent
+After=network-online.target adojapan-relay-broker.socket
+Wants=network-online.target
+Requires=adojapan-relay-broker.socket
+
+[Service]
+Type=simple
+User=restream-agent
+Group=restream-agent
+WorkingDirectory=/var/lib/adojapan-relay-agent
+ExecStart=/usr/bin/python3 -Es /usr/local/lib/adojapan-relay-agent/agent-entry.py
+Restart=on-failure
+RestartSec=5s
+LimitCORE=0
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SocketBindDeny=any
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+ReadWritePaths=/var/lib/adojapan-relay-agent
+ReadOnlyPaths=/etc/adojapan-relay-agent/node.token
+
+[Install]
+WantedBy=multi-user.target

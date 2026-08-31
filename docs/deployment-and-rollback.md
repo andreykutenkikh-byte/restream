@@ -1,12 +1,216 @@
-# Future deployment and rollback
+# Production deployment and rollback
 
-Production deployment and remote-node onboarding require separate, explicitly approved change
-windows. This document is a gated plan only. Preparing Stage 4A did not deploy the application,
-connect to a production server, change DNS/firewalls/reverse proxy, restart an existing service,
-or create production credentials.
+Production changes and remote-node onboarding require separate, explicitly approved change
+windows. Use the incremental procedure below when the `adojapan-restream` project already exists.
+The first-install procedure later in this document applies only when the project is absent. Never
+combine the two procedures or repeat first-install DNS, proxy, firewall, or secret initialization
+during an incremental application release.
 
-The planned shared host is `147.45.231.225`. An attached restream node is a different host and
-must pass the onboarding gates in [Node onboarding](node-onboarding.md).
+The shared control-plane host is `147.45.231.225`. An attached restream node is a different host
+and must pass the onboarding gates in [Node onboarding](node-onboarding.md).
+
+## Incremental relay-control release (schema v3)
+
+The native Moblin relay-control release changes the backend application, static UI, and SQLite
+schema from version 2 to version 3. It does not change the bootstrap image, MediaMTX image or
+configuration, Compose model, reverse-proxy site, ports, or production environment. Consequently,
+build and recreate **only** `backend`. `bootstrap` and `mediamtx` must retain their container IDs,
+start times, restart counts, and OOM state.
+
+Before the window, require a successful CI run for the exact reviewed commit and a clean checkout.
+Preserve the existing production `.env`, bootstrap secret file, and `MASTER_ENCRYPTION_KEY`; do not
+print, regenerate, or rotate them. Read the live reverse-proxy configuration without changing it
+and verify that the general proxy location forwards `Authorization` and permits a request longer
+than the relay agent's 20-second long poll. The reviewed 30-second proxy read timeout is sufficient.
+
+Capture the release commit, current backend container/image, and all three container IDs before
+building. Keep a rollback tag for the exact old backend image; a subsequent build otherwise moves
+the normal project image tag.
+
+```bash
+test -z "$(git status --porcelain)"
+release_commit="$(git rev-parse HEAD)"
+release_backend_container="$(docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml ps -q backend)"
+test -n "$release_backend_container"
+release_old_image="$(docker inspect --format '{{.Image}}' "$release_backend_container")"
+release_bootstrap_container="$(docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml ps -q bootstrap)"
+release_mediamtx_container="$(docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml ps -q mediamtx)"
+test -n "$release_bootstrap_container"
+test -n "$release_mediamtx_container"
+release_bootstrap_fingerprint="$(docker inspect --format \
+  '{{.Id}}|{{.State.StartedAt}}|{{.RestartCount}}|{{.State.OOMKilled}}' \
+  "$release_bootstrap_container")"
+release_mediamtx_fingerprint="$(docker inspect --format \
+  '{{.Id}}|{{.State.StartedAt}}|{{.RestartCount}}|{{.State.OOMKilled}}' \
+  "$release_mediamtx_container")"
+docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml config --quiet
+docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml exec -T backend python - <<'PY'
+import sqlite3
+
+with sqlite3.connect("/srv/app/data/restream.db") as connection:
+    if connection.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+        raise SystemExit("Live database integrity check failed")
+    if connection.execute(
+        "SELECT MAX(version) FROM schema_migrations"
+    ).fetchone() != (2,):
+        raise SystemExit("Live database is not the expected schema v2")
+print("Live schema v2 verified")
+PY
+release_old_image_hex="${release_old_image#sha256:}"
+case "$release_old_image_hex" in
+  ''|*[!0-9a-f]*) printf '%s\n' 'Unexpected old backend image ID' >&2; exit 1 ;;
+esac
+test "${#release_old_image_hex}" -eq 64
+release_old_tag="adojapan-restream-backend:pre-relay-v3-$release_old_image_hex"
+if docker image inspect "$release_old_tag" >/dev/null 2>&1; then
+  release_tagged_image="$(docker image inspect --format '{{.Id}}' "$release_old_tag")"
+  test "$release_tagged_image" = "$release_old_image" || {
+    printf '%s\n' 'Rollback tag exists for a different image; refusing to overwrite it' >&2
+    exit 1
+  }
+else
+  docker image tag "$release_old_image" "$release_old_tag"
+fi
+docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml ps
+```
+
+Create the SQLite backup through the running backend so SQLite includes the WAL consistently.
+Both database and backup storage are named Compose volumes; a host-side
+`python scripts/restore.py backups/... --database data/...` command does **not** address those
+production volumes. The backup contains encrypted application secrets and session data, so copy it
+out of the container only to a protected mode-`0600` file and retain its checksum privately.
+
+```bash
+release_backup="$(docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml exec -T backend \
+  python scripts/backup.py --retain 14 | tr -d '\r')"
+case "$release_backup" in
+  /srv/app/backups/adojapan-restream-*.db) ;;
+  *) printf '%s\n' 'Unexpected backup path' >&2; exit 1 ;;
+esac
+docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml exec -T backend \
+  python - "$release_backup" <<'PY'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as connection:
+    if connection.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+        raise SystemExit("Backup integrity check failed")
+    if connection.execute(
+        "SELECT MAX(version) FROM schema_migrations"
+    ).fetchone() != (2,):
+        raise SystemExit("Unexpected pre-release schema")
+print("Backup verified")
+PY
+install -d -m 0700 backups
+release_backup_copy="backups/$(basename "$release_backup")"
+docker cp "$release_backend_container:$release_backup" "$release_backup_copy"
+chmod 0600 "$release_backup_copy"
+```
+
+Build and recreate only the backend. Do not pass `--build` to a project-wide `up`, and do not use
+`restart`: a recreated container is required to load the new image.
+
+```bash
+docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml build backend
+docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml up -d --no-deps --wait --wait-timeout 90 backend
+curl --fail --silent http://127.0.0.1:8088/health/live
+curl --fail --silent http://127.0.0.1:8088/health/ready
+docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml exec -T backend python - <<'PY'
+import sqlite3
+
+with sqlite3.connect("/srv/app/data/restream.db") as connection:
+    version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+    tables = {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_schema WHERE type = 'table'"
+        )
+    }
+if version != (3,) or not {"relay_nodes", "relay_commands"}.issubset(tables):
+    raise SystemExit("Schema v3 verification failed")
+print("Schema v3 verified")
+PY
+release_new_backend_container="$(docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml ps -q backend)"
+test -n "$release_new_backend_container"
+test "$release_new_backend_container" != "$release_backend_container"
+test "$(docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml ps -q bootstrap)" = \
+  "$release_bootstrap_container"
+test "$(docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml ps -q mediamtx)" = \
+  "$release_mediamtx_container"
+test "$(docker inspect --format \
+  '{{.Id}}|{{.State.StartedAt}}|{{.RestartCount}}|{{.State.OOMKilled}}' \
+  "$release_bootstrap_container")" = "$release_bootstrap_fingerprint"
+test "$(docker inspect --format \
+  '{{.Id}}|{{.State.StartedAt}}|{{.RestartCount}}|{{.State.OOMKilled}}' \
+  "$release_mediamtx_container")" = "$release_mediamtx_fingerprint"
+printf '%s\n' 'Backend-only container isolation verified'
+```
+
+Compare the saved IDs with the post-start snapshot. Only the backend ID and start time may change.
+Verify HTTPS login/logout, `/servers`, CSRF, the relay status facade, restart count, and OOM state.
+Do not provision or activate the HK agent until these checks pass. The native agent release does
+not require publishing or changing `NODE_AGENT_IMAGE` because it is not a Docker Node Agent.
+
+### Incremental rollback from schema v3
+
+The previous backend expects schema version 2 exactly and will fail readiness against schema 3.
+Code-only rollback is therefore unsafe. Stop only the HK control agent first if it was activated;
+never stop, start, enable, disable, or reconfigure `moblin-relay.service` as part of control-plane
+rollback. Then stop only the backend, restore the verified pre-release database through a one-off
+Compose container that mounts the named volumes, restore the saved backend image tag, and recreate
+only the backend.
+
+```bash
+docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml stop backend
+docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml run --rm --no-deps backend \
+  python scripts/restore.py "$release_backup" \
+  --database /srv/app/data/restream.db --confirm RESTORE_ADOJAPAN_RESTREAM
+docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml run --rm --no-deps backend \
+  python -c 'import sqlite3; c=sqlite3.connect("/srv/app/data/restream.db"); assert c.execute("PRAGMA integrity_check").fetchone() == ("ok",); assert c.execute("SELECT MAX(version) FROM schema_migrations").fetchone() == (2,); print("Schema v2 backup restored")'
+test "$(docker image inspect --format '{{.Id}}' "$release_old_tag")" = "$release_old_image"
+docker image tag "$release_old_tag" adojapan-restream-backend:latest
+docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml up -d --no-deps --force-recreate \
+  --wait --wait-timeout 90 backend
+curl --fail --silent http://127.0.0.1:8088/health/live
+curl --fail --silent http://127.0.0.1:8088/health/ready
+test "$(docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml ps -q bootstrap)" = \
+  "$release_bootstrap_container"
+test "$(docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml ps -q mediamtx)" = \
+  "$release_mediamtx_container"
+test "$(docker inspect --format \
+  '{{.Id}}|{{.State.StartedAt}}|{{.RestartCount}}|{{.State.OOMKilled}}' \
+  "$release_bootstrap_container")" = "$release_bootstrap_fingerprint"
+test "$(docker inspect --format \
+  '{{.Id}}|{{.State.StartedAt}}|{{.RestartCount}}|{{.State.OOMKilled}}' \
+  "$release_mediamtx_container")" = "$release_mediamtx_fingerprint"
+printf '%s\n' 'Rollback preserved bootstrap and MediaMTX containers'
+```
+
+Restoring the pre-release database discards every database change made after the backup, including
+relay enrollment and queued commands. Use a maintenance window and decide explicitly whether that
+loss is acceptable before deployment. Retain the old image and protected backup until the rollback
+window closes. Never use project-wide `down`, delete a volume, reload the proxy, restart Docker, or
+touch `bootstrap`/`mediamtx` for this incremental rollback.
 
 ## Required production profile
 
@@ -95,7 +299,10 @@ SELinux remains Enforcing, Docker is installed from the allowlisted official-com
 the exact Node Agent digest is used, and no host port/host network/socket mount appears. This plan
 does not authorize contacting or modifying that VPS during the coding PR.
 
-## Control-plane deployment
+## First control-plane deployment only
+
+Use this section only when the `adojapan-restream` Compose project is absent. For an existing
+production installation, use the incremental procedure above.
 
 1. Install the reviewed repository under `/opt/adojapan-restream` with a root/deployment-owned
    production `.env` and a bootstrap secret file excluded from Git, both mode `0600`. The dedicated
@@ -123,7 +330,7 @@ Do not combine first control-plane rollout, DNS/firewall cutover, and first real
 unless one reviewed change plan explicitly authorizes and sequences all three. Stage 4A nodes do
 not carry video, so onboarding one does not validate a media path.
 
-## Control-plane rollback
+## First-deployment project rollback
 
 Stop and remove only this Compose project while preserving persistent volumes:
 
@@ -133,11 +340,14 @@ docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.pr
 
 Restore only the dedicated reverse-proxy site backup and safely reload the existing proxy. If a
 database rollback is explicitly approved, keep the backend stopped and restore only a selected
-project backup:
+project backup through a one-off container that mounts the project's named volumes:
 
 ```bash
-python scripts/restore.py backups/adojapan-restream-YYYYMMDDTHHMMSSZ.db \
-  --database data/restream.db --confirm RESTORE_ADOJAPAN_RESTREAM
+docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml run --rm --no-deps backend \
+  python scripts/restore.py \
+  /srv/app/backups/adojapan-restream-YYYYMMDDTHHMMSSZ.db \
+  --database /srv/app/data/restream.db --confirm RESTORE_ADOJAPAN_RESTREAM
 ```
 
 Ordinary rollback never deletes persistent volumes. Volume deletion requires a separate reviewed

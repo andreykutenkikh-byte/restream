@@ -224,7 +224,7 @@ def test_schema_v1_upgrade_preserves_existing_restream_data(tmp_path: Path) -> N
             upgraded.execute("SELECT MAX(version) AS version FROM schema_migrations").fetchone()[
                 "version"
             ]
-            == 2
+            == 3
         )
         node_tables = {
             str(row["name"])

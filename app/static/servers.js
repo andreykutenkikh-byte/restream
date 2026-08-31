@@ -83,17 +83,146 @@
     return Math.min(POLL_INTERVAL_MS * 2 ** (failureCount - 1), MAX_TRANSIENT_POLL_DELAY_MS);
   }
 
+  function hasMoblinRelayCapability(node) {
+    return Array.isArray(node?.capabilities) && node.capabilities.includes("moblin_relay");
+  }
+
+  function canRevokeNode(status, relayCapable = false) {
+    return ["ready", "degraded", "offline"].includes(status)
+      || (relayCapable === true && status === "connecting");
+  }
+
+  function compactRelayValue(value) {
+    return String(value || "").replace(/\s+/g, "");
+  }
+
+  function buildYouTubeConfigPayload(formValues) {
+    const url = compactRelayValue(formValues?.url);
+    const streamKey = compactRelayValue(formValues?.stream_key);
+    const adminPassword = String(formValues?.admin_password || "");
+    if (!url.startsWith("rtmps://") || url.includes("#")) {
+      throw new TypeError("Укажите RTMPS URL без символа #.");
+    }
+    if (!streamKey) throw new TypeError("Введите YouTube stream key.");
+    if (!adminPassword.trim()) throw new TypeError("Введите пароль администратора панели.");
+    return { url, stream_key: streamKey, admin_password: adminPassword };
+  }
+
+  function buildAdminPasswordPayload(formValues) {
+    const adminPassword = String(formValues?.admin_password || "");
+    if (!adminPassword.trim()) throw new TypeError("Введите пароль администратора панели.");
+    return { admin_password: adminPassword };
+  }
+
+  function sanitizeSrtUrl(value) {
+    if (typeof value !== "string" || value.length > 4096 || /[\u0000-\u001f\u007f]/.test(value)) return "";
+    const candidate = value.trim();
+    return candidate.startsWith("srt://") ? candidate : "";
+  }
+
+  function clearSensitiveFields(container) {
+    if (!container || typeof container.querySelectorAll !== "function") return;
+    container.querySelectorAll('input[type="password"], [data-sensitive-output]').forEach((field) => {
+      if ("value" in field) field.value = "";
+      else field.textContent = "";
+    });
+  }
+
+  function wipeSecretObject(payload) {
+    if (!payload || typeof payload !== "object") return;
+    for (const key of ["stream_key", "admin_password", "public_url", "vpn_url"]) {
+      if (Object.hasOwn(payload, key)) payload[key] = "";
+    }
+  }
+
+  function createRelayIdempotencyKey(action, nonce = globalScope.crypto?.randomUUID?.()) {
+    const safeAction = typeof action === "string" && /^[a-z0-9_-]{1,32}$/.test(action) ? action : "";
+    const safeNonce = typeof nonce === "string" && /^[A-Za-z0-9-]{8,64}$/.test(nonce) ? nonce : "";
+    return safeAction && safeNonce ? `ui:${safeAction}:${safeNonce}` : null;
+  }
+
+  function isCurrentSecretRequest(
+    expectedNodeId,
+    currentNodeId,
+    expectedGeneration,
+    currentGeneration,
+    dialogOpen,
+  ) {
+    return Boolean(
+      expectedNodeId
+      && String(currentNodeId || "") === String(expectedNodeId)
+      && Number.isInteger(expectedGeneration)
+      && expectedGeneration === currentGeneration
+      && dialogOpen === true,
+    );
+  }
+
+  function normalizeRelayStatus(payload) {
+    const status = payload?.status && typeof payload.status === "object" ? payload.status : {};
+    const token = (value, allowed, fallback = "unknown") => {
+      const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+      return allowed.includes(normalized) ? normalized : fallback;
+    };
+    const source = typeof status.source === "string" ? status.source.trim().toUpperCase() : "";
+    return {
+      available: payload?.available === true,
+      service: token(status.service, ["active", "inactive", "activating", "deactivating", "failed"]),
+      enabled: status.enabled === true,
+      mainProcess: token(status.main_process, ["running", "stopped", "failed", "unknown"]),
+      srtListener: token(status.srt_listener, ["listening", "closed", "failed", "unknown"]),
+      source: ["SLATE", "LIVE"].includes(source) ? source : "unknown",
+      youtubeForward: token(status.youtube_forward, ["active", "inactive", "connecting", "failed", "unknown"]),
+      overall: token(status.overall, ["ok", "healthy", "degraded", "failed", "offline", "unknown"]),
+      youtubeUrlConfigured: status.youtube_url_configured === true,
+      youtubeKeyConfigured: status.youtube_key_configured === true,
+      portraitProfile: status.portrait_profile === true,
+      lastSeenAt: typeof payload?.last_seen_at === "string" ? payload.last_seen_at : "",
+    };
+  }
+
+  function relayIsOperable(relay) {
+    return relay?.available === true;
+  }
+
+  function relayIsSafelyStopped(relay) {
+    return relay?.service === "inactive" && relay?.mainProcess === "stopped";
+  }
+
+  function relayCommandOutcome(command) {
+    const state = typeof command?.state === "string" ? command.state.toLowerCase() : "";
+    const completion = typeof command?.completion_status === "string"
+      ? command.completion_status.toLowerCase()
+      : typeof command?.status === "string" ? command.status.toLowerCase() : "";
+    if (state === "completed" && completion === "ok") return "success";
+    if (completion === "conflict") return "conflict";
+    if (["completed", "failed", "cancelled"].includes(state)) return "failed";
+    return "pending";
+  }
+
   const exported = {
     MAX_POLL_ATTEMPTS,
     MAX_COMMAND_POLL_ATTEMPTS,
     MAX_TRANSIENT_POLL_FAILURES,
     POLL_INTERVAL_MS,
     TERMINAL_JOB_STATES,
+    buildAdminPasswordPayload,
     buildBootstrapPayload,
+    buildYouTubeConfigPayload,
+    canRevokeNode,
+    clearSensitiveFields,
+    createRelayIdempotencyKey,
     createPollBudget,
+    hasMoblinRelayCapability,
+    isCurrentSecretRequest,
     normalizeNodeStatus,
+    normalizeRelayStatus,
+    relayCommandOutcome,
+    relayIsOperable,
+    relayIsSafelyStopped,
     safeDisplayString,
+    sanitizeSrtUrl,
     transientPollDelay,
+    wipeSecretObject,
   };
 
   if (typeof module !== "undefined" && module.exports) module.exports = exported;
@@ -108,6 +237,18 @@
   const serverDialog = document.querySelector("[data-server-dialog]");
   const progressDialog = document.querySelector("[data-server-progress-dialog]");
   const revokeDialog = document.querySelector("[data-revoke-dialog]");
+  const youtubeConfigDialog = document.querySelector("[data-youtube-config-dialog]");
+  const youtubeConfigForm = document.querySelector("[data-youtube-config-form]");
+  const youtubeConfigError = document.querySelector("[data-youtube-config-error]");
+  const youtubeClearDialog = document.querySelector("[data-youtube-clear-dialog]");
+  const youtubeClearForm = document.querySelector("[data-youtube-clear-form]");
+  const youtubeClearError = document.querySelector("[data-youtube-clear-error]");
+  const moblinUrlDialog = document.querySelector("[data-moblin-url-dialog]");
+  const moblinUrlForm = document.querySelector("[data-moblin-url-form]");
+  const moblinUrlError = document.querySelector("[data-moblin-url-error]");
+  const moblinUrlResults = document.querySelector("[data-moblin-url-results]");
+  const moblinReauth = document.querySelector("[data-moblin-reauth]");
+  const revealMoblinButton = document.querySelector("[data-reveal-moblin-url]");
   const serverForm = document.querySelector("[data-server-form]");
   const sudoForm = document.querySelector("[data-sudo-form]");
   const serverList = document.querySelector("[data-server-list]");
@@ -130,6 +271,12 @@
   let pollBudget = createPollBudget();
   let transientPollFailures = 0;
   let pendingRevokeNodeId = null;
+  let pendingYouTubeNodeId = null;
+  let pendingYouTubeClearNodeId = null;
+  let pendingMoblinNodeId = null;
+  let youtubeConfigRequestGeneration = 0;
+  let youtubeClearRequestGeneration = 0;
+  let moblinRequestGeneration = 0;
 
   class ApiError extends Error {
     constructor(message, status = 0, payload = null) {
@@ -153,6 +300,11 @@
     return candidate.trim();
   }
 
+  function serverErrorCode(payload) {
+    const candidate = payload?.error?.code || payload?.safe_error?.code || payload?.detail?.code;
+    return typeof candidate === "string" && /^[a-z0-9_]{1,64}$/.test(candidate) ? candidate : "";
+  }
+
   function friendlyError(error, fallback = "Не удалось выполнить действие. Попробуйте ещё раз.") {
     if (!(error instanceof ApiError)) return fallback;
     if (error.status === 401) return "Сессия завершена. Войдите снова.";
@@ -162,6 +314,25 @@
     if (error.status === 429) return "Слишком много попыток. Подождите и повторите.";
     if (error.status >= 500) return "Сервис установки временно недоступен.";
     return serverMessage(error.payload) || fallback;
+  }
+
+  function friendlyRelayError(error, action = "выполнить действие") {
+    if (error instanceof TypeError && typeof error.message === "string") return error.message;
+    if (!(error instanceof ApiError)) return `Не удалось ${action}. Попробуйте ещё раз.`;
+    const code = serverErrorCode(error.payload);
+    if (error.status === 401 && code === "step_up_failed") return "Пароль администратора неверен.";
+    if (error.status === 401) return "Сессия завершена. Войдите снова.";
+    if (error.status === 403) return "Сессия устарела. Обновите страницу и повторите действие.";
+    if (error.status === 409) {
+      if (code === "relay_unavailable") return "Relay-сервер сейчас не на связи.";
+      if (code === "youtube_not_configured") return "Сначала настройте YouTube RTMPS URL и stream key.";
+      if (code === "relay_command_pending") return "Предыдущая команда relay ещё выполняется.";
+      if (code !== "relay_active") return `Сейчас нельзя ${action}. Обновите статус и повторите.`;
+      return "Ретранслятор активен. Завершите broadcast в YouTube и остановите relay, затем повторите.";
+    }
+    if (error.status === 422) return "Проверьте RTMPS URL, stream key и пароль администратора.";
+    if (error.status === 429) return "Слишком много попыток. Подождите и повторите.";
+    return `Не удалось ${action}. Попробуйте ещё раз.`;
   }
 
   async function apiRequest(path, options = {}) {
@@ -187,7 +358,9 @@
       }
     }
     if (!response.ok) {
-      if (response.status === 401) window.location.assign("/login");
+      if (response.status === 401 && serverErrorCode(payload) !== "step_up_failed") {
+        window.location.assign("/login");
+      }
       throw new ApiError(serverMessage(payload) || response.statusText, response.status, payload);
     }
     if (typeof payload?.csrf_token === "string") {
@@ -278,6 +451,188 @@
     list.append(row);
   }
 
+  const RELAY_LABELS = Object.freeze({
+    active: "Активен",
+    inactive: "Остановлен",
+    activating: "Запускается",
+    deactivating: "Останавливается",
+    running: "Работает",
+    stopped: "Остановлен",
+    listening: "Слушает SRT",
+    closed: "Не слушает",
+    connecting: "Подключается",
+    ok: "Норма",
+    healthy: "Норма",
+    degraded: "Требуется внимание",
+    failed: "Ошибка",
+    offline: "Нет связи",
+    unknown: "Нет данных",
+    LIVE: "LIVE — поток Moblin",
+    SLATE: "SLATE — серверная заставка",
+  });
+
+  function relayLabel(value) {
+    return RELAY_LABELS[value] || RELAY_LABELS.unknown;
+  }
+
+  function relayMetricRow(list, label, key, initial = "Проверяем…") {
+    const row = document.createElement("div");
+    appendText(row, "dt", "", label);
+    const value = appendText(row, "dd", "", initial);
+    value.dataset.relayField = key;
+    list.append(row);
+  }
+
+  function setRelayMetric(panel, key, value) {
+    const output = panel?.querySelector(`[data-relay-field="${key}"]`);
+    if (output) output.textContent = value;
+  }
+
+  function renderRelayPanel(node) {
+    const panel = document.createElement("section");
+    panel.className = "relay-panel";
+    panel.dataset.relayPanel = "";
+    panel.dataset.nodeId = String(node.id || "");
+    panel.setAttribute("aria-label", "Управление Moblin Relay");
+
+    const heading = document.createElement("div");
+    heading.className = "relay-panel__heading";
+    const titleGroup = document.createElement("div");
+    appendText(titleGroup, "h3", "", "Moblin Relay");
+    appendText(titleGroup, "p", "", "Вертикальный поток 720×1280 через SRT в YouTube");
+    const badge = appendText(heading, "span", "relay-badge relay-badge--neutral", "Проверяем…");
+    badge.dataset.relayBadge = "";
+    badge.setAttribute("role", "status");
+    heading.prepend(titleGroup);
+    panel.append(heading);
+
+    const alert = appendText(panel, "p", "relay-panel__notice", "Получаем безопасное состояние relay…");
+    alert.dataset.relayNotice = "";
+    alert.setAttribute("aria-live", "polite");
+
+    const metrics = document.createElement("dl");
+    metrics.className = "relay-metrics";
+    relayMetricRow(metrics, "Общее состояние", "overall");
+    relayMetricRow(metrics, "Сервис", "service");
+    relayMetricRow(metrics, "Источник", "source");
+    relayMetricRow(metrics, "Отправка в YouTube", "youtube-forward");
+    relayMetricRow(metrics, "SRT listener", "srt-listener");
+    relayMetricRow(metrics, "YouTube RTMPS URL", "youtube-url");
+    relayMetricRow(metrics, "YouTube stream key", "youtube-key");
+    relayMetricRow(metrics, "Профиль видео", "portrait-profile");
+    panel.append(metrics);
+
+    const actions = document.createElement("div");
+    actions.className = "relay-panel__actions";
+    const start = appendText(actions, "button", "button button--primary button--small", "Запустить relay");
+    start.type = "button";
+    start.dataset.relayAction = "start";
+    start.addEventListener("click", () => void requestRelayAction(node.id, "start", start, panel));
+    const stop = appendText(actions, "button", "button button--danger-soft button--small", "Остановить relay");
+    stop.type = "button";
+    stop.dataset.relayAction = "stop";
+    stop.addEventListener("click", () => void requestRelayAction(node.id, "stop", stop, panel));
+    const refresh = appendText(actions, "button", "button button--secondary button--small", "Обновить статус");
+    refresh.type = "button";
+    refresh.dataset.relayAction = "refresh";
+    refresh.addEventListener("click", () => void requestRelayAction(node.id, "refresh", refresh, panel));
+    const configure = appendText(actions, "button", "button button--secondary button--small", "Настроить YouTube");
+    configure.type = "button";
+    configure.dataset.relayAction = "configure";
+    configure.addEventListener("click", () => openYouTubeConfig(node.id));
+    const clearYouTube = appendText(actions, "button", "button button--danger-soft button--small", "Очистить YouTube");
+    clearYouTube.type = "button";
+    clearYouTube.dataset.relayAction = "clear-youtube";
+    clearYouTube.addEventListener("click", () => openYouTubeClear(node.id));
+    const reveal = appendText(actions, "button", "button button--quiet button--small", "Показать SRT для Moblin");
+    reveal.type = "button";
+    reveal.dataset.relayAction = "reveal";
+    reveal.addEventListener("click", () => openMoblinUrl(node.id));
+    panel.append(actions);
+    return panel;
+  }
+
+  function updateRelayPanel(panel, payload) {
+    if (!panel) return;
+    const relay = normalizeRelayStatus(payload);
+    const badge = panel.querySelector("[data-relay-badge]");
+    const notice = panel.querySelector("[data-relay-notice]");
+    const actionButtons = panel.querySelectorAll("[data-relay-action]");
+    const operable = relayIsOperable(relay);
+    const active = relay.service === "active" || relay.mainProcess === "running";
+    const safelyStopped = relayIsSafelyStopped(relay);
+    const fullyConfigured = relay.youtubeUrlConfigured && relay.youtubeKeyConfigured;
+    panel.dataset.relayActive = String(active);
+    panel.dataset.relayAvailable = String(operable);
+
+    if (badge) {
+      badge.className = "relay-badge relay-badge--neutral";
+      if (!operable) {
+        badge.textContent = relay.available ? "Нет связи" : "Недоступен";
+      } else if (["failed", "degraded"].includes(relay.service) || ["failed", "degraded"].includes(relay.overall)) {
+        badge.textContent = "Требуется внимание";
+        badge.className = "relay-badge relay-badge--danger";
+      } else if (active) {
+        badge.textContent = "Активен";
+        badge.className = "relay-badge relay-badge--success";
+      } else {
+        badge.textContent = "Остановлен";
+      }
+    }
+    if (notice) {
+      notice.textContent = !operable
+        ? relay.available
+          ? "Связь с relay-агентом потеряна. Управление временно заблокировано."
+          : "Узел не подтвердил доступность Moblin Relay. Проверьте связь с агентом."
+        : !safelyStopped
+          ? "Relay не подтвердил полную остановку. Завершите broadcast и остановите relay перед изменением YouTube."
+          : fullyConfigured
+            ? "Relay остановлен. Можно безопасно обновить настройки YouTube."
+            : "Relay остановлен. Перед запуском настройте YouTube RTMPS URL и stream key.";
+    }
+
+    setRelayMetric(panel, "overall", relayLabel(relay.overall));
+    setRelayMetric(panel, "service", relayLabel(relay.service));
+    setRelayMetric(panel, "source", relayLabel(relay.source));
+    setRelayMetric(panel, "youtube-forward", relayLabel(relay.youtubeForward));
+    setRelayMetric(panel, "srt-listener", relayLabel(relay.srtListener));
+    setRelayMetric(panel, "youtube-url", relay.youtubeUrlConfigured ? "Настроен" : "Не настроен");
+    setRelayMetric(panel, "youtube-key", relay.youtubeKeyConfigured ? "Настроен" : "Не настроен");
+    setRelayMetric(panel, "portrait-profile", relay.portraitProfile ? "720×1280 · 30 FPS" : "Не подтверждён");
+
+    for (const button of actionButtons) button.disabled = !operable;
+    const start = panel.querySelector('[data-relay-action="start"]');
+    const stop = panel.querySelector('[data-relay-action="stop"]');
+    const configure = panel.querySelector('[data-relay-action="configure"]');
+    const clearYouTube = panel.querySelector('[data-relay-action="clear-youtube"]');
+    if (start) {
+      start.disabled = !operable || !safelyStopped || !fullyConfigured;
+      start.title = !fullyConfigured ? "Сначала настройте YouTube RTMPS URL и stream key" : "";
+    }
+    if (stop) stop.disabled = !operable || safelyStopped;
+    if (configure) {
+      configure.disabled = !operable || !safelyStopped;
+      configure.title = !safelyStopped ? "Сначала завершите broadcast и остановите relay" : "";
+    }
+    if (clearYouTube) {
+      const configured = relay.youtubeUrlConfigured || relay.youtubeKeyConfigured;
+      clearYouTube.disabled = !operable || !safelyStopped || !configured;
+      clearYouTube.title = !safelyStopped ? "Сначала завершите broadcast и остановите relay" : "";
+    }
+  }
+
+  async function loadRelayStatus(nodeId, panel, { quiet = false } = {}) {
+    try {
+      const payload = await apiRequest(`/api/nodes/${encodeURIComponent(nodeId)}/relay`);
+      updateRelayPanel(panel, payload);
+      return payload;
+    } catch (error) {
+      updateRelayPanel(panel, { available: false });
+      if (!quiet) showToast("Не удалось получить состояние relay", friendlyRelayError(error), "error");
+      return null;
+    }
+  }
+
   function renderNodeCard(node) {
     const status = normalizeNodeStatus(node?.status);
     const [statusLabel, statusTone] = NODE_STATUS[status];
@@ -290,8 +645,17 @@
     const statusPill = appendText(identity, "span", `server-status server-status--${statusTone}`, statusLabel);
     statusPill.setAttribute("data-node-status", status);
     heading.append(identity);
-    const availability = appendText(heading, "span", "server-card__scope", "Подготовлен, но ещё не участвует в эфире");
-    availability.setAttribute("title", "Передача видеопотока будет добавлена на следующем этапе");
+    const relayCapable = hasMoblinRelayCapability(node);
+    const availability = appendText(
+      heading,
+      "span",
+      "server-card__scope",
+      relayCapable ? "Управление видеоретранслятором" : "Подготовлен, но ещё не участвует в эфире",
+    );
+    availability.setAttribute(
+      "title",
+      relayCapable ? "Состояние Moblin Relay обновляется с сервера" : "Передача видеопотока пока не назначена",
+    );
     card.append(heading);
 
     const metrics = document.createElement("dl");
@@ -318,18 +682,22 @@
     }
     card.append(metrics);
 
+    if (relayCapable) card.append(renderRelayPanel(node));
+
     const actions = document.createElement("div");
     actions.className = "server-card__actions";
-    const selfTest = appendText(actions, "button", "button button--secondary button--small", "Проверить сервер");
-    selfTest.type = "button";
-    selfTest.disabled = !["ready", "degraded", "offline"].includes(status);
-    selfTest.addEventListener("click", () => void requestSelfTest(node.id, selfTest));
+    if (!relayCapable) {
+      const selfTest = appendText(actions, "button", "button button--secondary button--small", "Проверить сервер");
+      selfTest.type = "button";
+      selfTest.disabled = !["ready", "degraded", "offline"].includes(status);
+      selfTest.addEventListener("click", () => void requestSelfTest(node.id, selfTest));
+    }
     const rename = appendText(actions, "button", "button button--quiet button--small", "Переименовать");
     rename.type = "button";
     rename.addEventListener("click", () => void renameNode(node));
     const revoke = appendText(actions, "button", "button button--danger-soft button--small", "Отозвать доступ");
     revoke.type = "button";
-    revoke.disabled = !["ready", "degraded", "offline"].includes(status);
+    revoke.disabled = !canRevokeNode(status, relayCapable);
     revoke.addEventListener("click", () => {
       pendingRevokeNodeId = node.id;
       openDialog(revokeDialog);
@@ -344,7 +712,12 @@
     try {
       const payload = await apiRequest("/api/nodes");
       const items = Array.isArray(payload?.items) ? payload.items : [];
-      serverList?.replaceChildren(...items.map(renderNodeCard));
+      const cards = items.map(renderNodeCard);
+      serverList?.replaceChildren(...cards);
+      items.forEach((node, index) => {
+        const panel = cards[index]?.querySelector("[data-relay-panel]");
+        if (panel) void loadRelayStatus(node.id, panel, { quiet: true });
+      });
       if (emptyState) emptyState.hidden = items.length > 0;
     } catch (error) {
       if (listError) listError.hidden = false;
@@ -493,6 +866,362 @@
     return null;
   }
 
+  async function waitForRelayCommand(nodeId, commandId, { isCurrent = () => true } = {}) {
+    const budget = createPollBudget(MAX_COMMAND_POLL_ATTEMPTS);
+    while (budget.consume()) {
+      if (!isCurrent()) return null;
+      const command = await apiRequest(
+        `/api/nodes/${encodeURIComponent(nodeId)}/relay/commands/${encodeURIComponent(commandId)}`,
+      );
+      if (!isCurrent()) return null;
+      if (relayCommandOutcome(command) !== "pending") return command;
+      await delay(POLL_INTERVAL_MS);
+    }
+    return null;
+  }
+
+  async function awaitRelayCompletion(nodeId, queued, { isCurrent = () => true } = {}) {
+    const commandId = typeof queued?.command_id === "string"
+      ? queued.command_id
+      : typeof queued?.id === "string" ? queued.id : "";
+    if (!commandId) throw new ApiError("Missing relay command identifier", 502);
+    const result = await waitForRelayCommand(nodeId, commandId, { isCurrent });
+    if (!result) return false;
+    const outcome = relayCommandOutcome(result);
+    if (outcome === "conflict") throw new ApiError("Relay command conflict", 409);
+    if (outcome !== "success") throw new ApiError("Relay command failed", 422);
+    return true;
+  }
+
+  function relayPanelForNode(nodeId) {
+    return [...document.querySelectorAll("[data-relay-panel]")]
+      .find((panel) => panel.dataset.nodeId === String(nodeId)) || null;
+  }
+
+  async function requestRelayAction(nodeId, action, button, panel = relayPanelForNode(nodeId)) {
+    const confirmations = {
+      start: "Запустить relay и начать отправку серверной заставки в настроенный YouTube broadcast?",
+      stop: "Остановить relay? Это немедленно прервёт отправку потока в YouTube broadcast.",
+    };
+    if (confirmations[action] && !window.confirm(confirmations[action])) return;
+    if (!new Set(["start", "stop", "refresh"]).has(action)) return;
+    setBusy(button, true);
+    try {
+      const queued = await apiRequest(
+        `/api/nodes/${encodeURIComponent(nodeId)}/relay/${encodeURIComponent(action)}`,
+        { method: "POST" },
+      );
+      const completed = await awaitRelayCompletion(nodeId, queued);
+      if (!completed) {
+        showToast("Команда ещё выполняется", "Обновите статус через несколько секунд.", "warning");
+        return;
+      }
+      if (action === "start") showToast("Relay запущен", "Проверьте Stream health в YouTube Studio.");
+      if (action === "stop") showToast("Relay остановлен", "Отправка в YouTube прекращена.");
+      if (action === "refresh") showToast("Состояние relay обновлено");
+    } catch (error) {
+      showToast("Команда relay не выполнена", friendlyRelayError(error), "error");
+    } finally {
+      setBusy(button, false);
+      await loadRelayStatus(nodeId, panel, { quiet: true });
+    }
+  }
+
+  function clearYouTubeConfig() {
+    youtubeConfigForm?.reset();
+    clearSensitiveFields(youtubeConfigDialog);
+    setBusy(youtubeConfigForm, false);
+    if (youtubeConfigError) {
+      youtubeConfigError.textContent = "";
+      youtubeConfigError.hidden = true;
+    }
+  }
+
+  function dialogRequestIsCurrent(nodeId, currentNodeId, generation, currentGeneration, dialog) {
+    const dialogOpen = dialog?.open === true || dialog?.hasAttribute?.("open") === true;
+    return isCurrentSecretRequest(
+      nodeId,
+      currentNodeId,
+      generation,
+      currentGeneration,
+      dialogOpen,
+    );
+  }
+
+  function openYouTubeConfig(nodeId) {
+    youtubeConfigRequestGeneration += 1;
+    clearYouTubeConfig();
+    pendingYouTubeNodeId = String(nodeId);
+    openDialog(youtubeConfigDialog);
+    youtubeConfigForm?.querySelector('[name="url"]')?.focus();
+  }
+
+  function clearMoblinUrlDialog() {
+    moblinUrlForm?.reset();
+    clearSensitiveFields(moblinUrlDialog);
+    setBusy(moblinUrlForm, false);
+    if (moblinUrlResults) moblinUrlResults.hidden = true;
+    if (moblinReauth) moblinReauth.hidden = false;
+    if (revealMoblinButton) revealMoblinButton.hidden = false;
+    moblinUrlDialog?.querySelectorAll("[data-public-url-row], [data-vpn-url-row]").forEach((row) => {
+      row.hidden = true;
+    });
+    if (moblinUrlError) {
+      moblinUrlError.textContent = "";
+      moblinUrlError.hidden = true;
+    }
+  }
+
+  function moblinRequestIsCurrent(nodeId, generation) {
+    return dialogRequestIsCurrent(
+      nodeId,
+      pendingMoblinNodeId,
+      generation,
+      moblinRequestGeneration,
+      moblinUrlDialog,
+    );
+  }
+
+  function openMoblinUrl(nodeId) {
+    moblinRequestGeneration += 1;
+    clearMoblinUrlDialog();
+    pendingMoblinNodeId = String(nodeId);
+    openDialog(moblinUrlDialog);
+    moblinUrlForm?.querySelector("[data-moblin-admin-password]")?.focus();
+  }
+
+  youtubeConfigForm?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!pendingYouTubeNodeId) return;
+    const nodeId = String(pendingYouTubeNodeId);
+    const requestGeneration = ++youtubeConfigRequestGeneration;
+    const requestIsCurrent = () => dialogRequestIsCurrent(
+      nodeId,
+      pendingYouTubeNodeId,
+      requestGeneration,
+      youtubeConfigRequestGeneration,
+      youtubeConfigDialog,
+    );
+    let payload = null;
+    let requestBody = "";
+    if (youtubeConfigError) youtubeConfigError.hidden = true;
+    setBusy(youtubeConfigForm, true);
+    try {
+      payload = buildYouTubeConfigPayload(Object.fromEntries(new FormData(youtubeConfigForm).entries()));
+      requestBody = JSON.stringify(payload);
+      const queued = await apiRequest(`/api/nodes/${encodeURIComponent(nodeId)}/relay/configure-youtube`, {
+        method: "PUT",
+        body: requestBody,
+      });
+      const completed = await awaitRelayCompletion(nodeId, queued, { isCurrent: requestIsCurrent });
+      if (!requestIsCurrent()) return;
+      pendingYouTubeNodeId = null;
+      clearYouTubeConfig();
+      closeDialog(youtubeConfigDialog);
+      await loadRelayStatus(nodeId, relayPanelForNode(nodeId), { quiet: true });
+      if (completed) {
+        showToast("YouTube настроен", "URL и stream key безопасно сохранены на relay-сервере.");
+      } else {
+        showToast("Настройка ещё выполняется", "Обновите статус через несколько секунд.", "warning");
+      }
+    } catch (error) {
+      if (!requestIsCurrent()) return;
+      if (youtubeConfigError) {
+        youtubeConfigError.textContent = friendlyRelayError(error, "сохранить настройки YouTube");
+        youtubeConfigError.hidden = false;
+      }
+    } finally {
+      wipeSecretObject(payload);
+      payload = null;
+      requestBody = "";
+      if (requestIsCurrent()) {
+        clearSensitiveFields(youtubeConfigForm);
+        const urlInput = youtubeConfigForm?.querySelector('[name="url"]');
+        if (urlInput) urlInput.value = "";
+        setBusy(youtubeConfigForm, false);
+      }
+    }
+  });
+
+  function clearYouTubeClearDialog() {
+    youtubeClearForm?.reset();
+    clearSensitiveFields(youtubeClearDialog);
+    setBusy(youtubeClearForm, false);
+    if (youtubeClearError) {
+      youtubeClearError.textContent = "";
+      youtubeClearError.hidden = true;
+    }
+  }
+
+  function openYouTubeClear(nodeId) {
+    youtubeClearRequestGeneration += 1;
+    clearYouTubeClearDialog();
+    pendingYouTubeClearNodeId = String(nodeId);
+    openDialog(youtubeClearDialog);
+    youtubeClearForm?.querySelector("[data-youtube-clear-admin-password]")?.focus();
+  }
+
+  youtubeClearForm?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!pendingYouTubeClearNodeId) return;
+    const nodeId = String(pendingYouTubeClearNodeId);
+    const requestGeneration = ++youtubeClearRequestGeneration;
+    const requestIsCurrent = () => dialogRequestIsCurrent(
+      nodeId,
+      pendingYouTubeClearNodeId,
+      requestGeneration,
+      youtubeClearRequestGeneration,
+      youtubeClearDialog,
+    );
+    let payload = null;
+    let requestBody = "";
+    if (youtubeClearError) youtubeClearError.hidden = true;
+    setBusy(youtubeClearForm, true);
+    try {
+      payload = buildAdminPasswordPayload(Object.fromEntries(new FormData(youtubeClearForm).entries()));
+      requestBody = JSON.stringify(payload);
+      const queued = await apiRequest(`/api/nodes/${encodeURIComponent(nodeId)}/relay/youtube`, {
+        method: "DELETE",
+        body: requestBody,
+      });
+      const completed = await awaitRelayCompletion(nodeId, queued, { isCurrent: requestIsCurrent });
+      if (!requestIsCurrent()) return;
+      pendingYouTubeClearNodeId = null;
+      clearYouTubeClearDialog();
+      closeDialog(youtubeClearDialog);
+      await loadRelayStatus(nodeId, relayPanelForNode(nodeId), { quiet: true });
+      if (completed) {
+        showToast("YouTube очищен", "RTMPS URL и stream key удалены с relay-сервера.");
+      } else {
+        showToast("Очистка ещё выполняется", "Обновите статус через несколько секунд.", "warning");
+      }
+    } catch (error) {
+      if (!requestIsCurrent()) return;
+      if (youtubeClearError) {
+        youtubeClearError.textContent = friendlyRelayError(error, "очистить настройки YouTube");
+        youtubeClearError.hidden = false;
+      }
+    } finally {
+      wipeSecretObject(payload);
+      payload = null;
+      requestBody = "";
+      if (requestIsCurrent()) {
+        clearSensitiveFields(youtubeClearForm);
+        setBusy(youtubeClearForm, false);
+      }
+    }
+  });
+
+  moblinUrlForm?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!pendingMoblinNodeId) return;
+    const nodeId = String(pendingMoblinNodeId);
+    const requestGeneration = ++moblinRequestGeneration;
+    const requestIsCurrent = () => moblinRequestIsCurrent(nodeId, requestGeneration);
+    const endpoint = `/api/nodes/${encodeURIComponent(nodeId)}/relay/reveal-moblin-url`;
+    const idempotencyKey = createRelayIdempotencyKey("reveal-moblin");
+    const requestHeaders = idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {};
+    let payload = null;
+    let response = null;
+    let requestBody = "";
+    if (moblinUrlError) moblinUrlError.hidden = true;
+    setBusy(moblinUrlForm, true);
+    try {
+      payload = buildAdminPasswordPayload(Object.fromEntries(new FormData(moblinUrlForm).entries()));
+      requestBody = JSON.stringify(payload);
+      response = await apiRequest(endpoint, { method: "POST", body: requestBody, headers: requestHeaders });
+      if (!requestIsCurrent()) return;
+      let publicUrl = sanitizeSrtUrl(response?.public_url);
+      let vpnUrl = sanitizeSrtUrl(response?.vpn_url);
+      if (!publicUrl && !vpnUrl && typeof response?.command_id === "string") {
+        const command = await waitForRelayCommand(nodeId, response.command_id, { isCurrent: requestIsCurrent });
+        if (!requestIsCurrent()) return;
+        if (!command) {
+          showToast("SRT URL готовится", "Повторите запрос через несколько секунд.", "warning");
+          return;
+        }
+        const outcome = relayCommandOutcome(command);
+        if (outcome === "conflict") throw new ApiError("Relay command conflict", 409);
+        if (outcome !== "success") throw new ApiError("Relay command failed", 422);
+        wipeSecretObject(response);
+        response = await apiRequest(`${endpoint}?wait=0`, {
+          method: "POST",
+          body: requestBody,
+          headers: requestHeaders,
+        });
+        if (!requestIsCurrent()) return;
+        publicUrl = sanitizeSrtUrl(response?.public_url);
+        vpnUrl = sanitizeSrtUrl(response?.vpn_url);
+        if (!publicUrl && !vpnUrl && typeof response?.command_id === "string") {
+          showToast("SRT URL готовится", "Повторите запрос через несколько секунд.", "warning");
+          return;
+        }
+      }
+      if (!publicUrl && !vpnUrl) throw new ApiError("Invalid relay response", 502);
+      const publicInput = moblinUrlDialog?.querySelector("[data-moblin-public-url]");
+      const vpnInput = moblinUrlDialog?.querySelector("[data-moblin-vpn-url]");
+      const publicRow = moblinUrlDialog?.querySelector("[data-public-url-row]");
+      const vpnRow = moblinUrlDialog?.querySelector("[data-vpn-url-row]");
+      if (publicInput) publicInput.value = publicUrl;
+      if (vpnInput) vpnInput.value = vpnUrl;
+      if (publicRow) publicRow.hidden = !publicUrl;
+      if (vpnRow) vpnRow.hidden = !vpnUrl;
+      if (moblinUrlResults) moblinUrlResults.hidden = false;
+      if (moblinReauth) moblinReauth.hidden = true;
+      if (revealMoblinButton) revealMoblinButton.hidden = true;
+    } catch (error) {
+      if (!requestIsCurrent()) return;
+      clearSensitiveFields(moblinUrlDialog);
+      if (moblinUrlError) {
+        moblinUrlError.textContent = friendlyRelayError(error, "получить SRT URL");
+        moblinUrlError.hidden = false;
+      }
+    } finally {
+      wipeSecretObject(payload);
+      wipeSecretObject(response);
+      payload = null;
+      response = null;
+      requestBody = "";
+      if (requestIsCurrent()) {
+        const passwordInput = moblinUrlForm.querySelector("[data-moblin-admin-password]");
+        if (passwordInput) passwordInput.value = "";
+        setBusy(moblinUrlForm, false);
+      }
+    }
+  });
+
+  moblinUrlDialog?.querySelectorAll("[data-copy-moblin-url]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const selector = button.dataset.copyMoblinUrl === "vpn" ? "[data-moblin-vpn-url]" : "[data-moblin-public-url]";
+      const value = sanitizeSrtUrl(moblinUrlDialog.querySelector(selector)?.value);
+      if (!value) return;
+      try {
+        await window.navigator.clipboard.writeText(value);
+        showToast("SRT URL скопирован", "Вставьте его в поле URL профиля Moblin.");
+      } catch (_error) {
+        showToast("Не удалось скопировать", "Выделите адрес и скопируйте вручную.", "error");
+      }
+    });
+  });
+
+  youtubeConfigDialog?.addEventListener("close", () => {
+    youtubeConfigRequestGeneration += 1;
+    clearYouTubeConfig();
+    pendingYouTubeNodeId = null;
+  });
+
+  youtubeClearDialog?.addEventListener("close", () => {
+    youtubeClearRequestGeneration += 1;
+    clearYouTubeClearDialog();
+    pendingYouTubeClearNodeId = null;
+  });
+
+  moblinUrlDialog?.addEventListener("close", () => {
+    moblinRequestGeneration += 1;
+    clearMoblinUrlDialog();
+    pendingMoblinNodeId = null;
+  });
+
   async function requestSelfTest(nodeId, button) {
     setBusy(button, true);
     try {
@@ -637,9 +1366,10 @@
     const closeButton = event.target.closest("[data-close-dialog]");
     if (closeButton) {
       const dialog = closeButton.closest("dialog");
-      dialog?.querySelectorAll('input[type="password"]').forEach((input) => {
-        input.value = "";
-      });
+      clearSensitiveFields(dialog);
+      if (dialog === youtubeConfigDialog) clearYouTubeConfig();
+      if (dialog === youtubeClearDialog) clearYouTubeClearDialog();
+      if (dialog === moblinUrlDialog) clearMoblinUrlDialog();
       closeDialog(dialog);
     }
   });
@@ -647,9 +1377,16 @@
   document.querySelector("[data-retry-servers]")?.addEventListener("click", () => void loadServers());
   window.addEventListener("pagehide", () => {
     stopPolling();
-    document.querySelectorAll('input[type="password"]').forEach((input) => {
-      input.value = "";
-    });
+    youtubeConfigRequestGeneration += 1;
+    youtubeClearRequestGeneration += 1;
+    moblinRequestGeneration += 1;
+    clearSensitiveFields(document);
+    clearYouTubeConfig();
+    clearYouTubeClearDialog();
+    clearMoblinUrlDialog();
+    pendingYouTubeNodeId = null;
+    pendingYouTubeClearNodeId = null;
+    pendingMoblinNodeId = null;
   });
 
   if (page.dataset.bootstrapAvailable !== "true") bootstrapUnavailable.hidden = false;

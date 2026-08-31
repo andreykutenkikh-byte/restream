@@ -27,6 +27,7 @@ from app.logging_config import configure_logging
 from app.login_limiter import LoginRateLimiter
 from app.node_api import NodeBodyLimitMiddleware, NodeCommandPollGate, NodeEnrollmentGate
 from app.node_api import router as node_router
+from app.relay_api import router as relay_router
 from app.runtime import ApplicationRuntime, URLValidator
 from app.services.bootstrap import (
     BootstrapClient,
@@ -36,7 +37,9 @@ from app.services.bootstrap import (
 from app.services.mediamtx import MediaMTXClient
 from app.services.nodes import NodeService
 from app.services.preview import PreviewService
+from app.services.relays import RelayService
 from app.session import SessionManager
+from app.step_up_limiter import StepUpRateLimiter
 
 LOGGER = logging.getLogger(__name__)
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -68,7 +71,11 @@ def create_app(
         username=settings.worker_auth_user,
         password=settings.worker_auth_password,
     )
-    nodes = NodeService(database)
+    relays = RelayService(database, settings.master_encryption_key)
+    nodes = NodeService(
+        database,
+        relay_payload_tombstone=relays.encrypted_empty_payload(),
+    )
     if bootstrap is not None:
         bootstrap_service = bootstrap
     elif settings.bootstrap_worker_secret:
@@ -94,6 +101,7 @@ def create_app(
                 await asyncio.sleep(30)
                 try:
                     nodes.prune_retention()
+                    relays.prune_retention()
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -104,6 +112,7 @@ def create_app(
         if recover_interrupted is not None:
             await recover_interrupted()
         nodes.prune_retention()
+        relays.prune_retention()
         await runtime.startup()
         try:
             monitor_active = getattr(bootstrap_service, "monitor_active_jobs", None)
@@ -145,12 +154,15 @@ def create_app(
         database, settings.session_secret, settings.session_ttl_seconds
     )
     app.state.login_limiter = LoginRateLimiter()
+    app.state.relay_step_up_limiter = StepUpRateLimiter()
     app.state.bootstrap_limiter = BootstrapRateLimiter()
     app.state.nodes = nodes
+    app.state.relays = relays
     app.state.bootstrap = bootstrap_service
     app.state.background_tasks = background_tasks
     app.state.node_enrollments = NodeEnrollmentGate()
     app.state.node_command_polls = NodeCommandPollGate()
+    app.state.relay_command_polls = NodeCommandPollGate()
     app.state.destination_lock = asyncio.Lock()
     app.state.templates = Jinja2Templates(directory=PACKAGE_DIR / "templates")
 
@@ -165,6 +177,7 @@ def create_app(
     app.mount("/static", StaticFiles(directory=PACKAGE_DIR / "static"), name="static")
     app.include_router(router)
     app.include_router(node_router)
+    app.include_router(relay_router)
     app.include_router(bootstrap_router)
 
     @app.middleware("http")
@@ -182,7 +195,9 @@ def create_app(
             "frame-ancestors 'none'; "
             "base-uri 'none'; form-action 'self'"
         )
-        if request.url.path.startswith(("/api/", "/node-api/")) or request.url.path in {
+        if request.url.path.startswith(
+            ("/api/", "/node-api/", "/relay-agent/")
+        ) or request.url.path in {
             "/",
             "/login",
             "/servers",
