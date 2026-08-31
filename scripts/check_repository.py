@@ -40,7 +40,9 @@ RUNTIME_POLICY_DIRECTORIES = {
     "app",
     "bootstrap_worker",
     "ci",
+    "deploy",
     "node_agent",
+    "relay_agent",
     "scripts",
 }
 RUNTIME_POLICY_ROOT_FILES = {

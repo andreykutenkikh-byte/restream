@@ -135,7 +135,14 @@ def redact_url(value: str, *, marker: str = REDACTION_MARKER) -> str:
     if "@" in netloc:
         netloc = f"{marker}@{netloc.rsplit('@', 1)[1]}"
     query = _redact_query(parsed.query, marker)
-    fragment = _redact_query(parsed.fragment, marker) if "=" in parsed.fragment else parsed.fragment
+    if parsed.scheme.lower() in {"rtmp", "rtmps"} and parsed.fragment:
+        # MediaMTX uses a bare URL fragment as the separator before the
+        # destination stream key.  It is never a diagnostic-safe anchor.
+        fragment = marker
+    else:
+        fragment = (
+            _redact_query(parsed.fragment, marker) if "=" in parsed.fragment else parsed.fragment
+        )
     return urlunsplit((parsed.scheme, netloc, parsed.path, query, fragment))
 
 

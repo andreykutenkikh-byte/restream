@@ -4,7 +4,9 @@ AdoJapan Restream is a small, self-hosted service that accepts one authenticated
 from OBS and copies it to manually configured RTMP/RTMPS destinations. Its media path is optimized
 for a modest host shared with other services: no transcoding, no recording, and no heavy frontend
 toolchain. Stage 4A adds password-based SSH onboarding and outbound-only health agents for future
-restream nodes; those nodes do not carry media yet.
+restream nodes. A separate native, outbound-only integration manages the existing HK Moblin relay
+from the same authenticated Servers page without moving that relay into Docker or exposing a new
+management port.
 
 Production domain: `restream.adojapan.ru`. Repository changes do not authorize deployment or
 change production.
@@ -36,6 +38,12 @@ administrator --> FastAPI -- authenticated UDS --> isolated bootstrap worker
                                                     +-- bounded SSH --> remote server
 
 remote Node Agent -- outbound HTTPS protocol v1 --> FastAPI node API
+
+HK Relay Agent -- outbound HTTPS protocol v1 --> FastAPI relay API
+       |                                                ^
+       +-- authenticated root UDS broker                |
+                    |                                   |
+                    +-- existing relayctl        administrator UI
 ```
 
 - **MediaMTX 1.19.2** accepts RTMP, remuxes the incoming H.264/AAC stream to HLS without
@@ -49,10 +57,16 @@ remote Node Agent -- outbound HTTPS protocol v1 --> FastAPI node API
   or inbound port.
 - **Node Agent** runs on an attached server as fixed UID/GID `10001:10001`, publishes no ports,
   enrolls once, sends five-second heartbeats, and accepts only `PING` and `SELF_TEST`.
+- **HK Relay Agent** is a native, unprivileged service with an allowlisted root Unix-socket broker.
+  It connects outward over HTTPS and exposes only safe status plus `start`, `stop`, YouTube
+  configuration/clear, and one-time Moblin SRT URL reveal. It does not alter Amnezia, Docker,
+  firewall, routes, interfaces, MediaMTX installation, or the existing relay secret store.
 - **SQLite** persists the encrypted ingest configuration, encrypted destination keys,
   destination intent/state metadata, hashed sessions, digests of node credentials, safe node/job
-  state, schema version, and bounded audit/event tails. Raw node tokens and SSH passwords are not
-  stored.
+  and relay state, schema version, and bounded audit/event tails. Relay command payloads are
+  encrypted only while delivery is pending and are cryptographically erased on terminal state;
+  an SRT result is encrypted, consumed once, and deleted. Raw node tokens and SSH passwords are
+  not stored.
 - **One FFmpeg supervisor per destination** uses an argument array with no shell and `-c copy`.
   A failed destination cannot stop another destination.
 - **Server templates, CSS, small JavaScript, and local hls.js 1.6.16** require no runtime CDN
@@ -199,8 +213,11 @@ or manual relabel command.
 - [Node Agent protocol v1](docs/node-agent-protocol.md)
 - [Bootstrap security boundaries](docs/node-bootstrap-security.md)
 
-Stage 4A is control-plane groundwork only: connected nodes do not receive real video, publish to
-YouTube, or hot-switch streams. SSH-key onboarding and remote uninstall are future work.
+Stage 4A generic Docker nodes remain control-plane groundwork only: they do not receive real
+video, publish to YouTube, or hot-switch streams. The dedicated native HK Moblin relay is a
+separate integration of the already deployed media service; see
+[`docs/native-relay-control.md`](docs/native-relay-control.md). SSH-key onboarding and generic-node
+remote uninstall remain future work.
 
 ## Ingest and destination states
 
@@ -348,18 +365,21 @@ files per container.
 
 ## Backup and restore
 
-Stage 1 does not schedule production backups. To create a consistent, bounded project-only
-SQLite backup from the running backend:
+The application does not schedule production backups. To create a consistent, bounded
+project-only SQLite backup from the running backend and its named database volume:
 
 ```bash
-docker compose -p adojapan-restream -f compose.yml exec backend \
+docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml exec -T backend \
   python scripts/backup.py --retain 14
 ```
 
 Restore requires a selected `adojapan-restream-*.db` file, a stopped backend, and the explicit
 confirmation phrase documented in
 [`docs/deployment-and-rollback.md`](docs/deployment-and-rollback.md). Ordinary rollback preserves
-all volumes.
+all volumes. Production database and backup storage are named Compose volumes; run restore through
+a one-off Compose container as documented instead of targeting the checkout's `data/` or
+`backups/` directories.
 
 ## Tests and repository checks
 
@@ -372,7 +392,7 @@ uv sync --locked
 uv lock --check
 uv run --locked ruff format --check .
 uv run --locked ruff check .
-uv run --locked mypy app bootstrap_worker node_agent scripts
+uv run --locked mypy app bootstrap_worker node_agent relay_agent scripts
 uv run --locked pytest
 uv run --locked python scripts/check_repository.py
 node --check app/static/app.js

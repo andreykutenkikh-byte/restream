@@ -32,7 +32,7 @@ dev = [
 required-version = "==0.11.28"
 
 [tool.setuptools.packages.find]
-include = ["app*", "bootstrap_worker*", "node_agent*", "scripts*"]
+include = ["app*", "bootstrap_worker*", "node_agent*", "relay_agent*", "scripts*"]
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"

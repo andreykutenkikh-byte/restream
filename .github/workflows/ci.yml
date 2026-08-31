@@ -61,7 +61,7 @@ jobs:
         run: uv run --locked ruff check .
 
       - name: Typecheck
-        run: uv run --locked mypy app bootstrap_worker node_agent scripts
+        run: uv run --locked mypy app bootstrap_worker node_agent relay_agent scripts
 
       - name: Tests
         run: uv run --locked pytest
@@ -81,7 +81,11 @@ jobs:
       - name: Shell syntax
         shell: bash
         run: |
-          for file in scripts/*.sh ci/rpm-fixture/* ci/ssh-target/fake-*; do
+          for file in \
+            scripts/*.sh \
+            deploy/hk-relay-agent/*.sh \
+            ci/rpm-fixture/* \
+            ci/ssh-target/fake-*; do
             sh -n "$file"
           done
 

@@ -1,0 +1,4 @@
+d /etc/adojapan-relay-agent 0750 root restream-agent -
+d /var/lib/adojapan-relay-agent 0700 restream-agent restream-agent -
+d /run/adojapan-relay 0750 root restream-agent -
+d /run/lock/moblin-relay 0700 root root -
