@@ -310,10 +310,59 @@ def test_fresh_stopped_heartbeat_is_available_even_when_broker_reports_offline(
 
     status = service.get_status(node_id)
     assert status["available"] is True
-    assert status["status"]["overall"] == "offline"
+    assert status["status"]["overall"] == "ok"
 
     clock.advance(seconds=31)
-    assert service.get_status(node_id)["available"] is False
+    stale_status = service.get_status(node_id)
+    assert stale_status["available"] is False
+    assert stale_status["status"]["overall"] == "offline"
+
+
+def test_fresh_inconsistent_stopped_state_is_not_normalized_to_ok(tmp_path: Path) -> None:
+    _, service, node_id, token, clock = provisioned(tmp_path)
+    clock.advance(seconds=2)
+    inconsistent = safe_state()
+    inconsistent["main_process"] = "running"
+    inconsistent["overall"] = "degraded"
+    service.record_heartbeat(token, heartbeat(inconsistent))
+
+    status = service.get_status(node_id)
+    assert status["available"] is True
+    assert status["status"]["service"] == "inactive"
+    assert status["status"]["main_process"] == "running"
+    assert status["status"]["overall"] == "degraded"
+
+
+@pytest.mark.parametrize("reported_overall", ["degraded", "failed"])
+def test_fresh_stopped_relay_preserves_reported_attention_state(
+    tmp_path: Path,
+    reported_overall: str,
+) -> None:
+    _, service, node_id, token, clock = provisioned(tmp_path)
+    clock.advance(seconds=2)
+    stopped = safe_state()
+    stopped["overall"] = reported_overall
+    service.record_heartbeat(token, heartbeat(stopped))
+
+    status = service.get_status(node_id)
+    assert status["available"] is True
+    assert status["status"]["service"] == "inactive"
+    assert status["status"]["main_process"] == "stopped"
+    assert status["status"]["overall"] == reported_overall
+
+
+def test_fresh_residual_forward_is_not_normalized_to_ok(tmp_path: Path) -> None:
+    _, service, node_id, token, clock = provisioned(tmp_path)
+    clock.advance(seconds=2)
+    residual = safe_state()
+    residual["overall"] = "offline"
+    residual["youtube_forward"] = "active"
+    service.record_heartbeat(token, heartbeat(residual))
+
+    status = service.get_status(node_id)
+    assert status["available"] is True
+    assert status["status"]["overall"] == "offline"
+    assert status["status"]["youtube_forward"] == "active"
 
 
 def test_provision_refuses_to_convert_an_existing_generic_node(tmp_path: Path) -> None:
@@ -483,6 +532,51 @@ def test_youtube_mutations_require_confirmed_inactive_stopped_state(
         )
     with pytest.raises(RelayActiveError):
         service.create_command(node_id, "CLEAR_YOUTUBE")
+
+
+@pytest.mark.parametrize(
+    ("srt_listener", "source", "youtube_forward", "overall", "last_error_code"),
+    [
+        ("listening", "NONE", "inactive", "offline", None),
+        ("closed", "LIVE", "inactive", "offline", None),
+        ("closed", "NONE", "active", "offline", None),
+        ("closed", "NONE", "inactive", "degraded", None),
+        ("closed", "NONE", "inactive", "offline", "relayctl_failed"),
+    ],
+)
+def test_mutations_reject_incoherent_stopped_snapshot(
+    tmp_path: Path,
+    srt_listener: str,
+    source: str,
+    youtube_forward: str,
+    overall: str,
+    last_error_code: str | None,
+) -> None:
+    database, service, node_id, _, _ = provisioned(tmp_path)
+    with database.connect() as connection:
+        connection.execute(
+            """
+            UPDATE relay_nodes
+            SET srt_listener = ?, source = ?, youtube_forward = ?, overall = ?,
+                last_error_code = ?
+            WHERE node_id = ?
+            """,
+            (srt_listener, source, youtube_forward, overall, last_error_code, node_id),
+        )
+
+    with pytest.raises(RelayActiveError):
+        service.create_command(
+            node_id,
+            "CONFIGURE_YOUTUBE",
+            payload={
+                "youtube_rtmps_url": "rtmps://a.rtmps.youtube.com/live2",
+                "youtube_stream_key": "replacement",
+            },
+        )
+    with pytest.raises(RelayActiveError):
+        service.create_command(node_id, "CLEAR_YOUTUBE")
+    with pytest.raises(RelayActiveError):
+        service.create_command(node_id, "START")
 
 
 def test_idempotency_binds_exact_payload_and_mutations_are_serialized(tmp_path: Path) -> None:

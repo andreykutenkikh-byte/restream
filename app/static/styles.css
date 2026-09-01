@@ -1591,6 +1591,7 @@ h3 {
 
 .server-grid {
   display: grid;
+  align-items: start;
   gap: 18px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
@@ -1649,12 +1650,19 @@ h3 {
 
 .server-card {
   display: grid;
+  align-content: start;
+  align-self: start;
   gap: 22px;
+  grid-auto-rows: max-content;
   padding: 24px;
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
   background: var(--surface);
   box-shadow: var(--shadow-sm);
+}
+
+.server-card--relay {
+  grid-column: 1 / -1;
 }
 
 .server-card__heading {
@@ -1670,9 +1678,9 @@ h3 {
 }
 
 .server-card__scope {
-  max-width: 180px;
+  max-width: 230px;
   color: var(--muted);
-  font-size: 0.7rem;
+  font-size: 0.78rem;
   line-height: 1.4;
   text-align: right;
 }
@@ -1725,18 +1733,68 @@ h3 {
   font-weight: 700;
 }
 
+.server-metrics--relay {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.server-metrics--relay > div {
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  grid-template-columns: 1fr;
+  min-height: 72px;
+  padding: 13px 14px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: var(--surface-soft);
+}
+
+.server-metrics--relay dt {
+  font-size: 0.72rem;
+}
+
+.server-metrics--relay dd {
+  font-size: 0.88rem;
+}
+
+.server-card__recovery {
+  margin: -6px 0 0;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 0.83rem;
+  line-height: 1.5;
+}
+
 .server-card__actions {
   display: flex;
+  align-items: center;
   flex-wrap: wrap;
   gap: 8px;
   padding-top: 17px;
   border-top: 1px solid var(--line);
 }
 
+.server-card__technical,
+.server-card__admin {
+  border-top: 1px solid var(--line);
+  padding-top: 14px;
+}
+
+.server-card__admin-metrics {
+  margin-top: 14px;
+}
+
+.server-card__admin .server-card__actions {
+  margin-top: 14px;
+}
+
 .relay-panel {
   display: grid;
-  gap: 16px;
-  padding: 18px;
+  gap: 18px;
+  padding: clamp(20px, 2.5vw, 28px);
   border: 1px solid #cfded8;
   border-radius: var(--radius-md);
   background: #f7fbf9;
@@ -1751,14 +1809,14 @@ h3 {
 
 .relay-panel__heading h3 {
   margin: 0 0 4px;
-  font-size: 1rem;
+  font-size: 1.2rem;
 }
 
 .relay-panel__heading p,
 .relay-panel__notice {
   margin: 0;
   color: var(--muted);
-  font-size: 0.72rem;
+  font-size: 0.84rem;
 }
 
 .relay-badge {
@@ -1769,7 +1827,7 @@ h3 {
   border-radius: 999px;
   background: #e7e8e5;
   color: var(--muted-strong);
-  font-size: 0.68rem;
+  font-size: 0.76rem;
   font-weight: 800;
   white-space: nowrap;
 }
@@ -1784,11 +1842,75 @@ h3 {
   color: var(--danger);
 }
 
+.relay-badge--warning {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.relay-badge--neutral {
+  background: #e7e8e5;
+  color: var(--muted-strong);
+}
+
 .relay-panel__notice {
-  padding: 10px 11px;
-  border-radius: 9px;
+  padding: 12px 14px;
+  border: 1px solid rgb(207 222 216 / 75%);
+  border-radius: 10px;
   background: rgb(255 255 255 / 75%);
   line-height: 1.45;
+}
+
+.relay-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin: 0;
+}
+
+.relay-summary > div {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid #dbe6e1;
+  border-radius: 11px;
+  background: #fff;
+}
+
+.relay-summary dt {
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.relay-summary dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--ink-soft);
+  font-size: 0.86rem;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.relay-technical,
+.relay-maintenance {
+  border-top: 1px solid #dbe6e1;
+  padding-top: 13px;
+}
+
+.relay-details__summary {
+  width: fit-content;
+  color: var(--muted-strong);
+  cursor: pointer;
+  font-size: 0.8rem;
+  font-weight: 750;
+}
+
+.relay-details__summary:hover {
+  color: var(--ink-soft);
+}
+
+.relay-technical__metrics {
+  margin-top: 14px;
 }
 
 .relay-metrics {
@@ -1817,15 +1939,53 @@ h3 {
   overflow-wrap: anywhere;
 }
 
-.relay-panel__actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 7px;
-  padding-top: 13px;
-  border-top: 1px solid #dbe6e1;
+.relay-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
 }
 
-.relay-panel__actions .button:disabled {
+.relay-action-group {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid #dbe6e1;
+  border-radius: 11px;
+  background: rgb(255 255 255 / 70%);
+}
+
+.relay-action-group__title {
+  margin: 0 0 10px;
+  color: var(--ink-soft);
+  font-size: 0.8rem;
+}
+
+.relay-action-group__controls,
+.relay-maintenance__actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.relay-actions .button,
+.relay-maintenance .button {
+  min-height: 44px;
+}
+
+.relay-actions__reason {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.relay-maintenance__actions {
+  margin-top: 12px;
+}
+
+.relay-actions .button:disabled,
+.relay-maintenance .button:disabled {
   cursor: not-allowed;
   opacity: 0.52;
 }
@@ -2141,6 +2301,11 @@ h3 {
   .switch__label {
     display: none;
   }
+
+  .server-metrics--relay,
+  .relay-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 860px) {
@@ -2184,6 +2349,10 @@ h3 {
   }
 
   .server-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .relay-actions {
     grid-template-columns: 1fr;
   }
 }
@@ -2397,8 +2566,14 @@ h3 {
     padding-top: 28px;
   }
 
+  .servers__heading {
+    display: grid;
+  }
+
   .servers__heading > .button {
-    display: none;
+    display: inline-flex;
+    min-height: 44px;
+    width: 100%;
   }
 
   .server-card {
@@ -2474,8 +2649,20 @@ h3 {
     justify-self: start;
   }
 
-  .relay-panel__actions .button {
-    flex: 1 1 100%;
+  .server-metrics--relay,
+  .relay-summary {
+    grid-template-columns: 1fr;
+  }
+
+  .relay-action-group__controls,
+  .relay-maintenance__actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .relay-action-group__controls .button,
+  .relay-maintenance__actions .button {
+    width: 100%;
   }
 
   .relay-url-field__control {

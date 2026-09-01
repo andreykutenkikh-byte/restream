@@ -164,18 +164,29 @@
       return allowed.includes(normalized) ? normalized : fallback;
     };
     const source = typeof status.source === "string" ? status.source.trim().toUpperCase() : "";
+    const errorCode = typeof status.error_code === "string" ? status.error_code.trim().toLowerCase() : "";
+    const allowedErrorCodes = [
+      "relay_active",
+      "youtube_not_configured",
+      "relayctl_failed",
+      "invalid_configuration",
+      "command_expired",
+      "unsupported_command",
+      "internal_error",
+    ];
     return {
       available: payload?.available === true,
       service: token(status.service, ["active", "inactive", "activating", "deactivating", "failed"]),
       enabled: status.enabled === true,
       mainProcess: token(status.main_process, ["running", "stopped", "failed", "unknown"]),
       srtListener: token(status.srt_listener, ["listening", "closed", "failed", "unknown"]),
-      source: ["SLATE", "LIVE"].includes(source) ? source : "unknown",
+      source: ["NONE", "SLATE", "LIVE"].includes(source) ? source : "unknown",
       youtubeForward: token(status.youtube_forward, ["active", "inactive", "connecting", "failed", "unknown"]),
       overall: token(status.overall, ["ok", "healthy", "degraded", "failed", "offline", "unknown"]),
       youtubeUrlConfigured: status.youtube_url_configured === true,
       youtubeKeyConfigured: status.youtube_key_configured === true,
       portraitProfile: status.portrait_profile === true,
+      errorCode: errorCode ? (allowedErrorCodes.includes(errorCode) ? errorCode : "unknown") : null,
       lastSeenAt: typeof payload?.last_seen_at === "string" ? payload.last_seen_at : "",
     };
   }
@@ -186,6 +197,154 @@
 
   function relayIsSafelyStopped(relay) {
     return relay?.service === "inactive" && relay?.mainProcess === "stopped";
+  }
+
+  function nodeStatusPresentation(value, relayCapable = false) {
+    const status = normalizeNodeStatus(value);
+    if (!relayCapable) return { status, label: NODE_STATUS[status][0], tone: NODE_STATUS[status][1] };
+    const relayLabels = Object.freeze({
+      installing: ["Агент устанавливается", "warning"],
+      connecting: ["Агент подключается", "warning"],
+      ready: ["Агент на связи", "success"],
+      degraded: ["Связь нестабильна", "warning"],
+      offline: ["Агент не на связи", "neutral"],
+      revoked: ["Доступ отозван", "danger"],
+      failed: ["Агент не установлен", "danger"],
+    });
+    return { status, label: relayLabels[status][0], tone: relayLabels[status][1] };
+  }
+
+  function sortNodesForDisplay(items) {
+    if (!Array.isArray(items)) return [];
+    return items
+      .map((node, index) => ({ node, index }))
+      .sort((left, right) => {
+        const relayOrder = Number(hasMoblinRelayCapability(right.node))
+          - Number(hasMoblinRelayCapability(left.node));
+        return relayOrder || left.index - right.index;
+      })
+      .map(({ node }) => node);
+  }
+
+  function relayViewModel(relay) {
+    const operable = relayIsOperable(relay);
+    const safelyStopped = relayIsSafelyStopped(relay);
+    const fullyConfigured = relay?.youtubeUrlConfigured === true && relay?.youtubeKeyConfigured === true;
+    const partiallyConfigured = relay?.youtubeUrlConfigured === true || relay?.youtubeKeyConfigured === true;
+    const active = relay?.service === "active" || relay?.mainProcess === "running";
+    const failed = [relay?.service, relay?.mainProcess, relay?.srtListener, relay?.youtubeForward, relay?.overall]
+      .includes("failed");
+    const degraded = relay?.overall === "degraded";
+    const blockingError = relay?.errorCode !== null
+      && relay?.errorCode !== undefined
+      && relay?.errorCode !== "youtube_not_configured";
+    const inconsistent = (relay?.service === "inactive" && relay?.mainProcess === "running")
+      || (relay?.service === "active" && relay?.mainProcess === "stopped")
+      || (safelyStopped && (
+        relay?.srtListener !== "closed"
+        || relay?.source !== "NONE"
+        || relay?.youtubeForward !== "inactive"
+        || !["ok", "healthy", "offline"].includes(relay?.overall)
+      ));
+    const profileFault = relay?.portraitProfile !== true;
+    const attention = failed || degraded || inconsistent || blockingError || profileFault;
+    const settingsSafeStopped = safelyStopped
+      && !failed
+      && !degraded
+      && !inconsistent
+      && !blockingError;
+
+    let badgeLabel = "Состояние уточняется";
+    let badgeTone = "warning";
+    let notice = "Состояние relay ещё не подтверждено. Дождитесь обновления перед запуском.";
+    if (!operable) {
+      badgeLabel = "Нет связи с сервером";
+      badgeTone = "danger";
+      notice = "Агент HK-сервера не отвечает. Команды временно недоступны.";
+    } else if (attention) {
+      badgeLabel = "Нужна проверка";
+      badgeTone = "danger";
+      notice = profileFault && !failed && !degraded && !inconsistent && !blockingError
+        ? "Вертикальный профиль 720×1280 не подтверждён. Запуск заблокирован до проверки профиля."
+        : inconsistent
+          ? "Сервер прислал противоречивое состояние. Обновите статус; запуск заблокирован."
+          : "Один из компонентов relay требует внимания. Запуск и изменение настроек заблокированы.";
+    } else if (relay?.service === "activating") {
+      badgeLabel = "Запускается";
+      badgeTone = "warning";
+      notice = "Relay запускается. Дождитесь устойчивого состояния перед следующим действием.";
+    } else if (relay?.service === "deactivating") {
+      badgeLabel = "Останавливается";
+      badgeTone = "warning";
+      notice = "Relay останавливается. Настройки YouTube станут доступны после полной остановки.";
+    } else if (active) {
+      badgeLabel = "Relay запущен";
+      badgeTone = "success";
+      notice = relay?.source === "LIVE"
+        ? "Relay принимает поток Moblin. Состояние отправки в YouTube показано отдельно ниже."
+        : "Relay работает на серверной заставке и ожидает поток из Moblin.";
+    } else if (settingsSafeStopped && fullyConfigured) {
+      badgeLabel = "Готов к запуску";
+      badgeTone = "success";
+      notice = "YouTube настроен. Запустите relay, затем передайте SRT-поток из Moblin.";
+    } else if (settingsSafeStopped) {
+      badgeLabel = "Нужна настройка";
+      badgeTone = "warning";
+      notice = "Перед запуском настройте YouTube RTMPS URL и stream key.";
+    }
+
+    let relayStateLabel = "Состояние уточняется";
+    if (!operable) relayStateLabel = "Недоступен";
+    else if (attention) relayStateLabel = "Требуется проверка";
+    else if (relay?.service === "activating") relayStateLabel = "Запускается";
+    else if (relay?.service === "deactivating") relayStateLabel = "Останавливается";
+    else if (active) relayStateLabel = "Работает";
+    else if (settingsSafeStopped) relayStateLabel = "Штатно остановлен";
+
+    let moblinLabel = "Состояние уточняется";
+    if (!operable) moblinLabel = "Состояние недоступно";
+    else if (relay?.srtListener === "failed") moblinLabel = "Ошибка SRT";
+    else if (relay?.source === "LIVE") moblinLabel = "Поток поступает";
+    else if (relay?.source === "SLATE") moblinLabel = "Заставка · ожидает Moblin";
+    else if (settingsSafeStopped) moblinLabel = "Запустится вместе с relay";
+    else if (relay?.srtListener === "listening" || relay?.source === "NONE") moblinLabel = "Ожидает поток";
+
+    let youtubeLabel = "Не настроен";
+    if (relay?.youtubeForward === "active") youtubeLabel = "Поток отправляется";
+    else if (relay?.youtubeForward === "connecting") youtubeLabel = "Подключение…";
+    else if (relay?.youtubeForward === "failed") youtubeLabel = "Ошибка отправки";
+    else if (fullyConfigured && settingsSafeStopped) youtubeLabel = "Настроен · отправка остановлена";
+    else if (fullyConfigured) youtubeLabel = "Настроен";
+    else if (partiallyConfigured) youtubeLabel = "Настройка не завершена";
+
+    let actionReason = "Relay готов к управлению.";
+    if (!operable) actionReason = "Команды недоступны, пока агент сервера не восстановит связь.";
+    else if (failed || degraded || inconsistent || blockingError) {
+      actionReason = "Команды запуска и настройки заблокированы до подтверждения безопасного состояния.";
+    }
+    else if (!safelyStopped) actionReason = "Настройки YouTube можно менять только после остановки relay.";
+    else if (!settingsSafeStopped) actionReason = "Обновите статус и дождитесь полной остановки компонентов relay.";
+    else if (profileFault) actionReason = "Запуск заблокирован: профиль 720×1280 не подтверждён.";
+    else if (!fullyConfigured) actionReason = "Для запуска сначала настройте YouTube.";
+
+    return {
+      actionReason,
+      active,
+      badgeLabel,
+      badgeTone,
+      clearDisabled: !operable || !settingsSafeStopped || !partiallyConfigured,
+      configureDisabled: !operable || !settingsSafeStopped,
+      fullyConfigured,
+      moblinLabel,
+      notice,
+      operable,
+      profileLabel: relay?.portraitProfile === true ? "720×1280 · 30 FPS" : "Профиль не подтверждён",
+      relayStateLabel,
+      safelyStopped: settingsSafeStopped,
+      startDisabled: !operable || !settingsSafeStopped || !fullyConfigured || profileFault,
+      stopDisabled: !operable || settingsSafeStopped,
+      youtubeLabel,
+    };
   }
 
   function relayCommandOutcome(command) {
@@ -216,11 +375,14 @@
     isCurrentSecretRequest,
     normalizeNodeStatus,
     normalizeRelayStatus,
+    nodeStatusPresentation,
     relayCommandOutcome,
     relayIsOperable,
     relayIsSafelyStopped,
+    relayViewModel,
     safeDisplayString,
     sanitizeSrtUrl,
+    sortNodesForDisplay,
     transientPollDelay,
     wipeSecretObject,
   };
@@ -451,6 +613,11 @@
     list.append(row);
   }
 
+  function metricRowIfPresent(list, label, value) {
+    if (value === "—" || value === "" || value === null || value === undefined) return;
+    metricRow(list, label, value);
+  }
+
   const RELAY_LABELS = Object.freeze({
     active: "Активен",
     inactive: "Остановлен",
@@ -469,6 +636,7 @@
     unknown: "Нет данных",
     LIVE: "LIVE — поток Moblin",
     SLATE: "SLATE — серверная заставка",
+    NONE: "Нет входящего потока",
   });
 
   function relayLabel(value) {
@@ -488,30 +656,57 @@
     if (output) output.textContent = value;
   }
 
+  function relaySummaryRow(list, label, key) {
+    const row = document.createElement("div");
+    appendText(row, "dt", "", label);
+    const value = appendText(row, "dd", "", "Проверяем…");
+    value.dataset.relayField = key;
+    list.append(row);
+  }
+
+  function domId(prefix, value) {
+    const token = String(value || "relay").replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 64) || "relay";
+    return `${prefix}-${token}`;
+  }
+
   function renderRelayPanel(node) {
     const panel = document.createElement("section");
     panel.className = "relay-panel";
     panel.dataset.relayPanel = "";
     panel.dataset.nodeId = String(node.id || "");
-    panel.setAttribute("aria-label", "Управление Moblin Relay");
+    const relayTitleId = domId("relay-title", node.id);
+    panel.setAttribute("aria-labelledby", relayTitleId);
 
     const heading = document.createElement("div");
     heading.className = "relay-panel__heading";
     const titleGroup = document.createElement("div");
-    appendText(titleGroup, "h3", "", "Moblin Relay");
-    appendText(titleGroup, "p", "", "Вертикальный поток 720×1280 через SRT в YouTube");
+    const title = appendText(titleGroup, "h3", "", "Управление трансляцией");
+    title.id = relayTitleId;
+    appendText(titleGroup, "p", "", "Moblin → SRT → HK relay → YouTube · 720×1280 · 30 FPS");
     const badge = appendText(heading, "span", "relay-badge relay-badge--neutral", "Проверяем…");
     badge.dataset.relayBadge = "";
     badge.setAttribute("role", "status");
+    badge.setAttribute("aria-live", "polite");
+    badge.setAttribute("aria-atomic", "true");
     heading.prepend(titleGroup);
     panel.append(heading);
 
-    const alert = appendText(panel, "p", "relay-panel__notice", "Получаем безопасное состояние relay…");
-    alert.dataset.relayNotice = "";
-    alert.setAttribute("aria-live", "polite");
+    const notice = appendText(panel, "p", "relay-panel__notice", "Получаем безопасное состояние relay…");
+    notice.dataset.relayNotice = "";
 
+    const summary = document.createElement("dl");
+    summary.className = "relay-summary";
+    relaySummaryRow(summary, "Relay", "relay-state");
+    relaySummaryRow(summary, "Moblin", "moblin-state");
+    relaySummaryRow(summary, "YouTube", "youtube-state");
+    relaySummaryRow(summary, "Профиль", "profile-state");
+    panel.append(summary);
+
+    const technical = document.createElement("details");
+    technical.className = "relay-technical";
+    appendText(technical, "summary", "relay-details__summary", "Технические детали");
     const metrics = document.createElement("dl");
-    metrics.className = "relay-metrics";
+    metrics.className = "relay-metrics relay-technical__metrics";
     relayMetricRow(metrics, "Общее состояние", "overall");
     relayMetricRow(metrics, "Сервис", "service");
     relayMetricRow(metrics, "Источник", "source");
@@ -520,77 +715,109 @@
     relayMetricRow(metrics, "YouTube RTMPS URL", "youtube-url");
     relayMetricRow(metrics, "YouTube stream key", "youtube-key");
     relayMetricRow(metrics, "Профиль видео", "portrait-profile");
-    panel.append(metrics);
+    technical.append(metrics);
+    panel.append(technical);
 
     const actions = document.createElement("div");
-    actions.className = "relay-panel__actions";
-    const start = appendText(actions, "button", "button button--primary button--small", "Запустить relay");
+    actions.className = "relay-actions";
+
+    const broadcastGroup = document.createElement("section");
+    broadcastGroup.className = "relay-action-group";
+    const broadcastTitle = appendText(broadcastGroup, "h4", "relay-action-group__title", "Relay");
+    broadcastTitle.id = domId("relay-broadcast-actions", node.id);
+    broadcastGroup.setAttribute("aria-labelledby", broadcastTitle.id);
+    const broadcastControls = document.createElement("div");
+    broadcastControls.className = "relay-action-group__controls";
+    const start = appendText(broadcastControls, "button", "button button--primary button--small", "Запустить relay");
     start.type = "button";
     start.dataset.relayAction = "start";
     start.addEventListener("click", () => void requestRelayAction(node.id, "start", start, panel));
-    const stop = appendText(actions, "button", "button button--danger-soft button--small", "Остановить relay");
+    const stop = appendText(broadcastControls, "button", "button button--danger-soft button--small", "Остановить relay");
     stop.type = "button";
     stop.dataset.relayAction = "stop";
     stop.addEventListener("click", () => void requestRelayAction(node.id, "stop", stop, panel));
-    const refresh = appendText(actions, "button", "button button--secondary button--small", "Обновить статус");
+    const refresh = appendText(broadcastControls, "button", "button button--quiet button--small", "Обновить");
     refresh.type = "button";
     refresh.dataset.relayAction = "refresh";
     refresh.addEventListener("click", () => void requestRelayAction(node.id, "refresh", refresh, panel));
-    const configure = appendText(actions, "button", "button button--secondary button--small", "Настроить YouTube");
-    configure.type = "button";
-    configure.dataset.relayAction = "configure";
-    configure.addEventListener("click", () => openYouTubeConfig(node.id));
-    const clearYouTube = appendText(actions, "button", "button button--danger-soft button--small", "Очистить YouTube");
-    clearYouTube.type = "button";
-    clearYouTube.dataset.relayAction = "clear-youtube";
-    clearYouTube.addEventListener("click", () => openYouTubeClear(node.id));
-    const reveal = appendText(actions, "button", "button button--quiet button--small", "Показать SRT для Moblin");
+    broadcastGroup.append(broadcastControls);
+    actions.append(broadcastGroup);
+
+    const connectionGroup = document.createElement("section");
+    connectionGroup.className = "relay-action-group";
+    const connectionTitle = appendText(connectionGroup, "h4", "relay-action-group__title", "Подключения");
+    connectionTitle.id = domId("relay-connection-actions", node.id);
+    connectionGroup.setAttribute("aria-labelledby", connectionTitle.id);
+    const connectionControls = document.createElement("div");
+    connectionControls.className = "relay-action-group__controls";
+    const reveal = appendText(connectionControls, "button", "button button--secondary button--small", "Получить SRT для Moblin");
     reveal.type = "button";
     reveal.dataset.relayAction = "reveal";
     reveal.addEventListener("click", () => openMoblinUrl(node.id));
+    const configure = appendText(connectionControls, "button", "button button--secondary button--small", "Настроить YouTube");
+    configure.type = "button";
+    configure.dataset.relayAction = "configure";
+    configure.addEventListener("click", () => openYouTubeConfig(node.id));
+    connectionGroup.append(connectionControls);
+    actions.append(connectionGroup);
+
+    const actionReason = appendText(actions, "p", "relay-actions__reason", "Проверяем доступность команд…");
+    actionReason.dataset.relayActionReason = "";
+    actionReason.id = domId("relay-action-reason", node.id);
+
+    const maintenance = document.createElement("details");
+    maintenance.className = "relay-maintenance";
+    appendText(maintenance, "summary", "relay-details__summary", "Дополнительные действия");
+    const maintenanceActions = document.createElement("div");
+    maintenanceActions.className = "relay-maintenance__actions";
+    const clearYouTube = appendText(maintenanceActions, "button", "button button--danger-soft button--small", "Очистить настройки YouTube");
+    clearYouTube.type = "button";
+    clearYouTube.dataset.relayAction = "clear-youtube";
+    clearYouTube.addEventListener("click", () => openYouTubeClear(node.id));
+    maintenanceActions.append(clearYouTube);
+    maintenance.append(maintenanceActions);
     panel.append(actions);
+    panel.append(maintenance);
+
+    for (const button of panel.querySelectorAll("[data-relay-action]")) {
+      button.disabled = true;
+      if (["start", "configure", "clear-youtube"].includes(button.dataset.relayAction)) {
+        button.setAttribute("aria-describedby", actionReason.id);
+      }
+    }
     return panel;
+  }
+
+  function setRelayPanelBusy(panel, busy) {
+    if (!panel) return;
+    panel.dataset.relayBusy = String(busy);
+    if (busy) {
+      for (const button of panel.querySelectorAll("[data-relay-action]")) button.disabled = true;
+    }
   }
 
   function updateRelayPanel(panel, payload) {
     if (!panel) return;
     const relay = normalizeRelayStatus(payload);
+    const view = relayViewModel(relay);
     const badge = panel.querySelector("[data-relay-badge]");
     const notice = panel.querySelector("[data-relay-notice]");
+    const actionReason = panel.querySelector("[data-relay-action-reason]");
     const actionButtons = panel.querySelectorAll("[data-relay-action]");
-    const operable = relayIsOperable(relay);
-    const active = relay.service === "active" || relay.mainProcess === "running";
-    const safelyStopped = relayIsSafelyStopped(relay);
-    const fullyConfigured = relay.youtubeUrlConfigured && relay.youtubeKeyConfigured;
-    panel.dataset.relayActive = String(active);
-    panel.dataset.relayAvailable = String(operable);
+    panel.dataset.relayActive = String(view.active);
+    panel.dataset.relayAvailable = String(view.operable);
 
     if (badge) {
-      badge.className = "relay-badge relay-badge--neutral";
-      if (!operable) {
-        badge.textContent = relay.available ? "Нет связи" : "Недоступен";
-      } else if (["failed", "degraded"].includes(relay.service) || ["failed", "degraded"].includes(relay.overall)) {
-        badge.textContent = "Требуется внимание";
-        badge.className = "relay-badge relay-badge--danger";
-      } else if (active) {
-        badge.textContent = "Активен";
-        badge.className = "relay-badge relay-badge--success";
-      } else {
-        badge.textContent = "Остановлен";
-      }
+      badge.className = `relay-badge relay-badge--${view.badgeTone}`;
+      badge.textContent = view.badgeLabel;
     }
-    if (notice) {
-      notice.textContent = !operable
-        ? relay.available
-          ? "Связь с relay-агентом потеряна. Управление временно заблокировано."
-          : "Узел не подтвердил доступность Moblin Relay. Проверьте связь с агентом."
-        : !safelyStopped
-          ? "Relay не подтвердил полную остановку. Завершите broadcast и остановите relay перед изменением YouTube."
-          : fullyConfigured
-            ? "Relay остановлен. Можно безопасно обновить настройки YouTube."
-            : "Relay остановлен. Перед запуском настройте YouTube RTMPS URL и stream key.";
-    }
+    if (notice) notice.textContent = view.notice;
+    if (actionReason) actionReason.textContent = view.actionReason;
 
+    setRelayMetric(panel, "relay-state", view.relayStateLabel);
+    setRelayMetric(panel, "moblin-state", view.moblinLabel);
+    setRelayMetric(panel, "youtube-state", view.youtubeLabel);
+    setRelayMetric(panel, "profile-state", view.profileLabel);
     setRelayMetric(panel, "overall", relayLabel(relay.overall));
     setRelayMetric(panel, "service", relayLabel(relay.service));
     setRelayMetric(panel, "source", relayLabel(relay.source));
@@ -600,24 +827,23 @@
     setRelayMetric(panel, "youtube-key", relay.youtubeKeyConfigured ? "Настроен" : "Не настроен");
     setRelayMetric(panel, "portrait-profile", relay.portraitProfile ? "720×1280 · 30 FPS" : "Не подтверждён");
 
-    for (const button of actionButtons) button.disabled = !operable;
+    for (const button of actionButtons) button.disabled = !view.operable;
     const start = panel.querySelector('[data-relay-action="start"]');
     const stop = panel.querySelector('[data-relay-action="stop"]');
     const configure = panel.querySelector('[data-relay-action="configure"]');
     const clearYouTube = panel.querySelector('[data-relay-action="clear-youtube"]');
     if (start) {
-      start.disabled = !operable || !safelyStopped || !fullyConfigured;
-      start.title = !fullyConfigured ? "Сначала настройте YouTube RTMPS URL и stream key" : "";
+      start.disabled = view.startDisabled;
+      start.title = !view.fullyConfigured ? "Сначала настройте YouTube RTMPS URL и stream key" : "";
     }
-    if (stop) stop.disabled = !operable || safelyStopped;
+    if (stop) stop.disabled = view.stopDisabled;
     if (configure) {
-      configure.disabled = !operable || !safelyStopped;
-      configure.title = !safelyStopped ? "Сначала завершите broadcast и остановите relay" : "";
+      configure.disabled = view.configureDisabled;
+      configure.title = !view.safelyStopped ? "Сначала завершите broadcast и остановите relay" : "";
     }
     if (clearYouTube) {
-      const configured = relay.youtubeUrlConfigured || relay.youtubeKeyConfigured;
-      clearYouTube.disabled = !operable || !safelyStopped || !configured;
-      clearYouTube.title = !safelyStopped ? "Сначала завершите broadcast и остановите relay" : "";
+      clearYouTube.disabled = view.clearDisabled;
+      clearYouTube.title = !view.safelyStopped ? "Сначала завершите broadcast и остановите relay" : "";
     }
   }
 
@@ -634,53 +860,65 @@
   }
 
   function renderNodeCard(node) {
-    const status = normalizeNodeStatus(node?.status);
-    const [statusLabel, statusTone] = NODE_STATUS[status];
+    const relayCapable = hasMoblinRelayCapability(node);
+    const statusPresentation = nodeStatusPresentation(node?.status, relayCapable);
+    const { status, label: statusLabel, tone: statusTone } = statusPresentation;
     const card = document.createElement("article");
-    card.className = "server-card";
+    card.className = relayCapable ? "server-card server-card--relay" : "server-card";
     const heading = document.createElement("div");
     heading.className = "server-card__heading";
     const identity = document.createElement("div");
-    appendText(identity, "h2", "", safeDisplayString(node?.display_name, "Сервер"));
+    const nodeTitle = appendText(identity, "h2", "", safeDisplayString(node?.display_name, "Сервер"));
+    nodeTitle.id = domId("server-title", node?.id);
+    card.setAttribute("aria-labelledby", nodeTitle.id);
     const statusPill = appendText(identity, "span", `server-status server-status--${statusTone}`, statusLabel);
     statusPill.setAttribute("data-node-status", status);
     heading.append(identity);
-    const relayCapable = hasMoblinRelayCapability(node);
     const availability = appendText(
       heading,
       "span",
       "server-card__scope",
-      relayCapable ? "Управление видеоретранслятором" : "Подготовлен, но ещё не участвует в эфире",
+      relayCapable
+        ? "Управление эфиром Moblin → YouTube"
+        : status === "failed" ? "Установка сервера не завершена" : "Резервный сервер",
     );
     availability.setAttribute(
       "title",
-      relayCapable ? "Состояние Moblin Relay обновляется с сервера" : "Передача видеопотока пока не назначена",
+      relayCapable ? "Состояние relay обновляется агентом HK-сервера" : "Передача видеопотока пока не назначена",
     );
     card.append(heading);
 
     const metrics = document.createElement("dl");
-    metrics.className = "server-metrics";
+    metrics.className = relayCapable ? "server-metrics server-metrics--relay" : "server-metrics";
     metricRow(metrics, "IP", safeDisplayString(node?.resolved_ip || node?.address));
     const os = [safeDisplayString(node?.os_name, "", 60), safeDisplayString(node?.os_version, "", 30)]
       .filter(Boolean)
       .join(" ") || "—";
-    metricRow(metrics, "Операционная система", os);
-    metricRow(metrics, "CPU", Number.isInteger(node?.cpu_count) ? `${node.cpu_count} ядер` : "—");
-    metricRow(metrics, "RAM", formatBytes(node?.memory_total_bytes));
-    metricRow(metrics, "Диск свободен", formatBytes(node?.disk_free_bytes));
+    if (!relayCapable) metricRowIfPresent(metrics, "Операционная система", os);
+    if (!relayCapable) {
+      metricRowIfPresent(metrics, "CPU", Number.isInteger(node?.cpu_count) ? `${node.cpu_count} ядер` : "—");
+    }
+    metricRowIfPresent(metrics, "RAM", formatBytes(node?.memory_total_bytes));
+    metricRowIfPresent(metrics, "Диск свободен", formatBytes(node?.disk_free_bytes));
     const controlLatency = node?.control_latency_ms;
     const controlLatencyLabel = Number.isFinite(controlLatency)
       && controlLatency >= 0
       && controlLatency <= 60000
       ? `${Math.round(controlLatency)} мс`
       : "—";
-    metricRow(metrics, "Связь с панелью", controlLatencyLabel);
-    metricRow(metrics, "Последний heartbeat", formatAge(node?.last_seen_at));
-    metricRow(metrics, "Версия агента", safeDisplayString(node?.agent_version));
-    if (node?.host_key_fingerprint) {
-      metricRow(metrics, "SSH fingerprint", safeDisplayString(node.host_key_fingerprint, "—", 128));
-    }
+    if (!relayCapable) metricRowIfPresent(metrics, "Связь с панелью", controlLatencyLabel);
+    metricRowIfPresent(metrics, relayCapable ? "Последняя связь" : "Последний heartbeat", formatAge(node?.last_seen_at));
+    if (!relayCapable) metricRowIfPresent(metrics, "Версия агента", safeDisplayString(node?.agent_version));
     card.append(metrics);
+
+    if (status === "failed") {
+      appendText(
+        card,
+        "p",
+        "server-card__recovery",
+        "Подключение не завершено. Проверьте доступы и запустите подключение сервера ещё раз.",
+      );
+    }
 
     if (relayCapable) card.append(renderRelayPanel(node));
 
@@ -702,7 +940,33 @@
       pendingRevokeNodeId = node.id;
       openDialog(revokeDialog);
     });
-    card.append(actions);
+
+    const fingerprint = safeDisplayString(node?.host_key_fingerprint, "", 128);
+    if (relayCapable) {
+      const serverAdmin = document.createElement("details");
+      serverAdmin.className = "server-card__admin";
+      appendText(serverAdmin, "summary", "relay-details__summary", "Управление сервером");
+      if (fingerprint) {
+        const technicalMetrics = document.createElement("dl");
+        technicalMetrics.className = "server-metrics server-card__admin-metrics";
+        metricRow(technicalMetrics, "SSH fingerprint", fingerprint);
+        serverAdmin.append(technicalMetrics);
+      }
+      serverAdmin.append(actions);
+      card.append(serverAdmin);
+    } else {
+      if (fingerprint) {
+        const technical = document.createElement("details");
+        technical.className = "server-card__technical";
+        appendText(technical, "summary", "relay-details__summary", "Технические данные");
+        const technicalMetrics = document.createElement("dl");
+        technicalMetrics.className = "server-metrics";
+        metricRow(technicalMetrics, "SSH fingerprint", fingerprint);
+        technical.append(technicalMetrics);
+        card.append(technical);
+      }
+      card.append(actions);
+    }
     return card;
   }
 
@@ -711,7 +975,7 @@
     if (listError) listError.hidden = true;
     try {
       const payload = await apiRequest("/api/nodes");
-      const items = Array.isArray(payload?.items) ? payload.items : [];
+      const items = sortNodesForDisplay(payload?.items);
       const cards = items.map(renderNodeCard);
       serverList?.replaceChildren(...cards);
       items.forEach((node, index) => {
@@ -906,6 +1170,7 @@
     if (confirmations[action] && !window.confirm(confirmations[action])) return;
     if (!new Set(["start", "stop", "refresh"]).has(action)) return;
     setBusy(button, true);
+    setRelayPanelBusy(panel, true);
     try {
       const queued = await apiRequest(
         `/api/nodes/${encodeURIComponent(nodeId)}/relay/${encodeURIComponent(action)}`,
@@ -922,8 +1187,9 @@
     } catch (error) {
       showToast("Команда relay не выполнена", friendlyRelayError(error), "error");
     } finally {
-      setBusy(button, false);
+      setRelayPanelBusy(panel, false);
       await loadRelayStatus(nodeId, panel, { quiet: true });
+      button?.setAttribute("aria-busy", "false");
     }
   }
 

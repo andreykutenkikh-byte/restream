@@ -21,16 +21,20 @@ const {
   isCurrentSecretRequest,
   normalizeNodeStatus,
   normalizeRelayStatus,
+  nodeStatusPresentation,
   relayCommandOutcome,
   relayIsOperable,
   relayIsSafelyStopped,
+  relayViewModel,
   safeDisplayString,
   sanitizeSrtUrl,
+  sortNodesForDisplay,
   transientPollDelay,
   wipeSecretObject,
 } = require("../../app/static/servers.js");
 
 const root = path.resolve(__dirname, "../..");
+const baseTemplate = fs.readFileSync(path.join(root, "app/templates/base.html"), "utf8");
 const template = fs.readFileSync(path.join(root, "app/templates/servers.html"), "utf8");
 const source = fs.readFileSync(path.join(root, "app/static/servers.js"), "utf8");
 const styles = fs.readFileSync(path.join(root, "app/static/styles.css"), "utf8");
@@ -167,6 +171,7 @@ test("relay status helpers fail closed and never accept injected SRT output", ()
       youtubeUrlConfigured: true,
       youtubeKeyConfigured: true,
       portraitProfile: true,
+      errorCode: null,
       lastSeenAt: "",
     },
   );
@@ -196,6 +201,124 @@ test("relay status helpers fail closed and never accept injected SRT output", ()
   assert.equal(relayCommandOutcome({ state: "completed", completion_status: "conflict" }), "conflict");
   assert.equal(relayCommandOutcome({ state: "completed" }), "failed");
   assert.equal(relayCommandOutcome({ state: "acknowledged" }), "pending");
+});
+
+test("relay presentation separates server connection, stopped state, Moblin, and YouTube", () => {
+  assert.deepEqual(nodeStatusPresentation("ready", true), {
+    status: "ready",
+    label: "Агент на связи",
+    tone: "success",
+  });
+  assert.deepEqual(
+    sortNodesForDisplay([
+      { id: "generic-a", capabilities: [] },
+      { id: "relay", capabilities: ["moblin_relay"] },
+      { id: "generic-b", capabilities: [] },
+    ]).map((node) => node.id),
+    ["relay", "generic-a", "generic-b"],
+  );
+
+  const stopped = normalizeRelayStatus({
+    available: true,
+    status: {
+      service: "inactive",
+      main_process: "stopped",
+      srt_listener: "closed",
+      source: "NONE",
+      youtube_forward: "inactive",
+      overall: "ok",
+      youtube_url_configured: true,
+      youtube_key_configured: true,
+      portrait_profile: true,
+    },
+  });
+  const stoppedView = relayViewModel(stopped);
+  assert.equal(stopped.source, "NONE");
+  assert.equal(stoppedView.badgeLabel, "Готов к запуску");
+  assert.equal(stoppedView.relayStateLabel, "Штатно остановлен");
+  assert.equal(stoppedView.moblinLabel, "Запустится вместе с relay");
+  assert.equal(stoppedView.youtubeLabel, "Настроен · отправка остановлена");
+  assert.equal(stoppedView.startDisabled, false);
+  assert.equal(stoppedView.stopDisabled, true);
+  assert.equal(stoppedView.configureDisabled, false);
+
+  const unavailableView = relayViewModel(normalizeRelayStatus({
+    available: false,
+    status: { service: "inactive", main_process: "stopped", overall: "offline" },
+  }));
+  assert.equal(unavailableView.badgeLabel, "Нет связи с сервером");
+  assert.equal(unavailableView.startDisabled, true);
+  assert.equal(unavailableView.stopDisabled, true);
+  assert.equal(unavailableView.configureDisabled, true);
+
+  const liveView = relayViewModel(normalizeRelayStatus({
+    available: true,
+    status: {
+      service: "active",
+      main_process: "running",
+      srt_listener: "listening",
+      source: "LIVE",
+      youtube_forward: "active",
+      overall: "healthy",
+      youtube_url_configured: true,
+      youtube_key_configured: true,
+      portrait_profile: true,
+    },
+  }));
+  assert.equal(liveView.badgeLabel, "Relay запущен");
+  assert.equal(liveView.moblinLabel, "Поток поступает");
+  assert.equal(liveView.youtubeLabel, "Поток отправляется");
+  assert.equal(liveView.stopDisabled, false);
+  assert.equal(liveView.configureDisabled, true);
+
+  for (const unsafeStatus of [
+    {
+      service: "inactive",
+      main_process: "stopped",
+      srt_listener: "closed",
+      source: "NONE",
+      youtube_forward: "inactive",
+      overall: "degraded",
+      youtube_url_configured: true,
+      youtube_key_configured: true,
+      portrait_profile: true,
+    },
+    {
+      service: "inactive",
+      main_process: "stopped",
+      srt_listener: "closed",
+      source: "NONE",
+      youtube_forward: "active",
+      overall: "offline",
+      youtube_url_configured: true,
+      youtube_key_configured: true,
+      portrait_profile: true,
+    },
+  ]) {
+    const unsafeView = relayViewModel(normalizeRelayStatus({ available: true, status: unsafeStatus }));
+    assert.equal(unsafeView.badgeLabel, "Нужна проверка");
+    assert.equal(unsafeView.startDisabled, true);
+    assert.equal(unsafeView.configureDisabled, true);
+    assert.equal(unsafeView.clearDisabled, true);
+  }
+
+  const wrongProfileView = relayViewModel(normalizeRelayStatus({
+    available: true,
+    status: {
+      service: "inactive",
+      main_process: "stopped",
+      srt_listener: "closed",
+      source: "NONE",
+      youtube_forward: "inactive",
+      overall: "ok",
+      youtube_url_configured: true,
+      youtube_key_configured: true,
+      portrait_profile: false,
+    },
+  }));
+  assert.equal(wrongProfileView.badgeLabel, "Нужна проверка");
+  assert.equal(wrongProfileView.startDisabled, true);
+  assert.equal(wrongProfileView.configureDisabled, false);
 });
 
 test("relay secrets and revealed URLs have explicit cleanup helpers", () => {
@@ -293,7 +416,7 @@ test("self-test action is enabled only for operable node states", () => {
     /selfTest\.disabled = !\["ready", "degraded", "offline"\]\.includes\(status\)/,
   );
   assert.match(source, /control_latency_ms/);
-  assert.match(source, /metricRow\(metrics, "Связь с панелью", controlLatencyLabel\)/);
+  assert.match(source, /metricRowIfPresent\(metrics, "Связь с панелью", controlLatencyLabel\)/);
   assert.equal(canRevokeNode("connecting", true), true);
   assert.equal(canRevokeNode("connecting", false), false);
   assert.equal(canRevokeNode("ready", false), true);
@@ -305,9 +428,21 @@ test("UI includes progress, sudo, revoke confirmation, and mobile layout", () =>
   assert.match(template, /data-install-steps/);
   assert.match(template, /data-sudo-password/);
   assert.match(template, /data-revoke-dialog/);
-  assert.match(source, /Готов к назначению/);
+  assert.match(template, /Серверы и ретрансляция/);
+  assert.match(source, /Агент на связи/);
   assert.match(styles, /@media \(max-width: 680px\)/);
-  assert.match(styles, /\.server-grid/);
+  assert.match(styles, /\.server-grid \{[\s\S]{0,140}align-items: start/);
+  assert.match(styles, /\.server-card--relay \{[\s\S]{0,80}grid-column: 1 \/ -1/);
+  assert.match(styles, /\.server-card \{[\s\S]{0,180}align-content: start/);
+  assert.match(styles, /\.relay-summary \{[\s\S]{0,180}grid-template-columns: repeat\(4/);
+  assert.match(styles, /\.servers__heading > \.button \{[\s\S]{0,80}display: inline-flex/);
+  assert.match(source, /Получить SRT для Moblin/);
+  assert.match(source, /Дополнительные действия/);
+  assert.match(source, /data-relay-action-reason/);
+  assert.match(source, /button\.disabled = true/);
+  assert.match(baseTemplate, /styles\.css[^"\n]*\?v=20260902\.1/);
+  assert.match(baseTemplate, /app\.js[^"\n]*\?v=20260902\.1/);
+  assert.match(template, /servers\.js\?v=20260902\.1/);
   assert.match(source, /result\.safe_result\?\.status === "ok"/);
   assert.match(source, /Docker может остаться установленным на сервере/);
 });

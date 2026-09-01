@@ -9,7 +9,7 @@
     <meta name="api-base" content="/api">
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
     <title>{% block title %}AdoJapan Restream{% endblock %}</title>
-    <link rel="stylesheet" href="{{ url_for('static', path='styles.css') if url_for is defined else '/static/styles.css' }}">
+    <link rel="stylesheet" href="{{ url_for('static', path='styles.css') if url_for is defined else '/static/styles.css' }}?v=20260902.1">
     {% block head %}{% endblock %}
   </head>
   <body class="{% block body_class %}{% endblock %}">
@@ -29,7 +29,7 @@
       aria-relevant="additions"
     ></div>
 
-    <script src="{{ url_for('static', path='app.js') if url_for is defined else '/static/app.js' }}" defer></script>
+    <script src="{{ url_for('static', path='app.js') if url_for is defined else '/static/app.js' }}?v=20260902.1" defer></script>
     {% block scripts %}{% endblock %}
   </body>
 </html>
