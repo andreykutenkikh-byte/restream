@@ -44,10 +44,10 @@
     <div class="page-heading servers__heading">
       <div>
         <p class="eyebrow">Инфраструктура</p>
-        <h1>Серверы для рестриминга</h1>
+        <h1>Серверы и ретрансляция</h1>
         <p class="page-heading__lead">
-          Подключите дополнительный сервер, чтобы в дальнейшем передавать эфир
-          через другой IP и использовать резервный маршрут.
+          Управляйте эфиром Moblin → YouTube на основном relay-сервере
+          и подключайте дополнительные серверы для резервных маршрутов.
         </p>
       </div>
       <button class="button button--primary" type="button" data-open-server-dialog>
@@ -373,5 +373,5 @@
 {% endblock %}
 
 {% block scripts %}
-  <script src="/static/servers.js" defer></script>
+  <script src="/static/servers.js?v=20260902.1" defer></script>
 {% endblock %}

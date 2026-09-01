@@ -145,6 +145,20 @@ def _json(value: Mapping[str, Any] | list[str]) -> str:
     return json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
 
 
+def _relay_snapshot_is_coherently_stopped(row: sqlite3.Row) -> bool:
+    """Return true only for the complete, non-forwarding stopped snapshot."""
+
+    return (
+        str(row["service_state"]) == "inactive"
+        and str(row["main_process"]) == "stopped"
+        and str(row["srt_listener"]) == "closed"
+        and str(row["source"]) == "NONE"
+        and str(row["youtube_forward"]) == "inactive"
+        and str(row["overall"]) in {"offline", "ok", "healthy"}
+        and row["last_error_code"] in {None, "youtube_not_configured"}
+    )
+
+
 class RelayService:
     """Atomic relay provisioning, presence, command, and secret transitions."""
 
@@ -568,7 +582,16 @@ class RelayService:
                 age = (self._time() - _parse_timestamp(last_seen)).total_seconds()
                 generic_status = "offline" if age > 30 else "degraded" if age > 15 else "ready"
         service = str(row["service_state"])
-        overall = "offline" if generic_status == "offline" else str(row["overall"])
+        main_process = str(row["main_process"])
+        reported_overall = str(row["overall"])
+        if generic_status == "offline":
+            overall = "offline"
+        elif reported_overall == "offline" and _relay_snapshot_is_coherently_stopped(row):
+            # A live agent reporting an intentionally stopped relay is healthy
+            # transport-wise. Reserve "offline" for an actually stale heartbeat.
+            overall = "ok"
+        else:
+            overall = reported_overall
         return {
             # Availability is transport presence, not the relay service's
             # active/inactive state. A freshly-heartbeating stopped relay is
@@ -577,7 +600,7 @@ class RelayService:
             "status": {
                 "service": service,
                 "enabled": bool(row["service_enabled"]),
-                "main_process": str(row["main_process"]),
+                "main_process": main_process,
                 "srt_listener": str(row["srt_listener"]),
                 "source": str(row["source"]),
                 "youtube_forward": str(row["youtube_forward"]),
@@ -714,16 +737,17 @@ class RelayService:
             except RelayDomainError:
                 connection.execute("ROLLBACK")
                 raise
-            if command_type in {"CONFIGURE_YOUTUBE", "CLEAR_YOUTUBE"} and (
-                relay["service_state"] != "inactive" or relay["main_process"] != "stopped"
-            ):
+            coherently_stopped = _relay_snapshot_is_coherently_stopped(relay)
+            if command_type in {"CONFIGURE_YOUTUBE", "CLEAR_YOUTUBE"} and not coherently_stopped:
                 connection.execute("ROLLBACK")
-                raise RelayActiveError("relay must be stopped before configuration")
-            if command_type == "START" and not (
-                relay["youtube_url_configured"] and relay["youtube_key_configured"]
-            ):
-                connection.execute("ROLLBACK")
-                raise RelayNotConfiguredError("YouTube is not configured")
+                raise RelayActiveError("relay must be safely stopped before configuration")
+            if command_type == "START":
+                if not coherently_stopped or not bool(relay["portrait_profile"]):
+                    connection.execute("ROLLBACK")
+                    raise RelayActiveError("relay is not ready for a safe start")
+                if not (relay["youtube_url_configured"] and relay["youtube_key_configured"]):
+                    connection.execute("ROLLBACK")
+                    raise RelayNotConfiguredError("YouTube is not configured")
             if command_type != "STATUS":
                 pending = connection.execute(
                     """
