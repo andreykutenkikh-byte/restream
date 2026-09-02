@@ -30,8 +30,10 @@ LOCAL_HLS_PATH = "/iphone-live/index.m3u8"
 LOCAL_HLS_USERNAME = "relay-preview"
 MAX_PLAYLIST_BYTES = 64 * 1024
 MAX_SEGMENT_BYTES = 3 * 1024 * 1024
-_PLAYLIST_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\.m3u8\Z")
-_SEGMENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\.ts\Z")
+_SESSION_UUID4 = r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+_SESSION_QUERY = rf"(?:\?session={_SESSION_UUID4})?"
+_PLAYLIST_RESOURCE = re.compile(rf"[A-Za-z0-9][A-Za-z0-9_.-]{{0,127}}\.m3u8{_SESSION_QUERY}\Z")
+_SEGMENT_RESOURCE = re.compile(rf"[A-Za-z0-9][A-Za-z0-9_.-]{{0,127}}\.ts{_SESSION_QUERY}\Z")
 _MEDIA_SEQUENCE = re.compile(r"#EXT-X-MEDIA-SEQUENCE:([0-9]{1,19})\Z")
 logger = logging.getLogger("relay_agent")
 
@@ -70,7 +72,7 @@ def parse_master_playlist(payload: bytes) -> str | None:
     candidates = [line for line in lines if not line.startswith("#")]
     if not any(line.startswith("#EXT-X-STREAM-INF:") for line in lines):
         return None
-    if len(candidates) != 1 or _PLAYLIST_NAME.fullmatch(candidates[0]) is None:
+    if len(candidates) != 1 or _PLAYLIST_RESOURCE.fullmatch(candidates[0]) is None:
         raise RelayAgentError("preview_playlist_invalid")
     return candidates[0]
 
@@ -90,7 +92,7 @@ def parse_media_playlist(payload: bytes) -> list[LocalSegment]:
     names = [line for line in lines if not line.startswith("#")]
     if not names or len(names) > 32:
         raise RelayAgentError("preview_playlist_invalid")
-    if any(_SEGMENT_NAME.fullmatch(name) is None for name in names):
+    if any(_SEGMENT_RESOURCE.fullmatch(name) is None for name in names):
         raise RelayAgentError("preview_playlist_invalid")
     if first_sequence + len(names) - 1 > 2**63 - 1:
         raise RelayAgentError("preview_playlist_invalid")
@@ -131,14 +133,16 @@ class LocalHLSReader:
         return parse_media_playlist(media)
 
     def read_segment(self, name: str) -> bytes:
-        if _SEGMENT_NAME.fullmatch(name) is None:
+        if _SEGMENT_RESOURCE.fullmatch(name) is None:
             raise RelayAgentError("preview_segment_invalid")
         payload = self._fetch(f"/iphone-live/{name}", MAX_SEGMENT_BYTES, playlist=False)
         validate_mpegts(payload)
         return payload
 
     def _fetch(self, path: str, limit: int, *, playlist: bool) -> bytes:
-        if not path.startswith("/iphone-live/") or "?" in path or "#" in path:
+        prefix = "/iphone-live/"
+        resource_pattern = _PLAYLIST_RESOURCE if playlist else _SEGMENT_RESOURCE
+        if not path.startswith(prefix) or resource_pattern.fullmatch(path[len(prefix) :]) is None:
             raise RelayAgentError("preview_local_request_invalid")
         url = f"{LOCAL_HLS_ORIGIN}{path}"
         parsed = urlsplit(url)
@@ -148,6 +152,7 @@ class LocalHLSReader:
             or parsed.port != 8888
             or parsed.username is not None
             or parsed.password is not None
+            or parsed.fragment
         ):
             raise RelayAgentError("preview_local_request_invalid")
         accepted = "application/vnd.apple.mpegurl" if playlist else "video/mp2t"

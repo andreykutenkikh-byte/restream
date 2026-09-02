@@ -10,6 +10,9 @@ from relay_agent.client import ControlClient
 from relay_agent.errors import RelayAgentError
 from relay_agent.models import HostMetrics, RelaySnapshot
 from relay_agent.preview import (
+    MAX_PLAYLIST_BYTES,
+    MAX_SEGMENT_BYTES,
+    LocalHLSReader,
     LocalSegment,
     PreviewPump,
     parse_master_playlist,
@@ -18,6 +21,8 @@ from relay_agent.preview import (
 )
 from relay_agent.security import SensitiveToken
 from relay_agent.service import AgentService
+
+SESSION_UUID4 = "123e4567-e89b-42d3-a456-426614174000"
 
 
 def media_playlist(*names: str, sequence: int = 7) -> bytes:
@@ -45,6 +50,21 @@ def test_strict_playlist_parser_accepts_plain_relative_mpegts_names() -> None:
     ]
 
 
+def test_strict_playlist_parser_accepts_mediamtx_session_resources() -> None:
+    master_resource = f"video.m3u8?session={SESSION_UUID4}"
+    master = (f"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=4000000\n{master_resource}\n").encode("ascii")
+    segment_resources = (
+        f"seg7.ts?session={SESSION_UUID4}",
+        f"seg8.ts?session={SESSION_UUID4}",
+    )
+
+    assert parse_master_playlist(master) == master_resource
+    assert parse_media_playlist(media_playlist(*segment_resources)) == [
+        LocalSegment(7, segment_resources[0]),
+        LocalSegment(8, segment_resources[1]),
+    ]
+
+
 @pytest.mark.parametrize(
     "name",
     [
@@ -52,6 +72,15 @@ def test_strict_playlist_parser_accepts_plain_relative_mpegts_names() -> None:
         "/absolute.ts",
         "http://example.test/a.ts",
         "segment.ts?token=value",
+        f"segment.ts?session={SESSION_UUID4}&extra=value",
+        f"segment.ts?extra=value&session={SESSION_UUID4}",
+        f"segment.ts?session={SESSION_UUID4}&session={SESSION_UUID4}",
+        "segment.ts?session=123e4567-e89b-12d3-a456-426614174000",
+        "segment.ts?session=123e4567-e89b-42d3-7456-426614174000",
+        "segment.ts?session=123E4567-E89B-42D3-A456-426614174000",
+        "segment.ts?session=123e4567-e89b-42d3-a456-42661417400%30",
+        f"segment.ts?session={SESSION_UUID4}#fragment",
+        "segment.ts?",
         "segment%2ets",
         "segment.mp4",
     ],
@@ -66,6 +95,127 @@ def test_media_playlist_requires_one_bounded_sequence() -> None:
         parse_media_playlist(b"#EXTM3U\nsegment.ts\n")
     with pytest.raises(RelayAgentError, match="preview_playlist_invalid"):
         parse_media_playlist(media_playlist("segment.ts", "next.ts", sequence=2**63 - 1))
+
+
+@pytest.mark.parametrize(
+    "resource",
+    [
+        "../video.m3u8",
+        "/video.m3u8",
+        "https://example.test/video.m3u8",
+        f"video.m3u8?session={SESSION_UUID4}&extra=value",
+        f"video.m3u8?session={SESSION_UUID4}#fragment",
+        "video.m3u8?session=123e4567-e89b-12d3-a456-426614174000",
+        "video.m3u8?session=123E4567-E89B-42D3-A456-426614174000",
+        "video%2em3u8",
+        "video.m3u8?",
+    ],
+)
+def test_master_playlist_rejects_noncanonical_or_unsafe_resources(resource: str) -> None:
+    payload = (f"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=4000000\n{resource}\n").encode("ascii")
+    with pytest.raises(RelayAgentError, match="preview_playlist_invalid"):
+        parse_master_playlist(payload)
+
+
+def test_local_hls_reader_fetches_exact_mediamtx_session_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    playlist_resource = f"video.m3u8?session={SESSION_UUID4}"
+    segment_resource = f"seg7.ts?session={SESSION_UUID4}"
+    responses = [
+        (
+            "application/vnd.apple.mpegurl",
+            (f"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=4000000\n{playlist_resource}\n").encode(
+                "ascii"
+            ),
+        ),
+        (
+            "application/vnd.apple.mpegurl",
+            media_playlist(segment_resource),
+        ),
+        ("video/mp2t", ts_segment()),
+    ]
+    requests: list[tuple[str, str]] = []
+
+    class Headers:
+        def __init__(self, content_type: str) -> None:
+            self._content_type = content_type
+
+        def get_content_type(self) -> str:
+            return self._content_type
+
+    class Response:
+        status = 200
+
+        def __init__(self, content_type: str, payload: bytes) -> None:
+            self.headers = Headers(content_type)
+            self._payload = payload
+
+        def __enter__(self) -> Response:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self, limit: int) -> bytes:
+            assert len(self._payload) <= limit
+            return self._payload
+
+    class Opener:
+        def open(self, request: object, *, timeout: float) -> Response:
+            requests.append((request.full_url, request.headers["Accept"]))  # type: ignore[attr-defined]
+            assert timeout == 4.0
+            return Response(*responses.pop(0))
+
+    monkeypatch.setattr("relay_agent.preview.build_opener", lambda *_handlers: Opener())
+    reader = LocalHLSReader(SensitiveToken.parse("p" * 32))
+
+    assert reader.completed_segments() == [LocalSegment(7, segment_resource)]
+    assert reader.read_segment(segment_resource) == ts_segment()
+    assert requests == [
+        (
+            "http://127.0.0.1:8888/iphone-live/index.m3u8",
+            "application/vnd.apple.mpegurl",
+        ),
+        (
+            f"http://127.0.0.1:8888/iphone-live/{playlist_resource}",
+            "application/vnd.apple.mpegurl",
+        ),
+        (
+            f"http://127.0.0.1:8888/iphone-live/{segment_resource}",
+            "video/mp2t",
+        ),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("path", "playlist"),
+    [
+        (f"/iphone-live/video.m3u8?session={SESSION_UUID4}&extra=value", True),
+        (f"/iphone-live/video.m3u8?session={SESSION_UUID4}#fragment", True),
+        ("/iphone-live/video.m3u8?session=123E4567-E89B-42D3-A456-426614174000", True),
+        (f"/iphone-live/subdir/video.m3u8?session={SESSION_UUID4}", True),
+        (f"/iphone-live/segment.ts?session={SESSION_UUID4}/extra", False),
+        (f"/other/segment.ts?session={SESSION_UUID4}", False),
+    ],
+)
+def test_local_hls_reader_rejects_unsafe_request_targets_before_network(
+    monkeypatch: pytest.MonkeyPatch, path: str, playlist: bool
+) -> None:
+    class Opener:
+        @staticmethod
+        def open(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("unsafe request reached the network")
+
+    monkeypatch.setattr("relay_agent.preview.build_opener", lambda *_handlers: Opener())
+    reader = LocalHLSReader(SensitiveToken.parse("p" * 32))
+
+    with pytest.raises(RelayAgentError, match="preview_local_request_invalid"):
+        reader._fetch(
+            path,
+            MAX_PLAYLIST_BYTES if playlist else MAX_SEGMENT_BYTES,
+            playlist=playlist,
+        )
 
 
 def test_preview_pump_uploads_each_completed_segment_once_and_rotates_generation() -> None:
@@ -220,7 +370,7 @@ def test_control_client_accepts_optional_preview_demand_and_uses_separate_media_
     assert method == "GET"
     assert path == "/relay-agent/v1/commands/next?wait=0"
     assert sent is None
-    assert headers["X-Relay-Agent-Version"] == "1.2.0"
+    assert headers["X-Relay-Agent-Version"] == "1.2.1"
 
     payload = ts_segment()
     client.upload_preview_segment(generation, 22, payload)
