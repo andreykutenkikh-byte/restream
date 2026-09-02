@@ -103,7 +103,7 @@ test("unknown node states fail closed and display strings remove controls", () =
 
 test("password fields use browser-safe attributes and are cleared after acceptance", () => {
   const passwordFields = template.match(/<input[^>]+type="password"[^>]*>/g) || [];
-  assert.equal(passwordFields.length, 6);
+  assert.equal(passwordFields.length, 4);
   for (const field of passwordFields) {
     assert.match(field, /autocomplete="new-password"/);
     assert.match(field, /spellcheck="false"/);
@@ -119,24 +119,23 @@ test("YouTube payload accepts only RTMPS and compacts accidental whitespace", ()
     buildYouTubeConfigPayload({
       url: "  rtmps://example.test/live2\r\n",
       stream_key: " abcd-efgh\n-ijkl ",
-      admin_password: "  operator password  ",
+      admin_password: "must-not-be-sent",
     }),
     {
       url: "rtmps://example.test/live2",
       stream_key: "abcd-efgh-ijkl",
-      admin_password: "  operator password  ",
     },
   );
   assert.throws(
-    () => buildYouTubeConfigPayload({ url: "rtmp://example.test/live2", stream_key: "x", admin_password: "x" }),
+    () => buildYouTubeConfigPayload({ url: "rtmp://example.test/live2", stream_key: "x" }),
     TypeError,
   );
   assert.throws(
-    () => buildYouTubeConfigPayload({ url: "rtmps://example.test/live2#bad", stream_key: "x", admin_password: "x" }),
+    () => buildYouTubeConfigPayload({ url: "rtmps://example.test/live2#bad", stream_key: "x" }),
     TypeError,
   );
   assert.throws(
-    () => buildYouTubeConfigPayload({ url: "rtmps://example.test/live2", stream_key: " \n", admin_password: "x" }),
+    () => buildYouTubeConfigPayload({ url: "rtmps://example.test/live2", stream_key: " \n" }),
     TypeError,
   );
   assert.deepEqual(buildAdminPasswordPayload({ admin_password: "secret" }), { admin_password: "secret" });
@@ -363,10 +362,15 @@ test("server rendering never uses HTML injection or browser persistence", () => 
 });
 
 test("relay UI never persists or displays YouTube secrets", () => {
+  const youtubeConfigForm = template.match(/<form[^>]+data-youtube-config-form[\s\S]*?<\/form>/)?.[0] || "";
+  const youtubeClearForm = template.match(/<form[^>]+data-youtube-clear-form[\s\S]*?<\/form>/)?.[0] || "";
+  const moblinUrlForm = template.match(/<form[^>]+data-moblin-url-form[\s\S]*?<\/form>/)?.[0] || "";
   assert.match(template, /data-youtube-config-form[^>]+method="dialog"/);
   assert.match(template, /data-youtube-config-form[^>]+autocomplete="off"/);
   assert.match(template, /name="stream_key"[\s\S]*?type="password"[\s\S]*?autocomplete="new-password"/);
-  assert.match(template, /name="admin_password"[\s\S]*?type="password"[\s\S]*?autocomplete="new-password"/);
+  assert.doesNotMatch(youtubeConfigForm, /name="admin_password"/);
+  assert.doesNotMatch(moblinUrlForm, /name="admin_password"/);
+  assert.match(youtubeClearForm, /name="admin_password"[\s\S]*?type="password"[\s\S]*?autocomplete="new-password"/);
   assert.match(template, /data-sensitive-output/);
   assert.match(template, /data-youtube-clear-form[^>]+autocomplete="off"/);
   assert.match(template, /data-youtube-clear-form[^>]+method="dialog"/);
@@ -381,6 +385,9 @@ test("relay UI never persists or displays YouTube secrets", () => {
   assert.doesNotMatch(source, /localStorage|sessionStorage|indexedDB/);
   assert.match(source, /wipeSecretObject\(payload\)/);
   assert.match(source, /wipeSecretObject\(response\)/);
+  assert.match(source, /let requestBody = "\{\}";/);
+  assert.doesNotMatch(source, /data-moblin-admin-password|data-youtube-admin-password|moblinReauth/);
+  assert.doesNotMatch(source, /Проверьте RTMPS URL, stream key и пароль администратора/);
   assert.match(source, /window\.addEventListener\("pagehide"/);
   assert.match(source, /if \(!requestIsCurrent\(\)\) return;/);
   assert.match(source, /serverErrorCode\(payload\) !== "step_up_failed"/);
@@ -442,7 +449,7 @@ test("UI includes progress, sudo, revoke confirmation, and mobile layout", () =>
   assert.match(source, /button\.disabled = true/);
   assert.match(baseTemplate, /styles\.css[^"\n]*\?v=20260902\.3/);
   assert.match(baseTemplate, /app\.js[^"\n]*\?v=20260902\.3/);
-  assert.match(template, /servers\.js\?v=20260902\.3/);
+  assert.match(template, /servers\.js\?v=20260902\.4/);
   assert.match(source, /result\.safe_result\?\.status === "ok"/);
   assert.match(source, /Docker может остаться установленным на сервере/);
 });

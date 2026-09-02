@@ -134,6 +134,108 @@ def test_relay_api_rejects_invalid_or_labeled_input_telemetry(
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize(
+    ("method", "endpoint", "payload", "agent_version"),
+    [
+        (
+            "PUT",
+            "configure-youtube",
+            {
+                "url": "rtmps://a.rtmps.youtube.com/live2",
+                "stream_key": "ROUTINE_FULL_KEY_CANARY_41",
+            },
+            "1.2.0",
+        ),
+        (
+            "PUT",
+            "configure-youtube-key",
+            {"stream_key": "ROUTINE_KEY_ONLY_CANARY_42"},
+            "1.2.0",
+        ),
+        ("POST", "reveal-moblin-url?wait=0", {}, "1.2.0"),
+    ],
+    ids=("configure-youtube", "configure-youtube-key", "reveal-moblin-url"),
+)
+def test_routine_relay_actions_use_session_csrf_and_origin_without_step_up(
+    method: str,
+    endpoint: str,
+    payload: dict[str, str],
+    agent_version: str,
+    settings: Settings,
+    admin_password: str,
+) -> None:
+    app = create_app(settings, mediamtx=FakeMediaMTX())  # type: ignore[arg-type]
+    legacy_password_marker = "IGNORED_CACHED_PASSWORD_CANARY_43"
+    with TestClient(app) as client:
+        grant = app.state.relays.provision_node(display_name="HK relay", address="relay.example")
+        bearer = {"Authorization": f"Bearer {grant.node_token}"}
+        assert (
+            client.post(
+                "/relay-agent/v1/heartbeat",
+                json=heartbeat_payload(agent_version=agent_version),
+                headers=bearer,
+            ).status_code
+            == 200
+        )
+        path = f"/api/nodes/{grant.node_id}/relay/{endpoint}"
+        idempotency_key = f"test:routine:{endpoint.split('?', 1)[0]}"
+
+        unauthenticated = client.request(
+            method,
+            path,
+            json=payload,
+            headers={
+                "Origin": "http://testserver",
+                "X-CSRF-Token": "invalid",
+                "Idempotency-Key": idempotency_key,
+            },
+        )
+        assert unauthenticated.status_code == 401
+
+        headers = admin_headers(client, settings, admin_password)
+        missing_csrf = client.request(
+            method,
+            path,
+            json=payload,
+            headers={"Origin": headers["Origin"], "Idempotency-Key": idempotency_key},
+        )
+        assert missing_csrf.status_code == 403
+        missing_origin = client.request(
+            method,
+            path,
+            json=payload,
+            headers={
+                "X-CSRF-Token": headers["X-CSRF-Token"],
+                "Idempotency-Key": idempotency_key,
+            },
+        )
+        assert missing_origin.status_code == 403
+
+        accepted = client.request(
+            method,
+            path,
+            json=payload,
+            headers={**headers, "Idempotency-Key": idempotency_key},
+        )
+        assert accepted.status_code == 202
+
+        cached_frontend_replay = client.request(
+            method,
+            path,
+            json={**payload, "admin_password": legacy_password_marker},
+            headers={**headers, "Idempotency-Key": idempotency_key},
+        )
+        assert cached_frontend_replay.status_code == 202
+        assert cached_frontend_replay.json()["command_id"] == accepted.json()["command_id"]
+        assert legacy_password_marker not in cached_frontend_replay.text
+        audit = str(app.state.database.list_audit_events())
+        assert "relay.step_up" not in audit
+        assert legacy_password_marker not in audit
+        with app.state.database.connect() as connection:
+            database_dump = "\n".join(connection.iterdump())
+        assert legacy_password_marker not in database_dump
+
+
 def test_relay_api_encrypts_config_and_reports_only_terminal_success(
     settings: Settings, admin_password: str
 ) -> None:
@@ -507,7 +609,7 @@ def test_reveal_result_is_returned_once_and_removed_from_sqlite(
         reveal_headers = {**headers, "Idempotency-Key": "ui:reveal:001"}
         first = client.post(
             f"/api/nodes/{grant.node_id}/relay/reveal-moblin-url?wait=0",
-            json={"admin_password": admin_password},
+            json={},
             headers=reveal_headers,
         )
         assert first.status_code == 202
@@ -543,7 +645,7 @@ def test_reveal_result_is_returned_once_and_removed_from_sqlite(
 
         revealed = client.post(
             f"/api/nodes/{grant.node_id}/relay/reveal-moblin-url?wait=0",
-            json={"admin_password": admin_password},
+            json={},
             headers=reveal_headers,
         )
         assert revealed.status_code == 200
@@ -569,12 +671,11 @@ def test_reveal_result_is_returned_once_and_removed_from_sqlite(
         assert command_count == 1
 
 
-def test_relay_step_up_rate_limit_is_independent_and_never_audits_secrets(
+def test_clear_youtube_step_up_remains_required_rate_limited_and_secret_safe(
     settings: Settings, admin_password: str
 ) -> None:
     app = create_app(settings, mediamtx=FakeMediaMTX())  # type: ignore[arg-type]
     app.state.relay_step_up_limiter = StepUpRateLimiter(attempts=2, window_seconds=60)
-    key_marker = "STEPUP_KEY_CANARY_86"
     password_markers = ("WRONG_PASSWORD_CANARY_87", "WRONG_PASSWORD_CANARY_88")
     with TestClient(app) as client:
         grant = app.state.relays.provision_node(display_name="HK relay", address="relay.example")
@@ -586,37 +687,31 @@ def test_relay_step_up_rate_limit_is_independent_and_never_audits_secrets(
             == 200
         )
         headers = admin_headers(client, settings, admin_password)
-        endpoint = f"/api/nodes/{grant.node_id}/relay/configure-youtube"
+        endpoint = f"/api/nodes/{grant.node_id}/relay/youtube"
+
+        missing = client.request("DELETE", endpoint, json={}, headers=headers)
+        assert missing.status_code == 422
 
         for password_marker in password_markers:
-            rejected = client.put(
+            rejected = client.request(
+                "DELETE",
                 endpoint,
-                json={
-                    "url": "rtmps://a.rtmps.youtube.com/live2",
-                    "stream_key": key_marker,
-                    "admin_password": password_marker,
-                },
+                json={"admin_password": password_marker},
                 headers=headers,
             )
             assert rejected.status_code == 401
             assert password_marker not in rejected.text
-            assert key_marker not in rejected.text
 
-        locked = client.put(
+        locked = client.request(
+            "DELETE",
             endpoint,
-            json={
-                "url": "rtmps://a.rtmps.youtube.com/live2",
-                "stream_key": key_marker,
-                "admin_password": admin_password,
-            },
+            json={"admin_password": admin_password},
             headers=headers,
         )
         assert locked.status_code == 429
         assert locked.headers["retry-after"] == "60"
-        assert key_marker not in locked.text
 
         audit = str(app.state.database.list_audit_events())
-        assert key_marker not in audit
         assert all(marker not in audit for marker in password_markers)
 
         # The dedicated relay throttle never consumes or resets the login budget.
@@ -629,23 +724,17 @@ def test_relay_step_up_rate_limit_is_independent_and_never_audits_secrets(
             "X-CSRF-Token": str(relogin.json()["csrf_token"]),
             "Origin": "http://testserver",
         }
-        accepted = client.put(
+        accepted = client.request(
+            "DELETE",
             endpoint,
-            json={
-                "url": "rtmps://a.rtmps.youtube.com/live2",
-                "stream_key": key_marker,
-                "admin_password": admin_password,
-            },
+            json={"admin_password": admin_password},
             headers=fresh_headers,
         )
         assert accepted.status_code == 202
-        assert key_marker not in accepted.text
         final_audit = str(app.state.database.list_audit_events())
-        assert key_marker not in final_audit
         assert all(marker not in final_audit for marker in password_markers)
         with app.state.database.connect() as connection:
             database_dump = "\n".join(connection.iterdump())
-        assert key_marker not in database_dump
         assert all(marker not in database_dump for marker in password_markers)
 
 

@@ -99,13 +99,11 @@
   function buildYouTubeConfigPayload(formValues) {
     const url = compactRelayValue(formValues?.url);
     const streamKey = compactRelayValue(formValues?.stream_key);
-    const adminPassword = String(formValues?.admin_password || "");
     if (!url.startsWith("rtmps://") || url.includes("#")) {
       throw new TypeError("Укажите RTMPS URL без символа #.");
     }
     if (!streamKey) throw new TypeError("Введите YouTube stream key.");
-    if (!adminPassword.trim()) throw new TypeError("Введите пароль администратора панели.");
-    return { url, stream_key: streamKey, admin_password: adminPassword };
+    return { url, stream_key: streamKey };
   }
 
   function buildAdminPasswordPayload(formValues) {
@@ -409,7 +407,6 @@
   const moblinUrlForm = document.querySelector("[data-moblin-url-form]");
   const moblinUrlError = document.querySelector("[data-moblin-url-error]");
   const moblinUrlResults = document.querySelector("[data-moblin-url-results]");
-  const moblinReauth = document.querySelector("[data-moblin-reauth]");
   const revealMoblinButton = document.querySelector("[data-reveal-moblin-url]");
   const serverForm = document.querySelector("[data-server-form]");
   const sudoForm = document.querySelector("[data-sudo-form]");
@@ -492,7 +489,7 @@
       if (code !== "relay_active") return `Сейчас нельзя ${action}. Обновите статус и повторите.`;
       return "Ретранслятор активен. Завершите broadcast в YouTube и остановите relay, затем повторите.";
     }
-    if (error.status === 422) return "Проверьте RTMPS URL, stream key и пароль администратора.";
+    if (error.status === 422) return "Проверьте введённые данные.";
     if (error.status === 429) return "Слишком много попыток. Подождите и повторите.";
     return `Не удалось ${action}. Попробуйте ещё раз.`;
   }
@@ -1227,7 +1224,6 @@
     clearSensitiveFields(moblinUrlDialog);
     setBusy(moblinUrlForm, false);
     if (moblinUrlResults) moblinUrlResults.hidden = true;
-    if (moblinReauth) moblinReauth.hidden = false;
     if (revealMoblinButton) revealMoblinButton.hidden = false;
     moblinUrlDialog?.querySelectorAll("[data-public-url-row], [data-vpn-url-row]").forEach((row) => {
       row.hidden = true;
@@ -1253,7 +1249,7 @@
     clearMoblinUrlDialog();
     pendingMoblinNodeId = String(nodeId);
     openDialog(moblinUrlDialog);
-    moblinUrlForm?.querySelector("[data-moblin-admin-password]")?.focus();
+    revealMoblinButton?.focus();
   }
 
   youtubeConfigForm?.addEventListener("submit", async (event) => {
@@ -1387,14 +1383,11 @@
     const endpoint = `/api/nodes/${encodeURIComponent(nodeId)}/relay/reveal-moblin-url`;
     const idempotencyKey = createRelayIdempotencyKey("reveal-moblin");
     const requestHeaders = idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {};
-    let payload = null;
     let response = null;
-    let requestBody = "";
+    let requestBody = "{}";
     if (moblinUrlError) moblinUrlError.hidden = true;
     setBusy(moblinUrlForm, true);
     try {
-      payload = buildAdminPasswordPayload(Object.fromEntries(new FormData(moblinUrlForm).entries()));
-      requestBody = JSON.stringify(payload);
       response = await apiRequest(endpoint, { method: "POST", body: requestBody, headers: requestHeaders });
       if (!requestIsCurrent()) return;
       let publicUrl = sanitizeSrtUrl(response?.public_url);
@@ -1433,7 +1426,6 @@
       if (publicRow) publicRow.hidden = !publicUrl;
       if (vpnRow) vpnRow.hidden = !vpnUrl;
       if (moblinUrlResults) moblinUrlResults.hidden = false;
-      if (moblinReauth) moblinReauth.hidden = true;
       if (revealMoblinButton) revealMoblinButton.hidden = true;
     } catch (error) {
       if (!requestIsCurrent()) return;
@@ -1443,14 +1435,10 @@
         moblinUrlError.hidden = false;
       }
     } finally {
-      wipeSecretObject(payload);
       wipeSecretObject(response);
-      payload = null;
       response = null;
       requestBody = "";
       if (requestIsCurrent()) {
-        const passwordInput = moblinUrlForm.querySelector("[data-moblin-admin-password]");
-        if (passwordInput) passwordInput.value = "";
         setBusy(moblinUrlForm, false);
       }
     }

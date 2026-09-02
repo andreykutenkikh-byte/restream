@@ -27,6 +27,7 @@ from app.schemas import (
     RelayConfigureYouTubeKeyRequest,
     RelayConfigureYouTubeRequest,
     RelayHeartbeatRequest,
+    RelayRevealMoblinURLRequest,
     RelayStepUpRequest,
 )
 from app.services.relay_preview import RelayPreviewStore
@@ -412,7 +413,6 @@ async def configure_youtube(
     __: None = Depends(require_same_origin),
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> dict[str, Any]:
-    _step_up(request, payload.admin_password.get_secret_value(), node_id)
     return _queue(
         request,
         node_id,
@@ -437,7 +437,6 @@ async def configure_youtube_key(
     __: None = Depends(require_same_origin),
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> dict[str, Any]:
-    _step_up(request, payload.admin_password.get_secret_value(), node_id)
     return _queue(
         request,
         node_id,
@@ -506,14 +505,13 @@ def _parse_srt_result(secret: str) -> dict[str, str | None]:
 @router.post("/api/nodes/{node_id}/relay/reveal-moblin-url")
 async def reveal_moblin_url(
     node_id: str,
-    payload: RelayStepUpRequest,
+    payload: RelayRevealMoblinURLRequest,
     request: Request,
     wait: Annotated[int, Query(ge=0, le=20)] = 20,
     _: dict[str, str] = Depends(require_csrf),
     __: None = Depends(require_same_origin),
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> Response:
-    _step_up(request, payload.admin_password.get_secret_value(), node_id)
     queued = _queue(
         request,
         node_id,

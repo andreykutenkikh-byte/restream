@@ -537,9 +537,7 @@ def test_connecting_relay_can_be_revoked_then_rotated_and_requires_new_heartbeat
 def test_youtube_url_trust_boundary_rejects_non_official_rtmps(url: str) -> None:
     marker = "KEY_CANARY_90"
     with pytest.raises(ValidationError) as exc:
-        RelayConfigureYouTubeRequest.model_validate(
-            {"url": url, "stream_key": marker, "admin_password": "admin-password"}
-        )
+        RelayConfigureYouTubeRequest.model_validate({"url": url, "stream_key": marker})
     assert marker not in str(exc.value)
 
 
@@ -549,10 +547,19 @@ def test_youtube_url_accepts_exact_official_primary_and_backup() -> None:
             {
                 "url": f"rtmps://{host}:443/live2",
                 "stream_key": "valid_key-123",
-                "admin_password": "admin-password",
             }
         )
         assert request.url.get_secret_value() == f"rtmps://{host}:443/live2"
+        assert request.admin_password is None
+
+    legacy_request = RelayConfigureYouTubeRequest.model_validate(
+        {
+            "url": "rtmps://a.rtmps.youtube.com/live2",
+            "stream_key": "valid_key-123",
+            "admin_password": "cached-frontend-password",
+        }
+    )
+    assert legacy_request.admin_password is not None
 
 
 def test_encrypted_command_payload_and_active_configuration_conflict(tmp_path: Path) -> None:

@@ -201,10 +201,6 @@
           </label>
           <p class="form-help">Обычно адрес не меняется. Используйте точное значение из YouTube Studio.</p>
         </details>
-        <label class="form-field">
-          <span>Пароль администратора панели</span>
-          <input name="admin_password" type="password" maxlength="1024" autocomplete="new-password" spellcheck="false" required data-dashboard-youtube-admin-password>
-        </label>
         <p class="form-help">Если relay активен, сначала завершите broadcast в YouTube и остановите relay.</p>
         <p class="field-error" data-relay-dashboard-youtube-error hidden role="alert"></p>
       </div>
@@ -223,13 +219,6 @@
       </header>
       <div class="modal__body relay-secret-form">
         <p class="form-help">В Moblin откройте <strong>Settings → Streams → профиль → URL</strong> и вставьте SRT URL.</p>
-        <div data-dashboard-moblin-reauth>
-          <label class="form-field">
-            <span>Пароль администратора панели</span>
-            <input name="admin_password" type="password" maxlength="1024" autocomplete="new-password" spellcheck="false" required data-dashboard-moblin-admin-password>
-          </label>
-          <p class="form-help">Ссылка содержит секрет доступа, поэтому требуется повторное подтверждение.</p>
-        </div>
         <div class="relay-url-results" data-dashboard-moblin-results hidden aria-live="polite">
           <div class="form-field relay-url-field" data-dashboard-public-url-row hidden>
             <label for="dashboard-moblin-public-url">SRT URL для приложения</label>
@@ -279,5 +268,5 @@
 {% endblock %}
 
 {% block scripts %}
-  <script src="/static/relay-dashboard.js?v=20260902.3" defer></script>
+  <script src="/static/relay-dashboard.js?v=20260902.4" defer></script>
 {% endblock %}
