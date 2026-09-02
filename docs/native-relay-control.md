@@ -90,10 +90,13 @@ minutes.
 
 Read operations require an authenticated session. Mutations additionally
 require the synchronizer CSRF token and an exact same-origin `Origin` header.
-YouTube configuration, clearing, and Moblin URL reveal require the current
-administrator password as a step-up check. Failed step-up checks use a separate
-per-session-and-client throttle; it neither consumes nor resets the login
-throttle and returns a bounded `Retry-After` when locked.
+Routine YouTube configuration and the one-time Moblin URL reveal use that
+authenticated session directly, without asking the operator to enter the panel
+password again. Clearing the saved YouTube configuration is destructive and
+still requires the current administrator password as a step-up check. Failed
+step-up checks use a separate per-session-and-client throttle; it neither
+consumes nor resets the login throttle and returns a bounded `Retry-After` when
+locked.
 
 - `GET /api/nodes/{node_id}/relay`
 - `POST /api/nodes/{node_id}/relay/refresh`
@@ -168,7 +171,7 @@ YouTube secrets.
 Keep these three values separate:
 
 1. On the main **Трансляция** page, enter the **YouTube stream key** in the
-   protected first-step dialog. The exact **YouTube RTMPS URL** from Live
+   first-step dialog. The exact **YouTube RTMPS URL** from Live
    Control Room is required only during initial setup or when its endpoint must
    be replaced; it stays collapsed under the dialog's additional settings once
    configured. Both values are written to the HK relay's existing root-owned

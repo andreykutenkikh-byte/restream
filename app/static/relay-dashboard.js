@@ -129,21 +129,17 @@
   function buildYouTubePayload(values) {
     const url = String(values.url || "").trim();
     const streamKey = String(values.stream_key || "").trim();
-    const adminPassword = String(values.admin_password || "");
     if (!url.startsWith("rtmps://") || url.includes("#") || /\s/.test(url)) {
       throw new TypeError("Используйте точный rtmps:// адрес из YouTube Studio без пробелов и символа #.");
     }
     if (!streamKey || /\s/.test(streamKey)) throw new TypeError("Введите stream key без пробелов.");
-    if (!adminPassword) throw new TypeError("Введите пароль администратора панели.");
-    return { url, stream_key: streamKey, admin_password: adminPassword };
+    return { url, stream_key: streamKey };
   }
 
   function buildYouTubeKeyPayload(values) {
     const streamKey = String(values.stream_key || "").trim();
-    const adminPassword = String(values.admin_password || "");
     if (!streamKey || /\s/.test(streamKey)) throw new TypeError("Введите stream key без пробелов.");
-    if (!adminPassword) throw new TypeError("Введите пароль администратора панели.");
-    return { stream_key: streamKey, admin_password: adminPassword };
+    return { stream_key: streamKey };
   }
 
   function buildAdminPasswordPayload(values) {
@@ -180,6 +176,22 @@
     return typeof random === "string" ? `ui:${action}:${random}` : "";
   }
 
+  function isCurrentDialogRequest(
+    expectedNodeId,
+    currentNodeId,
+    expectedGeneration,
+    currentGeneration,
+    dialogOpen,
+  ) {
+    return Boolean(
+      expectedNodeId
+      && String(currentNodeId || "") === String(expectedNodeId)
+      && Number.isInteger(expectedGeneration)
+      && expectedGeneration === currentGeneration
+      && dialogOpen === true,
+    );
+  }
+
   function previewUpdateIsCurrent(expectedGeneration, currentGeneration, expectedNodeId, currentNodeId, relay) {
     return Number.isInteger(expectedGeneration)
       && expectedGeneration === currentGeneration
@@ -197,6 +209,7 @@
       buildYouTubePayload,
       formatAge,
       formatBitrate,
+      isCurrentDialogRequest,
       normalizeRelayStatus,
       previewUpdateIsCurrent,
       relayCommandOutcome,
@@ -240,6 +253,9 @@
   let previewLeaseRenewedAt = 0;
   let previewUpdateGeneration = 0;
   let commandBusy = false;
+  let youtubeRequestGeneration = 0;
+  let moblinRequestGeneration = 0;
+  let clearRequestGeneration = 0;
 
   class ApiError extends Error {
     constructor(message, status = 0, payload = null) {
@@ -524,12 +540,15 @@
     }
   }
 
-  async function waitForRelayCommand(commandId) {
+  async function waitForRelayCommand(nodeId, commandId, { isCurrent = null } = {}) {
     for (let attempt = 0; attempt < COMMAND_POLL_LIMIT; attempt += 1) {
-      const command = await apiRequest(`/api/nodes/${encodeURIComponent(relayNodeId)}/relay/commands/${encodeURIComponent(commandId)}`);
+      if (isCurrent && !isCurrent()) return "stale";
+      const command = await apiRequest(`/api/nodes/${encodeURIComponent(nodeId)}/relay/commands/${encodeURIComponent(commandId)}`);
+      if (isCurrent && !isCurrent()) return "stale";
       const outcome = relayCommandOutcome(command);
       if (outcome !== "pending") return outcome;
       await new Promise((resolve) => setTimeout(resolve, COMMAND_POLL_MS));
+      if (isCurrent && !isCurrent()) return "stale";
     }
     return "pending";
   }
@@ -541,11 +560,12 @@
     commandBusy = true;
     updateControls(currentRelay, currentView);
     try {
+      const nodeId = String(relayNodeId);
       const headers = {};
       const key = createIdempotencyKey(action);
       if (key) headers["Idempotency-Key"] = key;
-      const queued = await apiRequest(`/api/nodes/${encodeURIComponent(relayNodeId)}/relay/${action}`, { method: "POST", headers });
-      const outcome = await waitForRelayCommand(queued?.command_id || "");
+      const queued = await apiRequest(`/api/nodes/${encodeURIComponent(nodeId)}/relay/${action}`, { method: "POST", headers });
+      const outcome = await waitForRelayCommand(nodeId, queued?.command_id || "");
       if (outcome !== "success") throw new ApiError("Relay command failed", outcome === "conflict" ? 409 : 422);
       showToast(action === "start" ? "Relay запущен" : action === "stop" ? "Relay остановлен" : "Состояние обновлено");
     } catch (error) {
@@ -558,11 +578,24 @@
 
   function resetDialog(dialog, errorOutput) {
     clearSensitiveFields(dialog);
-    dialog?.querySelector("form")?.reset();
+    const form = dialog?.querySelector("form");
+    form?.reset();
+    setBusy(form, false);
     if (errorOutput) {
       errorOutput.textContent = "";
       errorOutput.hidden = true;
     }
+  }
+
+  function dialogRequestIsCurrent(nodeId, generation, currentGeneration, dialog) {
+    const dialogOpen = dialog?.open === true || dialog?.hasAttribute?.("open") === true;
+    return isCurrentDialogRequest(
+      nodeId,
+      relayNodeId,
+      generation,
+      currentGeneration,
+      dialogOpen,
+    );
   }
 
   function prepareYouTubeDialog() {
@@ -589,6 +622,14 @@
   async function submitYouTube(event) {
     event.preventDefault();
     if (!relayNodeId) return;
+    const nodeId = String(relayNodeId);
+    const requestGeneration = ++youtubeRequestGeneration;
+    const requestIsCurrent = () => dialogRequestIsCurrent(
+      nodeId,
+      requestGeneration,
+      youtubeRequestGeneration,
+      youtubeDialog,
+    );
     let payload = null;
     let body = "";
     setBusy(youtubeForm, true);
@@ -603,14 +644,18 @@
       const action = keyOnly ? "configure-youtube-key" : "configure-youtube";
       const key = createIdempotencyKey(action);
       if (key) headers["Idempotency-Key"] = key;
-      const queued = await apiRequest(`/api/nodes/${encodeURIComponent(relayNodeId)}/relay/${action}`, { method: "PUT", body, headers });
-      const outcome = await waitForRelayCommand(queued?.command_id || "");
+      const queued = await apiRequest(`/api/nodes/${encodeURIComponent(nodeId)}/relay/${action}`, { method: "PUT", body, headers });
+      if (!requestIsCurrent()) return;
+      const outcome = await waitForRelayCommand(nodeId, queued?.command_id || "", { isCurrent: requestIsCurrent });
+      if (!requestIsCurrent()) return;
       if (outcome !== "success") throw new ApiError("Relay command failed", outcome === "conflict" ? 409 : 422);
+      await loadStatus({ quiet: true });
+      if (!requestIsCurrent()) return;
       resetDialog(youtubeDialog, youtubeError);
       closeDialog(youtubeDialog);
       showToast("Данные YouTube сохранены");
-      await loadStatus({ quiet: true });
     } catch (error) {
+      if (!requestIsCurrent()) return;
       if (youtubeError) {
         youtubeError.textContent = friendlyError(error, "Не удалось сохранить данные YouTube.");
         youtubeError.hidden = false;
@@ -619,38 +664,49 @@
       wipeSecretObject(payload);
       payload = null;
       body = "";
-      clearSensitiveFields(youtubeForm);
-      setBusy(youtubeForm, false);
+      if (requestIsCurrent()) {
+        clearSensitiveFields(youtubeForm);
+        setBusy(youtubeForm, false);
+      }
     }
   }
 
   async function submitMoblin(event) {
     event.preventDefault();
     if (!relayNodeId) return;
-    let payload = null;
+    const nodeId = String(relayNodeId);
+    const requestGeneration = ++moblinRequestGeneration;
+    const requestIsCurrent = () => dialogRequestIsCurrent(
+      nodeId,
+      requestGeneration,
+      moblinRequestGeneration,
+      moblinDialog,
+    );
     let response = null;
-    let body = "";
+    let body = "{}";
     setBusy(moblinForm, true);
     if (moblinError) moblinError.hidden = true;
     try {
-      payload = buildAdminPasswordPayload(Object.fromEntries(new FormData(moblinForm).entries()));
-      body = JSON.stringify(payload);
       const headers = {};
       const key = createIdempotencyKey("reveal-moblin");
       if (key) headers["Idempotency-Key"] = key;
-      response = await apiRequest(`/api/nodes/${encodeURIComponent(relayNodeId)}/relay/reveal-moblin-url`, { method: "POST", body, headers });
+      const endpoint = `/api/nodes/${encodeURIComponent(nodeId)}/relay/reveal-moblin-url`;
+      response = await apiRequest(endpoint, { method: "POST", body, headers });
+      if (!requestIsCurrent()) return;
       let publicUrl = sanitizeSrtUrl(response?.public_url);
       let vpnUrl = sanitizeSrtUrl(response?.vpn_url);
       if (!publicUrl && !vpnUrl && typeof response?.command_id === "string") {
-        const outcome = await waitForRelayCommand(response.command_id);
+        const outcome = await waitForRelayCommand(nodeId, response.command_id, { isCurrent: requestIsCurrent });
+        if (!requestIsCurrent()) return;
         if (outcome !== "success") {
           throw new ApiError("Relay command failed", outcome === "conflict" ? 409 : 422);
         }
         wipeSecretObject(response);
         response = await apiRequest(
-          `/api/nodes/${encodeURIComponent(relayNodeId)}/relay/reveal-moblin-url?wait=0`,
+          `${endpoint}?wait=0`,
           { method: "POST", body, headers },
         );
+        if (!requestIsCurrent()) return;
         publicUrl = sanitizeSrtUrl(response?.public_url);
         vpnUrl = sanitizeSrtUrl(response?.vpn_url);
       }
@@ -664,31 +720,34 @@
       if (publicRow) publicRow.hidden = !publicUrl;
       if (vpnRow) vpnRow.hidden = !vpnUrl;
       const results = moblinDialog.querySelector("[data-dashboard-moblin-results]");
-      const reauth = moblinDialog.querySelector("[data-dashboard-moblin-reauth]");
       const reveal = moblinDialog.querySelector("[data-dashboard-reveal-moblin]");
       if (results) results.hidden = false;
-      if (reauth) reauth.hidden = true;
       if (reveal) reveal.hidden = true;
-      const password = moblinDialog.querySelector("[data-dashboard-moblin-admin-password]");
-      if (password) password.value = "";
     } catch (error) {
+      if (!requestIsCurrent()) return;
       if (moblinError) {
         moblinError.textContent = friendlyError(error, "Не удалось получить SRT URL.");
         moblinError.hidden = false;
       }
     } finally {
-      wipeSecretObject(payload);
       wipeSecretObject(response);
-      payload = null;
       response = null;
       body = "";
-      setBusy(moblinForm, false);
+      if (requestIsCurrent()) setBusy(moblinForm, false);
     }
   }
 
   async function submitClear(event) {
     event.preventDefault();
     if (!relayNodeId) return;
+    const nodeId = String(relayNodeId);
+    const requestGeneration = ++clearRequestGeneration;
+    const requestIsCurrent = () => dialogRequestIsCurrent(
+      nodeId,
+      requestGeneration,
+      clearRequestGeneration,
+      clearDialog,
+    );
     let payload = null;
     let body = "";
     setBusy(clearForm, true);
@@ -699,14 +758,18 @@
       const headers = {};
       const key = createIdempotencyKey("clear-youtube");
       if (key) headers["Idempotency-Key"] = key;
-      const queued = await apiRequest(`/api/nodes/${encodeURIComponent(relayNodeId)}/relay/youtube`, { method: "DELETE", body, headers });
-      const outcome = await waitForRelayCommand(queued?.command_id || "");
+      const queued = await apiRequest(`/api/nodes/${encodeURIComponent(nodeId)}/relay/youtube`, { method: "DELETE", body, headers });
+      if (!requestIsCurrent()) return;
+      const outcome = await waitForRelayCommand(nodeId, queued?.command_id || "", { isCurrent: requestIsCurrent });
+      if (!requestIsCurrent()) return;
       if (outcome !== "success") throw new ApiError("Relay command failed", outcome === "conflict" ? 409 : 422);
+      await loadStatus({ quiet: true });
+      if (!requestIsCurrent()) return;
       resetDialog(clearDialog, clearError);
       closeDialog(clearDialog);
       showToast("Данные YouTube удалены");
-      await loadStatus({ quiet: true });
     } catch (error) {
+      if (!requestIsCurrent()) return;
       if (clearError) {
         clearError.textContent = friendlyError(error, "Не удалось удалить данные YouTube.");
         clearError.hidden = false;
@@ -715,13 +778,16 @@
       wipeSecretObject(payload);
       payload = null;
       body = "";
-      clearSensitiveFields(clearForm);
-      setBusy(clearForm, false);
+      if (requestIsCurrent()) {
+        clearSensitiveFields(clearForm);
+        setBusy(clearForm, false);
+      }
     }
   }
 
   page.addEventListener("click", (event) => {
     if (event.target.closest("[data-open-youtube-config]")) {
+      youtubeRequestGeneration += 1;
       resetDialog(youtubeDialog, youtubeError);
       prepareYouTubeDialog();
       openDialog(youtubeDialog);
@@ -729,17 +795,17 @@
       return;
     }
     if (event.target.closest("[data-open-moblin-url]")) {
+      moblinRequestGeneration += 1;
       resetDialog(moblinDialog, moblinError);
       moblinDialog?.querySelector("[data-dashboard-moblin-results]")?.setAttribute("hidden", "");
-      const reauth = moblinDialog?.querySelector("[data-dashboard-moblin-reauth]");
       const reveal = moblinDialog?.querySelector("[data-dashboard-reveal-moblin]");
-      if (reauth) reauth.hidden = false;
       if (reveal) reveal.hidden = false;
       openDialog(moblinDialog);
-      moblinDialog?.querySelector("[data-dashboard-moblin-admin-password]")?.focus();
+      reveal?.focus();
       return;
     }
     if (event.target.closest("[data-open-youtube-clear]")) {
+      clearRequestGeneration += 1;
       resetDialog(clearDialog, clearError);
       openDialog(clearDialog);
       clearDialog?.querySelector("[data-dashboard-clear-admin-password]")?.focus();
@@ -752,9 +818,18 @@
     if (event.target.closest("[data-relay-refresh]")) void runRelayAction("refresh");
   });
 
-  for (const dialog of [youtubeDialog, moblinDialog, clearDialog]) {
-    dialog?.addEventListener("close", () => resetDialog(dialog, dialog.querySelector(".field-error")));
-  }
+  youtubeDialog?.addEventListener("close", () => {
+    youtubeRequestGeneration += 1;
+    resetDialog(youtubeDialog, youtubeError);
+  });
+  moblinDialog?.addEventListener("close", () => {
+    moblinRequestGeneration += 1;
+    resetDialog(moblinDialog, moblinError);
+  });
+  clearDialog?.addEventListener("close", () => {
+    clearRequestGeneration += 1;
+    resetDialog(clearDialog, clearError);
+  });
   youtubeForm?.addEventListener("submit", submitYouTube);
   moblinForm?.addEventListener("submit", submitMoblin);
   clearForm?.addEventListener("submit", submitClear);
@@ -783,6 +858,12 @@
     if (pollTimer !== null) clearTimeout(pollTimer);
     loadGeneration += 1;
     previewUpdateGeneration += 1;
+    youtubeRequestGeneration += 1;
+    moblinRequestGeneration += 1;
+    clearRequestGeneration += 1;
+    setBusy(youtubeForm, false);
+    setBusy(moblinForm, false);
+    setBusy(clearForm, false);
     previewController?.suspend("offline");
     clearSensitiveFields(document);
   });

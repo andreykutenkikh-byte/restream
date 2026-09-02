@@ -1,5 +1,7 @@
 "use strict";
 
+const fs = require("node:fs");
+const path = require("node:path");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
@@ -9,6 +11,7 @@ const {
   buildYouTubePayload,
   formatAge,
   formatBitrate,
+  isCurrentDialogRequest,
   normalizeRelayStatus,
   previewUpdateIsCurrent,
   relayCommandOutcome,
@@ -16,6 +19,15 @@ const {
   sanitizeSrtUrl,
   wipeSecretObject,
 } = require("../../app/static/relay-dashboard.js");
+
+const dashboardTemplate = fs.readFileSync(
+  path.join(__dirname, "../../app/templates/dashboard.html"),
+  "utf8",
+);
+  const dashboardJavascript = fs.readFileSync(
+  path.join(__dirname, "../../app/static/relay-dashboard.js"),
+  "utf8",
+);
 
 function status(overrides = {}) {
   return normalizeRelayStatus({
@@ -80,6 +92,71 @@ test("stale LIVE preview work cannot overwrite a newer offline state", () => {
   assert.equal(previewUpdateIsCurrent(7, 7, "relay-a", "relay-b", live), false);
 });
 
+test("dialog request guard binds node, generation, and open lifecycle", () => {
+  assert.equal(isCurrentDialogRequest("relay-a", "relay-a", 7, 7, true), true);
+  assert.equal(isCurrentDialogRequest("relay-a", "relay-b", 7, 7, true), false);
+  assert.equal(isCurrentDialogRequest("relay-a", "relay-a", 7, 8, true), false);
+  assert.equal(isCurrentDialogRequest("relay-a", "relay-a", 7, 7, false), false);
+  assert.equal(isCurrentDialogRequest("", "", 7, 7, true), false);
+});
+
+test("late secret completion cannot mutate a closed and reopened dialog", async () => {
+  let currentNodeId = "relay-a";
+  let currentGeneration = 11;
+  let dialogOpen = true;
+  const expectedNodeId = currentNodeId;
+  const expectedGeneration = currentGeneration;
+  const requestIsCurrent = () => isCurrentDialogRequest(
+    expectedNodeId,
+    currentNodeId,
+    expectedGeneration,
+    currentGeneration,
+    dialogOpen,
+  );
+  let resolveResponse;
+  const responsePromise = new Promise((resolve) => { resolveResponse = resolve; });
+  const response = { public_url: "srt://relay.test:8890?secret=late" };
+  const dialogState = {
+    srtValue: "",
+    busy: "reopened-dialog",
+    error: "reopened-dialog-error",
+    resetCount: 0,
+    closeCount: 0,
+  };
+
+  const lateRequest = (async () => {
+    const result = await responsePromise;
+    if (!requestIsCurrent()) {
+      wipeSecretObject(result);
+      return;
+    }
+    dialogState.srtValue = result.public_url;
+    dialogState.busy = false;
+    dialogState.error = "";
+    dialogState.resetCount += 1;
+    dialogState.closeCount += 1;
+  })();
+
+  dialogOpen = false;
+  currentGeneration += 1;
+  dialogState.busy = false;
+  dialogOpen = true;
+  resolveResponse(response);
+  await lateRequest;
+
+  assert.equal(response.public_url, "");
+  assert.deepEqual(dialogState, {
+    srtValue: "",
+    busy: false,
+    error: "reopened-dialog-error",
+    resetCount: 0,
+    closeCount: 0,
+  });
+
+  currentNodeId = "relay-b";
+  assert.equal(requestIsCurrent(), false);
+});
+
 test("bitrate and age labels are concise", () => {
   assert.equal(formatBitrate(3_850_000), "3.9 Мбит/с");
   assert.equal(formatBitrate(null), "—");
@@ -96,21 +173,18 @@ test("YouTube form accepts only exact secret-safe RTMPS data", () => {
   assert.deepEqual(buildYouTubePayload({
     url: "  rtmps://a.rtmp.youtube.com/live2  ",
     stream_key: "stream-key_123",
-    admin_password: "panel-password",
+    admin_password: "stale-field-must-not-be-sent",
   }), {
     url: "rtmps://a.rtmp.youtube.com/live2",
     stream_key: "stream-key_123",
-    admin_password: "panel-password",
   });
   assert.throws(() => buildYouTubePayload({
     url: "rtmp://a.rtmp.youtube.com/live2",
     stream_key: "secret",
-    admin_password: "password",
   }));
   assert.throws(() => buildYouTubePayload({
     url: "rtmps://a.rtmp.youtube.com/live2#secret",
     stream_key: "secret",
-    admin_password: "password",
   }));
   assert.deepEqual(buildAdminPasswordPayload({ admin_password: "password" }), { admin_password: "password" });
 });
@@ -118,15 +192,52 @@ test("YouTube form accepts only exact secret-safe RTMPS data", () => {
 test("configured YouTube can rotate only the stream key", () => {
   assert.deepEqual(buildYouTubeKeyPayload({
     stream_key: " new-key_456 ",
-    admin_password: "panel-password",
+    admin_password: "stale-field-must-not-be-sent",
   }), {
     stream_key: "new-key_456",
-    admin_password: "panel-password",
   });
   assert.throws(() => buildYouTubeKeyPayload({
     stream_key: "key with spaces",
-    admin_password: "panel-password",
   }));
+});
+
+test("routine setup omits step-up password while destructive clear keeps it", () => {
+  assert.doesNotMatch(dashboardTemplate, /data-dashboard-(?:youtube|moblin)-admin-password/);
+  assert.equal((dashboardTemplate.match(/name="admin_password"/g) || []).length, 1);
+  assert.match(dashboardTemplate, /data-dashboard-clear-admin-password/);
+  assert.match(dashboardTemplate, /relay-dashboard\.js\?v=20260902\.4/);
+
+  const moblinSubmit = dashboardJavascript
+    .split("async function submitMoblin", 2)[1]
+    .split("async function submitClear", 1)[0];
+  assert.doesNotMatch(moblinSubmit, /admin_password|buildAdminPasswordPayload/);
+  assert.match(moblinSubmit, /let body = "\{\}";/);
+  assert.match(moblinSubmit, /await apiRequest[\s\S]*?if \(!requestIsCurrent\(\)\) return;/);
+  assert.match(moblinSubmit, /finally \{[\s\S]*?if \(requestIsCurrent\(\)\) setBusy/);
+
+  const youtubeSubmit = dashboardJavascript
+    .split("async function submitYouTube", 2)[1]
+    .split("async function submitMoblin", 1)[0];
+  assert.match(youtubeSubmit, /await apiRequest[\s\S]*?if \(!requestIsCurrent\(\)\) return;/);
+  assert.match(youtubeSubmit, /finally \{[\s\S]*?if \(requestIsCurrent\(\)\)/);
+
+  const clearSubmit = dashboardJavascript
+    .split("async function submitClear", 2)[1]
+    .split("page.addEventListener", 1)[0];
+  assert.match(clearSubmit, /await apiRequest[\s\S]*?if \(!requestIsCurrent\(\)\) return;/);
+  assert.match(clearSubmit, /finally \{[\s\S]*?if \(requestIsCurrent\(\)\)/);
+  assert.match(
+    dashboardJavascript,
+    /addEventListener\("pagehide"[\s\S]*?youtubeRequestGeneration \+= 1;[\s\S]*?moblinRequestGeneration \+= 1;[\s\S]*?clearRequestGeneration \+= 1;/,
+  );
+  const resetDialogSource = dashboardJavascript
+    .split("function resetDialog", 2)[1]
+    .split("function prepareYouTubeDialog", 1)[0];
+  assert.match(resetDialogSource, /setBusy\(form, false\)/);
+  assert.match(
+    dashboardJavascript,
+    /addEventListener\("pagehide"[\s\S]*?setBusy\(youtubeForm, false\)[\s\S]*?setBusy\(moblinForm, false\)[\s\S]*?setBusy\(clearForm, false\)/,
+  );
 });
 
 test("SRT reveal accepts only a bounded SRT URL", () => {

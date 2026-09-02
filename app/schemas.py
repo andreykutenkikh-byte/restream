@@ -344,7 +344,9 @@ class RelayConfigureYouTubeRequest(StrictModel):
     # Both values use SecretStr so a failed validation can never echo a submitted key.
     url: SecretStr
     stream_key: SecretStr
-    admin_password: SecretStr
+    # Deprecated compatibility field for older cached frontends. Authentication
+    # is provided by the administrator session, CSRF token, and same-origin gate.
+    admin_password: SecretStr | None = None
 
     @field_validator("url")
     @classmethod
@@ -358,13 +360,14 @@ class RelayConfigureYouTubeRequest(StrictModel):
 
     @field_validator("admin_password")
     @classmethod
-    def validate_admin_password(cls, value: SecretStr) -> SecretStr:
-        return _validate_admin_password(value)
+    def validate_legacy_admin_password(cls, value: SecretStr | None) -> SecretStr | None:
+        return None if value is None else _validate_admin_password(value)
 
 
 class RelayConfigureYouTubeKeyRequest(StrictModel):
     stream_key: SecretStr
-    admin_password: SecretStr
+    # Accepted but ignored while cached pre-update pages age out.
+    admin_password: SecretStr | None = None
 
     @field_validator("stream_key")
     @classmethod
@@ -373,8 +376,18 @@ class RelayConfigureYouTubeKeyRequest(StrictModel):
 
     @field_validator("admin_password")
     @classmethod
-    def validate_admin_password(cls, value: SecretStr) -> SecretStr:
-        return _validate_admin_password(value)
+    def validate_legacy_admin_password(cls, value: SecretStr | None) -> SecretStr | None:
+        return None if value is None else _validate_admin_password(value)
+
+
+class RelayRevealMoblinURLRequest(StrictModel):
+    # Accepted but ignored while cached pre-update pages age out.
+    admin_password: SecretStr | None = None
+
+    @field_validator("admin_password")
+    @classmethod
+    def validate_legacy_admin_password(cls, value: SecretStr | None) -> SecretStr | None:
+        return None if value is None else _validate_admin_password(value)
 
 
 class RelayStepUpRequest(StrictModel):

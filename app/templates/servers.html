@@ -247,18 +247,6 @@
             data-youtube-stream-key
           >
         </label>
-        <label class="form-field">
-          <span>Пароль администратора панели</span>
-          <input
-            name="admin_password"
-            type="password"
-            maxlength="1024"
-            autocomplete="new-password"
-            spellcheck="false"
-            required
-            data-youtube-admin-password
-          >
-        </label>
         <p class="form-help">
           Если ретранслятор активен, сначала завершите broadcast в YouTube и остановите relay.
         </p>
@@ -321,22 +309,6 @@
           Video ID и stream key — разные данные; RTMPS URL и stream key в Moblin не вводятся.
         </p>
 
-        <div data-moblin-reauth>
-          <label class="form-field">
-            <span>Пароль администратора панели</span>
-            <input
-              name="admin_password"
-              type="password"
-              maxlength="1024"
-              autocomplete="new-password"
-              spellcheck="false"
-              required
-              data-moblin-admin-password
-            >
-          </label>
-          <p class="form-help">Адрес содержит секрет доступа, поэтому требуется повторное подтверждение.</p>
-        </div>
-
         <div class="relay-url-results" data-moblin-url-results hidden aria-live="polite">
           <div class="form-field relay-url-field" data-public-url-row hidden>
             <label for="moblin-public-url">Публичный SRT URL</label>
@@ -373,5 +345,5 @@
 {% endblock %}
 
 {% block scripts %}
-  <script src="/static/servers.js?v=20260902.3" defer></script>
+  <script src="/static/servers.js?v=20260902.4" defer></script>
 {% endblock %}
