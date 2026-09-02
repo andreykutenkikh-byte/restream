@@ -97,6 +97,7 @@ class BrokerClient:
             "start",
             "stop",
             "configure_youtube",
+            "configure_youtube_key",
             "clear_youtube",
             "reveal_moblin_url",
         }:

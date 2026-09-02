@@ -14,6 +14,7 @@ from relay_agent.broker import (
     BROKER_CLIENT_TIMEOUT_SECONDS,
     BROKER_RESPONSE_RESERVE_SECONDS,
     MAX_BROKER_MESSAGE_BYTES,
+    InputBitrateSampler,
     RelayBroker,
     _acquire_relay_transaction_lock,
     _enable_child_subreaper,
@@ -26,6 +27,7 @@ from relay_agent.broker import (
 )
 from relay_agent.errors import RelayAgentError
 from relay_agent.models import RelaySnapshot
+from relay_agent.security import effective_uid
 
 
 class FakeSocket:
@@ -48,6 +50,9 @@ class FakeRelayCtl:
         self.saved = 0
         self.start_outside_lock = False
         self.stop_outside_lock = False
+        self.live = False
+        self.connection_id = "a0b1c2d3-e4f5-6789-abcd-ef0123456789"
+        self.bytes_received: float = 0
         self.secrets = {
             "youtube": {"url": "", "key": ""},
             "srt": {"user": "u", "password": "p", "passphrase": "phrase"},
@@ -132,8 +137,7 @@ class FakeRelayCtl:
         print(f"Overall: {'PASS' if self.active else 'FAIL'}")
         return 0 if self.active else 1
 
-    @staticmethod
-    def parse_metrics(_metrics: str, name: str) -> list[tuple[dict[str, str], float]]:
+    def parse_metrics(self, _metrics: str, name: str) -> list[tuple[dict[str, str], float]]:
         if name == "paths":
             return [({"name": "iphone-live", "state": "ready"}, 1.0)]
         if name == "forward_dests":
@@ -145,6 +149,30 @@ class FakeRelayCtl:
                         "state": "forwarding",
                     },
                     1.0,
+                )
+            ]
+        if name == "srt_conns" and self.live:
+            return [
+                (
+                    {
+                        "id": self.connection_id,
+                        "path": "iphone-live",
+                        "remoteAddr": "198.51.100.200:40000",
+                        "state": "publish",
+                    },
+                    1.0,
+                )
+            ]
+        if name == "srt_conns_bytes_received" and self.live:
+            return [
+                (
+                    {
+                        "id": self.connection_id,
+                        "path": "iphone-live",
+                        "remoteAddr": "198.51.100.200:40000",
+                        "state": "publish",
+                    },
+                    self.bytes_received,
                 )
             ]
         return []
@@ -266,6 +294,237 @@ def test_broker_configure_clear_start_stop_and_reveal(monkeypatch: pytest.Monkey
     cleared = broker.handle({"action": "clear_youtube", "payload": {}})
     assert cleared["status"] == "ok"
     assert fake.secrets["youtube"] == {"url": "", "key": ""}
+
+
+def test_broker_key_only_configuration_preserves_existing_url_and_other_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker, fake = broker_with_fake(monkeypatch)
+    original_url = "rtmps://b.rtmps.youtube.com:443/live2"
+    original_srt = copy.deepcopy(fake.secrets["srt"])
+    fake.secrets["youtube"] = {
+        "url": original_url,
+        "key": "old-key",
+        "future_safe_field": "preserved",
+    }
+    marker = "KEY_ONLY_BROKER_SECRET_5e1a"
+
+    configured = broker.handle(
+        {
+            "action": "configure_youtube_key",
+            "payload": {"youtube_stream_key": f"  {marker}\n"},
+        }
+    )
+
+    assert configured["status"] == "ok"
+    assert configured["secret_result"] is None
+    assert configured["safe_result"]["youtube_url_configured"] is True
+    assert configured["safe_result"]["youtube_key_configured"] is True
+    assert fake.secrets["youtube"] == {
+        "url": original_url,
+        "key": marker,
+        "future_safe_field": "preserved",
+    }
+    assert fake.secrets["srt"] == original_srt
+    assert fake.saved == 1
+    assert marker not in json.dumps(configured, sort_keys=True)
+
+
+def test_broker_key_only_configuration_refuses_active_relay_without_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker, fake = broker_with_fake(monkeypatch)
+    fake.secrets["youtube"] = {
+        "url": "rtmps://a.rtmps.youtube.com/live2",
+        "key": "old-key",
+    }
+    original = copy.deepcopy(fake.secrets)
+    fake.active = True
+    fake.enabled = True
+
+    result = broker.handle(
+        {
+            "action": "configure_youtube_key",
+            "payload": {"youtube_stream_key": "replacement-key"},
+        }
+    )
+
+    assert result["status"] == "conflict"
+    assert result["safe_result"]["error_code"] == "relay_active"
+    assert fake.secrets == original
+    assert fake.saved == 0
+
+
+@pytest.mark.parametrize(
+    "youtube",
+    [
+        {"url": "", "key": "old-key"},
+        {"url": "rtmp://a.rtmp.youtube.com/live2", "key": "old-key"},
+        {"url": "rtmps://youtube.example/live2", "key": "old-key"},
+        {"url": " rtmps://a.rtmps.youtube.com/live2", "key": "old-key"},
+        None,
+    ],
+)
+def test_broker_key_only_configuration_fails_closed_without_valid_existing_url(
+    youtube: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker, fake = broker_with_fake(monkeypatch)
+    fake.secrets["youtube"] = youtube  # type: ignore[assignment]
+    original = copy.deepcopy(fake.secrets)
+
+    result = broker.handle(
+        {
+            "action": "configure_youtube_key",
+            "payload": {"youtube_stream_key": "replacement-key"},
+        }
+    )
+
+    assert result["status"] == "failed"
+    assert result["safe_result"]["error_code"] == "invalid_configuration"
+    assert fake.secrets == original
+    assert fake.saved == 0
+
+
+def test_broker_key_only_configuration_rejects_expanded_payload_without_secret_echo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker, fake = broker_with_fake(monkeypatch)
+    fake.secrets["youtube"] = {
+        "url": "rtmps://a.rtmps.youtube.com/live2",
+        "key": "old-key",
+    }
+    marker = "KEY_ONLY_EXPANDED_PAYLOAD_8c3d"
+
+    result = broker.handle(
+        {
+            "action": "configure_youtube_key",
+            "payload": {
+                "youtube_stream_key": marker,
+                "youtube_rtmps_url": "rtmps://b.rtmps.youtube.com/live2",
+            },
+        }
+    )
+
+    assert result["status"] == "failed"
+    assert result["safe_result"]["error_code"] == "invalid_configuration"
+    assert fake.saved == 0
+    assert marker not in json.dumps(result, sort_keys=True)
+
+
+def test_live_input_bitrate_uses_counter_delta_and_exposes_only_bps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observed_at = 100.0
+
+    def clock() -> float:
+        return observed_at
+
+    fake = FakeRelayCtl()
+    fake.active = True
+    fake.enabled = True
+    fake.live = True
+    fake.bytes_received = 1_000_000
+    sampler = InputBitrateSampler(
+        tmp_path / "bitrate.json", clock=clock, expected_uid=effective_uid()
+    )
+    broker = RelayBroker(fake.namespace(), bitrate_sampler=sampler)
+    monkeypatch.setattr(broker, "_portrait_profile", lambda: True)
+
+    baseline = broker.snapshot()
+    assert baseline.source == "LIVE"
+    assert baseline.input_bitrate_bps is None
+    assert "input_bitrate_bps" not in baseline.to_json()
+
+    observed_at += 5
+    fake.bytes_received += 2_500_000
+    measured = broker.snapshot()
+    assert measured.input_bitrate_bps == 4_000_000
+    serialized = json.dumps(measured.to_json(), sort_keys=True)
+    assert fake.connection_id not in serialized
+    assert "remoteAddr" not in serialized
+    assert "198.51.100.200" not in serialized
+    state = (tmp_path / "bitrate.json").read_text(encoding="ascii")
+    assert fake.connection_id not in state
+
+
+def test_live_input_bitrate_resets_on_stream_change_rollback_stale_and_non_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    observed_at = 100.0
+
+    def clock() -> float:
+        return observed_at
+
+    fake = FakeRelayCtl()
+    fake.active = True
+    fake.enabled = True
+    fake.live = True
+    fake.bytes_received = 1_000
+    sampler = InputBitrateSampler(
+        tmp_path / "bitrate.json", clock=clock, expected_uid=effective_uid()
+    )
+    broker = RelayBroker(fake.namespace(), bitrate_sampler=sampler)
+    monkeypatch.setattr(broker, "_portrait_profile", lambda: True)
+
+    assert broker.snapshot().input_bitrate_bps is None
+    observed_at += 5
+    fake.bytes_received += 2_500
+    assert broker.snapshot().input_bitrate_bps == 4_000
+
+    observed_at += 5
+    fake.connection_id = "b0b1c2d3-e4f5-6789-abcd-ef0123456789"
+    fake.bytes_received = 500
+    assert broker.snapshot().input_bitrate_bps is None
+
+    observed_at += 5
+    fake.bytes_received = 100
+    assert broker.snapshot().input_bitrate_bps is None
+
+    observed_at += 16
+    fake.bytes_received = 1_000
+    assert broker.snapshot().input_bitrate_bps is None
+
+    fake.live = False
+    observed_at += 5
+    non_live = broker.snapshot()
+    assert non_live.source == "SLATE"
+    assert non_live.input_bitrate_bps is None
+    assert not (tmp_path / "bitrate.json").exists()
+
+    fake.live = True
+    fake.bytes_received = 2_000
+    observed_at += 5
+    assert broker.snapshot().input_bitrate_bps is None
+
+    observed_at += 5
+    fake.bytes_received += 700_000_000
+    assert broker.snapshot().input_bitrate_bps is None
+
+    observed_at += 5
+    assert broker.snapshot().input_bitrate_bps is None
+
+    observed_at += 5
+    fake.bytes_received += 2_500
+    assert broker.snapshot().input_bitrate_bps == 4_000
+
+
+@pytest.mark.parametrize("invalid_counter", [float("nan"), float("inf"), -1.0, 1.5])
+def test_live_input_bitrate_rejects_invalid_counter(
+    invalid_counter: float, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeRelayCtl()
+    fake.active = True
+    fake.live = True
+    fake.bytes_received = invalid_counter
+    sampler = InputBitrateSampler(
+        tmp_path / "bitrate.json", clock=lambda: 100.0, expected_uid=effective_uid()
+    )
+    broker = RelayBroker(fake.namespace(), bitrate_sampler=sampler)
+    monkeypatch.setattr(broker, "_portrait_profile", lambda: True)
+
+    assert broker.snapshot().input_bitrate_bps is None
+    assert not (tmp_path / "bitrate.json").exists()
 
 
 def test_broker_rejects_oversize_and_authenticates_exact_uid(

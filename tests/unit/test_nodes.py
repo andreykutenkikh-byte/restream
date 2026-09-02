@@ -16,7 +16,7 @@ from app.core.security import (
     generate_node_token,
     verify_opaque_token_digest,
 )
-from app.db import Database
+from app.db import SCHEMA_VERSION, Database
 from app.services.nodes import (
     COMMAND_LEASE_SECONDS,
     COMMAND_MAX_AGE_SECONDS,
@@ -224,7 +224,7 @@ def test_schema_v1_upgrade_preserves_existing_restream_data(tmp_path: Path) -> N
             upgraded.execute("SELECT MAX(version) AS version FROM schema_migrations").fetchone()[
                 "version"
             ]
-            == 3
+            == SCHEMA_VERSION
         )
         node_tables = {
             str(row["name"])

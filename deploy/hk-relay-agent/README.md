@@ -18,8 +18,10 @@ sudo systemctl status adojapan-relay-broker.socket --no-pager
 
 The token prompt is hidden. Paste the permanent node token there; never put it in a shell
 argument, environment variable, unit, command substitution, or deployment log. `install.sh`
-preserves the token and keeps a one-generation `relay_agent.old` code rollback. It deliberately
-does not enable or start the agent on a first install.
+preserves the token and keeps a one-generation `relay_agent.old` code rollback. Before swapping
+code, it also creates `/etc/adojapan-relay-agent/commands.v1.rollback.json`: a root-owned,
+mode-`0600`, old-agent-compatible command journal. An already valid rollback point is never
+overwritten. It deliberately does not enable or start the agent on a first install.
 
 Before first activation, verify the control plane has no queued relay commands. Then:
 
@@ -54,6 +56,17 @@ reply is returned. If restoration cannot be proven, the broker closes the reques
 claiming a completed failure. YouTube atomic save is the final blocking commit operation, so no
 health probe can turn an already committed configuration into a later timeout.
 
+The optional loopback preview credential is generated locally and never displayed:
+
+```bash
+sudo adojapan-relay-install-preview-token --generate
+```
+
+Creation or rotation fails closed unless both `moblin-relay.service` and
+`adojapan-relay-agent.service` are inactive with no main process. Install the renderer and
+credential together, then start only the agent. A later rotation uses the same stop-update-start
+sequence so MediaMTX and the agent cannot temporarily use different credentials.
+
 The broker intentionally does **not** use `PrivateNetwork=yes`: relay health reads the existing
 MediaMTX metrics endpoint on host loopback `127.0.0.1:9998`. Address families are restricted,
 the broker has no network listener, its IP access is limited to localhost, and the agent is
@@ -69,6 +82,7 @@ sudo systemctl cat adojapan-relay-agent.service adojapan-relay-broker.service
 sudo systemctl show adojapan-relay-agent.service -p User -p Environment -p ExecStart
 sudo journalctl -u adojapan-relay-agent.service -u adojapan-relay-broker.service --no-pager
 sudo stat -c '%a %U %G %F' /etc/adojapan-relay-agent/node.token \
+  /etc/adojapan-relay-agent/commands.v1.rollback.json \
   /run/adojapan-relay/broker.sock
 ```
 
@@ -76,6 +90,8 @@ Expected: token `600 restream-agent restream-agent regular file`; socket
 `660 root restream-agent socket`. Journals contain only fixed safe error codes and completion
 status, never Authorization, request bodies, YouTube configuration, or returned SRT URLs.
 The command journal is mode 0600 and stores only command ID/action plus a safe status snapshot.
+The current agent writes journal v2 and strictly accepts an existing legacy v1 journal. Journal
+v2 is required for key-only YouTube rotation entries and the optional input-bitrate sample.
 
 ## Rotate the node credential
 
@@ -96,9 +112,22 @@ reconfigures `moblin-relay.service`.
 
 ## Rollback / uninstall
 
-For an agent-code rollback, stop the agent, exchange the fixed
-`relay_agent`/`relay_agent.old` directories under `/usr/local/lib/adojapan-relay-agent`, then start
-the agent again. This does not touch the relay.
+For an agent-code rollback, stop the agent and the socket-activated broker process, exchange the
+fixed `relay_agent`/`relay_agent.old` directories under `/usr/local/lib/adojapan-relay-agent`, and
+restore the compatible journal **before** starting the old agent:
+
+```bash
+sudo systemctl stop adojapan-relay-agent.service
+sudo systemctl stop adojapan-relay-broker.service
+sudo adojapan-relay-restore-v1-journal
+```
+
+The restore command is root-only and refuses to run while either process is active. It validates
+the protected backup and live journal metadata without following links, then atomically restores
+an agent-owned mode-`0600` v1 journal. The projection intentionally omits v2-only key-rotation
+entries and removes the optional bitrate field. This may allow such a command to be delivered again
+after a later upgrade, so confirm the control-plane command queue before either rollback or
+re-upgrade. The journal restore and code-directory exchange do not touch the relay or its secrets.
 
 ```bash
 sudo sh deploy/hk-relay-agent/uninstall.sh
@@ -108,8 +137,9 @@ Before uninstalling, confirm in the control UI that no command is queued, leased
 or currently executing; otherwise stopping the control agent could interrupt acknowledgement of
 an operation that already reached `relayctl`.
 
-Uninstall retains `/etc/adojapan-relay-agent/node.token`,
-`/var/lib/adojapan-relay-agent/commands.json`, and the system account so rollback remains possible.
-After the control-plane credential is revoked and rollback is no longer needed, those two exact
-relay-agent directories and the account may be removed manually. Never remove
+Uninstall retains `/etc/adojapan-relay-agent/node.token`, the root-only v1 rollback point and
+restore command, `/var/lib/adojapan-relay-agent/commands.json`, and the system account so recovery
+remains possible. After the control-plane credential is revoked and rollback is no longer needed,
+the two exact relay-agent data directories, `/usr/local/sbin/adojapan-relay-restore-v1-journal`,
+and the account may be removed manually. Never remove
 `/etc/moblin-relay`, its baseline backup, or the `moblin-relay` user as part of this procedure.

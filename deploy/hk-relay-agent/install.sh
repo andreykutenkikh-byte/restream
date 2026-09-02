@@ -10,8 +10,13 @@ fi
 relay_agent_script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 relay_agent_repo_root=$(CDPATH= cd -- "$relay_agent_script_dir/../.." && pwd)
 relay_agent_source="$relay_agent_repo_root/relay_agent"
+relay_agent_journal_helper="$relay_agent_script_dir/journal-rollback.py"
 
 test -d "$relay_agent_source"
+if [ ! -f "$relay_agent_journal_helper" ] || [ -L "$relay_agent_journal_helper" ]; then
+    printf '%s\n' 'Safety check failed: relay journal helper is unavailable.' >&2
+    exit 1
+fi
 test -f /usr/local/sbin/relayctl
 test -x /usr/bin/python3
 /usr/bin/python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'
@@ -65,6 +70,13 @@ install -o root -g root -m 0644 "$relay_agent_script_dir/adojapan-relay-agent.tm
     /etc/tmpfiles.d/adojapan-relay-agent.conf
 systemd-tmpfiles --create /etc/tmpfiles.d/adojapan-relay-agent.conf
 
+# Preserve a strict legacy-v1 journal before installing code that writes v2.
+# The root-only helper validates both storage trees without following links and
+# never replaces an already valid rollback point.
+/usr/bin/python3 -Es "$relay_agent_journal_helper" --prepare
+install -o root -g root -m 0700 "$relay_agent_journal_helper" \
+    /usr/local/sbin/adojapan-relay-restore-v1-journal
+
 install -d -o root -g root -m 0755 /usr/local/lib/adojapan-relay-agent
 rm -rf /usr/local/lib/adojapan-relay-agent/relay_agent.new
 install -d -o root -g root -m 0700 /usr/local/lib/adojapan-relay-agent/relay_agent.new
@@ -112,6 +124,8 @@ install -o root -g root -m 0755 "$relay_agent_script_dir/broker-entry.py" \
     /usr/local/lib/adojapan-relay-agent/broker-entry.py
 install -o root -g root -m 0755 "$relay_agent_script_dir/install-token.py" \
     /usr/local/sbin/adojapan-relay-install-token
+install -o root -g root -m 0755 "$relay_agent_script_dir/install-preview-token.py" \
+    /usr/local/sbin/adojapan-relay-install-preview-token
 install -o root -g root -m 0644 "$relay_agent_script_dir/adojapan-relay-agent.service" \
     /etc/systemd/system/adojapan-relay-agent.service
 install -o root -g root -m 0644 "$relay_agent_script_dir/adojapan-relay-broker.service" \
@@ -134,5 +148,9 @@ fi
 
 if [ ! -f /etc/adojapan-relay-agent/node.token ]; then
     printf '%s\n' 'Install the node token: sudo adojapan-relay-install-token'
+fi
+if [ ! -f /etc/adojapan-relay-agent/preview-reader.token ]; then
+    printf '%s\n' \
+        'Generate the preview reader token: sudo adojapan-relay-install-preview-token --generate'
 fi
 printf '%s\n' 'Relay agent files installed; agent remains inactive.'

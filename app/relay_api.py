@@ -24,10 +24,12 @@ from app.node_api import (
 from app.schemas import (
     RelayCommandAckRequest,
     RelayCommandCompleteRequest,
+    RelayConfigureYouTubeKeyRequest,
     RelayConfigureYouTubeRequest,
     RelayHeartbeatRequest,
     RelayStepUpRequest,
 )
+from app.services.relay_preview import RelayPreviewStore
 from app.services.relays import (
     RelayActiveError,
     RelayAuthenticationError,
@@ -51,6 +53,15 @@ _SRT_TOKEN = re.compile(r"srt://[^\s\"'<>]+", re.IGNORECASE)
 
 def _relays(request: Request) -> RelayService:
     return cast(RelayService, request.app.state.relays)
+
+
+def _relay_preview(request: Request) -> RelayPreviewStore:
+    return cast(RelayPreviewStore, request.app.state.relay_preview)
+
+
+def _supports_preview_demand(agent_version: str) -> bool:
+    match = re.fullmatch(r"([0-9]{1,4})\.([0-9]{1,4})\.([0-9]{1,4})", agent_version)
+    return match is not None and tuple(int(value) for value in match.groups()) >= (1, 1, 0)
 
 
 def _fail(http_status: int, code: str, message: str, **headers: str) -> NoReturn:
@@ -191,8 +202,9 @@ async def relay_heartbeat(
     request: Request,
     token: str = Depends(_bearer_token),
 ) -> dict[str, Any]:
+    snapshot = payload.model_dump(mode="json")
     try:
-        result = _relays(request).record_heartbeat(token, payload.model_dump(mode="json"))
+        result = _relays(request).record_heartbeat(token, snapshot)
     except RelayAuthenticationError:
         _fail(status.HTTP_401_UNAUTHORIZED, "relay_authentication_failed", "Authentication failed")
     except RelayUnsupportedProtocolError:
@@ -204,13 +216,30 @@ async def relay_heartbeat(
             "Heartbeat sent too frequently",
             **{"Retry-After": "1"},
         )
-    return {"status": "ok", **result}
+    node_id = str(result["node_id"])
+    response = {"status": "ok", **result}
+    relay_state = snapshot["relay"]
+    relay_is_live = (
+        relay_state["service_state"] == "active"
+        and relay_state["main_process"] == "running"
+        and relay_state["srt_listener"] == "listening"
+        and relay_state["source"] == "LIVE"
+    )
+    if not relay_is_live:
+        _relay_preview(request).purge_node(node_id)
+    if _supports_preview_demand(str(snapshot["agent_version"])):
+        response["preview_requested"] = relay_is_live and _relay_preview(request).requested(node_id)
+    return response
 
 
 @router.get("/relay-agent/v1/commands/next", response_model=None, include_in_schema=False)
 async def relay_next_command(
     request: Request,
     wait: Annotated[int, Query(ge=0, le=20)] = 20,
+    polling_agent_version: Annotated[
+        str | None,
+        Header(alias="X-Relay-Agent-Version", min_length=1, max_length=64),
+    ] = None,
     token: str = Depends(_bearer_token),
 ) -> dict[str, Any] | Response:
     service = _relays(request)
@@ -226,7 +255,10 @@ async def relay_next_command(
             deadline = monotonic() + wait
             while True:
                 try:
-                    command = service.lease_next_command(token)
+                    command = service.lease_next_command(
+                        token,
+                        polling_agent_version=polling_agent_version,
+                    )
                 except RelayAuthenticationError:
                     _fail(
                         status.HTTP_401_UNAUTHORIZED,
@@ -289,8 +321,10 @@ async def relay_complete_command(
     token: str = Depends(_bearer_token),
 ) -> dict[str, str]:
     secret = payload.secret_result.get_secret_value() if payload.secret_result is not None else None
+    service = _relays(request)
     try:
-        result = _relays(request).complete_command(
+        authenticated = service.authenticate(token, require_supported_protocol=True)
+        result = service.complete_command(
             token,
             command_id,
             status=payload.status,
@@ -306,6 +340,8 @@ async def relay_complete_command(
         _fail(status.HTTP_404_NOT_FOUND, "command_not_found", "Command not found")
     except RelayCommandStateError:
         _fail(status.HTTP_409_CONFLICT, "invalid_command_state", "Command state changed")
+    if payload.safe_result.source != "LIVE":
+        _relay_preview(request).purge_node(str(authenticated["node_id"]))
     return {"status": result}
 
 
@@ -385,6 +421,28 @@ async def configure_youtube(
             "youtube_rtmps_url": payload.url.get_secret_value(),
             "youtube_stream_key": payload.stream_key.get_secret_value(),
         },
+        idempotency_key=idempotency_key,
+    )
+
+
+@router.put(
+    "/api/nodes/{node_id}/relay/configure-youtube-key",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def configure_youtube_key(
+    node_id: str,
+    payload: RelayConfigureYouTubeKeyRequest,
+    request: Request,
+    _: dict[str, str] = Depends(require_csrf),
+    __: None = Depends(require_same_origin),
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> dict[str, Any]:
+    _step_up(request, payload.admin_password.get_secret_value(), node_id)
+    return _queue(
+        request,
+        node_id,
+        "CONFIGURE_YOUTUBE_KEY",
+        payload={"youtube_stream_key": payload.stream_key.get_secret_value()},
         idempotency_key=idempotency_key,
     )
 

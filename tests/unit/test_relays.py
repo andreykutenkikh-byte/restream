@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -24,10 +25,12 @@ from app.services.relays import (
     RelayCommandPendingError,
     RelayCommandStateError,
     RelayIdempotencyConflictError,
+    RelayNotConfiguredError,
     RelayProvisionConflictError,
     RelaySecretUnavailableError,
     RelayService,
     RelayUnavailableError,
+    RelayUnsupportedProtocolError,
 )
 
 
@@ -59,9 +62,9 @@ def safe_state(*, active: bool = False) -> dict[str, Any]:
     }
 
 
-def heartbeat(state: dict[str, Any]) -> dict[str, Any]:
+def heartbeat(state: dict[str, Any], *, agent_version: str = "1.0.0") -> dict[str, Any]:
     return {
-        "agent_version": "1.0.0",
+        "agent_version": agent_version,
         "protocol_version": 1,
         "hostname": "hk-relay",
         "relay": state,
@@ -316,6 +319,114 @@ def test_fresh_stopped_heartbeat_is_available_even_when_broker_reports_offline(
     stale_status = service.get_status(node_id)
     assert stale_status["available"] is False
     assert stale_status["status"]["overall"] == "offline"
+
+
+def test_live_input_bitrate_is_persisted_and_hidden_when_stale_or_non_live(
+    tmp_path: Path,
+) -> None:
+    database, service, node_id, token, clock = provisioned(tmp_path)
+    clock.advance(seconds=2)
+    live = safe_state(active=True)
+    live["source"] = "LIVE"
+    live["input_bitrate_bps"] = 4_000_000
+    service.record_heartbeat(token, heartbeat(live))
+
+    status = service.get_status(node_id)
+    assert status["status"]["source"] == "LIVE"
+    assert status["status"]["input_bitrate_bps"] == 4_000_000
+    with database.connect() as connection:
+        stored = connection.execute(
+            "SELECT input_bitrate_bps FROM relay_nodes WHERE node_id = ?", (node_id,)
+        ).fetchone()[0]
+    assert stored == 4_000_000
+
+    clock.advance(seconds=16)
+    stale = service.get_status(node_id)
+    assert stale["available"] is True
+    assert stale["status"]["input_bitrate_bps"] is None
+
+    clock.advance(seconds=15)
+    stale = service.get_status(node_id)
+    assert stale["available"] is False
+    assert stale["status"]["input_bitrate_bps"] is None
+
+    clock.advance(seconds=1)
+    service.record_heartbeat(token, heartbeat(safe_state()))
+    assert service.get_status(node_id)["status"]["input_bitrate_bps"] is None
+    with database.connect() as connection:
+        cleared = connection.execute(
+            "SELECT input_bitrate_bps FROM relay_nodes WHERE node_id = ?", (node_id,)
+        ).fetchone()[0]
+    assert cleared is None
+
+
+def test_old_agent_heartbeat_without_input_bitrate_remains_supported(tmp_path: Path) -> None:
+    _, service, node_id, _, _ = provisioned(tmp_path)
+
+    status = service.get_status(node_id)
+    assert status["available"] is True
+    assert status["status"]["input_bitrate_bps"] is None
+
+
+def test_command_completion_updates_live_input_bitrate(tmp_path: Path) -> None:
+    _, service, node_id, token, clock = provisioned(tmp_path)
+    command = service.create_command(node_id, "STATUS")
+    assert service.lease_next_command(token) is not None
+    service.acknowledge_command(token, command["id"])
+    live = safe_state(active=True)
+    live["source"] = "LIVE"
+    live["input_bitrate_bps"] = 3_750_000
+
+    assert (
+        service.complete_command(
+            token,
+            command["id"],
+            status="ok",
+            completed_at=clock().isoformat(),
+            safe_result=live,
+            secret_result=None,
+        )
+        == "completed"
+    )
+    assert service.get_status(node_id)["status"]["input_bitrate_bps"] == 3_750_000
+
+
+def test_legacy_completed_result_without_bitrate_remains_idempotent(tmp_path: Path) -> None:
+    database, service, node_id, token, clock = provisioned(tmp_path)
+    command = service.create_command(node_id, "STATUS")
+    assert service.lease_next_command(token) is not None
+    service.acknowledge_command(token, command["id"])
+    result = safe_state()
+    service.complete_command(
+        token,
+        command["id"],
+        status="ok",
+        completed_at=clock().isoformat(),
+        safe_result=result,
+        secret_result=None,
+    )
+    with database.connect() as connection:
+        stored = connection.execute(
+            "SELECT safe_result_json FROM relay_commands WHERE id = ?", (command["id"],)
+        ).fetchone()[0]
+        legacy = json.loads(stored)
+        legacy.pop("input_bitrate_bps")
+        connection.execute(
+            "UPDATE relay_commands SET safe_result_json = ? WHERE id = ?",
+            (json.dumps(legacy, separators=(",", ":"), sort_keys=True), command["id"]),
+        )
+
+    assert (
+        service.complete_command(
+            token,
+            command["id"],
+            status="ok",
+            completed_at=clock().isoformat(),
+            safe_result=result,
+            secret_result=None,
+        )
+        == "completed"
+    )
 
 
 def test_fresh_inconsistent_stopped_state_is_not_normalized_to_ok(tmp_path: Path) -> None:
@@ -612,6 +723,163 @@ def test_idempotency_binds_exact_payload_and_mutations_are_serialized(tmp_path: 
 
     with pytest.raises(RelayCommandPendingError):
         service.create_command(node_id, "CLEAR_YOUTUBE")
+
+
+def test_key_only_command_requires_capable_agent_and_is_secret_idempotent(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "relay.sqlite")
+    database.migrate()
+    clock = MutableClock()
+    service = RelayService(database, generate_master_key(), clock=clock)
+    grant = service.provision_node(display_name="HK relay", address="198.51.100.20")
+    service.record_heartbeat(grant.node_token, heartbeat(safe_state()))
+    marker = "KEY_ONLY_SECRET_FIRST_71"
+
+    with pytest.raises(RelayUnsupportedProtocolError):
+        service.create_command(
+            grant.node_id,
+            "CONFIGURE_YOUTUBE_KEY",
+            payload={"youtube_stream_key": marker},
+        )
+
+    clock.advance(seconds=2)
+    service.record_heartbeat(
+        grant.node_token,
+        heartbeat(safe_state(), agent_version="1.2.0"),
+    )
+    command = service.create_command(
+        grant.node_id,
+        "CONFIGURE_YOUTUBE_KEY",
+        payload={"youtube_stream_key": marker},
+        idempotency_key="test:key-only:0001",
+    )
+    repeated = service.create_command(
+        grant.node_id,
+        "CONFIGURE_YOUTUBE_KEY",
+        payload={"youtube_stream_key": marker},
+        idempotency_key="test:key-only:0001",
+    )
+    assert repeated["id"] == command["id"]
+    replacement = "KEY_ONLY_SECRET_SECOND_72"
+    with pytest.raises(RelayIdempotencyConflictError) as mismatch:
+        service.create_command(
+            grant.node_id,
+            "CONFIGURE_YOUTUBE_KEY",
+            payload={"youtube_stream_key": replacement},
+            idempotency_key="test:key-only:0001",
+        )
+    assert marker not in database_dump(database)
+    assert replacement not in database_dump(database)
+    assert replacement not in str(mismatch.value)
+
+    leased = service.lease_next_command(
+        grant.node_token,
+        polling_agent_version="1.2.0",
+    )
+    assert leased is not None
+    assert leased["action"] == "CONFIGURE_YOUTUBE_KEY"
+    assert leased["payload"] == {"youtube_stream_key": marker}
+
+
+def test_key_only_command_refuses_active_missing_url_and_malformed_payload(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "relay.sqlite")
+    database.migrate()
+    clock = MutableClock()
+    service = RelayService(database, generate_master_key(), clock=clock)
+    grant = service.provision_node(display_name="HK relay", address="198.51.100.20")
+    active = safe_state(active=True)
+    service.record_heartbeat(
+        grant.node_token,
+        heartbeat(active, agent_version="1.2.0"),
+    )
+    with pytest.raises(RelayActiveError):
+        service.create_command(
+            grant.node_id,
+            "CONFIGURE_YOUTUBE_KEY",
+            payload={"youtube_stream_key": "replacement"},
+        )
+
+    clock.advance(seconds=2)
+    missing_url = safe_state()
+    missing_url["youtube_url_configured"] = False
+    missing_url["youtube_key_configured"] = False
+    missing_url["error_code"] = "youtube_not_configured"
+    service.record_heartbeat(
+        grant.node_token,
+        heartbeat(missing_url, agent_version="1.2.0"),
+    )
+    with pytest.raises(RelayNotConfiguredError):
+        service.create_command(
+            grant.node_id,
+            "CONFIGURE_YOUTUBE_KEY",
+            payload={"youtube_stream_key": "replacement"},
+        )
+    with pytest.raises(ValueError, match="configure key payload"):
+        service.create_command(
+            grant.node_id,
+            "CONFIGURE_YOUTUBE_KEY",
+            payload={"youtube_rtmps_url": "rtmps://a.rtmps.youtube.com/live2"},
+        )
+    with pytest.raises(ValueError, match="configure key payload"):
+        service.create_command(
+            grant.node_id,
+            "CONFIGURE_YOUTUBE_KEY",
+            payload={"youtube_stream_key": "invalid key!"},
+        )
+
+
+def test_old_poll_terminalizes_key_only_command_before_downgrade_heartbeat(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "relay.sqlite")
+    database.migrate()
+    clock = MutableClock()
+    service = RelayService(database, generate_master_key(), clock=clock)
+    grant = service.provision_node(display_name="HK relay", address="198.51.100.20")
+    service.record_heartbeat(
+        grant.node_token,
+        heartbeat(safe_state(), agent_version="1.2.0"),
+    )
+    marker = "KEY_ONLY_DOWNGRADE_RACE_SECRET_73"
+    command = service.create_command(
+        grant.node_id,
+        "CONFIGURE_YOUTUBE_KEY",
+        payload={"youtube_stream_key": marker},
+        idempotency_key="test:key-only:downgrade-race:0001",
+    )
+
+    # A rolled-back agent polls before it has sent the heartbeat that would
+    # downgrade the stored 1.2 capability.  Old clients omit the assertion.
+    assert service.lease_next_command(grant.node_token) is None
+    terminal = service.get_command(grant.node_id, command["id"])
+    assert terminal is not None
+    assert terminal["state"] == "failed"
+    assert terminal["completion_status"] == "failed"
+    assert terminal["safe_result"] == {"error_code": "unsupported_command"}
+    assert terminal["secret_available"] is False
+
+    with database.connect() as connection:
+        row = connection.execute(
+            "SELECT payload_encrypted FROM relay_commands WHERE id = ?",
+            (command["id"],),
+        ).fetchone()
+    assert row is not None
+    assert decrypt_destination_key(row["payload_encrypted"], service.master_encryption_key) == "{}"
+    assert marker not in database_dump(database)
+
+    # The safe terminal row no longer blocks a subsequent mutation.
+    replacement = service.create_command(
+        grant.node_id,
+        "CLEAR_YOUTUBE",
+        idempotency_key="test:key-only:downgrade-race:0002",
+    )
+    assert replacement["state"] == "queued"
+    legacy_lease = service.lease_next_command(grant.node_token)
+    assert legacy_lease is not None
+    assert legacy_lease["action"] == "CLEAR_YOUTUBE"
 
 
 def test_rotation_requires_fresh_stopped_state_and_no_command(tmp_path: Path) -> None:

@@ -190,6 +190,7 @@ RelayCommandType = Literal[
     "START",
     "STOP",
     "CONFIGURE_YOUTUBE",
+    "CONFIGURE_YOUTUBE_KEY",
     "REVEAL_MOBLIN_URL",
     "CLEAR_YOUTUBE",
 ]
@@ -225,6 +226,18 @@ class RelaySafeState(StrictModel):
     healthy: bool
     portrait_profile: bool
     error_code: RelayErrorCode | None = None
+    input_bitrate_bps: int | None = Field(
+        default=None,
+        strict=True,
+        ge=0,
+        le=1_000_000_000,
+    )
+
+    @model_validator(mode="after")
+    def validate_input_bitrate(self) -> RelaySafeState:
+        if self.source != "LIVE" and self.input_bitrate_bps is not None:
+            raise ValueError("input bitrate is valid only for a LIVE source")
+        return self
 
 
 class RelayHostMetrics(StrictModel):
@@ -313,6 +326,20 @@ def _normalize_youtube_rtmps_url(value: SecretStr) -> SecretStr:
     return SecretStr(f"rtmps://{canonical_host}{port}/live2")
 
 
+def _normalize_youtube_stream_key(value: SecretStr) -> SecretStr:
+    normalized = "".join(value.get_secret_value().split())
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,256}", normalized) is None:
+        raise ValueError("invalid YouTube stream key")
+    return SecretStr(normalized)
+
+
+def _validate_admin_password(value: SecretStr) -> SecretStr:
+    plaintext = value.get_secret_value()
+    if not 1 <= len(plaintext) <= 1024:
+        raise ValueError("invalid administrator password")
+    return value
+
+
 class RelayConfigureYouTubeRequest(StrictModel):
     # Both values use SecretStr so a failed validation can never echo a submitted key.
     url: SecretStr
@@ -327,18 +354,27 @@ class RelayConfigureYouTubeRequest(StrictModel):
     @field_validator("stream_key")
     @classmethod
     def validate_youtube_stream_key(cls, value: SecretStr) -> SecretStr:
-        normalized = "".join(value.get_secret_value().split())
-        if re.fullmatch(r"[A-Za-z0-9_-]{1,256}", normalized) is None:
-            raise ValueError("invalid YouTube stream key")
-        return SecretStr(normalized)
+        return _normalize_youtube_stream_key(value)
 
     @field_validator("admin_password")
     @classmethod
     def validate_admin_password(cls, value: SecretStr) -> SecretStr:
-        plaintext = value.get_secret_value()
-        if not 1 <= len(plaintext) <= 1024:
-            raise ValueError("invalid administrator password")
-        return value
+        return _validate_admin_password(value)
+
+
+class RelayConfigureYouTubeKeyRequest(StrictModel):
+    stream_key: SecretStr
+    admin_password: SecretStr
+
+    @field_validator("stream_key")
+    @classmethod
+    def validate_youtube_stream_key(cls, value: SecretStr) -> SecretStr:
+        return _normalize_youtube_stream_key(value)
+
+    @field_validator("admin_password")
+    @classmethod
+    def validate_admin_password(cls, value: SecretStr) -> SecretStr:
+        return _validate_admin_password(value)
 
 
 class RelayStepUpRequest(StrictModel):
@@ -347,7 +383,4 @@ class RelayStepUpRequest(StrictModel):
     @field_validator("admin_password")
     @classmethod
     def validate_admin_password(cls, value: SecretStr) -> SecretStr:
-        plaintext = value.get_secret_value()
-        if not 1 <= len(plaintext) <= 1024:
-            raise ValueError("invalid administrator password")
-        return value
+        return _validate_admin_password(value)

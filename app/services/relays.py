@@ -42,6 +42,7 @@ RelayCommandType = Literal[
     "START",
     "STOP",
     "CONFIGURE_YOUTUBE",
+    "CONFIGURE_YOUTUBE_KEY",
     "REVEAL_MOBLIN_URL",
     "CLEAR_YOUTUBE",
 ]
@@ -52,10 +53,14 @@ _COMMAND_TYPES: Final = {
     "START",
     "STOP",
     "CONFIGURE_YOUTUBE",
+    "CONFIGURE_YOUTUBE_KEY",
     "REVEAL_MOBLIN_URL",
     "CLEAR_YOUTUBE",
 }
 _IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
+_AGENT_VERSION = re.compile(r"([0-9]{1,4})\.([0-9]{1,4})\.([0-9]{1,4})")
+_YOUTUBE_STREAM_KEY = re.compile(r"[A-Za-z0-9_-]{1,256}\Z")
+_CONFIGURE_YOUTUBE_KEY_CAPABILITY: Final = "moblin_relay.configure_youtube_key"
 
 
 class RelayDomainError(RuntimeError):
@@ -157,6 +162,50 @@ def _relay_snapshot_is_coherently_stopped(row: sqlite3.Row) -> bool:
         and str(row["overall"]) in {"offline", "ok", "healthy"}
         and row["last_error_code"] in {None, "youtube_not_configured"}
     )
+
+
+def _input_bitrate(relay: Mapping[str, Any]) -> int | None:
+    """Return only a bounded LIVE bitrate from an already-safe snapshot."""
+
+    value = relay.get("input_bitrate_bps")
+    if (
+        relay.get("source") != "LIVE"
+        or not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 0 <= value <= 1_000_000_000
+    ):
+        return None
+    return value
+
+
+def _safe_result_matches(stored: object, normalized: Mapping[str, Any]) -> bool:
+    """Compare command results across the optional telemetry field rollout."""
+
+    if not isinstance(stored, str):
+        return False
+    try:
+        decoded = json.loads(stored)
+        previous = RelaySafeState.model_validate(decoded).model_dump(mode="json")
+    except (TypeError, ValueError):
+        return False
+    return previous == normalized
+
+
+def _supports_configure_youtube_key(agent_version: object) -> bool:
+    if not isinstance(agent_version, str):
+        return False
+    match = _AGENT_VERSION.fullmatch(agent_version)
+    return match is not None and tuple(int(value) for value in match.groups()) >= (1, 2, 0)
+
+
+def _relay_capabilities(row: Mapping[str, Any] | sqlite3.Row) -> set[str]:
+    try:
+        decoded = json.loads(str(row["capabilities_json"]))
+    except (IndexError, KeyError, TypeError, ValueError):
+        return set()
+    if not isinstance(decoded, list):
+        return set()
+    return {value for value in decoded if isinstance(value, str)}
 
 
 class RelayService:
@@ -407,7 +456,7 @@ class RelayService:
                 ON CONFLICT(node_id) DO UPDATE SET
                     service_state = 'unknown', service_enabled = 0,
                     main_process = 'unknown', srt_listener = 'unknown', source = 'UNKNOWN',
-                    youtube_forward = 'unknown', overall = 'unknown',
+                    input_bitrate_bps = NULL, youtube_forward = 'unknown', overall = 'unknown',
                     youtube_url_configured = 0, youtube_key_configured = 0,
                     healthy = 0, portrait_profile = 0, last_error_code = NULL,
                     current_command_id = NULL, last_seen_at = NULL,
@@ -463,10 +512,7 @@ class RelayService:
             or row["status"] == "revoked"
         ):
             raise RelayAuthenticationError("relay authentication failed")
-        try:
-            capabilities = json.loads(str(row["capabilities_json"]))
-        except (TypeError, ValueError):
-            capabilities = []
+        capabilities = _relay_capabilities(row)
         if "moblin_relay" not in capabilities:
             raise RelayAuthenticationError("relay authentication failed")
         if require_supported_protocol and row["protocol_version"] != RELAY_PROTOCOL_VERSION:
@@ -503,6 +549,9 @@ class RelayService:
             node_id = str(authenticated["node_id"])
             now = self._time()
             now_text = _timestamp(now)
+            capabilities = ["moblin_relay"]
+            if _supports_configure_youtube_key(snapshot.get("agent_version")):
+                capabilities.append(_CONFIGURE_YOUTUBE_KEY_CAPABILITY)
             if authenticated["relay_last_seen_at"] is not None:
                 previous = _parse_timestamp(str(authenticated["relay_last_seen_at"]))
                 if (now - previous).total_seconds() < RELAY_HEARTBEAT_MIN_INTERVAL_SECONDS:
@@ -512,7 +561,8 @@ class RelayService:
                 """
                 UPDATE relay_nodes
                 SET service_state = ?, service_enabled = ?, main_process = ?,
-                    srt_listener = ?, source = ?, youtube_forward = ?, overall = ?,
+                    srt_listener = ?, source = ?, input_bitrate_bps = ?,
+                    youtube_forward = ?, overall = ?,
                     youtube_url_configured = ?, youtube_key_configured = ?,
                     healthy = ?, portrait_profile = ?, last_error_code = ?, current_command_id = ?,
                     last_seen_at = ?, updated_at = ?
@@ -524,6 +574,7 @@ class RelayService:
                     relay["main_process"],
                     relay["srt_listener"],
                     relay["source"],
+                    _input_bitrate(relay),
                     relay["youtube_forward"],
                     relay["overall"],
                     int(bool(relay["youtube_url_configured"])),
@@ -558,7 +609,7 @@ class RelayService:
                     host["memory_available_bytes"],
                     host["disk_total_bytes"],
                     host["disk_free_bytes"],
-                    _json(["moblin_relay"]),
+                    _json(capabilities),
                     snapshot.get("current_command_id"),
                     now_text,
                     now_text,
@@ -592,6 +643,13 @@ class RelayService:
             overall = "ok"
         else:
             overall = reported_overall
+        input_bitrate_bps = (
+            int(row["input_bitrate_bps"])
+            if generic_status == "ready"
+            and str(row["source"]) == "LIVE"
+            and row["input_bitrate_bps"] is not None
+            else None
+        )
         return {
             # Availability is transport presence, not the relay service's
             # active/inactive state. A freshly-heartbeating stopped relay is
@@ -603,6 +661,7 @@ class RelayService:
                 "main_process": main_process,
                 "srt_listener": str(row["srt_listener"]),
                 "source": str(row["source"]),
+                "input_bitrate_bps": input_bitrate_bps,
                 "youtube_forward": str(row["youtube_forward"]),
                 "overall": overall,
                 "youtube_url_configured": bool(row["youtube_url_configured"]),
@@ -658,6 +717,7 @@ class RelayService:
         row = connection.execute(
             """
             SELECT relay.*, node.status AS node_status, node.protocol_version,
+                   node.capabilities_json,
                    credential.revoked_at AS credential_revoked_at
             FROM relay_nodes AS relay
             JOIN restream_nodes AS node ON node.id = relay.node_id
@@ -692,10 +752,19 @@ class RelayService:
             raise ValueError("unsupported relay command type")
         safe_payload = dict(payload or {})
         if command_type == "CONFIGURE_YOUTUBE":
-            if set(safe_payload) != {"youtube_rtmps_url", "youtube_stream_key"} or any(
+            expected_payload = {"youtube_rtmps_url", "youtube_stream_key"}
+            if set(safe_payload) != expected_payload or any(
                 not isinstance(value, str) or not value for value in safe_payload.values()
             ):
                 raise ValueError("configure payload is invalid")
+        elif command_type == "CONFIGURE_YOUTUBE_KEY":
+            stream_key = safe_payload.get("youtube_stream_key")
+            if (
+                set(safe_payload) != {"youtube_stream_key"}
+                or not isinstance(stream_key, str)
+                or _YOUTUBE_STREAM_KEY.fullmatch(stream_key) is None
+            ):
+                raise ValueError("configure key payload is invalid")
         elif safe_payload:
             raise ValueError("command does not accept a payload")
         if idempotency_key is None:
@@ -719,6 +788,14 @@ class RelayService:
             except RelayDomainError:
                 connection.execute("ROLLBACK")
                 raise
+            if (
+                command_type == "CONFIGURE_YOUTUBE_KEY"
+                and _CONFIGURE_YOUTUBE_KEY_CAPABILITY not in _relay_capabilities(relay)
+            ):
+                connection.execute("ROLLBACK")
+                raise RelayUnsupportedProtocolError(
+                    "relay agent does not support YouTube key-only configuration"
+                )
             existing = connection.execute(
                 "SELECT * FROM relay_commands WHERE node_id = ? AND idempotency_key = ?",
                 (node_id, idempotency_key),
@@ -738,9 +815,22 @@ class RelayService:
                 connection.execute("ROLLBACK")
                 raise
             coherently_stopped = _relay_snapshot_is_coherently_stopped(relay)
-            if command_type in {"CONFIGURE_YOUTUBE", "CLEAR_YOUTUBE"} and not coherently_stopped:
+            if (
+                command_type
+                in {
+                    "CONFIGURE_YOUTUBE",
+                    "CONFIGURE_YOUTUBE_KEY",
+                    "CLEAR_YOUTUBE",
+                }
+                and not coherently_stopped
+            ):
                 connection.execute("ROLLBACK")
                 raise RelayActiveError("relay must be safely stopped before configuration")
+            if command_type == "CONFIGURE_YOUTUBE_KEY" and not bool(
+                relay["youtube_url_configured"]
+            ):
+                connection.execute("ROLLBACK")
+                raise RelayNotConfiguredError("YouTube RTMPS URL is not configured")
             if command_type == "START":
                 if not coherently_stopped or not bool(relay["portrait_profile"]):
                     connection.execute("ROLLBACK")
@@ -815,7 +905,21 @@ class RelayService:
             raise RuntimeError("relay command was not persisted")
         return self._command_view(created)
 
-    def lease_next_command(self, node_token: str) -> dict[str, Any] | None:
+    def lease_next_command(
+        self,
+        node_token: str,
+        *,
+        polling_agent_version: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Lease only commands understood by the agent making this poll.
+
+        The persisted heartbeat describes the last reporter, which can be a
+        different process during a downgrade or rollback.  The poll therefore
+        carries its own version assertion.  Clients predating that assertion
+        remain compatible with legacy actions, but can never receive a newer
+        key-only command.
+        """
+
         authenticated = self.authenticate(node_token, require_supported_protocol=True)
         node_id = str(authenticated["node_id"])
         self.reconcile_command_leases(node_id=node_id)
@@ -834,6 +938,7 @@ class RelayService:
             now_text = _timestamp(now)
             lease_until = _timestamp(now + timedelta(seconds=RELAY_COMMAND_LEASE_SECONDS))
             expired_safe = _json({"error_code": "command_expired"})
+            unsupported_safe = _json({"error_code": "unsupported_command"})
             erased_payload = self._encrypt_mapping({})
             connection.execute(
                 """
@@ -844,14 +949,39 @@ class RelayService:
                 """,
                 (now_text, expired_safe, erased_payload, node_id, lease_until),
             )
+            polling_client_supports_key_only = _supports_configure_youtube_key(
+                polling_agent_version
+            )
+            if not polling_client_supports_key_only:
+                # This transition and the following lease selection share one
+                # write transaction.  An old process can therefore neither
+                # receive the secret nor leave it queued to block later
+                # mutations after a rollback race.
+                connection.execute(
+                    """
+                    UPDATE relay_commands
+                    SET state = 'failed', lease_until = NULL, completed_at = ?,
+                        completion_status = 'failed', safe_result_json = ?,
+                        payload_encrypted = ?, secret_result_encrypted = NULL
+                    WHERE node_id = ? AND state = 'queued'
+                      AND command_type = 'CONFIGURE_YOUTUBE_KEY'
+                    """,
+                    (now_text, unsupported_safe, erased_payload, node_id),
+                )
             row = connection.execute(
                 """
                 SELECT * FROM relay_commands
                 WHERE node_id = ? AND state = 'queued' AND expires_at >= ?
                   AND attempt_count < ?
+                  AND (? = 1 OR command_type != 'CONFIGURE_YOUTUBE_KEY')
                 ORDER BY created_at, id LIMIT 1
                 """,
-                (node_id, lease_until, RELAY_COMMAND_MAX_ATTEMPTS),
+                (
+                    node_id,
+                    lease_until,
+                    RELAY_COMMAND_MAX_ATTEMPTS,
+                    int(polling_client_supports_key_only),
+                ),
             ).fetchone()
             if row is None:
                 connection.execute("COMMIT")
@@ -967,14 +1097,14 @@ class RelayService:
                     raise RelayCommandStateError("command must not return a secret")
                 encrypted_secret = None
             if (
-                command_type == "CONFIGURE_YOUTUBE"
+                command_type in {"CONFIGURE_YOUTUBE", "CONFIGURE_YOUTUBE_KEY"}
                 and status == "conflict"
                 and normalized_safe.get("error_code") != "relay_active"
             ):
                 connection.execute("ROLLBACK")
                 raise RelayCommandStateError("configuration conflict result is invalid")
             if (
-                command_type == "CONFIGURE_YOUTUBE"
+                command_type in {"CONFIGURE_YOUTUBE", "CONFIGURE_YOUTUBE_KEY"}
                 and status == "ok"
                 and not (
                     normalized_safe["youtube_url_configured"]
@@ -996,9 +1126,8 @@ class RelayService:
             state = str(row["state"])
             if state == "completed":
                 connection.execute("COMMIT")
-                if (
-                    row["completion_status"] != status
-                    or row["safe_result_json"] != safe_result_json
+                if row["completion_status"] != status or not _safe_result_matches(
+                    row["safe_result_json"], normalized_safe
                 ):
                     raise RelayCommandStateError("relay command has a different result")
                 return "completed"
@@ -1029,7 +1158,8 @@ class RelayService:
                 """
                 UPDATE relay_nodes
                 SET service_state = ?, service_enabled = ?, main_process = ?,
-                    srt_listener = ?, source = ?, youtube_forward = ?, overall = ?,
+                    srt_listener = ?, source = ?, input_bitrate_bps = ?,
+                    youtube_forward = ?, overall = ?,
                     youtube_url_configured = ?, youtube_key_configured = ?, healthy = ?,
                     portrait_profile = ?, last_error_code = ?, current_command_id = NULL,
                     last_seen_at = ?, updated_at = ?
@@ -1041,6 +1171,7 @@ class RelayService:
                     normalized_safe["main_process"],
                     normalized_safe["srt_listener"],
                     normalized_safe["source"],
+                    _input_bitrate(normalized_safe),
                     normalized_safe["youtube_forward"],
                     normalized_safe["overall"],
                     int(normalized_safe["youtube_url_configured"]),

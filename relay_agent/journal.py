@@ -19,9 +19,47 @@ from relay_agent.models import (
 )
 from relay_agent.security import atomic_write_private, effective_uid, ensure_private_directory
 
-JOURNAL_VERSION = 1
+JOURNAL_VERSION = 2
+LEGACY_JOURNAL_VERSION = 1
 MAX_JOURNAL_ENTRIES = 64
 MAX_JOURNAL_BYTES = 64 * 1024
+
+_LEGACY_ACTIONS = frozenset(
+    {
+        "STATUS",
+        "START",
+        "STOP",
+        "CONFIGURE_YOUTUBE",
+        "CLEAR_YOUTUBE",
+        "REVEAL_MOBLIN_URL",
+    }
+)
+_CURRENT_ACTIONS = _LEGACY_ACTIONS | {"CONFIGURE_YOUTUBE_KEY"}
+_LEGACY_SNAPSHOT_FIELDS = frozenset(
+    {
+        "service_state",
+        "enabled",
+        "main_process",
+        "srt_listener",
+        "source",
+        "youtube_forward",
+        "overall",
+        "youtube_url_configured",
+        "youtube_key_configured",
+        "healthy",
+        "portrait_profile",
+        "error_code",
+    }
+)
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise RelayAgentError("invalid_journal")
+        result[key] = value
+    return result
 
 
 class CommandJournal:
@@ -78,31 +116,27 @@ class CommandJournal:
 
     def _load(self) -> OrderedDict[str, tuple[Action, RelayCompletion]]:
         entries: OrderedDict[str, tuple[Action, RelayCompletion]] = OrderedDict()
-        if not self._path.exists():
+        raw_payload = self._read_payload()
+        if raw_payload is None:
             return entries
         try:
-            metadata = self._path.lstat()
-            if (
-                stat.S_ISLNK(metadata.st_mode)
-                or not stat.S_ISREG(metadata.st_mode)
-                or (os.name == "posix" and metadata.st_uid != effective_uid())
-                or (os.name == "posix" and metadata.st_mode & 0o777 != 0o600)
-                or metadata.st_size > MAX_JOURNAL_BYTES
-            ):
-                raise RelayAgentError("unsafe_journal")
-            decoded = json.loads(self._path.read_bytes())
+            decoded = json.loads(raw_payload, object_pairs_hook=_reject_duplicate_keys)
         except RelayAgentError:
             raise
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise RelayAgentError("invalid_journal") from exc
+        if not isinstance(decoded, dict) or set(decoded) != {"version", "entries"}:
+            raise RelayAgentError("invalid_journal")
+        version = decoded["version"]
         if (
-            not isinstance(decoded, dict)
-            or set(decoded) != {"version", "entries"}
-            or decoded["version"] != JOURNAL_VERSION
+            not isinstance(version, int)
+            or isinstance(version, bool)
+            or version not in {LEGACY_JOURNAL_VERSION, JOURNAL_VERSION}
             or not isinstance(decoded["entries"], list)
             or len(decoded["entries"]) > MAX_JOURNAL_ENTRIES
         ):
             raise RelayAgentError("invalid_journal")
+        allowed_actions = _LEGACY_ACTIONS if version == LEGACY_JOURNAL_VERSION else _CURRENT_ACTIONS
         for raw in decoded["entries"]:
             if not isinstance(raw, dict) or set(raw) != {
                 "id",
@@ -117,24 +151,66 @@ class CommandJournal:
             status = raw["status"]
             if (
                 not isinstance(command_id, str)
-                or action
-                not in {
-                    "STATUS",
-                    "START",
-                    "STOP",
-                    "CONFIGURE_YOUTUBE",
-                    "CLEAR_YOUTUBE",
-                    "REVEAL_MOBLIN_URL",
-                }
+                or not isinstance(action, str)
+                or action not in allowed_actions
+                or not isinstance(status, str)
                 or status not in {"ok", "failed", "conflict"}
                 or command_id in entries
+            ):
+                raise RelayAgentError("invalid_journal")
+            safe_result = raw["safe_result"]
+            if version == LEGACY_JOURNAL_VERSION and (
+                not isinstance(safe_result, dict) or set(safe_result) != _LEGACY_SNAPSHOT_FIELDS
             ):
                 raise RelayAgentError("invalid_journal")
             completion = RelayCompletion(
                 cast(CompletionStatus, status),
                 cast(str, raw["completed_at"]),
-                RelaySnapshot.parse(raw["safe_result"]),
+                RelaySnapshot.parse(safe_result),
                 None,
             )
             entries[command_id] = (cast(Action, action), completion)
         return entries
+
+    def _read_payload(self) -> bytes | None:
+        try:
+            before = self._path.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise RelayAgentError("invalid_journal") from exc
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or (os.name == "posix" and before.st_uid != effective_uid())
+            or (os.name == "posix" and before.st_mode & 0o777 != 0o600)
+            or before.st_size > MAX_JOURNAL_BYTES
+        ):
+            raise RelayAgentError("unsafe_journal")
+
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = -1
+        try:
+            fd = os.open(self._path, flags)
+            opened = os.fstat(fd)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+                or (os.name == "posix" and opened.st_uid != effective_uid())
+                or (os.name == "posix" and opened.st_mode & 0o777 != 0o600)
+                or opened.st_size > MAX_JOURNAL_BYTES
+            ):
+                raise RelayAgentError("unsafe_journal")
+            with os.fdopen(fd, "rb") as handle:
+                fd = -1
+                payload = handle.read(MAX_JOURNAL_BYTES + 1)
+            if len(payload) > MAX_JOURNAL_BYTES or len(payload) != opened.st_size:
+                raise RelayAgentError("invalid_journal")
+            return payload
+        except RelayAgentError:
+            raise
+        except OSError as exc:
+            raise RelayAgentError("unsafe_journal") from exc
+        finally:
+            if fd >= 0:
+                os.close(fd)

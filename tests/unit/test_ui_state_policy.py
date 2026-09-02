@@ -10,12 +10,13 @@ def _read(path: str) -> str:
 
 
 def test_only_confirmed_live_state_is_presented_as_on_air() -> None:
-    javascript = _read("app/static/app.js")
+    javascript = _read("app/static/relay-dashboard.js")
     dashboard = _read("app/templates/dashboard.html")
 
-    assert "running: {" not in javascript
-    assert "['running', 'live']" not in dashboard
-    assert "destination_state == 'live'" in dashboard
+    assert 'relay.source === "LIVE"' in javascript
+    assert "Видеопоток из Moblin поступает" in javascript
+    assert "Moblin не подключён" in javascript
+    assert "data-relay-signal-state" in dashboard
 
 
 def test_ingest_preview_markup_is_safe_and_accessible() -> None:
@@ -27,13 +28,13 @@ def test_ingest_preview_markup_is_safe_and_accessible() -> None:
     for boolean_attribute in ("autoplay", "muted", "playsinline", "controls"):
         assert re.search(rf"\b{boolean_attribute}\b", attributes)
     assert 'preload="metadata"' in attributes
-    assert "data-ingest-video" in attributes
+    assert "data-relay-video" in attributes
     assert "src=" not in attributes
-    assert 'data-preview-state="' in dashboard
-    assert "Предпросмотр появится после запуска трансляции в OBS" in dashboard
-    assert "Подготавливаем предпросмотр…" in dashboard
-    assert "Входящий поток продолжает приниматься." in dashboard
-    assert "data-preview-retry" in dashboard
+    assert 'data-preview-state="offline"' in dashboard
+    assert "Видео пока не поступает" in dashboard
+    assert "Подготавливаем защищённое превью…" in dashboard
+    assert "Приём видеопотока может продолжаться." in dashboard
+    assert "data-relay-preview-retry" in dashboard
 
 
 def test_preview_uses_only_pinned_local_scripts() -> None:
@@ -42,7 +43,7 @@ def test_preview_uses_only_pinned_local_scripts() -> None:
     script_sources = re.findall(r'<script[^>]+src="([^"]+)"', dashboard + base)
 
     assert "/static/vendor/hls.min.js" in script_sources
-    assert "/static/preview-player.js" in script_sources
+    assert any(source.startswith("/static/preview-player.js?") for source in script_sources)
     assert all(not source.startswith(("http://", "https://", "//")) for source in script_sources)
     hls_bundle = ROOT / "app/static/vendor/hls.min.js"
     assert hls_bundle.is_file()
@@ -54,16 +55,18 @@ def test_preview_uses_only_pinned_local_scripts() -> None:
 
 
 def test_preview_lifecycle_and_metadata_rendering_policy() -> None:
-    javascript = _read("app/static/app.js")
+    javascript = _read("app/static/relay-dashboard.js")
     controller = _read("app/static/preview-player.js")
 
-    assert 'const PREVIEW_URL = "/api/ingest/preview/index.m3u8"' in javascript
-    assert "sourceUrl: PREVIEW_URL" in javascript
-    assert "INGEST_POLL_LIVE_MS = 2000" in javascript
-    assert "previewController?.setStreamState(state)" in javascript
+    assert "/relay/preview/index.m3u8" in javascript
+    assert "sourceUrl:" in javascript
+    assert "POLL_ACTIVE_MS = 3000" in javascript
+    resume = javascript.index("previewController.resume()")
+    set_live = javascript.index('previewController.setStreamState("live")')
+    assert resume < set_live
     assert 'previewController?.suspend("offline")' in javascript
-    assert 'output.textContent = present ? value : "—"' in javascript
-    assert "data-metadata" in javascript
+    assert "formatBitrate" in javascript
+    assert "data-relay-bitrate" in javascript
     assert "enableWorker: false" in controller
     assert "blockedAfterError" in controller
     assert "this.hlsClass.isSupported()" in controller
@@ -72,15 +75,26 @@ def test_preview_lifecycle_and_metadata_rendering_policy() -> None:
     assert "worker_auth" not in controller.lower()
 
 
-def test_preview_layout_keeps_two_columns_until_very_narrow_screens() -> None:
+def test_preview_layout_is_portrait_and_reflows_on_mobile() -> None:
     stylesheet = _read("app/static/styles.css")
 
-    assert "aspect-ratio: 16 / 9" in stylesheet
-    assert ".signal-preview video" in stylesheet
-    narrow_rules = stylesheet.split("@media (max-width: 420px)", maxsplit=1)[1]
-    assert ".signal-metadata" in narrow_rules
-    assert "grid-template-columns: 1fr" in narrow_rules
+    assert ".signal-preview--portrait" in stylesheet
+    assert "aspect-ratio: 9 / 16" in stylesheet
     mobile_rules = stylesheet.split("@media (max-width: 680px)", maxsplit=1)[1].split(
         "@media (max-width: 420px)", maxsplit=1
     )[0]
-    assert ".signal-metadata" not in mobile_rules
+    assert ".relay-monitor__layout" in mobile_rules
+    assert "grid-template-columns: 1fr" in mobile_rules
+
+
+def test_primary_dashboard_has_two_setup_actions_and_collapsed_advanced_controls() -> None:
+    dashboard = _read("app/templates/dashboard.html")
+
+    assert dashboard.count('data-setup-step="') == 2
+    assert "Ключ потока YouTube" in dashboard
+    assert "Ссылка для Moblin или OBS" in dashboard
+    assert "Дополнительно: заменить RTMPS-адрес" in dashboard
+    assert '"configure-youtube-key"' in _read("app/static/relay-dashboard.js")
+    assert '<details class="panel relay-advanced"' in dashboard
+    assert "data-relay-start" in dashboard
+    assert "data-relay-stop" in dashboard

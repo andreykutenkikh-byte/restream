@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Literal, TypeAlias, cast
@@ -20,6 +21,7 @@ Action = Literal[
     "START",
     "STOP",
     "CONFIGURE_YOUTUBE",
+    "CONFIGURE_YOUTUBE_KEY",
     "CLEAR_YOUTUBE",
     "REVEAL_MOBLIN_URL",
 ]
@@ -31,6 +33,7 @@ SUPPORTED_ACTIONS = frozenset(
         "START",
         "STOP",
         "CONFIGURE_YOUTUBE",
+        "CONFIGURE_YOUTUBE_KEY",
         "CLEAR_YOUTUBE",
         "REVEAL_MOBLIN_URL",
     }
@@ -46,6 +49,7 @@ SAFE_ERROR_CODES = frozenset(
         "internal_error",
     }
 )
+_YOUTUBE_STREAM_KEY = re.compile(r"[A-Za-z0-9_-]{1,256}\Z")
 
 
 def utc_timestamp() -> str:
@@ -96,6 +100,7 @@ class RelaySnapshot:
     healthy: bool
     portrait_profile: bool
     error_code: str | None = None
+    input_bitrate_bps: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.service_state, str) or self.service_state not in {
@@ -158,12 +163,19 @@ class RelaySnapshot:
             not isinstance(self.error_code, str) or self.error_code not in SAFE_ERROR_CODES
         ):
             raise RelayAgentError("invalid_protocol")
+        if self.input_bitrate_bps is not None and (
+            self.source != "LIVE"
+            or not isinstance(self.input_bitrate_bps, int)
+            or isinstance(self.input_bitrate_bps, bool)
+            or not 0 <= self.input_bitrate_bps <= 1_000_000_000
+        ):
+            raise RelayAgentError("invalid_protocol")
 
     def with_error(self, code: str) -> RelaySnapshot:
         return replace(self, healthy=False, error_code=code)
 
     def to_json(self) -> JsonObject:
-        return {
+        result: JsonObject = {
             "service_state": self.service_state,
             "enabled": self.enabled,
             "main_process": self.main_process,
@@ -177,10 +189,16 @@ class RelaySnapshot:
             "portrait_profile": self.portrait_profile,
             "error_code": self.error_code,
         }
+        # Omitting an unavailable sample preserves compatibility during a
+        # backend-first rollout and prevents a non-LIVE snapshot from claiming
+        # input telemetry.
+        if self.input_bitrate_bps is not None:
+            result["input_bitrate_bps"] = self.input_bitrate_bps
+        return result
 
     @classmethod
     def parse(cls, value: object) -> RelaySnapshot:
-        if not isinstance(value, dict) or set(value) != {
+        required = {
             "service_state",
             "enabled",
             "main_process",
@@ -193,7 +211,11 @@ class RelaySnapshot:
             "healthy",
             "portrait_profile",
             "error_code",
-        }:
+        }
+        if not isinstance(value, dict) or not required.issubset(value):
+            raise RelayAgentError("invalid_protocol")
+        extra = set(value) - required
+        if extra not in (set(), {"input_bitrate_bps"}):
             raise RelayAgentError("invalid_protocol")
         return cls(
             service_state=cast(
@@ -220,6 +242,7 @@ class RelaySnapshot:
             healthy=cast(bool, value["healthy"]),
             portrait_profile=cast(bool, value["portrait_profile"]),
             error_code=cast(str | None, value["error_code"]),
+            input_bitrate_bps=cast(int | None, value.get("input_bitrate_bps")),
         )
 
     @classmethod
@@ -295,6 +318,17 @@ class YouTubeConfiguration:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class YouTubeKeyConfiguration:
+    stream_key: str
+
+    def __repr__(self) -> str:
+        return "YouTubeKeyConfiguration(stream_key=[REDACTED])"
+
+    def to_broker_payload(self) -> JsonObject:
+        return {"youtube_stream_key": self.stream_key}
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class RelayCommand:
     command_id: str
     action: Action
@@ -302,6 +336,7 @@ class RelayCommand:
     attempt_count: int
     expires_at: datetime
     youtube: YouTubeConfiguration | None = None
+    youtube_key: YouTubeKeyConfiguration | None = None
 
     def __repr__(self) -> str:
         return (
@@ -341,6 +376,7 @@ class RelayCommand:
         ):
             raise RelayAgentError("invalid_protocol")
         youtube: YouTubeConfiguration | None = None
+        youtube_key: YouTubeKeyConfiguration | None = None
         if action == "CONFIGURE_YOUTUBE":
             if not isinstance(payload, dict) or set(payload) != {
                 "youtube_rtmps_url",
@@ -357,6 +393,13 @@ class RelayCommand:
             ):
                 raise RelayAgentError("invalid_protocol")
             youtube = YouTubeConfiguration(url, stream_key)
+        elif action == "CONFIGURE_YOUTUBE_KEY":
+            if not isinstance(payload, dict) or set(payload) != {"youtube_stream_key"}:
+                raise RelayAgentError("invalid_protocol")
+            stream_key = payload["youtube_stream_key"]
+            if not isinstance(stream_key, str) or _YOUTUBE_STREAM_KEY.fullmatch(stream_key) is None:
+                raise RelayAgentError("invalid_protocol")
+            youtube_key = YouTubeKeyConfiguration(stream_key)
         elif not isinstance(payload, dict) or payload:
             raise RelayAgentError("invalid_protocol")
         return cls(
@@ -366,6 +409,7 @@ class RelayCommand:
             attempt_count=attempt_count,
             expires_at=parse_timestamp(value["expires_at"]),
             youtube=youtube,
+            youtube_key=youtube_key,
         )
 
     def expired(self, now: datetime | None = None) -> bool:

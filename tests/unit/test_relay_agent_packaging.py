@@ -45,6 +45,7 @@ def test_installers_do_not_mutate_moblin_relay_or_use_secret_arguments() -> None
     installer = (DEPLOY / "install.sh").read_text(encoding="utf-8")
     uninstaller = (DEPLOY / "uninstall.sh").read_text(encoding="utf-8")
     token_installer = (DEPLOY / "install-token.py").read_text(encoding="utf-8")
+    journal_helper = (DEPLOY / "journal-rollback.py").read_text(encoding="utf-8")
     for script in (installer, uninstaller):
         assert "systemctl start moblin-relay" not in script
         assert "systemctl stop moblin-relay" not in script
@@ -61,6 +62,17 @@ def test_installers_do_not_mutate_moblin_relay_or_use_secret_arguments() -> None
     assert "-type l -print -quit" in installer
     assert "Stop adojapan-relay-agent.service before install or update." in installer
     assert "Stop adojapan-relay-broker.service before install or update." in installer
+    prepare_position = installer.index('"$relay_agent_journal_helper" --prepare')
+    code_swap_position = installer.index("relay_agent.old")
+    assert prepare_position < code_swap_position
+    assert '-m 0700 "$relay_agent_journal_helper"' in installer
+    assert "/usr/local/sbin/adojapan-relay-restore-v1-journal" in installer
+    assert "rm -f /usr/local/sbin/adojapan-relay-restore-v1-journal" not in uninstaller
+    assert "subprocess.run(  # noqa: S603" in journal_helper
+    assert "shell=True" not in journal_helper
+    assert "commands.v1.rollback.json" in journal_helper
+    assert '"O_NOFOLLOW"' in journal_helper
+    assert "os.replace(temporary, path)" in journal_helper
 
 
 def test_agent_sources_have_no_shell_execution_or_secret_logging() -> None:

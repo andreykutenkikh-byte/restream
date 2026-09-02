@@ -48,10 +48,20 @@ Every request uses `Authorization: Bearer <node token>`:
 - `POST /relay-agent/v1/commands/{command_id}/ack`
 - `POST /relay-agent/v1/commands/{command_id}/complete`
 
+Agent version 1.1 adds a backward-compatible optional `preview_requested`
+boolean to a successful heartbeat response. Version 1.2 adds the separately
+gated key-only YouTube command and the optional LIVE input-bitrate sample.
+Older agents receive the original response shape and cannot be leased a command
+they do not support. Preview media never uses the small control route: the agent
+uploads completed MPEG-TS segments to the separate, node-authenticated
+`/relay-media/v1/preview/segments/{generation}/{sequence}` endpoint.
+
 The fixed action allowlist is `STATUS`, `START`, `STOP`,
-`CONFIGURE_YOUTUBE`, `CLEAR_YOUTUBE`, and `REVEAL_MOBLIN_URL`. A leased
-`CONFIGURE_YOUTUBE` payload contains `youtube_rtmps_url` and
-`youtube_stream_key`. All other command payloads are empty objects.
+`CONFIGURE_YOUTUBE`, `CONFIGURE_YOUTUBE_KEY`, `CLEAR_YOUTUBE`, and
+`REVEAL_MOBLIN_URL`. A leased `CONFIGURE_YOUTUBE` payload contains
+`youtube_rtmps_url` and `youtube_stream_key`; `CONFIGURE_YOUTUBE_KEY` contains
+only `youtube_stream_key` and is available only to agent 1.2 or newer. All
+other command payloads are empty objects.
 
 Leases last 120 seconds and retry at most three times. A command has a ten-minute
 absolute delivery lifetime, but a lease is issued only when the entire
@@ -90,6 +100,7 @@ throttle and returns a bounded `Retry-After` when locked.
 - `POST /api/nodes/{node_id}/relay/start`
 - `POST /api/nodes/{node_id}/relay/stop`
 - `PUT /api/nodes/{node_id}/relay/configure-youtube`
+- `PUT /api/nodes/{node_id}/relay/configure-youtube-key`
 - `DELETE /api/nodes/{node_id}/relay/youtube`
 - `POST /api/nodes/{node_id}/relay/reveal-moblin-url`
 - `GET /api/nodes/{node_id}/relay/commands/{command_id}`
@@ -107,15 +118,63 @@ secret-bearing admin response. API responses use `Cache-Control: no-store`,
 and audit details contain only node IDs, action names, command IDs, and fixed
 statuses.
 
+## Remote relay preview transport
+
+The browser renews a short preview lease with same-origin session, CSRF, and
+Origin protection, then reads a session-authenticated playlist and segments:
+
+- `POST /api/nodes/{node_id}/relay/preview/lease`
+- `GET /api/nodes/{node_id}/relay/preview/index.m3u8`
+- `GET /api/nodes/{node_id}/relay/preview/segment/{generation}/{sequence}.ts`
+
+The HK host remains outbound-only. MediaMTX HLS must bind only to
+`127.0.0.1:8888`, use the `mpegts` variant and two-second segments, and grant
+read access to `iphone-live` only to the dedicated `relay-preview` user. No HLS,
+API, WebRTC, firewall, route, interface, Docker, Amnezia, SRT, or management
+port is published or changed for this feature.
+The transport uses the standard MPEG-TS HLS functionality present in MediaMTX
+1.19.2 and does not depend on its control API or WebRTC; the HK image version
+must nevertheless remain whatever the existing relay manifest already pins.
+
+The backend accepts no agent-supplied playlist or URL. It validates canonical
+generation/sequence values, exact `video/mp2t`, declared and streamed size,
+and every 188-byte MPEG-TS sync byte. It keeps at most four segments and 12 MiB
+per node, 24 MiB process-wide, and purges on lease expiry, non-LIVE heartbeat,
+successful stop completion, administrator logout, and application shutdown.
+Nginx raises its body allowance to 3 MiB only for the exact relay-media segment
+route and disables request and response buffering there; the global 1 MiB and
+the relay-agent 16 KiB limits remain unchanged.
+
+While `moblin-relay.service` and the control agent are inactive, generate the
+local HLS reader credential without printing or transporting it:
+
+```bash
+sudo adojapan-relay-install-preview-token --generate
+```
+
+The root-only MediaMTX renderer must read that same local file, write only the
+supported password hash into its root-owned runtime configuration, and never
+place the value in argv, environment, logs, Git, unit files, or reports. The
+agent reads `/etc/adojapan-relay-agent/preview-reader.token` as
+`restream-agent`; absence or unsafe ownership/mode disables only preview.
+Deployment must verify owner `restream-agent`, mode `0600`, loopback listeners,
+and external refusal on ports 8888 and 9998 before enabling the agent. Rollout
+order is backend and narrow proxy route, then the inactive HK agent, then the
+loopback renderer; rollback is the reverse order and does not touch relay or
+YouTube secrets.
+
 ## Operator data flow
 
 Keep these three values separate:
 
-1. Enter the exact **YouTube RTMPS URL** copied from Live Control Room and the
-   **YouTube stream key** only in the protected YouTube dialog on the Servers
-   page. They are written to the HK relay's existing root-owned secret store
-   and are never shown back. A reusable stream key normally needs to be set
-   once; configure it again whenever YouTube issues a replacement key.
+1. On the main **Трансляция** page, enter the **YouTube stream key** in the
+   protected first-step dialog. The exact **YouTube RTMPS URL** from Live
+   Control Room is required only during initial setup or when its endpoint must
+   be replaced; it stays collapsed under the dialog's additional settings once
+   configured. Both values are written to the HK relay's existing root-owned
+   secret store and are never shown back. A reusable stream key normally needs
+   to be set once; use the same dialog to replace only the key whenever YouTube
+   issues a new one.
 2. Reveal and copy only the **SRT URL** into Moblin at
    `Settings → Streams → profile → URL`. If Moblin offers to replace it with a
    direct YouTube RTMP URL, choose `No`.
@@ -129,7 +188,7 @@ Moblin's relay profile is portrait: Portrait ON, 720p producing 720×1280,
 SRT latency 2000–3000 ms, and local recording ON.
 
 The safe broadcast order is: create the scheduled YouTube broadcast; configure
-YouTube on the Servers page if needed; start the relay; wait for the slate and
-good Stream health; press Go Live manually in YouTube Studio; then start SRT in
-Moblin. To finish, end the YouTube broadcast manually before stopping the
-relay.
+the key on the main «Трансляция» page if needed; start the relay; wait for the
+slate and good Stream health; press Go Live manually in YouTube Studio; then
+start SRT in Moblin. To finish, end the YouTube broadcast manually before
+stopping the relay.
