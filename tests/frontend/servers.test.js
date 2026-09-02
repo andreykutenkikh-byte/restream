@@ -428,7 +428,7 @@ test("UI includes progress, sudo, revoke confirmation, and mobile layout", () =>
   assert.match(template, /data-install-steps/);
   assert.match(template, /data-sudo-password/);
   assert.match(template, /data-revoke-dialog/);
-  assert.match(template, /Серверы и ретрансляция/);
+  assert.match(template, /Серверы и диагностика/);
   assert.match(source, /Агент на связи/);
   assert.match(styles, /@media \(max-width: 680px\)/);
   assert.match(styles, /\.server-grid \{[\s\S]{0,140}align-items: start/);
@@ -440,9 +440,9 @@ test("UI includes progress, sudo, revoke confirmation, and mobile layout", () =>
   assert.match(source, /Дополнительные действия/);
   assert.match(source, /data-relay-action-reason/);
   assert.match(source, /button\.disabled = true/);
-  assert.match(baseTemplate, /styles\.css[^"\n]*\?v=20260902\.1/);
-  assert.match(baseTemplate, /app\.js[^"\n]*\?v=20260902\.1/);
-  assert.match(template, /servers\.js\?v=20260902\.1/);
+  assert.match(baseTemplate, /styles\.css[^"\n]*\?v=20260902\.3/);
+  assert.match(baseTemplate, /app\.js[^"\n]*\?v=20260902\.3/);
+  assert.match(template, /servers\.js\?v=20260902\.3/);
   assert.match(source, /result\.safe_result\?\.status === "ok"/);
   assert.match(source, /Docker может остаться установленным на сервере/);
 });

@@ -19,7 +19,7 @@
 
       <nav class="primary-nav" aria-label="Основные разделы">
         <a class="primary-nav__link" href="/">Трансляция</a>
-        <a class="primary-nav__link" href="/servers" aria-current="page">Серверы</a>
+        <a class="primary-nav__link" href="/servers" aria-current="page">Дополнительно</a>
       </nav>
 
       <div class="header-actions">
@@ -43,11 +43,11 @@
   >
     <div class="page-heading servers__heading">
       <div>
-        <p class="eyebrow">Инфраструктура</p>
-        <h1>Серверы и ретрансляция</h1>
+        <p class="eyebrow">Дополнительно</p>
+        <h1>Серверы и диагностика</h1>
         <p class="page-heading__lead">
-          Управляйте эфиром Moblin → YouTube на основном relay-сервере
-          и подключайте дополнительные серверы для резервных маршрутов.
+          Здесь находятся технические параметры и управление инфраструктурой.
+          Основной эфир настраивается в разделе «Трансляция».
         </p>
       </div>
       <button class="button button--primary" type="button" data-open-server-dialog>
@@ -373,5 +373,5 @@
 {% endblock %}
 
 {% block scripts %}
-  <script src="/static/servers.js?v=20260902.1" defer></script>
+  <script src="/static/servers.js?v=20260902.3" defer></script>
 {% endblock %}

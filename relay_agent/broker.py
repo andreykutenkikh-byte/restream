@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import math
 import os
 import runpy
 import select
@@ -14,12 +16,13 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout, suppress
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, cast
 from urllib.parse import urlsplit
+from uuid import UUID
 
 from relay_agent.errors import RelayAgentError
 from relay_agent.models import JsonObject, RelaySnapshot
@@ -43,6 +46,10 @@ _SYSTEMCTL_PATH = "/usr/bin/systemctl"
 _MOBLIN_RELAY_SERVICE = "moblin-relay.service"
 _RELAY_LOCK_DIRECTORY = Path("/run/lock/moblin-relay")
 _RELAY_LOCK_PATH = _RELAY_LOCK_DIRECTORY / "control.lock"
+_BITRATE_STATE_PATH = _RELAY_LOCK_DIRECTORY / "input-bitrate.json"
+_BITRATE_STALE_AFTER_SECONDS = 15.0
+_MAX_INPUT_BITRATE_BPS = 1_000_000_000
+_MAX_INPUT_COUNTER = 2**53 - 1
 _PR_SET_CHILD_SUBREAPER = 36
 _subreaper_enabled = False
 _YOUTUBE_HOSTS = frozenset({"a.rtmps.youtube.com", "b.rtmps.youtube.com"})
@@ -52,6 +59,7 @@ _ACTIONS = frozenset(
         "start",
         "stop",
         "configure_youtube",
+        "configure_youtube_key",
         "clear_youtube",
         "reveal_moblin_url",
     }
@@ -83,6 +91,188 @@ _RELAYCTL_REQUIRED = frozenset(
 
 class RelayCtlNamespace(Protocol):
     def __getitem__(self, key: str) -> object: ...
+
+
+class InputBitrateSampler:
+    """Derive safe input bitrate from one MediaMTX publisher counter.
+
+    Broker requests run in short-lived forked workers, so the minimum baseline
+    needed for a monotonic delta lives in a root-only runtime file. The raw
+    connection label is never persisted or returned; only its SHA-256 identity
+    is retained to detect publisher changes.
+    """
+
+    def __init__(
+        self,
+        state_path: Path = _BITRATE_STATE_PATH,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        stale_after_seconds: float = _BITRATE_STALE_AFTER_SECONDS,
+        expected_uid: int = 0,
+    ) -> None:
+        if not math.isfinite(stale_after_seconds) or stale_after_seconds <= 0:
+            raise ValueError("stale_after_seconds must be positive")
+        if not isinstance(expected_uid, int) or isinstance(expected_uid, bool) or expected_uid < 0:
+            raise ValueError("expected_uid must be non-negative")
+        self._state_path = state_path
+        self._clock = clock
+        self._stale_after_seconds = stale_after_seconds
+        self._expected_uid = expected_uid
+
+    def reset(self) -> None:
+        with suppress(OSError):
+            self._state_path.unlink(missing_ok=True)
+
+    def _load(self) -> tuple[str, int, float] | None:
+        try:
+            before = self._state_path.lstat()
+            if (
+                stat.S_ISLNK(before.st_mode)
+                or not stat.S_ISREG(before.st_mode)
+                or before.st_size < 1
+                or before.st_size > 512
+                or (
+                    os.name == "posix"
+                    and (before.st_uid != self._expected_uid or before.st_mode & 0o777 != 0o600)
+                )
+            ):
+                return None
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(self._state_path, flags)
+            try:
+                opened = os.fstat(fd)
+                if not stat.S_ISREG(opened.st_mode) or (before.st_dev, before.st_ino) != (
+                    opened.st_dev,
+                    opened.st_ino,
+                ):
+                    return None
+                with os.fdopen(fd, "r", encoding="ascii", closefd=False) as stream:
+                    decoded = json.load(stream)
+            finally:
+                os.close(fd)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(decoded, dict) or set(decoded) != {
+            "connection_identity",
+            "bytes_received",
+            "observed_at",
+        }:
+            return None
+        identity = decoded["connection_identity"]
+        counter = decoded["bytes_received"]
+        observed_at = decoded["observed_at"]
+        if (
+            not isinstance(identity, str)
+            or len(identity) != 64
+            or any(character not in "0123456789abcdef" for character in identity)
+            or not isinstance(counter, int)
+            or isinstance(counter, bool)
+            or not 0 <= counter <= _MAX_INPUT_COUNTER
+            or not isinstance(observed_at, (int, float))
+            or isinstance(observed_at, bool)
+            or not math.isfinite(float(observed_at))
+            or float(observed_at) < 0
+        ):
+            return None
+        return identity, counter, float(observed_at)
+
+    def _save(self, identity: str, counter: int, observed_at: float) -> bool:
+        encoded = json.dumps(
+            {
+                "connection_identity": identity,
+                "bytes_received": counter,
+                "observed_at": observed_at,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        temporary = self._state_path.with_name(
+            f".{self._state_path.name}.{os.getpid()}.{time.monotonic_ns()}"
+        )
+        fd = -1
+        try:
+            self._state_path.parent.mkdir(mode=0o700, parents=False, exist_ok=True)
+            directory = self._state_path.parent.lstat()
+            if not stat.S_ISDIR(directory.st_mode) or (
+                os.name == "posix"
+                and (directory.st_uid != self._expected_uid or directory.st_mode & 0o077)
+            ):
+                return False
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            fd = os.open(temporary, flags, 0o600)
+            with os.fdopen(fd, "wb", closefd=False) as stream:
+                stream.write(encoded)
+                stream.flush()
+            os.fsync(fd)
+            os.close(fd)
+            fd = -1
+            os.replace(temporary, self._state_path)
+            return True
+        except OSError:
+            return False
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
+
+    def sample(self, *, connection_id: object, bytes_received: object) -> int | None:
+        observed_at = self._clock()
+        if (
+            not isinstance(connection_id, str)
+            or not 1 <= len(connection_id) <= 64
+            or not connection_id.isascii()
+            or not isinstance(bytes_received, (int, float))
+            or isinstance(bytes_received, bool)
+            or not math.isfinite(float(bytes_received))
+            or not float(bytes_received).is_integer()
+            or not 0 <= float(bytes_received) <= _MAX_INPUT_COUNTER
+            or not isinstance(observed_at, (int, float))
+            or isinstance(observed_at, bool)
+            or not math.isfinite(float(observed_at))
+            or observed_at < 0
+        ):
+            self.reset()
+            return None
+        try:
+            canonical_id = str(UUID(connection_id))
+        except ValueError:
+            self.reset()
+            return None
+        if canonical_id != connection_id.lower():
+            self.reset()
+            return None
+        identity = hashlib.sha256(canonical_id.encode("ascii")).hexdigest()
+        counter = int(bytes_received)
+        now = float(observed_at)
+        previous = self._load()
+        if previous is None:
+            self.reset()
+            self._save(identity, counter, now)
+            return None
+        previous_identity, previous_counter, previous_at = previous
+        elapsed = now - previous_at
+        if (
+            identity != previous_identity
+            or counter < previous_counter
+            or elapsed <= 0
+            or elapsed >= self._stale_after_seconds
+        ):
+            self.reset()
+            self._save(identity, counter, now)
+            return None
+        bitrate = round(((counter - previous_counter) * 8) / elapsed)
+        if not 0 <= bitrate <= _MAX_INPUT_BITRATE_BPS or not self._save(identity, counter, now):
+            self.reset()
+            return None
+        return bitrate
 
 
 def _function(namespace: Mapping[str, object], name: str) -> Callable[..., Any]:
@@ -235,9 +425,15 @@ def _capture_return_code(function: object) -> int:
 class RelayBroker:
     """Allowlisted privileged operations over the exact existing relayctl code."""
 
-    def __init__(self, relayctl: Mapping[str, object] | None = None) -> None:
+    def __init__(
+        self,
+        relayctl: Mapping[str, object] | None = None,
+        *,
+        bitrate_sampler: InputBitrateSampler | None = None,
+    ) -> None:
         self._relayctl = relayctl if relayctl is not None else _safe_relayctl_namespace()
         self._portrait_cache: tuple[int, int, bool] | None = None
+        self._bitrate_sampler = bitrate_sampler or InputBitrateSampler()
 
     def reconciliation_state(self, request: JsonObject) -> tuple[bool, bool] | None:
         """Capture START/STOP state before the worker is armed for mutation."""
@@ -277,6 +473,8 @@ class RelayBroker:
                 return self._stop(relay_lock_held=relay_lock_held)
             if action == "configure_youtube":
                 return self._configure_youtube(payload)
+            if action == "configure_youtube_key":
+                return self._configure_youtube_key(payload)
             if action == "clear_youtube":
                 if payload:
                     raise RelayAgentError("invalid_configuration")
@@ -328,7 +526,9 @@ class RelayBroker:
             portrait_profile = self._portrait_profile()
             main_process = self._main_process(active, service_state)
             srt_listener = self._srt_listener(active, service_state)
-            source, metrics_ok, path_ready, forward_ok = self._media_state(active)
+            source, metrics_ok, path_ready, forward_ok, input_bitrate_bps = self._media_state(
+                active
+            )
             if forward_ok:
                 youtube_forward = "active"
             elif service_state == "inactive":
@@ -383,6 +583,7 @@ class RelayBroker:
             healthy=healthy,
             portrait_profile=portrait_profile,
             error_code=error_code,
+            input_bitrate_bps=input_bitrate_bps,
         )
 
     def _portrait_profile(self) -> bool:
@@ -485,9 +686,16 @@ class RelayBroker:
 
     def _media_state(
         self, active: bool
-    ) -> tuple[Literal["SLATE", "LIVE", "NONE", "UNKNOWN"], bool, bool, bool]:
+    ) -> tuple[
+        Literal["SLATE", "LIVE", "NONE", "UNKNOWN"],
+        bool,
+        bool,
+        bool,
+        int | None,
+    ]:
         if not active:
-            return "NONE", False, False, False
+            self._bitrate_sampler.reset()
+            return "NONE", False, False, False, None
         try:
             metrics = _function(self._relayctl, "read_metrics")()
             parse = _function(self._relayctl, "parse_metric_samples")
@@ -496,10 +704,19 @@ class RelayBroker:
                 labels.get("name") == path_name and labels.get("state") == "ready" and value == 1
                 for labels, value in parse(metrics, "paths")
             )
-            live = any(
-                labels.get("path") == path_name and labels.get("state") == "publish" and value == 1
+            live_publishers = [
+                labels
                 for labels, value in parse(metrics, "srt_conns")
-            )
+                if labels.get("path") == path_name
+                and labels.get("state") == "publish"
+                and value == 1
+            ]
+            live = bool(live_publishers)
+            counter_samples = [
+                (labels, value)
+                for labels, value in parse(metrics, "srt_conns_bytes_received")
+                if labels.get("path") == path_name and labels.get("state") == "publish"
+            ]
             forward_ok = any(
                 labels.get("path") == path_name
                 and labels.get("protocol") == "rtmps"
@@ -508,10 +725,31 @@ class RelayBroker:
                 for labels, value in parse(metrics, "forward_dests")
             )
         except (OSError, TypeError, ValueError):
-            return "UNKNOWN", False, False, False
+            self._bitrate_sampler.reset()
+            return "UNKNOWN", False, False, False, None
         if live:
-            return "LIVE", True, path_ready, forward_ok
-        return ("SLATE" if path_ready else "UNKNOWN"), True, path_ready, forward_ok
+            input_bitrate_bps = self._input_bitrate(live_publishers, counter_samples)
+            return "LIVE", True, path_ready, forward_ok, input_bitrate_bps
+        self._bitrate_sampler.reset()
+        return ("SLATE" if path_ready else "UNKNOWN"), True, path_ready, forward_ok, None
+
+    def _input_bitrate(
+        self,
+        live_publishers: list[dict[str, str]],
+        counter_samples: list[tuple[dict[str, str], float]],
+    ) -> int | None:
+        if len(live_publishers) != 1:
+            self._bitrate_sampler.reset()
+            return None
+        connection_id = live_publishers[0].get("id")
+        matching = [value for labels, value in counter_samples if labels.get("id") == connection_id]
+        if len(matching) != 1:
+            self._bitrate_sampler.reset()
+            return None
+        return self._bitrate_sampler.sample(
+            connection_id=connection_id,
+            bytes_received=matching[0],
+        )
 
     def _start(self, *, relay_lock_held: bool = False) -> JsonObject:
         before = self.snapshot()
@@ -602,6 +840,59 @@ class RelayBroker:
             raise RelayAgentError("relayctl_failed") from exc
         # The durable atomic save is the final blocking operation. Never turn a
         # committed configuration into a timeout/failure during a later probe.
+        return self._result(
+            "ok",
+            replace(
+                before_commit,
+                youtube_url_configured=True,
+                youtube_key_configured=True,
+                error_code=(
+                    None
+                    if before_commit.error_code == "youtube_not_configured"
+                    else before_commit.error_code
+                ),
+            ),
+        )
+
+    def _configure_youtube_key(self, payload: dict[object, object]) -> JsonObject:
+        if set(payload) != {"youtube_stream_key"}:
+            raise RelayAgentError("invalid_configuration")
+        raw_key = payload.get("youtube_stream_key")
+        if not isinstance(raw_key, str):
+            raise RelayAgentError("invalid_configuration")
+        lock_factory = _function(self._relayctl, "RelayLock")
+        before_commit: RelaySnapshot
+        try:
+            with lock_factory():
+                if not _function(self._relayctl, "service_allows_reconfiguration")():
+                    return self._result("conflict", self.snapshot().with_error("relay_active"))
+                data = _function(self._relayctl, "load_secrets")(optional=True)
+                if not isinstance(data, dict):
+                    raise RelayAgentError("relayctl_failed")
+                youtube = data.get("youtube")
+                if not isinstance(youtube, dict):
+                    raise RelayAgentError("invalid_configuration")
+                existing_url = youtube.get("url")
+                if not isinstance(existing_url, str) or not existing_url.strip():
+                    raise RelayAgentError("invalid_configuration")
+                try:
+                    validated_url, stream_key = _function(self._relayctl, "validate_youtube")(
+                        existing_url, raw_key
+                    )
+                except ValueError as exc:
+                    raise RelayAgentError("invalid_configuration") from exc
+                validate_official_youtube_endpoint(validated_url)
+                # This action is deliberately key-only. A URL requiring even
+                # normalization must be repaired through the full configure action.
+                if validated_url != existing_url:
+                    raise RelayAgentError("invalid_configuration")
+                youtube["key"] = stream_key
+                before_commit = self.snapshot()
+                _function(self._relayctl, "atomic_save_secrets")(data)
+        except RelayAgentError:
+            raise
+        except (KeyError, OSError, TypeError, ValueError, SystemExit) as exc:
+            raise RelayAgentError("relayctl_failed") from exc
         return self._result(
             "ok",
             replace(
@@ -1085,6 +1376,7 @@ def _execute_bounded_request(
         "start",
         "stop",
         "configure_youtube",
+        "configure_youtube_key",
         "clear_youtube",
     }
     needs_reconciliation = (
@@ -1135,6 +1427,7 @@ def _execute_bounded_request_with_lock(
         "start",
         "stop",
         "configure_youtube",
+        "configure_youtube_key",
         "clear_youtube",
     }
     needs_reconciliation = (

@@ -15,6 +15,7 @@ from relay_agent.models import (
     RelayCommand,
     RelaySnapshot,
     YouTubeConfiguration,
+    YouTubeKeyConfiguration,
 )
 from relay_agent.processor import CommandProcessor
 from relay_agent.security import SensitiveToken
@@ -40,11 +41,12 @@ def safe_snapshot() -> RelaySnapshot:
 class FakeBroker:
     def __init__(self, srt_secret: str) -> None:
         self.calls: list[str] = []
+        self.payloads: list[tuple[str, dict[str, object] | None]] = []
         self.srt_secret = srt_secret
 
     def call(self, action: str, payload: dict[str, object] | None = None) -> BrokerResponse:
-        del payload
         self.calls.append(action)
+        self.payloads.append((action, payload))
         return BrokerResponse(
             "ok",
             safe_snapshot(),
@@ -52,7 +54,11 @@ class FakeBroker:
         )
 
 
-def command(action: str, youtube: YouTubeConfiguration | None = None) -> RelayCommand:
+def command(
+    action: str,
+    youtube: YouTubeConfiguration | None = None,
+    youtube_key: YouTubeKeyConfiguration | None = None,
+) -> RelayCommand:
     return RelayCommand(
         command_id=str(uuid4()),
         action=action,  # type: ignore[arg-type]
@@ -60,6 +66,7 @@ def command(action: str, youtube: YouTubeConfiguration | None = None) -> RelayCo
         attempt_count=1,
         expires_at=datetime.now(UTC) + timedelta(minutes=1),
         youtube=youtube,
+        youtube_key=youtube_key,
     )
 
 
@@ -92,6 +99,32 @@ def test_configure_is_idempotent_and_journal_never_contains_secrets(tmp_path: Pa
     assert repeated_reveal.completed_at == first_reveal.completed_at
     assert repeated_reveal.safe_result == first_reveal.safe_result
     assert broker.calls.count("reveal_moblin_url") == 2
+
+
+def test_key_only_configure_is_idempotent_redacted_and_has_exact_broker_payload(
+    tmp_path: Path,
+) -> None:
+    marker = "KEY_ONLY_AGENT_SECRET_7f4c"
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    private.chmod(0o700)
+    journal = CommandJournal(private / "commands.json")
+    broker = FakeBroker("unused")
+    processor = CommandProcessor(broker, journal)
+    configure = command(
+        "CONFIGURE_YOUTUBE_KEY",
+        youtube_key=YouTubeKeyConfiguration(marker),
+    )
+
+    first = processor.process(configure)
+    second = processor.process(configure)
+
+    assert first == second
+    assert broker.calls.count("configure_youtube_key") == 1
+    assert broker.payloads == [("configure_youtube_key", {"youtube_stream_key": marker})]
+    assert marker.encode() not in (private / "commands.json").read_bytes()
+    assert marker not in repr(configure)
+    assert marker not in repr(configure.youtube_key)
 
 
 def test_secret_wrappers_argv_environment_and_logs_are_redacted(

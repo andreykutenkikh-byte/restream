@@ -9,13 +9,21 @@ during an incremental application release.
 The shared control-plane host is `147.45.231.225`. An attached restream node is a different host
 and must pass the onboarding gates in [Node onboarding](node-onboarding.md).
 
-## Incremental relay-control release (schema v3)
+## Incremental simplified relay console release (schema v5)
 
-The native Moblin relay-control release changes the backend application, static UI, and SQLite
-schema from version 2 to version 3. It does not change the bootstrap image, MediaMTX image or
-configuration, Compose model, reverse-proxy site, ports, or production environment. Consequently,
-build and recreate **only** `backend`. `bootstrap` and `mediamtx` must retain their container IDs,
-start times, restart counts, and OOM state.
+This release changes the backend application, static UI, and SQLite schema from version 3 to
+version 5. Schema v4 adds the bounded incoming-bitrate sample and schema v5 adds the separately
+allowlisted key-only YouTube rotation command. The release also adds one exact reverse-proxy media
+upload location and updates the outbound-only HK control agent plus the existing root-owned
+MediaMTX renderer for loopback-only preview HLS. It does not change the bootstrap image, the
+control-plane MediaMTX image or configuration, the Compose model, public ports, production
+environment, Docker daemon, firewall, routes, interfaces, Amnezia, or the relay's existing YouTube
+secret store.
+
+Build and recreate **only** `backend`; `bootstrap` and the control-plane `mediamtx` must retain
+their container IDs, start times, restart counts, and OOM state. Apply the narrow proxy location
+only after backend readiness succeeds. Update the HK agent and renderer only while
+`moblin-relay.service` is both inactive and disabled. Do not start the relay during deployment.
 
 Before the window, require a successful CI run for the exact reviewed commit and a clean checkout.
 Preserve the existing production `.env`, bootstrap secret file, and `MASTER_ENCRYPTION_KEY`; do not
@@ -57,16 +65,16 @@ with sqlite3.connect("/srv/app/data/restream.db") as connection:
         raise SystemExit("Live database integrity check failed")
     if connection.execute(
         "SELECT MAX(version) FROM schema_migrations"
-    ).fetchone() != (2,):
-        raise SystemExit("Live database is not the expected schema v2")
-print("Live schema v2 verified")
+    ).fetchone() != (3,):
+        raise SystemExit("Live database is not the expected schema v3")
+print("Live schema v3 verified")
 PY
 release_old_image_hex="${release_old_image#sha256:}"
 case "$release_old_image_hex" in
   ''|*[!0-9a-f]*) printf '%s\n' 'Unexpected old backend image ID' >&2; exit 1 ;;
 esac
 test "${#release_old_image_hex}" -eq 64
-release_old_tag="adojapan-restream-backend:pre-relay-v3-$release_old_image_hex"
+release_old_tag="adojapan-restream-backend:pre-relay-v5-$release_old_image_hex"
 if docker image inspect "$release_old_tag" >/dev/null 2>&1; then
   release_tagged_image="$(docker image inspect --format '{{.Id}}' "$release_old_tag")"
   test "$release_tagged_image" = "$release_old_image" || {
@@ -105,7 +113,7 @@ with sqlite3.connect(sys.argv[1]) as connection:
         raise SystemExit("Backup integrity check failed")
     if connection.execute(
         "SELECT MAX(version) FROM schema_migrations"
-    ).fetchone() != (2,):
+    ).fetchone() != (3,):
         raise SystemExit("Unexpected pre-release schema")
 print("Backup verified")
 PY
@@ -113,6 +121,16 @@ install -d -m 0700 backups
 release_backup_copy="backups/$(basename "$release_backup")"
 docker cp "$release_backend_container:$release_backup" "$release_backup_copy"
 chmod 0600 "$release_backup_copy"
+release_backup_digest="$(sha256sum "$release_backup_copy" | awk '{print $1}')"
+case "$release_backup_digest" in
+  ''|*[!0-9a-f]*) printf '%s\n' 'Unexpected backup digest' >&2; exit 1 ;;
+esac
+test "${#release_backup_digest}" -eq 64
+release_backup_manifest="${release_backup_copy}.sha256"
+(umask 077; printf '%s  %s\n' "$release_backup_digest" "$release_backup_copy" > \
+  "$release_backup_manifest")
+chmod 0600 "$release_backup_manifest"
+sha256sum --check "$release_backup_manifest"
 ```
 
 Build and recreate only the backend. Do not pass `--build` to a project-wide `up`, and do not use
@@ -137,9 +155,17 @@ with sqlite3.connect("/srv/app/data/restream.db") as connection:
             "SELECT name FROM sqlite_schema WHERE type = 'table'"
         )
     }
-if version != (3,) or not {"relay_nodes", "relay_commands"}.issubset(tables):
-    raise SystemExit("Schema v3 verification failed")
-print("Schema v3 verified")
+    if version != (5,) or not {"relay_nodes", "relay_commands"}.issubset(tables):
+        raise SystemExit("Schema v5 verification failed")
+    relay_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(relay_nodes)")
+    }
+    relay_command_sql = connection.execute(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'relay_commands'"
+    ).fetchone()[0]
+if "input_bitrate_bps" not in relay_columns or "CONFIGURE_YOUTUBE_KEY" not in relay_command_sql:
+    raise SystemExit("Schema v5 relay fields are incomplete")
+print("Schema v5 verified")
 PY
 release_new_backend_container="$(docker compose -p adojapan-restream --env-file .env \
   -f compose.yml -f compose.production.yml ps -q backend)"
@@ -161,20 +187,65 @@ printf '%s\n' 'Backend-only container isolation verified'
 ```
 
 Compare the saved IDs with the post-start snapshot. Only the backend ID and start time may change.
-Verify HTTPS login/logout, `/servers`, CSRF, the relay status facade, restart count, and OOM state.
-Do not provision or activate the HK agent until these checks pass. The native agent release does
-not require publishing or changing `NODE_AGENT_IMAGE` because it is not a Docker Node Agent.
+Verify HTTPS login/logout, the simplified dashboard, `/servers`, CSRF, the relay status facade,
+restart count, and OOM state. Confirm that an agent older than 1.2.0 cannot receive the key-only
+command and that a legacy heartbeat without bitrate remains accepted. Do not update or activate
+the HK agent until these checks pass. The native agent release does not require publishing or
+changing `NODE_AGENT_IMAGE` because it is not a Docker Node Agent.
 
-### Incremental rollback from schema v3
+Back up only the active `restream.adojapan.ru` proxy site, replace it with the reviewed file, test
+the complete Nginx configuration, and reload Nginx. The new exception must match only
+`/relay-media/v1/preview/segments/<uuid>/<integer>`, allow at most 3 MiB, disable request/response
+buffering, and continue forwarding `Authorization`. All other relay-agent requests retain the
+16 KiB limit and the site-wide 1 MiB limit. A failed configuration test is a hard stop; restore the
+single site backup and do not reload.
 
-The previous backend expects schema version 2 exactly and will fail readiness against schema 3.
-Code-only rollback is therefore unsafe. Stop only the HK control agent first if it was activated;
-never stop, start, enable, disable, or reconfigure `moblin-relay.service` as part of control-plane
-rollback. Then stop only the backend, restore the verified pre-release database through a one-off
-Compose container that mounts the named volumes, restore the saved backend image tag, and recreate
-only the backend.
+On the HK host, first prove `moblin-relay.service` is inactive and disabled and that no relay
+command is pending. Back up the currently installed agent package, its command journal, and the two
+renderer files with root-only permissions. Create a root-owned mode-`0600` SHA-256 manifest for
+those exact rollback files and verify it before installing anything; never include secret-file
+contents in the manifest. The reviewed agent installer must complete its pre-swap journal step: it
+creates and validates the root-owned mode-`0600`
+`/etc/adojapan-relay-agent/commands.v1.rollback.json` without replacing an existing valid copy.
+Treat failure of that step as a hard stop. Install the reviewed agent package, then generate the
+shared local preview reader credential on that host without displaying or transporting it:
 
 ```bash
+sudo adojapan-relay-install-preview-token --generate
+```
+
+Install the reviewed renderer and service unit, run the existing renderer/config validation and a
+local synthetic preview test, and verify that the effective HLS listener is exactly
+`127.0.0.1:8888`, MPEG-TS only, and readable only as `relay-preview` for `iphone-live`. Verify that
+ports 8888 and 9998 refuse non-loopback connections. Start or restart only
+`adojapan-relay-agent.service`; wait for an agent 1.2.x heartbeat, status refresh, and a bounded
+nullable bitrate field. Leave `moblin-relay.service` inactive and disabled. The preview can remain
+empty until a later operator-started LIVE input; deployment must not use the real YouTube
+destination for a smoke test.
+
+### Incremental rollback from schema v5
+
+The previous backend expects schema version 3 exactly and will fail readiness against schema 5.
+Code-only rollback is therefore unsafe. Verify the protected HK rollback manifest before using any
+saved file. Stop only the HK control agent first if it was updated; stop the broker process and run
+`sudo adojapan-relay-restore-v1-journal` before starting the saved old agent package. The root-only
+restore command refuses active processes and atomically restores
+the pre-release v1 contract, intentionally dropping v2-only key-rotation entries and bitrate
+fields. Restore the saved renderer without touching relay or YouTube secrets, and verify the relay
+remains inactive and disabled. Restore the single saved proxy site and reload it only after a
+successful full Nginx configuration test. Never start, enable, or reconfigure
+`moblin-relay.service` as part of control-plane rollback. Then stop only the backend, restore the
+verified pre-release database through a one-off Compose container that mounts the named volumes,
+restore the saved backend image tag, and recreate only the backend.
+
+```bash
+test "$(stat -c '%a' "$release_backup_copy")" = 600
+test "$(stat -c '%a' "$release_backup_manifest")" = 600
+sha256sum --check "$release_backup_manifest"
+release_volume_digest="$(docker compose -p adojapan-restream --env-file .env \
+  -f compose.yml -f compose.production.yml run --rm --no-deps backend \
+  sha256sum "$release_backup" | awk '{print $1}')"
+test "$release_volume_digest" = "$release_backup_digest"
 docker compose -p adojapan-restream --env-file .env \
   -f compose.yml -f compose.production.yml stop backend
 docker compose -p adojapan-restream --env-file .env \
@@ -183,7 +254,7 @@ docker compose -p adojapan-restream --env-file .env \
   --database /srv/app/data/restream.db --confirm RESTORE_ADOJAPAN_RESTREAM
 docker compose -p adojapan-restream --env-file .env \
   -f compose.yml -f compose.production.yml run --rm --no-deps backend \
-  python -c 'import sqlite3; c=sqlite3.connect("/srv/app/data/restream.db"); assert c.execute("PRAGMA integrity_check").fetchone() == ("ok",); assert c.execute("SELECT MAX(version) FROM schema_migrations").fetchone() == (2,); print("Schema v2 backup restored")'
+  python -c 'import sqlite3; c=sqlite3.connect("/srv/app/data/restream.db"); assert c.execute("PRAGMA integrity_check").fetchone() == ("ok",); assert c.execute("SELECT MAX(version) FROM schema_migrations").fetchone() == (3,); print("Schema v3 backup restored")'
 test "$(docker image inspect --format '{{.Id}}' "$release_old_tag")" = "$release_old_image"
 docker image tag "$release_old_tag" adojapan-restream-backend:latest
 docker compose -p adojapan-restream --env-file .env \

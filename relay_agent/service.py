@@ -33,6 +33,12 @@ class ControlPlane(Protocol):
     def complete(self, command_id: str, completion: RelayCompletion) -> None: ...
 
 
+class PreviewController(Protocol):
+    def set_requested(self, requested: bool) -> None: ...
+
+    def run(self, stop_event: threading.Event) -> None: ...
+
+
 class Backoff:
     def __init__(self, minimum: float = 1.0, maximum: float = 30.0) -> None:
         self._minimum = minimum
@@ -57,6 +63,7 @@ class AgentService:
         processor: CommandProcessor,
         metrics: HostMetricsCollector,
         stop_event: threading.Event,
+        preview: PreviewController | None = None,
     ) -> None:
         hostname = socket.gethostname()
         if not 1 <= len(hostname) <= 253 or not all(
@@ -68,6 +75,7 @@ class AgentService:
         self._processor = processor
         self._metrics = metrics
         self._stop = stop_event
+        self._preview = preview
         self._current_lock = threading.Lock()
         self._current_command_id: str | None = None
 
@@ -78,11 +86,22 @@ class AgentService:
             daemon=True,
         )
         heartbeat.start()
+        preview_thread = None
+        if self._preview is not None:
+            preview_thread = threading.Thread(
+                target=self._preview.run,
+                args=(self._stop,),
+                name="relay-preview",
+                daemon=True,
+            )
+            preview_thread.start()
         try:
             self._command_loop()
         finally:
             self._stop.set()
             heartbeat.join(timeout=20.0)
+            if preview_thread is not None:
+                preview_thread.join(timeout=10.0)
 
     def _heartbeat_loop(self) -> None:
         backoff = Backoff()
@@ -91,16 +110,23 @@ class AgentService:
             try:
                 relay = self._processor.status()
                 host = self._metrics.collect()
-                self._control.heartbeat(
+                intervals = self._control.heartbeat(
                     hostname=self._hostname,
                     relay=relay,
                     host=host,
                     current_command_id=self._current_id(),
                 )
+                if self._preview is not None:
+                    requested = getattr(intervals, "preview_requested", False)
+                    self._preview.set_requested(requested is True and relay.source == "LIVE")
             except RelayAgentError as exc:
+                if self._preview is not None:
+                    self._preview.set_requested(False)
                 logger.warning("Heartbeat failed safely (%s)", exc.code)
                 delay = backoff.next_delay()
             except Exception:
+                if self._preview is not None:
+                    self._preview.set_requested(False)
                 logger.error("Heartbeat failed safely (internal_error)")
                 delay = backoff.next_delay()
             else:

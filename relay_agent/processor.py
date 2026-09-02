@@ -25,6 +25,7 @@ _BROKER_ACTIONS = {
     "START": "start",
     "STOP": "stop",
     "CONFIGURE_YOUTUBE": "configure_youtube",
+    "CONFIGURE_YOUTUBE_KEY": "configure_youtube_key",
     "CLEAR_YOUTUBE": "clear_youtube",
     "REVEAL_MOBLIN_URL": "reveal_moblin_url",
 }
@@ -68,6 +69,10 @@ class CommandProcessor:
             if command.youtube is None:
                 raise RelayAgentError("invalid_protocol")
             payload = command.youtube.to_broker_payload()
+        elif command.action == "CONFIGURE_YOUTUBE_KEY":
+            if command.youtube_key is None:
+                raise RelayAgentError("invalid_protocol")
+            payload = command.youtube_key.to_broker_payload()
         try:
             response = self._broker.call(_BROKER_ACTIONS[command.action], payload)
             self._validate_secret_semantics(command, response)

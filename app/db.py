@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 
 def utc_now() -> str:
@@ -219,6 +219,10 @@ class Database:
                     source TEXT NOT NULL DEFAULT 'UNKNOWN' CHECK (
                         source IN ('SLATE', 'LIVE', 'NONE', 'UNKNOWN')
                     ),
+                    input_bitrate_bps INTEGER CHECK (
+                        input_bitrate_bps IS NULL OR
+                        input_bitrate_bps BETWEEN 0 AND 1000000000
+                    ),
                     youtube_forward TEXT NOT NULL DEFAULT 'unknown' CHECK (
                         youtube_forward IN ('active', 'inactive', 'connecting', 'failed', 'unknown')
                     ),
@@ -249,7 +253,8 @@ class Database:
                     command_type TEXT NOT NULL CHECK (
                         command_type IN (
                             'STATUS', 'START', 'STOP', 'CONFIGURE_YOUTUBE',
-                            'REVEAL_MOBLIN_URL', 'CLEAR_YOUTUBE'
+                            'CONFIGURE_YOUTUBE_KEY', 'REVEAL_MOBLIN_URL',
+                            'CLEAR_YOUTUBE'
                         )
                     ),
                     payload_encrypted TEXT NOT NULL,
@@ -314,6 +319,103 @@ class Database:
                     ALTER TABLE relay_commands
                     ADD COLUMN request_fingerprint TEXT NOT NULL DEFAULT ''
                     """
+                )
+                connection.execute("COMMIT")
+            relay_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(relay_nodes)").fetchall()
+            }
+            connection.execute("BEGIN IMMEDIATE")
+            if "input_bitrate_bps" not in relay_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE relay_nodes ADD COLUMN input_bitrate_bps INTEGER
+                    CHECK (
+                        input_bitrate_bps IS NULL OR
+                        input_bitrate_bps BETWEEN 0 AND 1000000000
+                    )
+                    """
+                )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                "VALUES (4, CURRENT_TIMESTAMP)"
+            )
+            connection.execute("COMMIT")
+            relay_command_schema = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'relay_commands'"
+            ).fetchone()
+            supports_key_only = bool(
+                relay_command_schema and "CONFIGURE_YOUTUBE_KEY" in str(relay_command_schema["sql"])
+            )
+            if not supports_key_only:
+                connection.executescript(
+                    """
+                    BEGIN IMMEDIATE;
+                    ALTER TABLE relay_commands RENAME TO relay_commands_before_v5;
+                    DROP INDEX IF EXISTS idx_relay_commands_delivery;
+                    CREATE TABLE relay_commands (
+                        id TEXT PRIMARY KEY,
+                        node_id TEXT NOT NULL REFERENCES relay_nodes(node_id) ON DELETE CASCADE,
+                        command_type TEXT NOT NULL CHECK (
+                            command_type IN (
+                                'STATUS', 'START', 'STOP', 'CONFIGURE_YOUTUBE',
+                                'CONFIGURE_YOUTUBE_KEY', 'REVEAL_MOBLIN_URL',
+                                'CLEAR_YOUTUBE'
+                            )
+                        ),
+                        payload_encrypted TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK (
+                            state IN (
+                                'queued', 'leased', 'acknowledged', 'completed',
+                                'failed', 'cancelled'
+                            )
+                        ),
+                        lease_until TEXT,
+                        expires_at TEXT NOT NULL,
+                        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+                        idempotency_key TEXT NOT NULL,
+                        request_fingerprint TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        acknowledged_at TEXT,
+                        completed_at TEXT,
+                        completion_status TEXT CHECK (
+                            completion_status IS NULL OR
+                            completion_status IN ('ok', 'failed', 'conflict')
+                        ),
+                        safe_result_json TEXT,
+                        secret_result_encrypted TEXT,
+                        secret_consumed_at TEXT,
+                        UNIQUE(node_id, idempotency_key)
+                    );
+                    INSERT INTO relay_commands(
+                        id, node_id, command_type, payload_encrypted, state,
+                        lease_until, expires_at, attempt_count, idempotency_key,
+                        request_fingerprint, created_at, acknowledged_at, completed_at,
+                        completion_status, safe_result_json, secret_result_encrypted,
+                        secret_consumed_at
+                    )
+                    SELECT
+                        id, node_id, command_type, payload_encrypted, state,
+                        lease_until, expires_at, attempt_count, idempotency_key,
+                        request_fingerprint, created_at, acknowledged_at, completed_at,
+                        completion_status, safe_result_json, secret_result_encrypted,
+                        secret_consumed_at
+                    FROM relay_commands_before_v5;
+                    DROP TABLE relay_commands_before_v5;
+                    CREATE INDEX idx_relay_commands_delivery
+                        ON relay_commands(
+                            node_id, state, lease_until, expires_at, created_at
+                        );
+                    INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+                        VALUES (5, CURRENT_TIMESTAMP);
+                    COMMIT;
+                    """
+                )
+            else:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                    "VALUES (5, CURRENT_TIMESTAMP)"
                 )
                 connection.execute("COMMIT")
 

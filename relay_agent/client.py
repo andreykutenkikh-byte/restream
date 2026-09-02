@@ -9,6 +9,7 @@ import ssl
 from dataclasses import dataclass
 from typing import cast
 from urllib.parse import urlsplit
+from uuid import UUID
 
 from relay_agent import AGENT_VERSION, PROTOCOL_VERSION
 from relay_agent.errors import RelayAgentError
@@ -24,6 +25,7 @@ from relay_agent.security import SensitiveToken
 
 CONTROL_ORIGIN = "https://restream.adojapan.ru"
 MAX_CONTROL_RESPONSE_BYTES = 64 * 1024
+MAX_PREVIEW_SEGMENT_BYTES = 3 * 1024 * 1024
 _VERSION_PATTERN = re.compile(r"[A-Za-z0-9._+-]{1,64}\Z")
 
 
@@ -31,6 +33,7 @@ _VERSION_PATTERN = re.compile(r"[A-Za-z0-9._+-]{1,64}\Z")
 class HeartbeatIntervals:
     heartbeat_seconds: int
     poll_seconds: int
+    preview_requested: bool = False
 
 
 class ControlClient:
@@ -94,21 +97,75 @@ class ControlClient:
             expected_statuses={200},
             timeout_seconds=15.0,
         )
-        if not isinstance(response, dict) or set(response) != {
+        required_keys = {
             "status",
             "node_id",
             "heartbeat_interval_seconds",
             "command_poll_interval_seconds",
-        }:
+        }
+        if (
+            not isinstance(response, dict)
+            or not required_keys.issubset(response)
+            or not set(response).issubset(required_keys | {"preview_requested"})
+        ):
             raise RelayAgentError("invalid_control_response")
         if (
             response["status"] != "ok"
             or not is_uuid(response["node_id"])
             or response["heartbeat_interval_seconds"] != 5
             or response["command_poll_interval_seconds"] != 5
+            or not isinstance(response.get("preview_requested", False), bool)
         ):
             raise RelayAgentError("invalid_control_response")
-        return HeartbeatIntervals(5, 5)
+        return HeartbeatIntervals(5, 5, bool(response.get("preview_requested", False)))
+
+    def upload_preview_segment(self, generation: str, sequence: int, payload: bytes) -> None:
+        """Upload one bounded MPEG-TS segment to the separate media endpoint."""
+
+        try:
+            parsed_generation = UUID(generation)
+        except (TypeError, ValueError):
+            parsed_generation = None
+        if (
+            parsed_generation is None
+            or parsed_generation.version != 4
+            or str(parsed_generation) != generation
+            or not isinstance(sequence, int)
+            or isinstance(sequence, bool)
+            or not 0 <= sequence <= 2**63 - 1
+            or not isinstance(payload, bytes)
+            or not 0 < len(payload) <= MAX_PREVIEW_SEGMENT_BYTES
+        ):
+            raise RelayAgentError("invalid_preview_upload")
+        path = f"/relay-media/v1/preview/segments/{generation}/{sequence}"
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self._token.reveal_for_authorization_header()}",
+            "Content-Length": str(len(payload)),
+            "Content-Type": "video/mp2t",
+            "User-Agent": f"AdoJapan-HK-Relay-Agent/{self._agent_version}",
+        }
+        connection = http.client.HTTPSConnection(
+            self._host,
+            self._port,
+            timeout=15.0,
+            context=self._ssl_context,
+        )
+        try:
+            connection.request("PUT", path, body=payload, headers=headers)
+            response = connection.getresponse()
+            status = response.status
+            response_body = response.read(MAX_CONTROL_RESPONSE_BYTES + 1)
+        except (OSError, TimeoutError, http.client.HTTPException) as exc:
+            raise RelayAgentError("preview_upload_unavailable") from exc
+        finally:
+            connection.close()
+        if len(response_body) > MAX_CONTROL_RESPONSE_BYTES:
+            raise RelayAgentError("preview_upload_rejected")
+        if status in {401, 403}:
+            raise RelayAgentError("credential_rejected")
+        if status != 204 or response_body:
+            raise RelayAgentError("preview_upload_rejected")
 
     def next_command(self, *, wait_seconds: int = 20) -> RelayCommand | None:
         if (
@@ -175,6 +232,10 @@ class ControlClient:
             "Authorization": f"Bearer {self._token.reveal_for_authorization_header()}",
             "Content-Type": "application/json",
             "User-Agent": f"AdoJapan-HK-Relay-Agent/{self._agent_version}",
+            # The command poll uses this assertion instead of the potentially
+            # stale version from the last heartbeat.  Older agents omit the
+            # header and are intentionally limited to legacy command types.
+            "X-Relay-Agent-Version": self._agent_version,
         }
         connection = http.client.HTTPSConnection(
             self._host,

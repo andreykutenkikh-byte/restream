@@ -5,8 +5,9 @@ from OBS and copies it to manually configured RTMP/RTMPS destinations. Its media
 for a modest host shared with other services: no transcoding, no recording, and no heavy frontend
 toolchain. Stage 4A adds password-based SSH onboarding and outbound-only health agents for future
 restream nodes. A separate native, outbound-only integration manages the existing HK Moblin relay
-from the same authenticated Servers page without moving that relay into Docker or exposing a new
-management port.
+from a simplified authenticated broadcast console without moving that relay into Docker or exposing
+a new management port. The main flow contains only YouTube key setup and one-time Moblin SRT URL
+reveal; infrastructure controls remain in the additional section.
 
 Production domain: `restream.adojapan.ru`. Repository changes do not authorize deployment or
 change production.
@@ -59,8 +60,10 @@ HK Relay Agent -- outbound HTTPS protocol v1 --> FastAPI relay API
   enrolls once, sends five-second heartbeats, and accepts only `PING` and `SELF_TEST`.
 - **HK Relay Agent** is a native, unprivileged service with an allowlisted root Unix-socket broker.
   It connects outward over HTTPS and exposes only safe status plus `start`, `stop`, YouTube
-  configuration/clear, and one-time Moblin SRT URL reveal. It does not alter Amnezia, Docker,
-  firewall, routes, interfaces, MediaMTX installation, or the existing relay secret store.
+  configuration/clear, one-time Moblin SRT URL reveal, bounded LIVE input bitrate, and an on-demand
+  loopback-HLS preview forwarded to the authenticated browser through a memory-only cache. It does
+  not alter Amnezia, Docker, firewall, routes, interfaces, MediaMTX installation, or the existing
+  relay secret store.
 - **SQLite** persists the encrypted ingest configuration, encrypted destination keys,
   destination intent/state metadata, hashed sessions, digests of node credentials, safe node/job
   and relay state, schema version, and bounded audit/event tails. Relay command payloads are
@@ -397,8 +400,10 @@ uv run --locked pytest
 uv run --locked python scripts/check_repository.py
 node --check app/static/app.js
 node --check app/static/preview-player.js
+node --check app/static/relay-dashboard.js
 node --check app/static/servers.js
 node --test tests/frontend/preview-player.test.js
+node --test tests/frontend/relay-dashboard.test.js
 node --test tests/frontend/servers.test.js
 git diff --check
 ```

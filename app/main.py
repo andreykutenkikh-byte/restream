@@ -28,6 +28,7 @@ from app.login_limiter import LoginRateLimiter
 from app.node_api import NodeBodyLimitMiddleware, NodeCommandPollGate, NodeEnrollmentGate
 from app.node_api import router as node_router
 from app.relay_api import router as relay_router
+from app.relay_preview_api import router as relay_preview_router
 from app.runtime import ApplicationRuntime, URLValidator
 from app.services.bootstrap import (
     BootstrapClient,
@@ -37,6 +38,7 @@ from app.services.bootstrap import (
 from app.services.mediamtx import MediaMTXClient
 from app.services.nodes import NodeService
 from app.services.preview import PreviewService
+from app.services.relay_preview import RelayPreviewStore
 from app.services.relays import RelayService
 from app.session import SessionManager
 from app.step_up_limiter import StepUpRateLimiter
@@ -72,6 +74,7 @@ def create_app(
         password=settings.worker_auth_password,
     )
     relays = RelayService(database, settings.master_encryption_key)
+    relay_preview = RelayPreviewStore()
     nodes = NodeService(
         database,
         relay_payload_tombstone=relays.encrypted_empty_payload(),
@@ -125,6 +128,7 @@ def create_app(
             maintenance_task.add_done_callback(background_tasks.discard)
             yield
         finally:
+            relay_preview.clear()
             try:
                 await preview_service.close()
             finally:
@@ -158,6 +162,7 @@ def create_app(
     app.state.bootstrap_limiter = BootstrapRateLimiter()
     app.state.nodes = nodes
     app.state.relays = relays
+    app.state.relay_preview = relay_preview
     app.state.bootstrap = bootstrap_service
     app.state.background_tasks = background_tasks
     app.state.node_enrollments = NodeEnrollmentGate()
@@ -178,11 +183,18 @@ def create_app(
     app.include_router(router)
     app.include_router(node_router)
     app.include_router(relay_router)
+    app.include_router(relay_preview_router)
     app.include_router(bootstrap_router)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Callable[..., Any]) -> Any:
         response = await call_next(request)
+        if (
+            request.method == "POST"
+            and request.url.path == "/api/auth/logout"
+            and response.status_code < 400
+        ):
+            relay_preview.clear()
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "same-origin"
         response.headers["X-Frame-Options"] = "DENY"
@@ -196,7 +208,7 @@ def create_app(
             "base-uri 'none'; form-action 'self'"
         )
         if request.url.path.startswith(
-            ("/api/", "/node-api/", "/relay-agent/")
+            ("/api/", "/node-api/", "/relay-agent/", "/relay-media/")
         ) or request.url.path in {
             "/",
             "/login",

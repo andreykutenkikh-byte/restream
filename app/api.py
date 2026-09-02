@@ -171,19 +171,12 @@ async def dashboard_page(request: Request) -> Response:
         return RedirectResponse("/login", status_code=status.HTTP_303_SEE_OTHER)
     csrf_token = _sessions(request).ensure_csrf(session_token, request.cookies.get(CSRF_COOKIE))
     runtime = _runtime(request)
-    ingest = {
-        "rtmp_server_url": runtime.settings.public_rtmp_url,
-        "stream_key": runtime.ingest_key(),
-        **(await runtime.ingest_view()),
-    }
     response = _templates(request).TemplateResponse(
         request=request,
         name="dashboard.html",
         context={
             "csrf_token": csrf_token,
             "current_user": {"login": runtime.settings.admin_login},
-            "ingest": ingest,
-            "destinations": runtime.list_destination_views(),
         },
     )
     if request.cookies.get(CSRF_COOKIE) != csrf_token:

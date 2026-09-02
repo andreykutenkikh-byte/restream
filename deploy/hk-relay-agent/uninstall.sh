@@ -21,6 +21,9 @@ rm -f /etc/systemd/system/adojapan-relay-broker.socket
 rm -f /etc/sysusers.d/adojapan-relay-agent.conf
 rm -f /etc/tmpfiles.d/adojapan-relay-agent.conf
 rm -f /usr/local/sbin/adojapan-relay-install-token
+rm -f /usr/local/sbin/adojapan-relay-install-preview-token
+# Retain the root-only v1 restore command and its protected rollback point.
+# They are required to make a later old-agent recovery downgrade-safe.
 rm -rf /usr/local/lib/adojapan-relay-agent
 systemctl daemon-reload
 systemctl reset-failed adojapan-relay-agent.service adojapan-relay-broker.service 2>/dev/null || true
@@ -35,4 +38,5 @@ if [ "$relay_before_active" -ne "$relay_after_active" ] || \
     exit 1
 fi
 
-printf '%s\n' 'Agent removed; credential, journal and restream-agent account were retained.'
+printf '%s\n' \
+    'Agent removed; credentials, journals, v1 rollback point and restore command were retained.'

@@ -1,6 +1,9 @@
+import sqlite3
 from pathlib import Path
 
-from app.db import Database
+import pytest
+
+from app.db import SCHEMA_VERSION, Database
 
 
 def test_migrations_are_idempotent(tmp_path: Path) -> None:
@@ -8,6 +11,199 @@ def test_migrations_are_idempotent(tmp_path: Path) -> None:
     database.migrate()
     database.migrate()
     assert database.ready()
+    with database.connect() as connection:
+        version = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        relay_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(relay_nodes)")
+        }
+    assert version == SCHEMA_VERSION == 5
+    assert "input_bitrate_bps" in relay_columns
+
+
+def test_relay_input_bitrate_column_enforces_bounds(tmp_path: Path) -> None:
+    database = Database(tmp_path / "db.sqlite")
+    database.migrate()
+    with database.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO restream_nodes(
+                id, display_name, address, resolved_ip, ssh_port, ssh_username,
+                status, created_at, updated_at
+            ) VALUES ('node', 'node', 'relay.example', '192.0.2.1', 22, 'root',
+                      'ready', 'now', 'now')
+            """
+        )
+        connection.execute(
+            "INSERT INTO relay_nodes(node_id, input_bitrate_bps, created_at, updated_at) "
+            "VALUES ('node', 1000000000, 'now', 'now')"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            connection.execute(
+                "UPDATE relay_nodes SET input_bitrate_bps = 1000000001 WHERE node_id = 'node'"
+            )
+
+
+def test_schema_v3_database_is_upgraded_with_nullable_bitrate(tmp_path: Path) -> None:
+    database = Database(tmp_path / "db.sqlite")
+    database.migrate()
+    with database.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO restream_nodes(
+                id, display_name, address, resolved_ip, ssh_port, ssh_username,
+                status, created_at, updated_at
+            ) VALUES ('relay-node', 'HK relay', 'relay.example', '192.0.2.10', 22,
+                      'root', 'ready', 'created', 'updated')
+            """
+        )
+        connection.execute(
+            "INSERT INTO relay_nodes(node_id, created_at, updated_at) "
+            "VALUES ('relay-node', 'created', 'updated')"
+        )
+        connection.execute("ALTER TABLE relay_nodes DROP COLUMN input_bitrate_bps")
+        connection.execute("DELETE FROM schema_migrations WHERE version >= 4")
+        connection.executescript(
+            """
+            ALTER TABLE relay_commands RENAME TO relay_commands_current;
+            DROP INDEX IF EXISTS idx_relay_commands_delivery;
+            CREATE TABLE relay_commands (
+                id TEXT PRIMARY KEY,
+                node_id TEXT NOT NULL REFERENCES relay_nodes(node_id) ON DELETE CASCADE,
+                command_type TEXT NOT NULL CHECK (
+                    command_type IN (
+                        'STATUS', 'START', 'STOP', 'CONFIGURE_YOUTUBE',
+                        'REVEAL_MOBLIN_URL', 'CLEAR_YOUTUBE'
+                    )
+                ),
+                payload_encrypted TEXT NOT NULL,
+                state TEXT NOT NULL,
+                lease_until TEXT,
+                expires_at TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                idempotency_key TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                acknowledged_at TEXT,
+                completed_at TEXT,
+                completion_status TEXT,
+                safe_result_json TEXT,
+                secret_result_encrypted TEXT,
+                secret_consumed_at TEXT,
+                UNIQUE(node_id, idempotency_key)
+            );
+            INSERT INTO relay_commands SELECT * FROM relay_commands_current;
+            DROP TABLE relay_commands_current;
+            CREATE INDEX idx_relay_commands_delivery
+                ON relay_commands(node_id, state, lease_until, expires_at, created_at);
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO relay_commands(
+                id, node_id, command_type, payload_encrypted, state, lease_until,
+                expires_at, attempt_count, idempotency_key, request_fingerprint,
+                created_at, acknowledged_at, completed_at, completion_status,
+                safe_result_json, secret_result_encrypted, secret_consumed_at
+            ) VALUES (?, 'relay-node', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "queued-command",
+                    "CONFIGURE_YOUTUBE",
+                    "ciphertext-queued",
+                    "queued",
+                    None,
+                    "2030-01-01T00:00:00+00:00",
+                    0,
+                    "idem-queued",
+                    "fingerprint-queued",
+                    "2026-09-02T00:00:00+00:00",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                (
+                    "completed-command",
+                    "STATUS",
+                    "ciphertext-tombstone",
+                    "completed",
+                    None,
+                    "2030-01-01T00:00:00+00:00",
+                    1,
+                    "idem-completed",
+                    "fingerprint-completed",
+                    "2026-09-02T00:01:00+00:00",
+                    "2026-09-02T00:01:01+00:00",
+                    "2026-09-02T00:01:02+00:00",
+                    "ok",
+                    '{"overall":"offline"}',
+                    None,
+                    None,
+                ),
+                (
+                    "secret-command",
+                    "REVEAL_MOBLIN_URL",
+                    "ciphertext-empty",
+                    "completed",
+                    None,
+                    "2030-01-01T00:00:00+00:00",
+                    1,
+                    "idem-secret",
+                    "fingerprint-secret",
+                    "2026-09-02T00:02:00+00:00",
+                    "2026-09-02T00:02:01+00:00",
+                    "2026-09-02T00:02:02+00:00",
+                    "ok",
+                    '{"overall":"offline"}',
+                    "encrypted-secret-result",
+                    None,
+                ),
+            ],
+        )
+        before = [
+            dict(row)
+            for row in connection.execute("SELECT * FROM relay_commands ORDER BY id").fetchall()
+        ]
+    assert database.ready() is False
+
+    database.migrate()
+    database.migrate()
+
+    assert database.ready() is True
+    with database.connect() as connection:
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(relay_nodes)")}
+        value = connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        command_schema = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'relay_commands'"
+        ).fetchone()[0]
+        after = [
+            dict(row)
+            for row in connection.execute("SELECT * FROM relay_commands ORDER BY id").fetchall()
+        ]
+        delivery_index = {
+            row["name"] for row in connection.execute("PRAGMA index_list(relay_commands)")
+        }
+        foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
+            connection.execute(
+                """
+                INSERT INTO relay_commands(
+                    id, node_id, command_type, payload_encrypted, state,
+                    expires_at, idempotency_key, created_at
+                ) VALUES ('duplicate-idempotency', 'relay-node', 'STATUS',
+                          'ciphertext', 'queued', '2030-01-01T00:00:00+00:00',
+                          'idem-queued', '2026-09-02T00:03:00+00:00')
+                """
+            )
+    assert "input_bitrate_bps" in columns
+    assert value == 5
+    assert "CONFIGURE_YOUTUBE_KEY" in command_schema
+    assert after == before
+    assert "idx_relay_commands_delivery" in delivery_index
+    assert foreign_key_errors == []
 
 
 def test_destination_lifecycle(tmp_path: Path) -> None:

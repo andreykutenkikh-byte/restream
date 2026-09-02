@@ -14,11 +14,13 @@ from relay_agent.client import ControlClient
 from relay_agent.errors import RelayAgentError
 from relay_agent.journal import CommandJournal
 from relay_agent.metrics import HostMetricsCollector
+from relay_agent.preview import LocalHLSReader, PreviewPump
 from relay_agent.processor import CommandProcessor
 from relay_agent.security import effective_uid, read_private_token
 from relay_agent.service import AgentService
 
 TOKEN_PATH = Path("/etc/adojapan-relay-agent/node.token")
+PREVIEW_TOKEN_PATH = Path("/etc/adojapan-relay-agent/preview-reader.token")
 JOURNAL_PATH = Path("/var/lib/adojapan-relay-agent/commands.json")
 
 
@@ -43,11 +45,18 @@ def main() -> int:
         broker = BrokerClient()
         journal = CommandJournal(JOURNAL_PATH)
         processor = CommandProcessor(broker, journal)
+        preview = None
+        try:
+            preview_token = read_private_token(PREVIEW_TOKEN_PATH)
+            preview = PreviewPump(LocalHLSReader(preview_token), control)
+        except RelayAgentError as exc:
+            logging.getLogger("relay_agent").warning("Preview disabled safely (%s)", exc.code)
         service = AgentService(
             control=control,
             processor=processor,
             metrics=HostMetricsCollector(),
             stop_event=stop_event,
+            preview=preview,
         )
         service.run()
     except RelayAgentError as exc:

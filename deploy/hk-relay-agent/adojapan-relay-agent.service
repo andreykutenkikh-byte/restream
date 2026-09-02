@@ -37,7 +37,7 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 ReadWritePaths=/var/lib/adojapan-relay-agent
-ReadOnlyPaths=/etc/adojapan-relay-agent/node.token
+ReadOnlyPaths=/etc/adojapan-relay-agent/node.token -/etc/adojapan-relay-agent/preview-reader.token
 
 [Install]
 WantedBy=multi-user.target

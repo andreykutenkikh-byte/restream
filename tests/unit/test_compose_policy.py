@@ -605,7 +605,10 @@ def test_ci_runtime_always_uses_test_override_and_cleans_up() -> None:
     assert "node --check app/static/app.js" in workflow
     assert "node --check app/static/preview-player.js" in workflow
     assert "node --check app/static/servers.js" in workflow
-    assert "tests/frontend/preview-player.test.js tests/frontend/servers.test.js" in workflow
+    assert (
+        "tests/frontend/preview-player.test.js tests/frontend/relay-dashboard.test.js "
+        "tests/frontend/servers.test.js"
+    ) in workflow
     assert "Real RTMP rotation and output end-to-end smoke" in workflow
     assert "python scripts/ci_output_smoke.py" in workflow
     assert "SSH bootstrap and Node Agent end-to-end smoke" in workflow
