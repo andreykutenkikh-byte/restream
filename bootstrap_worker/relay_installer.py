@@ -583,10 +583,23 @@ class RemoteRelayInstaller:
         await self._run_checked(
             session,
             privilege,
-            f"tar -xzf {temp}/mediamtx.tar.gz -C {temp}/mediamtx mediamtx LICENSE && "
-            f"test -x {temp}/mediamtx/mediamtx && test -f {temp}/mediamtx/LICENSE",
+            f"tar -xzf {temp}/mediamtx.tar.gz -C {temp}/mediamtx mediamtx LICENSE",
             timeout=timeouts.command_seconds,
             code="mediamtx_archive_invalid",
+        )
+        await self._run_checked(
+            session,
+            privilege,
+            f"test -f {temp}/mediamtx/LICENSE",
+            timeout=timeouts.command_seconds,
+            code="mediamtx_license_missing",
+        )
+        await self._run_checked(
+            session,
+            privilege,
+            f"test -f {temp}/mediamtx/mediamtx && test -x {temp}/mediamtx/mediamtx",
+            timeout=timeouts.command_seconds,
+            code="mediamtx_binary_invalid",
         )
 
         # Generate the immutable 12-second fallback before claiming any managed

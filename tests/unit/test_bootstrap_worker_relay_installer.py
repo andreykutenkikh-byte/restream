@@ -354,6 +354,8 @@ async def test_install_uses_pinned_mediamtx_and_never_mutates_host_networking() 
         ("curl --fail --location", "mediamtx_download_failed"),
         ("sha256sum --check --status", "mediamtx_checksum_failed"),
         ("tar -xzf", "mediamtx_archive_invalid"),
+        ("test -f /tmp/adojapan-relay-bootstrap-", "mediamtx_license_missing"),
+        ("test -x /tmp/adojapan-relay-bootstrap-", "mediamtx_binary_invalid"),
     ],
 )
 async def test_install_reports_exact_safe_mediamtx_stage(
