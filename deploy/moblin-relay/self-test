@@ -61,9 +61,10 @@ SELF_TEST_STAGES = frozenset(
         "topology",
         "auth",
         "auth-source",
-        "auth-live",
         "auth-scan",
         "auth-exclusive",
+        "live-ingest",
+        "live-normalize",
         "outages",
         "outage-slate",
         "outage-normal",
@@ -1885,12 +1886,27 @@ def main() -> int:
         primary_helper = start_source_helper(primary_config, "primary", SOURCE_PRIMARY_METRICS_PORT)
         publisher = start_local_publisher(SOURCE_PRIMARY_RTMP_PORT)
         wait_helper_path(SOURCE_PRIMARY_METRICS_PORT)
-        mark_self_test_stage("auth-live")
         initial_live_started = time.monotonic()
+        initial_live_deadline = initial_live_started + 20
+        mark_self_test_stage("live-ingest")
+        accepted_ingest = observer.wait_sample(
+            "initial authenticated SRT ingest",
+            lambda sample: (
+                sample.get("ingest_live")
+                and len(sample.get("ingest_ids", [])) == 1
+                and sample.get("path_ready")
+                and sample.get("forward")
+                and sample.get("sink_ids") == [initial_sink_id]
+            ),
+            max(0.0, initial_live_deadline - time.monotonic()),
+            not_before=initial_live_started,
+        )
+        mark_self_test_stage("live-normalize")
         initial_live = wait_healthy_live(
             "initial healthy LIVE",
-            20,
-            not_before=initial_live_started,
+            max(0.0, initial_live_deadline - time.monotonic()),
+            not_before=float(accepted_ingest["t"]),
+            expected_ingest_ids=list(accepted_ingest["ingest_ids"]),
         )
         initial_ingest_ids = list(initial_live["ingest_ids"])
         if len(initial_ingest_ids) != 1:

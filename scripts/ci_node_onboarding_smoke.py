@@ -74,6 +74,8 @@ SAFE_BOOTSTRAP_DIAGNOSTIC_CODES = frozenset(
         "relay_self_test_auth_live_failed",
         "relay_self_test_auth_scan_failed",
         "relay_self_test_auth_exclusivity_failed",
+        "relay_self_test_live_ingest_failed",
+        "relay_self_test_live_normalize_failed",
         "relay_self_test_outages_failed",
         "relay_self_test_outage_slate_failed",
         "relay_self_test_outage_normal_failed",

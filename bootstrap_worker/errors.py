@@ -149,6 +149,12 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_auth_exclusivity_failed": (
             "Запрет второго SRT-издателя не прошёл самопроверку."
         ),
+        "relay_self_test_live_ingest_failed": (
+            "Тестовый зашифрованный SRT-поток не был принят сервером."
+        ),
+        "relay_self_test_live_normalize_failed": (
+            "Нормализатор не сформировал тестовый LIVE-поток."
+        ),
         "relay_self_test_outages_failed": "Переключение LIVE и заставки не прошло самопроверку.",
         "relay_self_test_outage_slate_failed": (
             "Переход на заставку после обрыва LIVE не прошёл самопроверку."

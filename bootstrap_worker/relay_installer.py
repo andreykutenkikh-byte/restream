@@ -114,6 +114,8 @@ _SELF_TEST_STAGE_CODES = {
     "auth-live": "relay_self_test_auth_live_failed",
     "auth-scan": "relay_self_test_auth_scan_failed",
     "auth-exclusive": "relay_self_test_auth_exclusivity_failed",
+    "live-ingest": "relay_self_test_live_ingest_failed",
+    "live-normalize": "relay_self_test_live_normalize_failed",
     "outages": "relay_self_test_outages_failed",
     "outage-slate": "relay_self_test_outage_slate_failed",
     "outage-normal": "relay_self_test_outage_normal_failed",
