@@ -212,3 +212,31 @@ def test_bundle_python_sources_parse_as_python_310() -> None:
     ):
         path = BUNDLE / name
         ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 10))
+
+
+def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
+    source = (BUNDLE / "self-test").read_text(encoding="utf-8")
+
+    assert 'os.environ.pop("MOBLIN_RELAY_SELF_TEST_STAGE_FILE", "")' in source
+    assert 'r"/run/moblin-relay-self-test\\.' in source
+    assert "os.O_NOFOLLOW" in source
+    assert "os.O_NONBLOCK" in source
+    assert "parent_metadata.st_uid != 0" in source
+    assert "stat.S_IMODE(parent_metadata.st_mode) & 0o022" in source
+    assert "stat.S_ISREG(metadata.st_mode)" in source
+    assert "metadata.st_uid != 0" in source
+    assert "metadata.st_nlink != 1" in source
+    assert "os.fchmod(descriptor, 0o600)" in source
+    assert "os.ftruncate(descriptor, 0)" in source
+    for stage in (
+        "startup",
+        "assets",
+        "topology",
+        "auth",
+        "outages",
+        "continuity",
+        "decode",
+        "secrets",
+        "cleanup",
+    ):
+        assert f'mark_self_test_stage("{stage}")' in source

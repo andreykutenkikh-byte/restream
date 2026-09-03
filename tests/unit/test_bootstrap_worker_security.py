@@ -44,6 +44,16 @@ def test_native_relay_failures_have_stable_localized_messages() -> None:
         "relay_agent_preflight_failed",
         "relay_agent_units_failed",
         "relay_self_test_failed",
+        "relay_unit_verify_failed",
+        "relay_self_test_startup_failed",
+        "relay_self_test_assets_failed",
+        "relay_self_test_topology_failed",
+        "relay_self_test_auth_failed",
+        "relay_self_test_outages_failed",
+        "relay_self_test_continuity_failed",
+        "relay_self_test_decode_failed",
+        "relay_self_test_secrets_failed",
+        "relay_self_test_cleanup_failed",
         "relay_final_check_failed",
     }
     fallback = safe_failure("unknown_test_failure").safe_message

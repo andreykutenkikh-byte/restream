@@ -332,6 +332,8 @@ async def test_install_uses_pinned_mediamtx_and_never_mutates_host_networking() 
     assert "systemctl disable --now moblin-relay.service" in commands
     assert "systemctl enable --now adojapan-relay-agent.service" in commands
     assert "/opt/moblin-relay/libexec/self-test --quick" in commands
+    assert "MOBLIN_RELAY_SELF_TEST_STAGE_FILE=/run/moblin-relay-self-test." in commands
+    assert "self_test_status" in commands
     assert "account_shell" in commands and "group_members" in commands
     assert TOKEN_VALUE not in commands
     for forbidden in (
@@ -449,6 +451,72 @@ async def test_agent_install_failure_rejects_an_unknown_diagnostic_stage() -> No
     assert captured.value.code == "relay_agent_install_failed"
 
 
+@pytest.mark.parametrize(
+    ("diagnostic", "expected_code"),
+    [
+        ("startup", "relay_self_test_startup_failed"),
+        ("assets", "relay_self_test_assets_failed"),
+        ("topology", "relay_self_test_topology_failed"),
+        ("auth", "relay_self_test_auth_failed"),
+        ("outages", "relay_self_test_outages_failed"),
+        ("continuity", "relay_self_test_continuity_failed"),
+        ("decode", "relay_self_test_decode_failed"),
+        ("secrets", "relay_self_test_secrets_failed"),
+        ("cleanup", "relay_self_test_cleanup_failed"),
+    ],
+)
+async def test_self_test_failure_uses_only_a_derived_allowlisted_diagnostic(
+    diagnostic: str,
+    expected_code: str,
+) -> None:
+    def responder(command: str, stdin: SecretStr | None) -> RemoteResult:
+        del stdin
+        if "self-test --quick >/dev/null 2>&1" in command:
+            return RemoteResult(1)
+        if "self_test_stage_value=$(cat" in command:
+            return RemoteResult(0, diagnostic)
+        return RemoteResult(0)
+
+    session = FakeSession(responder)
+    with pytest.raises(BootstrapError) as captured:
+        await RemoteRelayInstaller().install(
+            session,
+            PrivilegeContext(PrivilegeMode.ROOT),
+            receipt(),
+            timeouts=TimeoutPolicy(),
+        )
+
+    assert captured.value.code == expected_code
+    diagnostic_command = next(
+        command for command, _, _ in session.commands if "self_test_stage_value=$(cat" in command
+    )
+    assert "/run/moblin-relay-self-test." in diagnostic_command
+    assert "test ! -L" in diagnostic_command
+    assert "'%u:%a:%h'" in diagnostic_command
+    assert "'0:600:1'" in diagnostic_command
+    assert '"$(wc -c <' in diagnostic_command
+
+
+async def test_self_test_failure_rejects_an_unknown_diagnostic() -> None:
+    def responder(command: str, stdin: SecretStr | None) -> RemoteResult:
+        del stdin
+        if "self-test --quick >/dev/null 2>&1" in command:
+            return RemoteResult(1)
+        if "self_test_stage_value=$(cat" in command:
+            return RemoteResult(0, "untrusted")
+        return RemoteResult(0)
+
+    with pytest.raises(BootstrapError) as captured:
+        await RemoteRelayInstaller().install(
+            FakeSession(responder),
+            PrivilegeContext(PrivilegeMode.ROOT),
+            receipt(),
+            timeouts=TimeoutPolicy(),
+        )
+
+    assert captured.value.code == "relay_self_test_failed"
+
+
 async def test_final_check_requires_agent_and_broker_but_relay_inactive_disabled() -> None:
     session = FakeSession()
     prepared = receipt()
@@ -499,6 +567,7 @@ async def test_cleanup_uses_privilege_and_only_the_exact_job_path() -> None:
     assert len(session.commands) == 1
     assert f"rm -rf -- {prepared.temp_root}" in session.commands[0][0]
     assert f"/run/adojapan-relay-install.{prepared.job_id}.stage" in session.commands[0][0]
+    assert f"/run/moblin-relay-self-test.{prepared.job_id}.stage" in session.commands[0][0]
     assert session.commands[0][0].startswith("env LC_ALL=C sh -c")
 
     session.commands.clear()

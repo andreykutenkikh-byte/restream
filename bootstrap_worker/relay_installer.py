@@ -105,6 +105,17 @@ _AGENT_INSTALL_STAGE_CODES = {
     "units": "relay_agent_units_failed",
     "broker": "relay_agent_broker_failed",
 }
+_SELF_TEST_STAGE_CODES = {
+    "startup": "relay_self_test_startup_failed",
+    "assets": "relay_self_test_assets_failed",
+    "topology": "relay_self_test_topology_failed",
+    "auth": "relay_self_test_auth_failed",
+    "outages": "relay_self_test_outages_failed",
+    "continuity": "relay_self_test_continuity_failed",
+    "decode": "relay_self_test_decode_failed",
+    "secrets": "relay_self_test_secrets_failed",
+    "cleanup": "relay_self_test_cleanup_failed",
+}
 
 
 @dataclass(slots=True)
@@ -757,15 +768,47 @@ class RemoteRelayInstaller:
             privilege,
             f"if test ! -e {shlex.quote(AGENT_ETC_ROOT + '/preview-reader.token')}; then "
             "/usr/local/sbin/adojapan-relay-install-preview-token --generate; fi && "
-            "systemctl daemon-reload && systemctl disable --now moblin-relay.service && "
+            "systemctl daemon-reload && systemctl disable --now moblin-relay.service",
+            timeout=timeouts.package_seconds,
+            code="relay_self_test_startup_failed",
+        )
+        await self._run_checked(
+            session,
+            privilege,
             "systemd-analyze verify /etc/systemd/system/moblin-relay.service "
             "/etc/systemd/system/adojapan-relay-agent.service "
             "/etc/systemd/system/adojapan-relay-broker.service "
-            "/etc/systemd/system/adojapan-relay-broker.socket && "
-            f"{shlex.quote(RELAY_OPT_ROOT + '/libexec/self-test')} --quick",
+            "/etc/systemd/system/adojapan-relay-broker.socket",
             timeout=timeouts.package_seconds,
-            code="relay_self_test_failed",
+            code="relay_unit_verify_failed",
         )
+        self_test_stage = shlex.quote(f"/run/moblin-relay-self-test.{receipt.job_id}.stage")
+        self_test = await privilege.run(
+            session,
+            "self_test_status=0; "
+            f"rm -f -- {self_test_stage} || exit $?; "
+            f"MOBLIN_RELAY_SELF_TEST_STAGE_FILE={self_test_stage} "
+            f"{shlex.quote(RELAY_OPT_ROOT + '/libexec/self-test')} "
+            "--quick >/dev/null 2>&1 || self_test_status=$?; "
+            'if test "$self_test_status" -eq 0; then '
+            f"rm -f -- {self_test_stage}; fi; "
+            'exit "$self_test_status"',
+            timeout=timeouts.package_seconds,
+        )
+        if self_test.exit_status != 0:
+            diagnostic = await privilege.run(
+                session,
+                "self_test_stage_value=; "
+                f"if test -f {self_test_stage} && test ! -L {self_test_stage} && "
+                f"test \"$(stat -c '%u:%a:%h' {self_test_stage})\" = '0:600:1' && "
+                f'test "$(wc -c < {self_test_stage})" -le 16; then '
+                f"self_test_stage_value=$(cat {self_test_stage}); fi; "
+                f"rm -f -- {self_test_stage}; "
+                "printf '%s' \"$self_test_stage_value\"",
+                timeout=timeouts.command_seconds,
+            )
+            stage_code = _SELF_TEST_STAGE_CODES.get(diagnostic.stdout.strip())
+            raise safe_failure(stage_code or "relay_self_test_failed")
 
         token_temp = shlex.quote(f"{AGENT_ETC_ROOT}/.node.token.{receipt.job_id}.tmp")
         await self._run_checked(
@@ -892,10 +935,12 @@ class RemoteRelayInstaller:
         # cleanup must use the already verified privilege context as well.
         token_temp = shlex.quote(f"{AGENT_ETC_ROOT}/.node.token.{receipt.job_id}.tmp")
         agent_stage = shlex.quote(f"/run/adojapan-relay-install.{receipt.job_id}.stage")
+        self_test_stage = shlex.quote(f"/run/moblin-relay-self-test.{receipt.job_id}.stage")
         with suppress(BootstrapError):
             await privilege.run(
                 session,
-                f"rm -f -- {token_temp} {agent_stage}; rm -rf -- {shlex.quote(receipt.temp_root)}",
+                f"rm -f -- {token_temp} {agent_stage} {self_test_stage}; "
+                f"rm -rf -- {shlex.quote(receipt.temp_root)}",
                 timeout=timeout,
             )
 
