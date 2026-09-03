@@ -419,7 +419,10 @@ def test_ci_native_ssh_and_legacy_agent_fixtures_are_non_production() -> None:
     agent = services["ci-node-agent"]
 
     assert "ports" not in target
-    assert target["networks"] == ["bootstrap-egress", "internal"]
+    assert target["networks"] == {
+        "internal": {},
+        "bootstrap-egress": {"gw_priority": 1},
+    }
     assert target.get("privileged") is not True
     # This container represents a disposable fresh server, so the real native
     # installer must be able to populate its root filesystem. It has no host

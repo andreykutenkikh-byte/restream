@@ -27,8 +27,12 @@ services:
       context: .
       dockerfile: ci/ssh-target/Dockerfile
     networks:
-      - bootstrap-egress
-      - internal
+      internal: {}
+      # The target also needs the isolated control-plane network for its CI
+      # heartbeat, so make the only egress-capable network the explicit
+      # default gateway instead of relying on attachment order.
+      bootstrap-egress:
+        gw_priority: 1
     volumes:
       - ci_node_data:/opt/adojapan-restream-node
     init: true
