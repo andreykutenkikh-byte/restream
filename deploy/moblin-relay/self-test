@@ -61,6 +61,10 @@ SELF_TEST_STAGES = frozenset(
         "topology",
         "auth",
         "outages",
+        "outage-slate",
+        "outage-normal",
+        "outage-hold",
+        "outage-live",
         "continuity",
         "decode",
         "secrets",
@@ -1629,10 +1633,13 @@ def main() -> int:
             outage_started = time.monotonic()
             safe_stop(publisher, force=True)
             publisher = None
+            mark_self_test_stage("outage-slate")
             to_slate = observer.wait_state("live", False, 20)
+            mark_self_test_stage("outage-normal")
             observer.wait_state("normalized", False, 20)
             to_slate_times.append(round(to_slate, 3))
             print(f"  outage {index}/3: SLATE active; total SRT outage target {duration}s", flush=True)
+            mark_self_test_stage("outage-hold")
             while time.monotonic() - outage_started < duration:
                 sample = observer.snapshot()
                 if not all(sample.get(name) for name in ("dut_alive", "sink_alive", "reader_alive", "path_ready", "forward")):
@@ -1645,6 +1652,7 @@ def main() -> int:
                 if remaining <= 0:
                     break
                 time.sleep(min(1.0, remaining))
+            mark_self_test_stage("outage-live")
             publisher = start_local_publisher(SOURCE_PRIMARY_RTMP_PORT)
             wait_helper_path(SOURCE_PRIMARY_METRICS_PORT)
             to_live = observer.wait_state("live", True, 20)

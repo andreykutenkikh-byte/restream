@@ -234,9 +234,30 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         "topology",
         "auth",
         "outages",
+        "outage-slate",
+        "outage-normal",
+        "outage-hold",
+        "outage-live",
         "continuity",
         "decode",
         "secrets",
         "cleanup",
     ):
+        assert len(f"{stage}\n".encode("ascii")) <= 16
         assert f'mark_self_test_stage("{stage}")' in source
+
+    outage_block = source.split('mark_self_test_stage("outages")', 1)[1].split(
+        'mark_self_test_stage("continuity")', 1
+    )[0]
+    assert outage_block.index('mark_self_test_stage("outage-slate")') < outage_block.index(
+        'observer.wait_state("live", False, 20)'
+    )
+    assert outage_block.index('mark_self_test_stage("outage-normal")') < outage_block.index(
+        'observer.wait_state("normalized", False, 20)'
+    )
+    assert outage_block.index('mark_self_test_stage("outage-hold")') < outage_block.index(
+        "while time.monotonic() - outage_started < duration"
+    )
+    assert outage_block.index('mark_self_test_stage("outage-live")') < outage_block.index(
+        "publisher = start_local_publisher(SOURCE_PRIMARY_RTMP_PORT)"
+    )

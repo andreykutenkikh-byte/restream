@@ -138,6 +138,18 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_topology_failed": "Локальный медиатракт Moblin Relay не запустился.",
         "relay_self_test_auth_failed": "Защита входящего SRT-потока не прошла самопроверку.",
         "relay_self_test_outages_failed": "Переключение LIVE и заставки не прошло самопроверку.",
+        "relay_self_test_outage_slate_failed": (
+            "Переход на заставку после обрыва LIVE не прошёл самопроверку."
+        ),
+        "relay_self_test_outage_normal_failed": (
+            "Остановка нормализации после обрыва LIVE не подтверждена."
+        ),
+        "relay_self_test_outage_hold_failed": (
+            "Непрерывность заставки во время обрыва LIVE не подтверждена."
+        ),
+        "relay_self_test_outage_live_failed": (
+            "Возврат LIVE после восстановления источника не прошёл самопроверку."
+        ),
         "relay_self_test_continuity_failed": "Непрерывность выходного потока не подтверждена.",
         "relay_self_test_decode_failed": "Декодирование и временные метки не прошли проверку.",
         "relay_self_test_secrets_failed": "Защита тестовых секретов не прошла самопроверку.",
