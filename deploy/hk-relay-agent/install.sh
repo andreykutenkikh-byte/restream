@@ -20,6 +20,26 @@ relay_agent_mark_stage() {
     (umask 077; printf '%s\n' "$1" >"$relay_agent_stage_file")
 }
 
+relay_agent_ensure_config_dir() {
+    relay_agent_config_dir=$1
+    if [ ! -e "$relay_agent_config_dir" ] && [ ! -L "$relay_agent_config_dir" ]; then
+        install -d -o root -g root -m 0755 -- "$relay_agent_config_dir"
+    fi
+    relay_agent_config_permissions=$(stat -c '%A' -- "$relay_agent_config_dir") || exit 1
+    if [ -L "$relay_agent_config_dir" ] || [ ! -d "$relay_agent_config_dir" ] || \
+       [ "$(stat -c '%u:%g' -- "$relay_agent_config_dir")" != '0:0' ]; then
+        printf '%s\n' 'Safety check failed: system configuration directory is unsafe.' >&2
+        exit 1
+    fi
+    case "$relay_agent_config_permissions" in
+        ?????w*|????????w*)
+            printf '%s\n' \
+                'Safety check failed: system configuration directory is writable.' >&2
+            exit 1
+            ;;
+    esac
+}
+
 relay_agent_mark_stage preflight
 relay_agent_script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 relay_agent_repo_root=$(CDPATH= cd -- "$relay_agent_script_dir/../.." && pwd)
@@ -78,10 +98,13 @@ systemctl is-active --quiet moblin-relay.service && relay_before_active=1 || tru
 systemctl is-enabled --quiet moblin-relay.service && relay_before_enabled=1 || true
 
 relay_agent_mark_stage accounts
+relay_agent_ensure_config_dir /etc/sysusers.d
 install -o root -g root -m 0644 "$relay_agent_script_dir/adojapan-relay-agent.sysusers" \
     /etc/sysusers.d/adojapan-relay-agent.conf
 relay_agent_mark_stage sysusers
 systemd-sysusers /etc/sysusers.d/adojapan-relay-agent.conf
+relay_agent_mark_stage accounts
+relay_agent_ensure_config_dir /etc/tmpfiles.d
 install -o root -g root -m 0644 "$relay_agent_script_dir/adojapan-relay-agent.tmpfiles" \
     /etc/tmpfiles.d/adojapan-relay-agent.conf
 relay_agent_mark_stage tmpfiles
