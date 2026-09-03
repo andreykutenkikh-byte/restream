@@ -178,9 +178,11 @@ Keep these three values separate:
    secret store and are never shown back. A reusable stream key normally needs
    to be set once; use the same dialog to replace only the key whenever YouTube
    issues a new one.
-2. Reveal and copy only the **SRT URL** into Moblin at
-   `Settings → Streams → profile → URL`. If Moblin offers to replace it with a
-   direct YouTube RTMP URL, choose `No`.
+2. In Moblin, open `Settings → Streams → profile → SRT(LA)`, select
+   `Implementation / Реализация → Official`, set `Latency` to `2000 ms`, and
+   turn `Big packets` ON. Reveal the **SRT URL**, copy it in full into the
+   profile's `URL` field, and do not edit it. If Moblin offers to replace it
+   with a direct YouTube RTMP URL, choose `No`.
 3. Put the scheduled broadcast's **YouTube Video ID** in Moblin at
    `Settings → Streams → profile → Streaming platforms → YouTube → Manage
    streams / Video IDs`. The Video ID is not the stream key and normally
@@ -188,7 +190,8 @@ Keep these three values separate:
 
 Moblin's relay profile is portrait: Portrait ON, 720p producing 720×1280,
 30 FPS, H.264/AVC, 3.5–4 Mbit/s, adaptive bitrate ON, two-second keyframes,
-SRT latency 2000–3000 ms, and local recording ON.
+official SRT implementation, SRT latency 2000 ms, Big packets ON, and local
+recording ON.
 
 The safe broadcast order is: create the scheduled YouTube broadcast; configure
 the key on the main «Трансляция» page if needed; start the relay; wait for the
