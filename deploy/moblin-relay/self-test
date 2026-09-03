@@ -121,6 +121,10 @@ PORTRAIT_HEIGHT = 1920
 VIDEO_FPS = 30
 VIDEO_GOP_FRAMES = 60
 ASSET_DURATION_SECONDS = 12
+# The synthetic LIVE input must not wrap while publisher exclusivity is observed.
+# A loop boundary is not representative of Moblin and can briefly starve the
+# normalizer exactly at the end of the 12-second exclusivity window.
+LIVE_FIXTURE_DURATION_SECONDS = 60
 GOP_DURATION_SECONDS = VIDEO_GOP_FRAMES / VIDEO_FPS
 TIMESTAMP_BACKWARD_TOLERANCE_SECONDS = 0.001
 VIDEO_PTS_DTS_OFFSET_LIMIT_SECONDS = GOP_DURATION_SECONDS + 0.1
@@ -964,8 +968,8 @@ def generate_live(work: Path) -> Path:
     command = [
         str(FFMPEG), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
         "-f", "lavfi", "-i",
-        f"testsrc2=size={PORTRAIT_WIDTH}x{PORTRAIT_HEIGHT}:rate={VIDEO_FPS}:duration={ASSET_DURATION_SECONDS}",
-        "-f", "lavfi", "-i", f"sine=frequency=880:sample_rate=48000:duration={ASSET_DURATION_SECONDS}",
+        f"testsrc2=size={PORTRAIT_WIDTH}x{PORTRAIT_HEIGHT}:rate={VIDEO_FPS}:duration={LIVE_FIXTURE_DURATION_SECONDS}",
+        "-f", "lavfi", "-i", f"sine=frequency=880:sample_rate=48000:duration={LIVE_FIXTURE_DURATION_SECONDS}",
         "-map", "0:v:0", "-map", "1:a:0",
         "-vf", "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text=LIVE:x=40:y=40:fontsize=54:fontcolor=white:box=1:boxcolor=red@0.75:boxborderw=16",
         "-c:v", "libx264", "-preset", "veryfast", "-profile:v", "main", "-level:v", "4.0",
@@ -974,7 +978,7 @@ def generate_live(work: Path) -> Path:
         "-b:v", "8000k", "-minrate", "8000k", "-maxrate", "8000k", "-bufsize", "16000k",
         "-x264-params", "nal-hrd=cbr:force-cfr=1:filler=1",
         "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "96k", "-ar", "48000", "-ac", "1",
-        "-t", str(ASSET_DURATION_SECONDS), "-shortest", "-movflags", "+faststart",
+        "-t", str(LIVE_FIXTURE_DURATION_SECONDS), "-shortest", "-movflags", "+faststart",
         "-video_track_timescale", "90000",
         str(output),
     ]
@@ -1055,7 +1059,13 @@ def stream_signature(path: Path, *, include_gop: bool = True) -> dict:
     return result
 
 
-def validate_portrait_asset(label: str, signature: dict, *, audio_channels: int = 2) -> None:
+def validate_portrait_asset(
+    label: str,
+    signature: dict,
+    *,
+    audio_channels: int = 2,
+    duration_seconds: int = ASSET_DURATION_SECONDS,
+) -> None:
     streams = signature.get("streams", [])
     if [stream.get("codec_type") for stream in streams] != ["video", "audio"]:
         raise TestFailure(f"{label} does not contain exactly video then audio")
@@ -1099,8 +1109,8 @@ def validate_portrait_asset(label: str, signature: dict, *, audio_channels: int 
             or any(interval != VIDEO_GOP_FRAMES for interval in gop.get("interval_frames", []))):
         raise TestFailure(f"{label} GOP is not exactly {VIDEO_GOP_FRAMES} frames")
     duration = signature.get("duration_seconds")
-    if duration is None or abs(duration - ASSET_DURATION_SECONDS) > 0.1:
-        raise TestFailure(f"{label} duration is not {ASSET_DURATION_SECONDS} seconds")
+    if duration is None or abs(duration - duration_seconds) > 0.1:
+        raise TestFailure(f"{label} duration is not {duration_seconds} seconds")
 
 
 def write_configs(work: Path, user: str, password: str, passphrase: str) -> tuple[Path, Path]:
@@ -1346,14 +1356,14 @@ def publisher_exclusivity_sample_problem(
     initial_ingest_bytes: int,
 ) -> str | None:
     ingest_bytes = sample.get("ingest_bytes")
-    if not sample.get("live"):
-        return "auth-x-live"
     if sample.get("ingest_ids") != initial_ingest_ids:
         return "auth-x-ingest"
     if sample.get("normalized_ids") != initial_normalized_ids:
         return "auth-x-norm"
     if sample.get("sink_ids") != [initial_sink_id]:
         return "auth-x-sink"
+    if not sample.get("live"):
+        return "auth-x-live"
     if type(ingest_bytes) is not int or ingest_bytes < initial_ingest_bytes:
         return "auth-x-bytes"
     return None
@@ -1925,7 +1935,12 @@ def main() -> int:
         live = generate_live(work)
         slate_sig, live_sig = stream_signature(SLATE), stream_signature(live)
         validate_portrait_asset("SLATE", slate_sig, audio_channels=2)
-        validate_portrait_asset("LIVE ingress", live_sig, audio_channels=1)
+        validate_portrait_asset(
+            "LIVE ingress",
+            live_sig,
+            audio_channels=1,
+            duration_seconds=LIVE_FIXTURE_DURATION_SECONDS,
+        )
         video_comparable = (
             "codec_type", "codec_name", "profile", "level", "width", "height",
             "pix_fmt", "r_frame_rate", "avg_frame_rate",
@@ -1941,7 +1956,9 @@ def main() -> int:
             for key in audio_comparable
         ):
             raise TestFailure("SLATE/LIVE audio codec or sample rate does not match")
-        if slate_sig["video_gop"]["interval_frames"] != live_sig["video_gop"]["interval_frames"]:
+        if set(slate_sig["video_gop"]["interval_frames"]) != set(
+            live_sig["video_gop"]["interval_frames"]
+        ):
             raise TestFailure("SLATE/LIVE GOP signatures do not match")
         result["asset_signatures"] = {"slate": slate_sig, "live": live_sig}
         result["stream_signature"] = slate_sig["streams"]

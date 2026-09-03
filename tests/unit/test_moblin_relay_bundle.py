@@ -233,6 +233,17 @@ def test_bundle_python_sources_parse_as_python_310() -> None:
 
 def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     source = (BUNDLE / "self-test").read_text(encoding="utf-8")
+    loaded = load_self_test()
+
+    assert loaded["ASSET_DURATION_SECONDS"] == 12
+    assert loaded["LIVE_FIXTURE_DURATION_SECONDS"] >= 5 * loaded["ASSET_DURATION_SECONDS"]
+    assert loaded["LIVE_FIXTURE_DURATION_SECONDS"] % loaded["ASSET_DURATION_SECONDS"] == 0
+    assert (loaded["LIVE_FIXTURE_DURATION_SECONDS"] * loaded["VIDEO_FPS"]) % loaded[
+        "VIDEO_GOP_FRAMES"
+    ] == 0
+    live_generator = source.split("def generate_live", 1)[1].split("def video_gop_signature", 1)[0]
+    assert live_generator.count("LIVE_FIXTURE_DURATION_SECONDS") == 3
+    assert "ASSET_DURATION_SECONDS" not in live_generator
 
     assert 'os.environ.pop("MOBLIN_RELAY_SELF_TEST_STAGE_FILE", "")' in source
     assert 'r"/run/moblin-relay-self-test\\.' in source
@@ -500,6 +511,27 @@ def test_self_test_publisher_exclusivity_uses_server_proof_and_stable_ids() -> N
             4096,
             True,
         )
+
+    assert (
+        problem(
+            dict(stable_sample, live=False, normalized_ids=[]),
+            ["primary-ingest"],
+            ["primary-normalizer"],
+            "downstream",
+            100,
+        )
+        == "auth-x-norm"
+    )
+    assert (
+        problem(
+            dict(stable_sample, live=False, ingest_ids=[]),
+            ["primary-ingest"],
+            ["primary-normalizer"],
+            "downstream",
+            100,
+        )
+        == "auth-x-ingest"
+    )
 
     no_progress = dict(stable_sample, ingest_bytes=100)
     assert (
