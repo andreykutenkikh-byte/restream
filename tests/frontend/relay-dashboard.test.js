@@ -240,6 +240,16 @@ test("routine setup omits step-up password while destructive clear keeps it", ()
   );
 });
 
+test("Moblin URL dialog gives the exact official SRT settings", () => {
+  assert.match(
+    dashboardTemplate,
+    /Settings → Streams → профиль → SRT\(LA\) → Implementation \/ Реализация → Official/,
+  );
+  assert.match(dashboardTemplate, /Latency: 2000 ms/);
+  assert.match(dashboardTemplate, /Big packets: ON/);
+  assert.match(dashboardTemplate, /SRT URL скопируйте целиком в поле URL и не редактируйте/);
+});
+
 test("SRT reveal accepts only a bounded SRT URL", () => {
   assert.equal(sanitizeSrtUrl("srt://example.test:8890?streamid=value"), "srt://example.test:8890?streamid=value");
   assert.equal(sanitizeSrtUrl("https://example.test/"), "");

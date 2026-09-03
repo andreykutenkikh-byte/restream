@@ -218,7 +218,11 @@
         <button class="icon-button icon-button--plain" type="button" data-close-dialog aria-label="Закрыть">×</button>
       </header>
       <div class="modal__body relay-secret-form">
-        <p class="form-help">В Moblin откройте <strong>Settings → Streams → профиль → URL</strong> и вставьте SRT URL.</p>
+        <p class="form-help">
+          Moblin: <strong>Settings → Streams → профиль → SRT(LA) → Implementation / Реализация → Official</strong>.
+          Установите <strong>Latency: 2000 ms</strong> и <strong>Big packets: ON</strong>.
+          SRT URL скопируйте целиком в поле URL и не редактируйте.
+        </p>
         <div class="relay-url-results" data-dashboard-moblin-results hidden aria-live="polite">
           <div class="form-field relay-url-field" data-dashboard-public-url-row hidden>
             <label for="dashboard-moblin-public-url">SRT URL для приложения</label>

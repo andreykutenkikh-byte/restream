@@ -379,7 +379,13 @@ test("relay UI never persists or displays YouTube secrets", () => {
   assert.match(template, /data-youtube-clear-dialog aria-labelledby="youtube-clear-title"/);
   assert.match(template, /data-moblin-url-dialog aria-labelledby="moblin-url-title"/);
   assert.match(template, /Relay должен быть остановлен/);
-  assert.match(template, /Settings → Streams → профиль → URL/);
+  assert.match(
+    template,
+    /Settings → Streams → профиль → SRT\(LA\) → Implementation \/ Реализация → Official/,
+  );
+  assert.match(template, /Latency: 2000 ms/);
+  assert.match(template, /Big packets: ON/);
+  assert.match(template, /SRT URL скопируйте целиком в поле URL и не редактируйте/);
   assert.match(template, /прямым YouTube RTMP URL, нажмите No/);
   assert.doesNotMatch(source, /\.innerHTML\s*=/);
   assert.doesNotMatch(source, /localStorage|sessionStorage|indexedDB/);
