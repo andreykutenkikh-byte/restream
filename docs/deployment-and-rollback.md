@@ -216,12 +216,15 @@ sudo adojapan-relay-install-preview-token --generate
 
 Install the reviewed renderer and service unit, run the existing renderer/config validation and a
 local synthetic preview test, and verify that the effective HLS listener is exactly
-`127.0.0.1:8888`, MPEG-TS only, and readable only as `relay-preview` for `iphone-live`. Verify that
-ports 8888 and 9998 refuse non-loopback connections. Start or restart only
-`adojapan-relay-agent.service`; wait for an agent 1.2.x heartbeat, status refresh, and a bounded
-nullable bitrate field. Leave `moblin-relay.service` inactive and disabled. The preview can remain
-empty until a later operator-started LIVE input; deployment must not use the real YouTube
-destination for a smoke test.
+`127.0.0.1:8888`, MPEG-TS only, and readable only as `relay-preview` for `relay-output`. Verify the
+normalizer reads `iphone-live` over loopback RTSP, publishes to `relay-output` over loopback RTMP,
+and that ports 1935, 8554, 8888, and 9998 refuse non-loopback connections. Start or restart only
+`adojapan-relay-agent.service`; wait for an agent 1.2.2 heartbeat, status refresh, and a bounded
+nullable bitrate field. Confirm that a lone SRT ingress or lone RTMP normalizer publisher is not
+reported as LIVE; both must be present, while preview and YouTube-forward health use only
+`relay-output`. Leave `moblin-relay.service` inactive and disabled. The preview can remain empty
+until a later operator-started LIVE input; deployment must not use the real YouTube destination for
+a smoke test.
 
 ### Incremental rollback from schema v5
 

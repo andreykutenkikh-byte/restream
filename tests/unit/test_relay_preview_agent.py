@@ -174,15 +174,15 @@ def test_local_hls_reader_fetches_exact_mediamtx_session_resources(
     assert reader.read_segment(segment_resource) == ts_segment()
     assert requests == [
         (
-            "http://127.0.0.1:8888/iphone-live/index.m3u8",
+            "http://127.0.0.1:8888/relay-output/index.m3u8",
             "application/vnd.apple.mpegurl",
         ),
         (
-            f"http://127.0.0.1:8888/iphone-live/{playlist_resource}",
+            f"http://127.0.0.1:8888/relay-output/{playlist_resource}",
             "application/vnd.apple.mpegurl",
         ),
         (
-            f"http://127.0.0.1:8888/iphone-live/{segment_resource}",
+            f"http://127.0.0.1:8888/relay-output/{segment_resource}",
             "video/mp2t",
         ),
     ]
@@ -191,11 +191,12 @@ def test_local_hls_reader_fetches_exact_mediamtx_session_resources(
 @pytest.mark.parametrize(
     ("path", "playlist"),
     [
-        (f"/iphone-live/video.m3u8?session={SESSION_UUID4}&extra=value", True),
-        (f"/iphone-live/video.m3u8?session={SESSION_UUID4}#fragment", True),
-        ("/iphone-live/video.m3u8?session=123E4567-E89B-42D3-A456-426614174000", True),
-        (f"/iphone-live/subdir/video.m3u8?session={SESSION_UUID4}", True),
-        (f"/iphone-live/segment.ts?session={SESSION_UUID4}/extra", False),
+        (f"/relay-output/video.m3u8?session={SESSION_UUID4}&extra=value", True),
+        (f"/relay-output/video.m3u8?session={SESSION_UUID4}#fragment", True),
+        ("/relay-output/video.m3u8?session=123E4567-E89B-42D3-A456-426614174000", True),
+        (f"/relay-output/subdir/video.m3u8?session={SESSION_UUID4}", True),
+        (f"/relay-output/segment.ts?session={SESSION_UUID4}/extra", False),
+        (f"/iphone-live/segment.ts?session={SESSION_UUID4}", False),
         (f"/other/segment.ts?session={SESSION_UUID4}", False),
     ],
 )
@@ -370,7 +371,7 @@ def test_control_client_accepts_optional_preview_demand_and_uses_separate_media_
     assert method == "GET"
     assert path == "/relay-agent/v1/commands/next?wait=0"
     assert sent is None
-    assert headers["X-Relay-Agent-Version"] == "1.2.1"
+    assert headers["X-Relay-Agent-Version"] == "1.2.2"
 
     payload = ts_segment()
     client.upload_preview_segment(generation, 22, payload)

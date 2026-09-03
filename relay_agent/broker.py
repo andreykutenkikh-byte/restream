@@ -50,6 +50,7 @@ _BITRATE_STATE_PATH = _RELAY_LOCK_DIRECTORY / "input-bitrate.json"
 _BITRATE_STALE_AFTER_SECONDS = 15.0
 _MAX_INPUT_BITRATE_BPS = 1_000_000_000
 _MAX_INPUT_COUNTER = 2**53 - 1
+_FINAL_OUTPUT_PATH = "relay-output"
 _PR_SET_CHILD_SUBREAPER = 36
 _subreaper_enabled = False
 _YOUTUBE_HOSTS = frozenset({"a.rtmps.youtube.com", "b.rtmps.youtube.com"})
@@ -699,26 +700,38 @@ class RelayBroker:
         try:
             metrics = _function(self._relayctl, "read_metrics")()
             parse = _function(self._relayctl, "parse_metric_samples")
-            path_name = str(self._relayctl["SRT_PATH"])
+            ingress_path = str(self._relayctl["SRT_PATH"])
             path_ready = any(
-                labels.get("name") == path_name and labels.get("state") == "ready" and value == 1
+                labels.get("name") == _FINAL_OUTPUT_PATH
+                and labels.get("state") == "ready"
+                and value == 1
                 for labels, value in parse(metrics, "paths")
             )
-            live_publishers = [
+            ingress_publishers = [
                 labels
                 for labels, value in parse(metrics, "srt_conns")
-                if labels.get("path") == path_name
+                if labels.get("path") == ingress_path
                 and labels.get("state") == "publish"
                 and value == 1
             ]
-            live = bool(live_publishers)
+            normalizer_publishers = [
+                labels
+                for labels, value in parse(metrics, "rtmp_conns")
+                if labels.get("path") == _FINAL_OUTPUT_PATH
+                and labels.get("state") == "publish"
+                and value == 1
+            ]
+            # SRT proves that Moblin reached the public ingress, while RTMP
+            # proves that the local audio normalizer reached the canonical
+            # output.  Neither half alone is a usable LIVE relay.
+            live = bool(ingress_publishers) and bool(normalizer_publishers)
             counter_samples = [
                 (labels, value)
                 for labels, value in parse(metrics, "srt_conns_bytes_received")
-                if labels.get("path") == path_name and labels.get("state") == "publish"
+                if labels.get("path") == ingress_path and labels.get("state") == "publish"
             ]
             forward_ok = any(
-                labels.get("path") == path_name
+                labels.get("path") == _FINAL_OUTPUT_PATH
                 and labels.get("protocol") == "rtmps"
                 and labels.get("state") in {"forwarding", "ready"}
                 and value == 1
@@ -728,7 +741,7 @@ class RelayBroker:
             self._bitrate_sampler.reset()
             return "UNKNOWN", False, False, False, None
         if live:
-            input_bitrate_bps = self._input_bitrate(live_publishers, counter_samples)
+            input_bitrate_bps = self._input_bitrate(ingress_publishers, counter_samples)
             return "LIVE", True, path_ready, forward_ok, input_bitrate_bps
         self._bitrate_sampler.reset()
         return ("SLATE" if path_ready else "UNKNOWN"), True, path_ready, forward_ok, None

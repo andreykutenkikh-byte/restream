@@ -51,6 +51,7 @@ class FakeRelayCtl:
         self.start_outside_lock = False
         self.stop_outside_lock = False
         self.live = False
+        self.normalizer_live = False
         self.connection_id = "a0b1c2d3-e4f5-6789-abcd-ef0123456789"
         self.bytes_received: float = 0
         self.secrets = {
@@ -139,12 +140,12 @@ class FakeRelayCtl:
 
     def parse_metrics(self, _metrics: str, name: str) -> list[tuple[dict[str, str], float]]:
         if name == "paths":
-            return [({"name": "iphone-live", "state": "ready"}, 1.0)]
+            return [({"name": "relay-output", "state": "ready"}, 1.0)]
         if name == "forward_dests":
             return [
                 (
                     {
-                        "path": "iphone-live",
+                        "path": "relay-output",
                         "protocol": "rtmps",
                         "state": "forwarding",
                     },
@@ -173,6 +174,18 @@ class FakeRelayCtl:
                         "state": "publish",
                     },
                     self.bytes_received,
+                )
+            ]
+        if name == "rtmp_conns" and self.normalizer_live:
+            return [
+                (
+                    {
+                        "id": "c0b1c2d3-e4f5-6789-abcd-ef0123456789",
+                        "path": "relay-output",
+                        "remoteAddr": "127.0.0.1:40001",
+                        "state": "publish",
+                    },
+                    1.0,
                 )
             ]
         return []
@@ -424,6 +437,7 @@ def test_live_input_bitrate_uses_counter_delta_and_exposes_only_bps(
     fake.active = True
     fake.enabled = True
     fake.live = True
+    fake.normalizer_live = True
     fake.bytes_received = 1_000_000
     sampler = InputBitrateSampler(
         tmp_path / "bitrate.json", clock=clock, expected_uid=effective_uid()
@@ -448,6 +462,34 @@ def test_live_input_bitrate_uses_counter_delta_and_exposes_only_bps(
     assert fake.connection_id not in state
 
 
+@pytest.mark.parametrize(
+    ("ingress_live", "normalizer_live", "expected_source"),
+    [
+        (True, False, "SLATE"),
+        (False, True, "SLATE"),
+        (True, True, "LIVE"),
+    ],
+)
+def test_live_requires_both_srt_ingress_and_rtmp_normalizer_publishers(
+    ingress_live: bool,
+    normalizer_live: bool,
+    expected_source: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker, fake = broker_with_fake(monkeypatch)
+    fake.active = True
+    fake.enabled = True
+    fake.live = ingress_live
+    fake.normalizer_live = normalizer_live
+
+    snapshot = broker.snapshot()
+
+    assert snapshot.source == expected_source
+    assert snapshot.input_bitrate_bps is None
+    assert snapshot.youtube_forward == "active"
+    assert snapshot.healthy is True
+
+
 def test_live_input_bitrate_resets_on_stream_change_rollback_stale_and_non_live(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -460,6 +502,7 @@ def test_live_input_bitrate_resets_on_stream_change_rollback_stale_and_non_live(
     fake.active = True
     fake.enabled = True
     fake.live = True
+    fake.normalizer_live = True
     fake.bytes_received = 1_000
     sampler = InputBitrateSampler(
         tmp_path / "bitrate.json", clock=clock, expected_uid=effective_uid()
@@ -493,6 +536,7 @@ def test_live_input_bitrate_resets_on_stream_change_rollback_stale_and_non_live(
     assert not (tmp_path / "bitrate.json").exists()
 
     fake.live = True
+    fake.normalizer_live = True
     fake.bytes_received = 2_000
     observed_at += 5
     assert broker.snapshot().input_bitrate_bps is None
@@ -516,6 +560,7 @@ def test_live_input_bitrate_rejects_invalid_counter(
     fake = FakeRelayCtl()
     fake.active = True
     fake.live = True
+    fake.normalizer_live = True
     fake.bytes_received = invalid_counter
     sampler = InputBitrateSampler(
         tmp_path / "bitrate.json", clock=lambda: 100.0, expected_uid=effective_uid()

@@ -72,8 +72,10 @@ MediaMTX metrics endpoint on host loopback `127.0.0.1:9998`. Address families ar
 the broker has no network listener, its IP access is limited to localhost, and the agent is
 denied all socket binds while retaining outbound HTTPS and Unix-socket client access. The broker
 has an empty capability set. It reads `ActiveState`/`MainPID` from systemd, the SRT listener via
-fixed `ss` arguments, and source/forward health from the existing loopback metrics endpoint; it
-does not require cross-process memory access.
+fixed `ss` arguments, and source/forward health from the existing loopback metrics endpoint. LIVE
+requires both the public SRT publisher on `iphone-live` and the internal RTMP normalizer publisher
+on `relay-output`; bitrate remains an ingress-SRT sample, while path readiness, YouTube forwarding,
+and HLS preview use `relay-output`. The broker does not require cross-process memory access.
 
 ## Safe checks
 

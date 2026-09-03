@@ -26,7 +26,8 @@ from relay_agent.errors import RelayAgentError
 from relay_agent.security import SensitiveToken
 
 LOCAL_HLS_ORIGIN = "http://127.0.0.1:8888"
-LOCAL_HLS_PATH = "/iphone-live/index.m3u8"
+_LOCAL_HLS_PREFIX = "/relay-output/"
+LOCAL_HLS_PATH = f"{_LOCAL_HLS_PREFIX}index.m3u8"
 LOCAL_HLS_USERNAME = "relay-preview"
 MAX_PLAYLIST_BYTES = 64 * 1024
 MAX_SEGMENT_BYTES = 3 * 1024 * 1024
@@ -129,20 +130,22 @@ class LocalHLSReader:
         nested = parse_master_playlist(root)
         media = root
         if nested is not None:
-            media = self._fetch(f"/iphone-live/{nested}", MAX_PLAYLIST_BYTES, playlist=True)
+            media = self._fetch(f"{_LOCAL_HLS_PREFIX}{nested}", MAX_PLAYLIST_BYTES, playlist=True)
         return parse_media_playlist(media)
 
     def read_segment(self, name: str) -> bytes:
         if _SEGMENT_RESOURCE.fullmatch(name) is None:
             raise RelayAgentError("preview_segment_invalid")
-        payload = self._fetch(f"/iphone-live/{name}", MAX_SEGMENT_BYTES, playlist=False)
+        payload = self._fetch(f"{_LOCAL_HLS_PREFIX}{name}", MAX_SEGMENT_BYTES, playlist=False)
         validate_mpegts(payload)
         return payload
 
     def _fetch(self, path: str, limit: int, *, playlist: bool) -> bytes:
-        prefix = "/iphone-live/"
         resource_pattern = _PLAYLIST_RESOURCE if playlist else _SEGMENT_RESOURCE
-        if not path.startswith(prefix) or resource_pattern.fullmatch(path[len(prefix) :]) is None:
+        if (
+            not path.startswith(_LOCAL_HLS_PREFIX)
+            or resource_pattern.fullmatch(path[len(_LOCAL_HLS_PREFIX) :]) is None
+        ):
             raise RelayAgentError("preview_local_request_invalid")
         url = f"{LOCAL_HLS_ORIGIN}{path}"
         parsed = urlsplit(url)

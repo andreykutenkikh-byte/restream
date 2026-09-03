@@ -51,6 +51,8 @@ Every request uses `Authorization: Bearer <node token>`:
 Agent version 1.1 adds a backward-compatible optional `preview_requested`
 boolean to a successful heartbeat response. Version 1.2 adds the separately
 gated key-only YouTube command and the optional LIVE input-bitrate sample.
+Agent 1.2.2 keeps that protocol unchanged while correlating the two local media
+paths used by the audio-normalizing relay.
 Older agents receive the original response shape and cannot be leased a command
 they do not support. Preview media never uses the small control route: the agent
 uploads completed MPEG-TS segments to the separate, node-authenticated
@@ -130,14 +132,24 @@ Origin protection, then reads a session-authenticated playlist and segments:
 - `GET /api/nodes/{node_id}/relay/preview/index.m3u8`
 - `GET /api/nodes/{node_id}/relay/preview/segment/{generation}/{sequence}.ts`
 
+The public, authenticated SRT publisher remains on `iphone-live`. A fixed local
+normalizer reads that ingress over loopback RTSP and publishes H.264-copy/AAC
+stereo over loopback RTMP to `relay-output`. The latter is the canonical final
+path: it owns the continuous slate fallback, YouTube forward, and preview. The
+agent reports LIVE only when both the SRT publisher on `iphone-live` and the RTMP
+publisher on `relay-output` exist; it samples incoming bitrate only from the SRT
+connection, while output readiness and YouTube-forward health come only from
+`relay-output`.
+
 The HK host remains outbound-only. MediaMTX HLS must bind only to
 `127.0.0.1:8888`, use the `mpegts` variant and two-second segments, and grant
-read access to `iphone-live` only to the dedicated `relay-preview` user. No HLS,
-API, WebRTC, firewall, route, interface, Docker, Amnezia, SRT, or management
-port is published or changed for this feature.
-The transport uses the standard MPEG-TS HLS functionality present in MediaMTX
-1.19.2 and does not depend on its control API or WebRTC; the HK image version
-must nevertheless remain whatever the existing relay manifest already pins.
+read access to `relay-output` only to the dedicated `relay-preview` user. RTSP
+and RTMP for normalization bind only to `127.0.0.1`. No HLS, RTSP, RTMP, API,
+WebRTC, firewall, route, interface, Docker, Amnezia, SRT, or management port is
+published publicly for this feature.
+The transport uses the standard MPEG-TS HLS functionality in the relay's pinned
+MediaMTX 1.20.1 image and does not depend on its control API or WebRTC; that
+image must not be replaced as part of the agent update.
 
 The backend accepts no agent-supplied playlist or URL. It validates canonical
 generation/sequence values, exact `video/mp2t`, declared and streamed size,
