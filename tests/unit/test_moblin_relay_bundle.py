@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 BUNDLE = ROOT / "deploy" / "moblin-relay"
 RELAYCTL = BUNDLE / "relayctl"
 SELF_TEST = BUNDLE / "self-test"
+NORMALIZER = BUNDLE / "moblin-relay-normalize"
 
 
 def load_relayctl() -> dict[str, object]:
@@ -39,6 +40,10 @@ def load_self_test() -> dict[str, object]:
         patch.dict(os.environ, {"MOBLIN_RELAY_SELF_TEST_STAGE_FILE": ""}),
     ):
         return runpy.run_path(str(SELF_TEST), run_name="_moblin_self_test")
+
+
+def load_normalizer() -> dict[str, object]:
+    return runpy.run_path(str(NORMALIZER), run_name="_moblin_normalizer_test")
 
 
 def node_config(
@@ -242,7 +247,11 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     assert "os.ftruncate(descriptor, 0)" in source
     assert '"dut_metrics_ok": False' in source
     assert 'sample["dut_metrics_ok"] = True' in source
-    assert 'if sample.get("dut_metrics_ok") and sample.get(field) is expected:' in source
+    assert 'sample.get("t", 0.0) >= not_before' in source
+    assert "and predicate(sample)" in source
+    assert "not_before=transition_started" in source
+    assert 'f"&payloadsize={SRT_PAYLOAD_SIZE}&conntimeo=3000"' in source
+    assert 'f"&passphrase={passphrase}&pbkeylen=32&latency={SRT_LATENCY_MILLISECONDS}"' in source
     direct_stages = (
         "startup",
         "assets",
@@ -284,18 +293,25 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         'mark_self_test_stage("continuity")', 1
     )[0]
     assert outage_block.index('mark_self_test_stage("outage-slate")') < outage_block.index(
-        'observer.wait_state("live", False, 20)'
+        "detached = wait_slate_with_live_srt("
     )
     assert 'stop_primary_srt_source(f"outage {index}")' in outage_block
     assert outage_block.index('stop_primary_srt_source(f"outage {index}")') < outage_block.index(
-        'observer.wait_state("ingest_live", False, 20)'
+        "detached = wait_slate_with_live_srt("
     )
-    assert outage_block.index('observer.wait_state("ingest_live", False, 20)') < (
-        outage_block.index('observer.wait_state("live", False, 20)')
+    assert outage_block.index("detached = wait_slate_with_live_srt(") < (
+        outage_block.index("wait_srt_idle_expiry(")
     )
+    assert "wait_slate_capture_growth(" in outage_block
+    assert "expected_ingest_ids=initial_ingest_ids" in outage_block
+    assert "signal.SIGSTOP" in outage_block
+    assert "signal.SIGCONT" in outage_block
+    assert "signal.SIGKILL" in outage_block
+    assert "wait_process_exit(old_child_pid, 1.0)" in outage_block
+    assert "maximum_capture_no_growth_seconds(" in outage_block
     assert "primary source helper exited during outage" not in outage_block
     assert outage_block.index('mark_self_test_stage("outage-normal")') < outage_block.index(
-        'observer.wait_state("normalized", False, 20)'
+        "detached = wait_slate_with_live_srt("
     )
     assert outage_block.index('mark_self_test_stage("outage-hold")') < outage_block.index(
         "while time.monotonic() - outage_started < duration"
@@ -323,8 +339,14 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         'mark_self_test_stage("decode")', 1
     )[0]
     assert 'stop_primary_srt_source("final continuity transition")' in continuity_block
-    assert 'observer.wait_state("ingest_live", False, 20)' in continuity_block
-    assert 'observer.wait_state("normalized", False, 20)' in continuity_block
+    assert "final_slate = wait_slate_with_live_srt(" in continuity_block
+    assert (
+        'wait_slate_capture_growth("final SLATE capture growth", final_slate)' in continuity_block
+    )
+    assert continuity_block.index("final_slate = wait_slate_with_live_srt(") < (
+        continuity_block.index("wait_srt_idle_expiry(")
+    )
+    assert "maximum_capture_no_growth_seconds(final_samples)" in continuity_block
 
     decode_block = source.split('mark_self_test_stage("decode")', 1)[1].split(
         'mark_self_test_stage("secrets")', 1
@@ -363,6 +385,114 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     assert '"capture decoder validation failed",' in source
     assert '"capture frame validation failed",' in source
     assert '"capture timestamp validation failed",' in source
+
+
+def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
+    loaded = load_normalizer()
+    build_argv = loaded["build_ffmpeg_argv"]
+    parse_inbound_bytes = loaded["parse_inbound_bytes"]
+    parse_output_sample = loaded["parse_output_sample"]
+    growth_gate = loaded["GrowthGate"]
+    output_growth_gate = loaded["OutputGrowthGate"]
+    watchdog_type = loaded["MediaWatchdog"]
+    sanitized_environment = loaded["sanitized_environment"]
+
+    argv = build_argv(18554, 11936)
+    input_index = argv.index("-i")
+    assert argv[argv.index("-rw_timeout") + 1] == "100000"
+    assert argv[argv.index("-timeout") + 1] == "100000"
+    assert argv.index("-rw_timeout") < input_index
+    assert argv.index("-timeout") < input_index
+    assert argv[argv.index("-c:v") + 1] == "copy"
+    assert "-copyinkf" not in argv
+    assert "rtsp://127.0.0.1:18554/iphone-live" in argv
+    assert "rtmp://127.0.0.1:11936/relay-output" in argv
+
+    metric = 'paths_inbound_bytes{state="ready",name="iphone-live"} 100\n'
+    assert parse_inbound_bytes(metric) == 100
+    assert parse_inbound_bytes(metric + metric) is None
+    assert parse_inbound_bytes('paths_inbound_bytes{name="other",state="ready"} 100\n') is None
+    output_metric = (
+        'rtmp_conns_inbound_bytes{remoteAddr="127.0.0.1:54321",id="normalizer-a",'
+        'state="publish",path="relay-output"} 500\n'
+    )
+    assert parse_output_sample(output_metric) == ("normalizer-a", 500)
+    assert parse_output_sample(output_metric + output_metric) is None
+    assert parse_output_sample(output_metric.replace('state="publish"', 'state="read"')) is None
+    assert parse_output_sample(output_metric.replace('path="relay-output"', 'path="other"')) is None
+    assert (
+        parse_output_sample(output_metric.replace("127.0.0.1:54321", "203.0.113.5:54321")) is None
+    )
+
+    gate = growth_gate()
+    assert gate.observe(100) is False
+    assert gate.observe(110) is False
+    assert gate.observe(120) is True
+    gate.reset()
+    assert gate.observe(120) is False
+    assert gate.observe(120) is False
+
+    output_gate = output_growth_gate()
+    assert output_gate.observe(("normalizer-a", 100)) is False
+    assert output_gate.observe(("normalizer-a", 110)) is False
+    assert output_gate.observe(("normalizer-a", 120)) is True
+    assert output_gate.observe(("normalizer-b", 130)) is False
+
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe(True, ("normalizer-a", 121), 1.09) is True
+    assert watchdog.observe(True, ("normalizer-a", 121), 1.18) is True
+    assert watchdog.observe(True, ("normalizer-a", 121), 1.191) is False
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe(False, None, 1.149) is True
+    assert watchdog.observe(False, None, 1.151) is False
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe(True, ("normalizer-b", 121), 1.01) is False
+    assert "make_parent_death_setup" in loaded
+
+    assert sanitized_environment(18554, 11936, 19998) == {
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "MOBLIN_RELAY_INTERNAL_RTSP_PORT": "18554",
+        "MOBLIN_RELAY_INTERNAL_RTMP_PORT": "11936",
+        "MOBLIN_RELAY_INTERNAL_METRICS_PORT": "19998",
+    }
+
+
+def test_normalizer_reexec_discards_hook_secrets() -> None:
+    loaded = load_normalizer()
+    main = loaded["main"]
+    captured: dict[str, object] = {}
+    marker = "must-not-survive-reexec"
+
+    def fake_execve(path: str, argv: list[str], environment: dict[str, str]) -> None:
+        captured.update(path=path, argv=argv, environment=environment)
+        raise OSError("stop before exec")
+
+    hook_environment = {
+        "MTX_PATH": "iphone-live",
+        "MTX_QUERY": f"publisher={marker}",
+        "RTSP_PORT": "18554",
+        "MOBLIN_RELAY_OUTPUT_RTMP_PORT": "11936",
+        "MOBLIN_RELAY_METRICS_PORT": "19998",
+    }
+    with (
+        patch.dict(os.environ, hook_environment, clear=True),
+        patch.object(os, "execve", fake_execve),
+        patch.object(sys, "argv", [str(NORMALIZER)]),
+    ):
+        assert main() == 1
+
+    assert captured["path"] == "/usr/bin/python3"
+    assert marker not in repr(captured)
+    assert captured["environment"] == {
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "MOBLIN_RELAY_INTERNAL_RTSP_PORT": "18554",
+        "MOBLIN_RELAY_INTERNAL_RTMP_PORT": "11936",
+        "MOBLIN_RELAY_INTERNAL_METRICS_PORT": "19998",
+    }
 
 
 @pytest.mark.parametrize(

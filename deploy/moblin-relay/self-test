@@ -100,6 +100,15 @@ AUDIO_PTS_DTS_OFFSET_LIMIT_SECONDS = 0.05
 VIDEO_PRESENTATION_GAP_LIMIT_SECONDS = GOP_DURATION_SECONDS + 0.1
 AUDIO_PRESENTATION_GAP_LIMIT_SECONDS = 0.25
 AV_END_DIFFERENCE_LIMIT_SECONDS = 0.25
+SRT_LATENCY_MILLISECONDS = 2000
+SRT_PAYLOAD_SIZE = 1316
+SRT_IDLE_LOWER_BOUND_SECONDS = 8.0
+SRT_IDLE_UPPER_BOUND_SECONDS = 13.0
+LIVE_TO_SLATE_DEADLINE_SECONDS = 4.5
+SLATE_CAPTURE_GROWTH_BYTES = 16_384
+SLATE_CAPTURE_GROWTH_TIMEOUT_SECONDS = 1.5
+CAPTURE_NO_GROWTH_LIMIT_SECONDS = 1.0
+SUPERVISOR_RESTART_TIMEOUT_SECONDS = 12.0
 
 
 class TestFailure(RuntimeError):
@@ -562,8 +571,12 @@ class Observer(threading.Thread):
                 "dut_metrics_ok": False,
                 "path_ready": False,
                 "ingest_live": False,
+                "ingest_ids": [],
+                "ingest_bytes": None,
                 "live": False,
                 "normalized": False,
+                "normalized_ids": [],
+                "normalized_bytes": None,
                 "forward": False,
                 "sink_ids": [],
                 "capture_size": self.capture.stat().st_size if self.capture.exists() else 0,
@@ -579,18 +592,48 @@ class Observer(threading.Thread):
                     labels.get("path") == INGEST_PATH and labels.get("state") == "publish" and value == 1
                     for labels, value in parse_metrics(dut_metrics, "srt_conns")
                 )
+                sample["ingest_ids"] = sorted(
+                    labels.get("id", "missing-id")
+                    for labels, value in parse_metrics(dut_metrics, "srt_conns")
+                    if labels.get("path") == INGEST_PATH
+                    and labels.get("state") == "publish"
+                    and value == 1
+                )
+                ingest_path_counters = [
+                    int(value)
+                    for labels, value in parse_metrics(
+                        dut_metrics, "paths_inbound_bytes"
+                    )
+                    if labels.get("name") == INGEST_PATH
+                    and labels.get("state") == "ready"
+                ]
+                if len(ingest_path_counters) == 1:
+                    sample["ingest_bytes"] = ingest_path_counters[0]
                 sample["forward"] = any(
                     labels.get("path") == OUTPUT_PATH
                     and labels.get("state") in ("ready", "forwarding")
                     and value == 1
                     for labels, value in parse_metrics(dut_metrics, "forward_dests")
                 )
-                sample["normalized"] = any(
-                    labels.get("path") == OUTPUT_PATH
+                sample["normalized_ids"] = sorted(
+                    labels.get("id", "missing-id")
+                    for labels, value in parse_metrics(dut_metrics, "rtmp_conns")
+                    if labels.get("path") == OUTPUT_PATH
                     and labels.get("state") == "publish"
                     and value == 1
-                    for labels, value in parse_metrics(dut_metrics, "rtmp_conns")
                 )
+                sample["normalized"] = len(sample["normalized_ids"]) == 1
+                normalizer_counters = [
+                    int(value)
+                    for labels, value in parse_metrics(
+                        dut_metrics, "rtmp_conns_inbound_bytes"
+                    )
+                    if labels.get("id") in sample["normalized_ids"]
+                    and labels.get("path") == OUTPUT_PATH
+                    and labels.get("state") == "publish"
+                ]
+                if len(normalizer_counters) == 1:
+                    sample["normalized_bytes"] = normalizer_counters[0]
                 sample["live"] = sample["ingest_live"] and sample["normalized"]
             except OSError:
                 pass
@@ -614,6 +657,7 @@ class Observer(threading.Thread):
                     self.cpu_first.setdefault(name, (now, ticks))
                     self.cpu_previous[name] = (now, ticks)
             with self.lock:
+                sample["finished"] = time.monotonic()
                 self.samples.append(sample)
             self.stop_event.wait(0.2)
 
@@ -625,17 +669,28 @@ class Observer(threading.Thread):
         with self.lock:
             return [dict(sample) for sample in self.samples if started <= sample["t"] <= finished]
 
-    def wait_state(self, field: str, expected: bool, timeout: float) -> float:
+    def wait_sample(
+        self,
+        description: str,
+        predicate,
+        timeout: float,
+        *,
+        not_before: float = 0.0,
+    ) -> dict:
         started = time.monotonic()
         deadline = started + timeout
         while time.monotonic() < deadline:
             sample = self.snapshot()
-            if sample.get("dut_metrics_ok") and sample.get(field) is expected:
-                return time.monotonic() - started
+            if (
+                sample.get("t", 0.0) >= not_before
+                and sample.get("dut_metrics_ok")
+                and predicate(sample)
+            ):
+                return sample
             if sample and not all(sample.get(name) for name in ("dut_alive", "sink_alive", "reader_alive")):
                 raise TestFailure("a core test process exited during a transition")
             time.sleep(0.05)
-        raise TestFailure(f"timed out waiting for {field}={expected}")
+        raise TestFailure(f"timed out waiting for {description}")
 
     def finish(self) -> None:
         self.stop_event.set()
@@ -648,6 +703,54 @@ class Observer(threading.Thread):
             if latest and latest[0] > first[0]:
                 averages[name] = (latest[1] - first[1]) / self.clock_ticks / (latest[0] - first[0]) * 100.0
         return averages
+
+
+def maximum_capture_no_growth_seconds(samples: list[dict]) -> float:
+    """Measure the longest observed wall-clock interval without captured media."""
+    if len(samples) < 2:
+        return float("inf")
+    previous_size = int(samples[0]["capture_size"])
+    last_growth = float(samples[0]["t"])
+    longest = 0.0
+    for sample in samples[1:]:
+        timestamp = float(sample["t"])
+        size = int(sample["capture_size"])
+        longest = max(longest, timestamp - last_growth)
+        if size > previous_size:
+            previous_size = size
+            last_growth = timestamp
+    return longest
+
+
+def matching_process_ids(required: tuple[bytes, ...]) -> list[int]:
+    matches: list[int] = []
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            command = (proc / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if all(marker in command for marker in required):
+            matches.append(int(proc.name))
+    return sorted(matches)
+
+
+def direct_child_process_ids(pid: int) -> list[int]:
+    try:
+        payload = Path(f"/proc/{pid}/task/{pid}/children").read_text()
+    except OSError:
+        return []
+    return sorted(int(item) for item in payload.split() if item.isdigit())
+
+
+def wait_process_exit(pid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not Path(f"/proc/{pid}").exists():
+            return True
+        time.sleep(0.025)
+    return not Path(f"/proc/{pid}").exists()
 
 
 def generate_live(work: Path) -> Path:
@@ -874,7 +977,8 @@ def write_source_config(
     """Write a root-only MediaMTX config that is the sole SRT-secret consumer."""
     destination = (
         f"srt://127.0.0.1:{DUT_SRT_PORT}?streamid=publish:{INGEST_PATH}:{user}:{password}"
-        f"&passphrase={passphrase}&pbkeylen=32&conntimeo=3000"
+        f"&passphrase={passphrase}&pbkeylen=32&latency={SRT_LATENCY_MILLISECONDS}"
+        f"&payloadsize={SRT_PAYLOAD_SIZE}&conntimeo=3000"
     )
     config = {
         "logLevel": "warn", "logDestinations": ["stdout"], "dumpPackets": False,
@@ -1509,6 +1613,7 @@ def main() -> int:
         wait_tcp(SINK_METRICS_PORT)
         dut_environment = os.environ.copy()
         dut_environment["MOBLIN_RELAY_OUTPUT_RTMP_PORT"] = str(DUT_RTMP_PORT)
+        dut_environment["MOBLIN_RELAY_METRICS_PORT"] = str(DUT_METRICS_PORT)
         dut = subprocess.Popen(
             [str(MEDIAMTX), str(dut_config)],
             stdin=subprocess.DEVNULL,
@@ -1609,6 +1714,102 @@ def main() -> int:
                 ("tcp", SOURCE_PRIMARY_METRICS_PORT),
             ))
 
+        def wait_healthy_live(
+            description: str,
+            timeout: float,
+            *,
+            not_before: float = 0.0,
+            expected_ingest_ids: list[str] | None = None,
+        ) -> dict:
+            return observer.wait_sample(
+                description,
+                lambda sample: (
+                    sample.get("live")
+                    and sample.get("normalized")
+                    and sample.get("path_ready")
+                    and sample.get("forward")
+                    and sample.get("sink_ids") == [initial_sink_id]
+                    and (
+                        expected_ingest_ids is None
+                        or sample.get("ingest_ids") == expected_ingest_ids
+                    )
+                ),
+                timeout,
+                not_before=not_before,
+            )
+
+        def wait_slate_with_live_srt(
+            description: str,
+            transition_started: float,
+            expected_ingest_ids: list[str],
+        ) -> dict:
+            remaining = LIVE_TO_SLATE_DEADLINE_SECONDS - (
+                time.monotonic() - transition_started
+            )
+            if remaining <= 0:
+                raise TestFailure(f"{description} exceeded the SLATE deadline")
+            sample = observer.wait_sample(
+                description,
+                lambda item: (
+                    not item.get("normalized")
+                    and not item.get("live")
+                    and item.get("ingest_live")
+                    and item.get("ingest_ids") == expected_ingest_ids
+                    and item.get("path_ready")
+                    and item.get("forward")
+                    and item.get("sink_ids") == [initial_sink_id]
+                ),
+                remaining,
+                not_before=transition_started,
+            )
+            elapsed = float(sample["t"]) - transition_started
+            if elapsed > LIVE_TO_SLATE_DEADLINE_SECONDS:
+                raise TestFailure(f"{description} exceeded the SLATE deadline")
+            return sample
+
+        def wait_slate_capture_growth(description: str, slate_sample: dict) -> dict:
+            minimum_size = int(slate_sample["capture_size"]) + SLATE_CAPTURE_GROWTH_BYTES
+            return observer.wait_sample(
+                description,
+                lambda item: (
+                    not item.get("normalized")
+                    and not item.get("live")
+                    and item.get("path_ready")
+                    and item.get("forward")
+                    and item.get("sink_ids") == [initial_sink_id]
+                    and int(item.get("capture_size", 0)) >= minimum_size
+                ),
+                SLATE_CAPTURE_GROWTH_TIMEOUT_SECONDS,
+                not_before=float(slate_sample["t"]),
+            )
+
+        def wait_srt_idle_expiry(
+            description: str,
+            outage_started: float,
+        ) -> tuple[dict, float]:
+            remaining = SRT_IDLE_UPPER_BOUND_SECONDS - (
+                time.monotonic() - outage_started
+            )
+            if remaining <= 0:
+                raise TestFailure(f"{description} exceeded the SRT idle timeout bound")
+            sample = observer.wait_sample(
+                description,
+                lambda item: (
+                    not item.get("ingest_live")
+                    and not item.get("normalized")
+                    and not item.get("live")
+                    and item.get("path_ready")
+                    and item.get("forward")
+                    and item.get("sink_ids") == [initial_sink_id]
+                ),
+                remaining,
+                not_before=outage_started,
+            )
+            elapsed = float(sample["t"]) - outage_started
+            if not SRT_IDLE_LOWER_BOUND_SECONDS <= elapsed <= SRT_IDLE_UPPER_BOUND_SECONDS:
+                raise TestFailure(f"{description} violated the configured SRT idle tolerance")
+            return sample, elapsed
+
         def reject_with_helper(config: Path, label: str) -> int:
             helper = start_source_helper(config, label, SOURCE_AUX_METRICS_PORT)
             candidate = start_local_publisher(SOURCE_AUX_RTMP_PORT)
@@ -1679,8 +1880,19 @@ def main() -> int:
         primary_helper = start_source_helper(primary_config, "primary", SOURCE_PRIMARY_METRICS_PORT)
         publisher = start_local_publisher(SOURCE_PRIMARY_RTMP_PORT)
         wait_helper_path(SOURCE_PRIMARY_METRICS_PORT)
-        to_live = observer.wait_state("live", True, 20)
-        result["initial_slate_to_live_seconds"] = round(to_live, 3)
+        initial_live_started = time.monotonic()
+        initial_live = wait_healthy_live(
+            "initial healthy LIVE",
+            20,
+            not_before=initial_live_started,
+        )
+        initial_ingest_ids = list(initial_live["ingest_ids"])
+        if len(initial_ingest_ids) != 1:
+            raise TestFailure("initial LIVE did not expose exactly one SRT connection")
+        result["initial_slate_to_live_seconds"] = round(
+            float(initial_live["t"]) - initial_live_started,
+            3,
+        )
         if publisher.poll() is not None or primary_helper.poll() is not None:
             raise TestFailure("primary source path exited unexpectedly")
 
@@ -1737,52 +1949,243 @@ def main() -> int:
             raise TestFailure("second publisher rejection failed")
 
         mark_self_test_stage("outages")
+        print("  checking a recoverable same-session media stall", flush=True)
+        before_pause = wait_healthy_live(
+            "healthy LIVE before same-session stall",
+            5,
+            expected_ingest_ids=initial_ingest_ids,
+        )
+        previous_normalizer_ids = list(before_pause["normalized_ids"])
+        if len(previous_normalizer_ids) != 1:
+            raise TestFailure("same-session stall precondition lacks one normalizer")
+        time.sleep(0.35)
+        same_session_started = time.monotonic()
+        publisher_paused = False
+        try:
+            os.kill(publisher.pid, signal.SIGSTOP)
+            publisher_paused = True
+            same_session_slate = wait_slate_with_live_srt(
+                "same-session SLATE transition",
+                same_session_started,
+                initial_ingest_ids,
+            )
+            wait_slate_capture_growth(
+                "same-session SLATE capture growth",
+                same_session_slate,
+            )
+            if time.monotonic() - same_session_started >= SRT_IDLE_LOWER_BOUND_SECONDS:
+                raise TestFailure("same-session source was not resumed before SRT idle expiry")
+            recovery_started = time.monotonic()
+            os.kill(publisher.pid, signal.SIGCONT)
+            publisher_paused = False
+            same_session_live = wait_healthy_live(
+                "same-session LIVE recovery",
+                6,
+                not_before=recovery_started,
+                expected_ingest_ids=initial_ingest_ids,
+            )
+        finally:
+            if publisher_paused and publisher is not None and publisher.poll() is None:
+                os.kill(publisher.pid, signal.SIGCONT)
+        if publisher.poll() is not None or primary_helper.poll() is not None:
+            raise TestFailure("same-session recovery replaced the upstream processes")
+        if same_session_live["normalized_ids"] == previous_normalizer_ids:
+            raise TestFailure("same-session recovery did not replace the normalizer publisher")
+        same_session_samples = observer.samples_between(
+            same_session_started,
+            float(same_session_live["t"]),
+        )
+        same_session_no_growth = maximum_capture_no_growth_seconds(
+            same_session_samples
+        )
+        if same_session_no_growth > CAPTURE_NO_GROWTH_LIMIT_SECONDS:
+            raise TestFailure("downstream media stalled during same-session recovery")
+        result["same_session_stall"] = {
+            "srt_connection_preserved": True,
+            "upstream_processes_preserved": True,
+            "normalizer_reconnected": True,
+            "to_slate_seconds": round(
+                float(same_session_slate["t"]) - same_session_started,
+                3,
+            ),
+            "to_live_seconds": round(
+                float(same_session_live["t"]) - recovery_started,
+                3,
+            ),
+            "max_capture_no_growth_seconds": round(same_session_no_growth, 3),
+        }
+
+        print("  checking supervisor crash containment and automatic recovery", flush=True)
+        before_crash = wait_healthy_live(
+            "healthy LIVE before supervisor crash",
+            5,
+            expected_ingest_ids=initial_ingest_ids,
+        )
+        old_normalizer_ids = list(before_crash["normalized_ids"])
+        supervisor_ids = matching_process_ids(
+            (str(NORMALIZER).encode(), b"--sanitized-supervisor")
+        )
+        if len(supervisor_ids) != 1:
+            raise TestFailure("unable to identify exactly one normalizer supervisor")
+        old_supervisor_pid = supervisor_ids[0]
+        old_children = direct_child_process_ids(old_supervisor_pid)
+        if len(old_children) != 1:
+            raise TestFailure("normalizer supervisor does not own exactly one child")
+        old_child_pid = old_children[0]
+        old_child_command = Path(f"/proc/{old_child_pid}/cmdline").read_bytes()
+        if str(FFMPEG).encode() not in old_child_command or OUTPUT_PATH.encode() not in old_child_command:
+            raise TestFailure("normalizer child identity is invalid")
+        supervisor_crash_started = time.monotonic()
+        os.kill(old_supervisor_pid, signal.SIGKILL)
+        if not wait_process_exit(old_supervisor_pid, 1.0):
+            raise TestFailure("killed normalizer supervisor remained present")
+        if not wait_process_exit(old_child_pid, 1.0):
+            raise TestFailure("FFmpeg child survived its supervisor")
+        crash_slate = wait_slate_with_live_srt(
+            "supervisor-crash SLATE transition",
+            supervisor_crash_started,
+            initial_ingest_ids,
+        )
+        wait_slate_capture_growth(
+            "supervisor-crash SLATE capture growth",
+            crash_slate,
+        )
+        crash_recovery_started = time.monotonic()
+        crash_live = wait_healthy_live(
+            "supervisor-crash LIVE recovery",
+            SUPERVISOR_RESTART_TIMEOUT_SECONDS,
+            not_before=crash_recovery_started,
+            expected_ingest_ids=initial_ingest_ids,
+        )
+        if crash_live["normalized_ids"] == old_normalizer_ids:
+            raise TestFailure("supervisor crash reused the old normalizer connection")
+        replacement_supervisors = matching_process_ids(
+            (str(NORMALIZER).encode(), b"--sanitized-supervisor")
+        )
+        if len(replacement_supervisors) != 1 or replacement_supervisors[0] == old_supervisor_pid:
+            raise TestFailure("normalizer supervisor was not replaced cleanly")
+        crash_samples = observer.samples_between(
+            supervisor_crash_started,
+            float(crash_live["t"]),
+        )
+        crash_no_growth = maximum_capture_no_growth_seconds(crash_samples)
+        if crash_no_growth > CAPTURE_NO_GROWTH_LIMIT_SECONDS:
+            raise TestFailure("downstream media stalled during supervisor recovery")
+        result["supervisor_crash_recovery"] = {
+            "ffmpeg_parent_death_passed": True,
+            "srt_connection_preserved": True,
+            "downstream_connection_preserved": True,
+            "max_capture_no_growth_seconds": round(crash_no_growth, 3),
+        }
+
         print("[4/8] Running required outages: " + ", ".join(str(item) + "s" for item in durations), flush=True)
-        to_slate_times, to_live_times = [], []
+        to_slate_times, to_live_times, srt_idle_times = [], [], []
+        outage_capture_stalls = []
         for index, duration in enumerate(durations, start=1):
+            before_outage = wait_healthy_live(
+                f"healthy LIVE before outage {index}",
+                5,
+            )
+            outage_ingest_ids = list(before_outage["ingest_ids"])
+            if len(outage_ingest_ids) != 1:
+                raise TestFailure(f"outage {index} precondition lacks one SRT connection")
             outage_started = time.monotonic()
             mark_self_test_stage("outage-slate")
             stop_primary_srt_source(f"outage {index}")
-            observer.wait_state("ingest_live", False, 20)
-            observer.wait_state("live", False, 20)
             mark_self_test_stage("outage-normal")
-            observer.wait_state("normalized", False, 20)
-            to_slate = time.monotonic() - outage_started
+            detached = wait_slate_with_live_srt(
+                f"outage {index} SLATE transition",
+                outage_started,
+                outage_ingest_ids,
+            )
+            to_slate = float(detached["t"]) - outage_started
+            wait_slate_capture_growth(
+                f"outage {index} SLATE capture growth",
+                detached,
+            )
+            _srt_expired, srt_idle_elapsed = wait_srt_idle_expiry(
+                f"outage {index} SRT idle expiry",
+                outage_started,
+            )
             to_slate_times.append(round(to_slate, 3))
+            srt_idle_times.append(round(srt_idle_elapsed, 3))
             print(f"  outage {index}/3: SLATE active; total SRT outage target {duration}s", flush=True)
             mark_self_test_stage("outage-hold")
             while time.monotonic() - outage_started < duration:
                 sample = observer.snapshot()
                 if not all(sample.get(name) for name in ("dut_alive", "sink_alive", "reader_alive", "path_ready", "forward")):
                     raise TestFailure(f"continuity failed during outage {index}")
+                if sample.get("ingest_live") or sample.get("normalized") or sample.get("live"):
+                    raise TestFailure(f"LIVE state returned unexpectedly during outage {index}")
                 if sample.get("sink_ids") != [initial_sink_id]:
                     raise TestFailure(f"downstream RTMP identity changed during outage {index}")
                 remaining = duration - (time.monotonic() - outage_started)
                 if remaining <= 0:
                     break
                 time.sleep(min(1.0, remaining))
+            recovery_started = time.monotonic()
+            outage_samples = observer.samples_between(
+                float(detached["t"]),
+                recovery_started,
+            )
+            outage_no_growth = maximum_capture_no_growth_seconds(outage_samples)
+            if outage_no_growth > CAPTURE_NO_GROWTH_LIMIT_SECONDS:
+                raise TestFailure(f"downstream media stalled during outage {index}")
+            outage_capture_stalls.append(round(outage_no_growth, 3))
             mark_self_test_stage("outage-live")
             primary_helper = start_source_helper(
                 primary_config, f"primary-recovery-{index}", SOURCE_PRIMARY_METRICS_PORT
             )
             publisher = start_local_publisher(SOURCE_PRIMARY_RTMP_PORT)
             wait_helper_path(SOURCE_PRIMARY_METRICS_PORT)
-            to_live = observer.wait_state("live", True, 20)
+            recovered = wait_healthy_live(
+                f"outage {index} LIVE recovery",
+                20,
+                not_before=recovery_started,
+            )
+            to_live = float(recovered["t"]) - recovery_started
             to_live_times.append(round(to_live, 3))
             print(f"  outage {index}/3: LIVE restored", flush=True)
             time.sleep(3 if not args.quick else 1)
         result["live_to_slate_seconds"] = to_slate_times
         result["slate_to_live_seconds"] = to_live_times
+        result["srt_idle_expiry_seconds"] = srt_idle_times
+        result["outage_max_capture_no_growth_seconds"] = outage_capture_stalls
 
         mark_self_test_stage("continuity")
         print("[5/8] Checking uninterrupted downstream identity and capture growth", flush=True)
+        before_final = wait_healthy_live("healthy LIVE before final transition", 5)
+        final_ingest_ids = list(before_final["ingest_ids"])
+        if len(final_ingest_ids) != 1:
+            raise TestFailure("final transition precondition lacks one SRT connection")
+        final_started = time.monotonic()
         stop_primary_srt_source("final continuity transition")
-        observer.wait_state("ingest_live", False, 20)
-        observer.wait_state("live", False, 20)
-        observer.wait_state("normalized", False, 20)
+        final_slate = wait_slate_with_live_srt(
+            "final SLATE transition",
+            final_started,
+            final_ingest_ids,
+        )
+        wait_slate_capture_growth("final SLATE capture growth", final_slate)
+        _final_expired, final_srt_idle = wait_srt_idle_expiry(
+            "final SRT idle expiry",
+            final_started,
+        )
         time.sleep(1)
+        final_finished = time.monotonic()
         observer.finish()
         samples = observer.samples
+        final_samples = observer.samples_between(
+            float(final_slate["t"]),
+            final_finished,
+        )
+        final_no_growth = maximum_capture_no_growth_seconds(final_samples)
+        if final_no_growth > CAPTURE_NO_GROWTH_LIMIT_SECONDS:
+            raise TestFailure("downstream media stalled during final transition")
+        result["final_transition"] = {
+            "to_slate_seconds": round(float(final_slate["t"]) - final_started, 3),
+            "srt_idle_expiry_seconds": round(final_srt_idle, 3),
+            "max_capture_no_growth_seconds": round(final_no_growth, 3),
+        }
         result["observer_samples"] = len(samples)
         result["downstream_unique_rtmp_ids"] = sorted({item for sample in samples for item in sample["sink_ids"]})
         result["downstream_missing_samples"] = sum(1 for sample in samples if sample["sink_ids"] != [initial_sink_id])
@@ -1888,7 +2291,9 @@ def main() -> int:
         result["decoded_audio_timestamps"] = analyze_decoded_audio_timestamps(capture)
         result["timestamps"] = analyze_timestamps(capture)
         decoded_audio = result["decoded_audio_timestamps"]
-        max_bounded_audio_backward_steps = 2 * len(durations) + 2
+        # Two switch pairs are added by the same-session and supervisor-crash
+        # resilience checks; the per-transition allowance itself is unchanged.
+        max_bounded_audio_backward_steps = 2 * len(durations) + 6
         bounded_splice_jitter_passed = (
             result["timestamps"]["dts_within_tolerance"]
             and result["timestamps"]["negative_dts_steps"].get(0, 0) == 0

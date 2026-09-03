@@ -14,6 +14,8 @@ import tempfile
 import types
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+
 if os.name != "posix":
     account = types.SimpleNamespace(pw_uid=0, pw_gid=0)
     sys.modules.setdefault("grp", types.SimpleNamespace(getgrnam=lambda _name: account))
@@ -45,10 +47,16 @@ def load_normalizer():
 def assert_normalizer_contract(normalizer) -> None:
     argv = normalizer.build_ffmpeg_argv(18554, 11936)
     joined = " ".join(argv)
+    input_index = argv.index("-i")
     assert argv[0] == "/usr/bin/ffmpeg"
     assert "rtsp://127.0.0.1:18554/iphone-live" in argv
     assert "rtmp://127.0.0.1:11936/relay-output" in argv
+    assert argv[argv.index("-rw_timeout") + 1] == "100000"
+    assert argv[argv.index("-timeout") + 1] == "100000"
+    assert argv.index("-rw_timeout") < input_index
+    assert argv.index("-timeout") < input_index
     assert argv[argv.index("-c:v") + 1] == "copy"
+    assert "-copyinkf" not in argv
     assert argv[argv.index("-c:a") + 1] == "aac"
     assert argv[argv.index("-profile:a") + 1] == "aac_low"
     assert argv[argv.index("-af") + 1] == "aresample=48000:async=1:first_pts=0"
@@ -58,6 +66,68 @@ def assert_normalizer_contract(normalizer) -> None:
     assert "-nostats" in argv
     assert "rtmps://" not in joined
     assert "passphrase=" not in joined
+
+    metric = 'paths_inbound_bytes{state="ready",name="iphone-live"} 123456\n'
+    assert normalizer.parse_inbound_bytes(metric) == 123456
+    assert normalizer.parse_inbound_bytes(metric + metric) is None
+    assert (
+        normalizer.parse_inbound_bytes('paths_inbound_bytes{name="other",state="ready"} 123456\n')
+        is None
+    )
+    output_metric = (
+        'rtmp_conns_inbound_bytes{state="publish",path="relay-output",'
+        'remoteAddr="127.0.0.1:54321",id="normalizer-id"} 456789\n'
+    )
+    assert normalizer.parse_output_sample(output_metric) == (
+        "normalizer-id",
+        456789,
+    )
+    assert normalizer.parse_output_sample(output_metric + output_metric) is None
+    assert (
+        normalizer.parse_output_sample(output_metric.replace('path="relay-output"', 'path="other"'))
+        is None
+    )
+    assert (
+        normalizer.parse_output_sample(
+            output_metric.replace("127.0.0.1:54321", "203.0.113.10:54321")
+        )
+        is None
+    )
+
+    gate = normalizer.GrowthGate()
+    assert gate.observe(100) is False
+    assert gate.observe(110) is False
+    assert gate.observe(120) is True
+    gate.reset()
+    assert gate.observe(120) is False
+    assert gate.observe(120) is False
+
+    output_gate = normalizer.OutputGrowthGate()
+    assert output_gate.observe(("connection-a", 100)) is False
+    assert output_gate.observe(("connection-a", 110)) is False
+    assert output_gate.observe(("connection-a", 120)) is True
+    assert output_gate.observe(("connection-b", 130)) is False
+
+    watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
+    assert watchdog.observe(True, ("connection-a", 121), 1.09) is True
+    assert watchdog.observe(True, ("connection-a", 121), 1.18) is True
+    assert watchdog.observe(True, ("connection-a", 121), 1.191) is False
+    watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
+    assert watchdog.observe(False, None, 1.149) is True
+    assert watchdog.observe(False, None, 1.151) is False
+    watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
+    assert watchdog.observe(True, ("connection-b", 121), 1.01) is False
+    assert hasattr(normalizer, "make_parent_death_setup")
+
+    environment = normalizer.sanitized_environment(18554, 11936, 19998)
+    assert environment == {
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "MOBLIN_RELAY_INTERNAL_RTSP_PORT": "18554",
+        "MOBLIN_RELAY_INTERNAL_RTMP_PORT": "11936",
+        "MOBLIN_RELAY_INTERNAL_METRICS_PORT": "19998",
+    }
 
 
 def assert_preview_contract(renderer) -> None:

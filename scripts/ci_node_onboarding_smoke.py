@@ -566,6 +566,13 @@ result = json.loads(
 assert result['status'] == 'PASS'
 assert result['mode'] == 'quick'
 assert result['outage_targets_seconds'] == [15, 17, 19]
+assert result['same_session_stall']['srt_connection_preserved'] is True
+assert result['same_session_stall']['normalizer_reconnected'] is True
+assert result['supervisor_crash_recovery']['ffmpeg_parent_death_passed'] is True
+assert result['supervisor_crash_recovery']['srt_connection_preserved'] is True
+assert len(result['srt_idle_expiry_seconds']) == 3
+assert all(8.0 <= value <= 13.0 for value in result['srt_idle_expiry_seconds'])
+assert all(value <= 1.0 for value in result['outage_max_capture_no_growth_seconds'])
 PY
 for spec in 'moblin-relay|/var/lib/moblin-relay' \
   'restream-agent|/var/lib/adojapan-relay-agent'; do
