@@ -48,6 +48,12 @@ def test_native_safe_failure_code_is_allowlisted() -> None:
         "relay_self_test_timestamp_audio_pts_failed",
         "relay_self_test_timestamp_gaps_failed",
         "relay_self_test_timestamp_av_sync_failed",
+        "relay_self_test_auth_exclusivity_core_failed",
+        "relay_self_test_auth_exclusivity_candidate_failed",
+        "relay_self_test_auth_exclusivity_primary_failed",
+        "relay_self_test_auth_exclusivity_continuity_failed",
+        "relay_self_test_auth_exclusivity_observability_failed",
+        "relay_self_test_auth_exclusivity_proof_failed",
     ):
         assert safe_bootstrap_diagnostic_code({"safe_error": {"code": code}}) == code
 

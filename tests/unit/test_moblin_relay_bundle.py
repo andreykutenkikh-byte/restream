@@ -263,6 +263,12 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         "auth-source",
         "auth-scan",
         "auth-exclusive",
+        "auth-x-core",
+        "auth-x-second",
+        "auth-x-primary",
+        "auth-x-flow",
+        "auth-x-blind",
+        "auth-x-attempt",
         "live-ingest",
         "live-normalize",
         "norm-hook",
@@ -407,6 +413,164 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     assert '"capture decoder validation failed",' in source
     assert '"capture frame validation failed",' in source
     assert '"capture timestamp validation failed",' in source
+
+
+def test_self_test_publisher_exclusivity_uses_server_proof_and_stable_ids() -> None:
+    loaded = load_self_test()
+    prove = loaded["publisher_exclusivity_proved"]
+    outbound_bytes = loaded["helper_forward_outbound_bytes"]
+    assert callable(prove)
+    assert callable(outbound_bytes)
+    stable_sample = {
+        "live": True,
+        "ingest_ids": ["primary-ingest"],
+        "normalized_ids": ["primary-normalizer"],
+        "sink_ids": ["downstream"],
+        "ingest_bytes": 120,
+    }
+
+    assert prove(
+        [stable_sample],
+        ["primary-ingest"],
+        ["primary-normalizer"],
+        "downstream",
+        100,
+        4096,
+        True,
+    )
+    assert not prove(
+        [stable_sample],
+        ["primary-ingest"],
+        ["primary-normalizer"],
+        "downstream",
+        100,
+        0,
+        True,
+    )
+    assert not prove(
+        [stable_sample],
+        ["primary-ingest"],
+        ["primary-normalizer"],
+        "downstream",
+        100,
+        4096,
+        False,
+    )
+
+    for field, replacement in (
+        ("ingest_ids", ["replacement-ingest"]),
+        ("normalized_ids", ["replacement-normalizer"]),
+        ("sink_ids", ["replacement-downstream"]),
+        ("live", False),
+        ("ingest_bytes", 100),
+    ):
+        changed = dict(stable_sample)
+        changed[field] = replacement
+        assert not prove(
+            [changed],
+            ["primary-ingest"],
+            ["primary-normalizer"],
+            "downstream",
+            100,
+            4096,
+            True,
+        )
+
+    metrics = (
+        "# Forward destinations\n"
+        'forward_dests{path="source/live",protocol="srt",'
+        'state="forwarding"} 1\n'
+        'forward_dests_outbound_bytes{path="source/live",protocol="srt",'
+        'state="forwarding"} 8192\n'
+    )
+    with patch.dict(outbound_bytes.__globals__, {"fetch_metrics": lambda _port: metrics}):
+        assert outbound_bytes(31998) == 8192
+    error_metrics = metrics.replace('state="forwarding"', 'state="error"').replace("8192", "16384")
+    with patch.dict(outbound_bytes.__globals__, {"fetch_metrics": lambda _port: error_metrics}):
+        assert outbound_bytes(31998) == 16384
+    wrong_path_metrics = metrics.replace('path="source/live"', 'path="other"')
+    with patch.dict(
+        outbound_bytes.__globals__, {"fetch_metrics": lambda _port: wrong_path_metrics}
+    ):
+        assert outbound_bytes(31998) is None
+
+
+def test_self_test_dut_log_marker_is_scoped_to_appended_tail(tmp_path: Path) -> None:
+    loaded = load_self_test()
+    open_tail = loaded["open_validated_log_tail"]
+    contains_marker = loaded["log_tail_contains_marker"]
+    failure = loaded["TestFailure"]
+    marker = loaded["DUPLICATE_PUBLISHER_LOG_MARKER"]
+    maximum_tail = loaded["MAX_REJECTION_LOG_TAIL_BYTES"]
+    assert callable(open_tail)
+    assert callable(contains_marker)
+    assert marker == b"someone is already publishing to path 'iphone-live'"
+    log_path = tmp_path / "dut.log"
+    other_path = tmp_path / "other.log"
+    expected_uid = getattr(os, "geteuid", lambda: 0)()
+
+    with (
+        log_path.open("w+b") as writer,
+        other_path.open("w+b") as other,
+        patch.dict(open_tail.__globals__, {"validate_workdir": lambda path: path.resolve()}),
+    ):
+        writer.write(marker + b"\n")
+        writer.flush()
+        descriptor, offset = open_tail(log_path, writer.fileno(), tmp_path, expected_uid)
+        try:
+            assert not contains_marker(descriptor, offset, marker, expected_uid)
+            writer.write(b"prefix " + marker + b" suffix\n")
+            writer.flush()
+            assert contains_marker(descriptor, offset, marker, expected_uid)
+        finally:
+            os.close(descriptor)
+
+        with pytest.raises(failure):
+            open_tail(log_path, other.fileno(), tmp_path, expected_uid)
+
+        descriptor, offset = open_tail(log_path, writer.fileno(), tmp_path, expected_uid)
+        try:
+            writer.truncate(0)
+            writer.flush()
+            with pytest.raises(failure, match="DUT log changed"):
+                contains_marker(descriptor, offset, marker, expected_uid)
+        finally:
+            os.close(descriptor)
+
+        descriptor, offset = open_tail(log_path, writer.fileno(), tmp_path, expected_uid)
+        try:
+            writer.truncate(maximum_tail + 1)
+            writer.flush()
+            with pytest.raises(failure, match="bounded inspection size"):
+                contains_marker(descriptor, offset, marker, expected_uid)
+        finally:
+            os.close(descriptor)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symbolic-link semantics only")
+def test_self_test_dut_log_reader_rejects_symlink(tmp_path: Path) -> None:
+    loaded = load_self_test()
+    open_tail = loaded["open_validated_log_tail"]
+    failure = loaded["TestFailure"]
+    assert callable(open_tail)
+    target = tmp_path / "target.log"
+    link = tmp_path / "dut.log"
+    expected_uid = os.geteuid()
+    with target.open("w+b") as writer:
+        link.symlink_to(target)
+        with (
+            patch.dict(open_tail.__globals__, {"validate_workdir": lambda path: path.resolve()}),
+            pytest.raises(failure),
+        ):
+            open_tail(link, writer.fileno(), tmp_path, expected_uid)
+        link.unlink()
+        hardlink = tmp_path / "hardlink.log"
+        os.link(target, hardlink)
+        with (
+            patch.dict(open_tail.__globals__, {"validate_workdir": lambda path: path.resolve()}),
+            pytest.raises(failure),
+        ):
+            open_tail(target, writer.fileno(), tmp_path, expected_uid)
 
 
 def test_self_test_distinguishes_unknown_metrics_from_media_outage() -> None:

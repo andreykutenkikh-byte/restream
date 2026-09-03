@@ -63,6 +63,12 @@ SELF_TEST_STAGES = frozenset(
         "auth-source",
         "auth-scan",
         "auth-exclusive",
+        "auth-x-core",
+        "auth-x-second",
+        "auth-x-primary",
+        "auth-x-flow",
+        "auth-x-blind",
+        "auth-x-attempt",
         "live-ingest",
         "live-normalize",
         "norm-hook",
@@ -130,6 +136,10 @@ CAPTURE_NO_GROWTH_LIMIT_SECONDS = 1.0
 CAPTURE_SAMPLE_INTERVAL_SECONDS = 0.1
 METRICS_BLIND_LIMIT_SECONDS = 3.0
 SUPERVISOR_RESTART_TIMEOUT_SECONDS = 12.0
+MAX_REJECTION_LOG_TAIL_BYTES = 1024 * 1024
+DUPLICATE_PUBLISHER_LOG_MARKER = (
+    f"someone is already publishing to path '{INGEST_PATH}'".encode("ascii")
+)
 
 
 class TestFailure(RuntimeError):
@@ -1235,6 +1245,140 @@ def helper_forward_error(metrics_port: int) -> bool:
     )
 
 
+def helper_forward_outbound_bytes(metrics_port: int) -> int | None:
+    try:
+        metrics = fetch_metrics(metrics_port)
+    except OSError:
+        return None
+    counters = [
+        int(value)
+        for labels, value in parse_metrics(metrics, "forward_dests_outbound_bytes")
+        if labels.get("path") == SOURCE_PATH
+        and labels.get("protocol") == "srt"
+        and labels.get("state") in ("forwarding", "error")
+        and value >= 0
+        and value.is_integer()
+    ]
+    return counters[0] if len(counters) == 1 else None
+
+
+def open_validated_log_tail(
+    path: Path,
+    writer_descriptor: int,
+    work: Path,
+    expected_uid: int,
+) -> tuple[int, int]:
+    work_resolved = validate_workdir(work)
+    path_metadata = os.lstat(path)
+    if (
+        not stat.S_ISREG(path_metadata.st_mode)
+        or stat.S_ISLNK(path_metadata.st_mode)
+        or path_metadata.st_uid != expected_uid
+        or path_metadata.st_nlink != 1
+        or path.resolve(strict=True).parent != work_resolved
+    ):
+        raise TestFailure("unsafe DUT log path")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        writer_metadata = os.fstat(writer_descriptor)
+        reader_metadata = os.fstat(descriptor)
+        identity = (path_metadata.st_dev, path_metadata.st_ino)
+        if (
+            not stat.S_ISREG(writer_metadata.st_mode)
+            or not stat.S_ISREG(reader_metadata.st_mode)
+            or writer_metadata.st_uid != expected_uid
+            or reader_metadata.st_uid != expected_uid
+            or writer_metadata.st_nlink != 1
+            or reader_metadata.st_nlink != 1
+            or identity != (writer_metadata.st_dev, writer_metadata.st_ino)
+            or identity != (reader_metadata.st_dev, reader_metadata.st_ino)
+        ):
+            raise TestFailure("DUT log reader does not match its writer")
+        return descriptor, reader_metadata.st_size
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def log_tail_contains_marker(
+    descriptor: int,
+    offset: int,
+    marker: bytes,
+    expected_uid: int,
+) -> bool:
+    if offset < 0 or not marker or len(marker) > 256:
+        raise TestFailure("invalid DUT log marker request")
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != expected_uid
+        or metadata.st_nlink != 1
+        or metadata.st_size < offset
+    ):
+        raise TestFailure("DUT log changed during publisher exclusivity check")
+    tail_size = metadata.st_size - offset
+    if tail_size > MAX_REJECTION_LOG_TAIL_BYTES:
+        raise TestFailure("DUT log tail exceeded its bounded inspection size")
+    os.lseek(descriptor, offset, os.SEEK_SET)
+    remaining = tail_size
+    chunks: list[bytes] = []
+    while remaining:
+        chunk = os.read(descriptor, min(remaining, 64 * 1024))
+        if not chunk:
+            raise TestFailure("DUT log tail could not be read completely")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return marker in b"".join(chunks)
+
+
+def publisher_exclusivity_sample_valid(
+    sample: dict,
+    initial_ingest_ids: list[str],
+    initial_normalized_ids: list[str],
+    initial_sink_id: str,
+    initial_ingest_bytes: int,
+) -> bool:
+    ingest_bytes = sample.get("ingest_bytes")
+    return bool(
+        sample.get("live")
+        and sample.get("ingest_ids") == initial_ingest_ids
+        and sample.get("normalized_ids") == initial_normalized_ids
+        and sample.get("sink_ids") == [initial_sink_id]
+        and type(ingest_bytes) is int
+        and ingest_bytes >= initial_ingest_bytes
+    )
+
+
+def publisher_exclusivity_proved(
+    samples: list[dict],
+    initial_ingest_ids: list[str],
+    initial_normalized_ids: list[str],
+    initial_sink_id: str,
+    initial_ingest_bytes: int,
+    second_outbound_bytes: int,
+    server_rejection_seen: bool,
+) -> bool:
+    return bool(
+        samples
+        and second_outbound_bytes > 0
+        and server_rejection_seen
+        and all(
+            publisher_exclusivity_sample_valid(
+                sample,
+                initial_ingest_ids,
+                initial_normalized_ids,
+                initial_sink_id,
+                initial_ingest_bytes,
+            )
+            for sample in samples
+        )
+        and max(int(sample["ingest_bytes"]) for sample in samples) > initial_ingest_bytes
+    )
+
+
 def wait_helper_path(metrics_port: int, timeout: float = 15.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -1793,7 +1937,8 @@ def main() -> int:
         secret_configs.add(dut_config)
         authorized_configs.add(dut_config)
         sink_log = (work / "sink.log").open("wb")
-        dut_log = (work / "dut.log").open("wb")
+        dut_log_path = work / "dut.log"
+        dut_log = dut_log_path.open("wb")
         reader_log = (work / "reader.log").open("wb")
         log_handles.extend((sink_log, dut_log, reader_log))
 
@@ -2144,6 +2289,12 @@ def main() -> int:
         initial_ingest_ids = list(initial_live["ingest_ids"])
         if len(initial_ingest_ids) != 1:
             raise TestFailure("initial LIVE did not expose exactly one SRT connection")
+        initial_normalized_ids = list(initial_live["normalized_ids"])
+        if len(initial_normalized_ids) != 1:
+            raise TestFailure("initial LIVE did not expose exactly one normalizer")
+        initial_ingest_bytes = initial_live.get("ingest_bytes")
+        if type(initial_ingest_bytes) is not int:
+            raise TestFailure("initial LIVE did not expose its SRT byte counter")
         result["initial_slate_to_live_seconds"] = round(
             float(initial_live["t"]) - initial_live_started,
             3,
@@ -2170,59 +2321,131 @@ def main() -> int:
         secret_configs.add(second_config)
         authorized_configs.add(second_config)
         second_helper = start_source_helper(second_config, "second", SOURCE_AUX_METRICS_PORT)
-        second = start_local_publisher(SOURCE_AUX_RTMP_PORT)
-        second_started = time.monotonic()
+        second = None
+        rejection_log_descriptor = None
         try:
+            rejection_log_descriptor, rejection_log_offset = open_validated_log_tail(
+                dut_log_path,
+                dut_log.fileno(),
+                work,
+                0,
+            )
+            second_started = time.monotonic()
+            second = start_local_publisher(SOURCE_AUX_RTMP_PORT)
             wait_helper_path(SOURCE_AUX_METRICS_PORT)
             second_error_seen = False
+            second_outbound_bytes = 0
+            server_rejection_seen = False
             deadline = time.monotonic() + 12
             while time.monotonic() < deadline:
                 second_error_seen = second_error_seen or helper_forward_error(SOURCE_AUX_METRICS_PORT)
-                sample = observer.checked_snapshot("second-publisher test")
+                observed_outbound_bytes = helper_forward_outbound_bytes(SOURCE_AUX_METRICS_PORT)
+                if observed_outbound_bytes is not None:
+                    second_outbound_bytes = max(second_outbound_bytes, observed_outbound_bytes)
+                server_rejection_seen = server_rejection_seen or log_tail_contains_marker(
+                    rejection_log_descriptor,
+                    rejection_log_offset,
+                    DUPLICATE_PUBLISHER_LOG_MARKER,
+                    0,
+                )
+                try:
+                    sample = observer.checked_snapshot("second-publisher test")
+                except TestFailure:
+                    mark_self_test_stage("auth-x-blind")
+                    raise
                 if sample and not all(
                     sample.get(name) for name in ("dut_alive", "sink_alive", "reader_alive")
                 ):
+                    mark_self_test_stage("auth-x-core")
                     raise TestFailure("a core process exited during second-publisher test")
                 if second.poll() is not None or second_helper.poll() is not None:
+                    mark_self_test_stage("auth-x-second")
                     raise TestFailure("second local source path exited before DUT rejection was verified")
                 if publisher.poll() is not None or primary_helper.poll() is not None:
+                    mark_self_test_stage("auth-x-primary")
                     raise TestFailure("primary source path exited during second-publisher test")
                 if not complete_metrics_sample(sample):
                     time.sleep(0.1)
                     continue
-                if not sample.get("live") or sample.get("sink_ids") != [initial_sink_id]:
+                if not publisher_exclusivity_sample_valid(
+                    sample,
+                    initial_ingest_ids,
+                    initial_normalized_ids,
+                    initial_sink_id,
+                    initial_ingest_bytes,
+                ):
+                    mark_self_test_stage("auth-x-flow")
                     raise TestFailure("second SRT publisher disrupted the primary publisher")
                 time.sleep(0.1)
+            final_outbound_bytes = helper_forward_outbound_bytes(SOURCE_AUX_METRICS_PORT)
+            if final_outbound_bytes is not None:
+                second_outbound_bytes = max(second_outbound_bytes, final_outbound_bytes)
+            server_rejection_seen = server_rejection_seen or log_tail_contains_marker(
+                rejection_log_descriptor,
+                rejection_log_offset,
+                DUPLICATE_PUBLISHER_LOG_MARKER,
+                0,
+            )
+            if any(process.poll() is not None for process in (dut, sink, reader)):
+                mark_self_test_stage("auth-x-core")
+                raise TestFailure("a core process exited at the end of second-publisher test")
+            if second.poll() is not None or second_helper.poll() is not None:
+                mark_self_test_stage("auth-x-second")
+                raise TestFailure("second local source path exited at the end of its test")
+            if publisher.poll() is not None or primary_helper.poll() is not None:
+                mark_self_test_stage("auth-x-primary")
+                raise TestFailure("primary source path exited at the end of second-publisher test")
             second_finished = time.monotonic()
             second_observed_interval = observer.samples_between(
                 second_started, second_finished
             )
+            mark_self_test_stage("auth-x-blind")
             require_metrics_coverage(
                 second_observed_interval,
                 second_started,
                 second_finished,
                 "second-publisher test",
             )
+            mark_self_test_stage("auth-exclusive")
             second_interval = [
                 sample
                 for sample in second_observed_interval
                 if complete_metrics_sample(sample)
             ]
             result["second_publisher_observer_samples"] = len(second_interval)
-            result["second_publisher_rejected"] = (
-                bool(second_interval)
-                and all(sample.get("live") for sample in second_interval)
-                and all(sample.get("sink_ids") == [initial_sink_id] for sample in second_interval)
-                and second_error_seen
+            result["second_publisher_client_error_seen"] = second_error_seen
+            result["second_publisher_attempted"] = second_outbound_bytes > 0
+            result["second_publisher_server_rejection_seen"] = server_rejection_seen
+            result["second_publisher_primary_ingest_progress"] = any(
+                type(sample.get("ingest_bytes")) is int
+                and sample["ingest_bytes"] > initial_ingest_bytes
+                for sample in second_interval
+            )
+            result["second_publisher_rejected"] = publisher_exclusivity_proved(
+                second_interval,
+                initial_ingest_ids,
+                initial_normalized_ids,
+                initial_sink_id,
+                initial_ingest_bytes,
+                second_outbound_bytes,
+                server_rejection_seen,
             )
         finally:
             safe_stop(second, force=True)
             safe_stop(second_helper)
+            if rejection_log_descriptor is not None:
+                os.close(rejection_log_descriptor)
             wait_ports_released((
                 ("tcp", SOURCE_AUX_RTMP_PORT),
                 ("tcp", SOURCE_AUX_METRICS_PORT),
             ))
         if not result["second_publisher_rejected"]:
+            if not result["second_publisher_attempted"] or not result[
+                "second_publisher_server_rejection_seen"
+            ]:
+                mark_self_test_stage("auth-x-attempt")
+            else:
+                mark_self_test_stage("auth-x-flow")
             raise TestFailure("second publisher rejection failed")
 
         mark_self_test_stage("outages")

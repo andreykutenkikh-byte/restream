@@ -149,6 +149,24 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_auth_exclusivity_failed": (
             "Запрет второго SRT-издателя не прошёл самопроверку."
         ),
+        "relay_self_test_auth_exclusivity_core_failed": (
+            "Основной медиатракт остановился во время проверки второго SRT-издателя."
+        ),
+        "relay_self_test_auth_exclusivity_candidate_failed": (
+            "Тестовый второй SRT-источник завершился до проверки серверного отказа."
+        ),
+        "relay_self_test_auth_exclusivity_primary_failed": (
+            "Основной SRT-источник остановился во время проверки эксклюзивности."
+        ),
+        "relay_self_test_auth_exclusivity_continuity_failed": (
+            "Второй SRT-издатель нарушил непрерывность основного медиатракта."
+        ),
+        "relay_self_test_auth_exclusivity_observability_failed": (
+            "Метрики стали недоступны во время проверки второго SRT-издателя."
+        ),
+        "relay_self_test_auth_exclusivity_proof_failed": (
+            "Серверный отказ второго SRT-издателя не был подтверждён."
+        ),
         "relay_self_test_live_ingest_failed": (
             "Тестовый зашифрованный SRT-поток не был принят сервером."
         ),
