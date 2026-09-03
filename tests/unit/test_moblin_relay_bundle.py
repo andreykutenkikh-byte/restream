@@ -562,6 +562,50 @@ def test_self_test_publisher_exclusivity_uses_server_proof_and_stable_ids() -> N
         True,
     )
 
+    fresh_baseline = dict(stable_sample, ingest_bytes=500)
+    assert not prove(
+        [fresh_baseline],
+        ["primary-ingest"],
+        ["primary-normalizer"],
+        "downstream",
+        500,
+        4096,
+        True,
+    )
+    assert prove(
+        [dict(fresh_baseline, ingest_bytes=501)],
+        ["primary-ingest"],
+        ["primary-normalizer"],
+        "downstream",
+        500,
+        4096,
+        True,
+    )
+    rebased_attack = dict(
+        fresh_baseline,
+        normalized_ids=["replacement-before-challenge"],
+        ingest_bytes=501,
+    )
+    assert prove(
+        [rebased_attack],
+        ["primary-ingest"],
+        ["replacement-before-challenge"],
+        "downstream",
+        500,
+        4096,
+        True,
+    )
+    assert (
+        problem(
+            dict(rebased_attack, normalized_ids=["primary-normalizer"]),
+            ["primary-ingest"],
+            ["replacement-before-challenge"],
+            "downstream",
+            500,
+        )
+        == "auth-x-norm"
+    )
+
     metrics = (
         "# Forward destinations\n"
         'forward_dests{path="source/live",protocol="srt",'
@@ -579,6 +623,37 @@ def test_self_test_publisher_exclusivity_uses_server_proof_and_stable_ids() -> N
         outbound_bytes.__globals__, {"fetch_metrics": lambda _port: wrong_path_metrics}
     ):
         assert outbound_bytes(31998) is None
+
+
+def test_self_test_refreshes_exclusivity_baseline_immediately_before_challenge() -> None:
+    source = SELF_TEST.read_text(encoding="utf-8")
+    block = source.split('mark_self_test_stage("auth-exclusive")', 1)[1].split(
+        'mark_self_test_stage("outages")', 1
+    )[0]
+
+    scan = 'result["secret_scan_while_live"] = scan_for_markers('
+    helper = 'second_helper = start_source_helper(second_config, "second"'
+    baseline = "exclusivity_baseline = wait_healthy_live("
+    log_tail = "rejection_log_descriptor, rejection_log_offset = open_validated_log_tail("
+    challenge = "second_started = time.monotonic()"
+    publisher = "second = start_local_publisher(SOURCE_AUX_RTMP_PORT)"
+    assert source.index(scan) < source.index(helper)
+    assert (
+        block.index(helper)
+        < block.index(baseline)
+        < block.index(log_tail)
+        < block.index(challenge)
+        < block.index(publisher)
+    )
+    assert '"healthy LIVE before second-publisher challenge"' in block
+    assert "expected_ingest_ids=initial_ingest_ids" in block
+
+    challenged = block.split(challenge, 1)[1]
+    assert "initial_normalized_ids" not in challenged
+    assert "initial_ingest_bytes" not in challenged
+    assert "exclusivity_normalized_ids" in challenged
+    assert "exclusivity_ingest_bytes" in challenged
+    assert 'sample["ingest_bytes"] > exclusivity_ingest_bytes' in challenged
 
 
 def test_self_test_dut_log_marker_is_scoped_to_appended_tail(tmp_path: Path) -> None:

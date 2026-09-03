@@ -2337,11 +2337,9 @@ def main() -> int:
         initial_ingest_ids = list(initial_live["ingest_ids"])
         if len(initial_ingest_ids) != 1:
             raise TestFailure("initial LIVE did not expose exactly one SRT connection")
-        initial_normalized_ids = list(initial_live["normalized_ids"])
-        if len(initial_normalized_ids) != 1:
+        if len(initial_live["normalized_ids"]) != 1:
             raise TestFailure("initial LIVE did not expose exactly one normalizer")
-        initial_ingest_bytes = initial_live.get("ingest_bytes")
-        if type(initial_ingest_bytes) is not int:
+        if type(initial_live.get("ingest_bytes")) is not int:
             raise TestFailure("initial LIVE did not expose its SRT byte counter")
         result["initial_slate_to_live_seconds"] = round(
             float(initial_live["t"]) - initial_live_started,
@@ -2372,6 +2370,16 @@ def main() -> int:
         second = None
         rejection_log_descriptor = None
         try:
+            exclusivity_baseline = wait_healthy_live(
+                "healthy LIVE before second-publisher challenge",
+                5,
+                expected_ingest_ids=initial_ingest_ids,
+            )
+            exclusivity_ingest_ids = list(exclusivity_baseline["ingest_ids"])
+            exclusivity_normalized_ids = list(exclusivity_baseline["normalized_ids"])
+            exclusivity_ingest_bytes = exclusivity_baseline.get("ingest_bytes")
+            if type(exclusivity_ingest_bytes) is not int:
+                raise TestFailure("publisher-exclusivity baseline lacks its SRT byte counter")
             rejection_log_descriptor, rejection_log_offset = open_validated_log_tail(
                 dut_log_path,
                 dut_log.fileno(),
@@ -2417,10 +2425,10 @@ def main() -> int:
                     continue
                 sample_problem = publisher_exclusivity_sample_problem(
                     sample,
-                    initial_ingest_ids,
-                    initial_normalized_ids,
+                    exclusivity_ingest_ids,
+                    exclusivity_normalized_ids,
                     initial_sink_id,
-                    initial_ingest_bytes,
+                    exclusivity_ingest_bytes,
                 )
                 if sample_problem:
                     mark_self_test_stage(sample_problem)
@@ -2467,15 +2475,15 @@ def main() -> int:
             result["second_publisher_server_rejection_seen"] = server_rejection_seen
             result["second_publisher_primary_ingest_progress"] = any(
                 type(sample.get("ingest_bytes")) is int
-                and sample["ingest_bytes"] > initial_ingest_bytes
+                and sample["ingest_bytes"] > exclusivity_ingest_bytes
                 for sample in second_interval
             )
             result["second_publisher_rejected"] = publisher_exclusivity_proved(
                 second_interval,
-                initial_ingest_ids,
-                initial_normalized_ids,
+                exclusivity_ingest_ids,
+                exclusivity_normalized_ids,
                 initial_sink_id,
-                initial_ingest_bytes,
+                exclusivity_ingest_bytes,
                 second_outbound_bytes,
                 server_rejection_seen,
             )
@@ -2498,10 +2506,10 @@ def main() -> int:
                 for sample in second_interval:
                     interval_problem = publisher_exclusivity_sample_problem(
                         sample,
-                        initial_ingest_ids,
-                        initial_normalized_ids,
+                        exclusivity_ingest_ids,
+                        exclusivity_normalized_ids,
                         initial_sink_id,
-                        initial_ingest_bytes,
+                        exclusivity_ingest_bytes,
                     )
                     if interval_problem:
                         break
