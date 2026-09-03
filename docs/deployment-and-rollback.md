@@ -451,6 +451,10 @@ Restore only the dedicated reverse-proxy site backup and safely reload the exist
 database rollback is explicitly approved, keep the backend stopped and restore only a selected
 project backup through a one-off container that mounts the project's named volumes:
 
+The same-host backup used here is rollback input only. It must never be presented as recovery from
+loss of the VPS; that requires the encrypted off-server set in
+[Disaster recovery](disaster-recovery.md).
+
 ```bash
 docker compose -p adojapan-restream --env-file .env \
   -f compose.yml -f compose.production.yml run --rm --no-deps backend \

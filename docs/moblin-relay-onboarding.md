@@ -91,6 +91,15 @@ Relay commands are rejected while the same node has an active bootstrap job. The
 relay heartbeat completes the control-plane connection, after which the fixed final check verifies
 the service states and protected files.
 
+## Recovering a lost relay VPS
+
+Git restores the relay software, installer, service definitions, and tests; it does not restore the
+generated credentials of a lost relay host. The supported default recovery is to revoke the missing
+node in the panel, bootstrap a fresh supported VPS, configure YouTube again, and replace the SRT URL
+in Moblin with the newly generated value. Do not copy `node.token` to a second host while the old
+host can still run. Exact credential continuity is an optional encrypted disaster-recovery workflow,
+not part of ordinary onboarding; see [Disaster recovery](disaster-recovery.md).
+
 ## Release verification
 
 Before enabling this path in production, run the Python, frontend, lint, type, repository-policy,

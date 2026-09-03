@@ -229,6 +229,7 @@ or manual relabel command.
 - [Legacy generic Node Agent onboarding](docs/node-onboarding.md)
 - [Node Agent protocol v1](docs/node-agent-protocol.md)
 - [Bootstrap security boundaries](docs/node-bootstrap-security.md)
+- [Disaster recovery boundary](docs/disaster-recovery.md)
 
 Legacy Stage 4A generic Docker nodes remain control-plane groundwork only: they do not receive real
 video, publish to YouTube, or hot-switch streams. Existing and newly installed native Moblin relays
@@ -381,8 +382,15 @@ files per container.
 
 ## Backup and restore
 
-The application does not schedule production backups. To create a consistent, bounded
-project-only SQLite backup from the running backend and its named database volume:
+**This is an operational rollback backup, not disaster recovery.** The command below writes to a
+Compose volume on the same host. Loss of that VPS or its storage can destroy both the live database
+and every one of these copies. Never commit `.env`, SQLite backups, relay credentials, or encrypted
+command payloads to this public repository. A recoverable production installation requires a
+separately configured encrypted off-server backup; see
+[`docs/disaster-recovery.md`](docs/disaster-recovery.md).
+
+The application does not schedule production backups. To create a consistent, bounded project-only
+SQLite backup from the running backend and its named database volume:
 
 ```bash
 docker compose -p adojapan-restream --env-file .env \
@@ -505,6 +513,7 @@ in the production audit.
 - [Legacy Node Agent onboarding and remote rollback](docs/node-onboarding.md)
 - [Node Agent protocol v1](docs/node-agent-protocol.md)
 - [Bootstrap security model](docs/node-bootstrap-security.md)
+- [Disaster recovery boundary](docs/disaster-recovery.md)
 
 If TCP 1935 is occupied, keep the owning service running, choose an approved alternative (for
 example 1936), and update both `PUBLIC_RTMP_PORT` and the displayed documentation. Production
