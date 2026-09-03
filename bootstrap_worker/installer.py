@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shlex
 from contextlib import suppress
@@ -43,6 +44,12 @@ MIN_CPU_COUNT = 1
 MIN_AVAILABLE_MEMORY_BYTES = 700 * 1024 * 1024
 MIN_FREE_DISK_BYTES = 8 * 1024 * 1024 * 1024
 DOCKER_GPG_FINGERPRINT = "060A61C51B558A7F742B77AAC52FEB6B621E9F35"
+RPM_REPOSITORY_PATH = "/etc/yum.repos.d/docker-ce.repo"
+RPM_REPOSITORY_TEMP_PATH = f"{RPM_REPOSITORY_PATH}.adojapan-tmp"
+RPM_GPG_KEY_PATH = "/etc/pki/rpm-gpg/docker-ce.asc"
+RPM_GPG_TEMP_PATH = f"{RPM_GPG_KEY_PATH}.adojapan-tmp"
+RPM_GPG_STAGE_PATH = f"{RPM_GPG_KEY_PATH}.adojapan-stage"
+RPM_REPOSITORY_MARKER = "# managed-by-adojapan-restream-node-bootstrap:v1"
 
 _SYSTEM_PROBE = r"""set -eu
 test -r /etc/os-release
@@ -318,6 +325,7 @@ class DockerInstallStep:
     command: str
     package_operation: bool = False
     failure_code: str = "docker_install_failed"
+    repository_commit: bool = False
 
 
 class DockerPlatformAdapter(Protocol):
@@ -443,6 +451,31 @@ class AptDockerAdapter:
         )
 
 
+class DnfRepositoryState(StrEnum):
+    CLEAN = "clean"
+    MANAGED = "managed"
+    LEGACY_ADOJAPAN_FAILED_INSTALL = "legacy_adojapan_failed_install"
+    UNSAFE = "unsafe"
+
+
+@dataclass(frozen=True, slots=True)
+class DnfRepositoryEvidence:
+    repo_kind: str
+    repo_uid: int
+    repo_sha256: str
+    key_kind: str
+    key_uid: int
+    key_fingerprint: str
+    foreign_repository: bool
+    temporary_artifact: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DnfRepositoryProfile:
+    distribution: str
+    release: str
+
+
 class DnfDockerAdapter:
     platform_family = PlatformFamily.RHEL
     package_manager = PackageManager.DNF
@@ -455,18 +488,44 @@ class DnfDockerAdapter:
         )
 
     @staticmethod
-    def clean_absence_check() -> str:
+    def runtime_absence_check() -> str:
         return (
             f"for package in {_RPM_OFFICIAL_PACKAGES}; do "
             'if rpm -q "$package" >/dev/null 2>&1; then exit 1; fi; done; '
-            "if grep -Rqs 'download.docker.com' /etc/yum.repos.d 2>/dev/null; "
-            "then exit 1; fi; "
-            "if find /etc/yum.repos.d -maxdepth 1 -type f "
-            "-iname '*docker*.repo' -print -quit 2>/dev/null | grep -q .; then exit 1; fi; "
             f"{_COMMON_DOCKER_ABSENCE_CHECK} && "
-            "test ! -e /etc/yum.repos.d/docker-ce.repo && "
-            "test ! -e /etc/pki/rpm-gpg/docker-ce.asc && "
-            "test ! -e /etc/pki/rpm-gpg/docker-ce.asc.adojapan-tmp"
+            f"test ! -e {shlex.quote(MANAGED_ROOT)} && "
+            f"test ! -L {shlex.quote(MANAGED_ROOT)}"
+        )
+
+    @staticmethod
+    def _foreign_repository_absence_guard() -> str:
+        repo = shlex.quote(RPM_REPOSITORY_PATH)
+        return (
+            "if find /etc/yum.repos.d -mindepth 1 -maxdepth 1 "
+            "\\( -type f -o -type l \\) -iname '*docker*.repo' "
+            f"! -path {repo} -print -quit 2>/dev/null | grep -q .; then exit 1; fi; "
+            "if find /etc/yum.repos.d -mindepth 1 -maxdepth 1 -type f "
+            f"! -path {repo} -exec grep -q 'download.docker.com' {{}} \\; "
+            "-print -quit 2>/dev/null | grep -q .; then exit 1; fi"
+        )
+
+    @classmethod
+    def clean_absence_check(cls) -> str:
+        artifact_paths = (
+            RPM_REPOSITORY_PATH,
+            RPM_REPOSITORY_TEMP_PATH,
+            RPM_GPG_KEY_PATH,
+            RPM_GPG_TEMP_PATH,
+            RPM_GPG_STAGE_PATH,
+        )
+        artifact_guard = " && ".join(
+            f"test ! -e {shlex.quote(path)} && test ! -L {shlex.quote(path)}"
+            for path in artifact_paths
+        )
+        return (
+            f"( {cls.runtime_absence_check()} ) && "
+            f"( {cls._foreign_repository_absence_guard()} ) && "
+            f"{artifact_guard}"
         )
 
     @staticmethod
@@ -477,51 +536,335 @@ class DnfDockerAdapter:
         )
 
     @staticmethod
-    def _repository_distribution(facts: SystemFacts) -> str:
-        distribution_by_os = {
-            "almalinux": "alma",
-            "rocky": "rocky",
-            "rhel": "rhel",
-            "centos": "centos",
+    def repository_profile(facts: SystemFacts) -> DnfRepositoryProfile:
+        profiles = {
+            ("almalinux", "8"): DnfRepositoryProfile("rhel", "8"),
+            ("almalinux", "9"): DnfRepositoryProfile("rhel", "9"),
+            ("rhel", "8"): DnfRepositoryProfile("rhel", "8"),
+            ("rhel", "9"): DnfRepositoryProfile("rhel", "9"),
+            ("rocky", "8"): DnfRepositoryProfile("rocky", "$releasever"),
+            ("rocky", "9"): DnfRepositoryProfile("rocky", "$releasever"),
+            ("centos", "9"): DnfRepositoryProfile("centos", "$releasever"),
         }
         try:
-            return distribution_by_os[facts.os_id]
+            return profiles[(facts.os_id, facts.os_major_version)]
         except KeyError as exc:
             raise safe_failure("unsupported_operating_system") from exc
 
+    @classmethod
+    def repository_content(cls, facts: SystemFacts) -> str:
+        profile = cls.repository_profile(facts)
+        return "\n".join(
+            (
+                RPM_REPOSITORY_MARKER,
+                "[docker-ce-stable]",
+                "name=Docker CE Stable",
+                f"baseurl=https://download.docker.com/linux/{profile.distribution}/"
+                f"{profile.release}/$basearch/stable",
+                "enabled=1",
+                "gpgcheck=1",
+                f"gpgkey=file://{RPM_GPG_KEY_PATH}",
+            )
+        )
+
+    @staticmethod
+    def legacy_alma_repository_content(facts: SystemFacts) -> str | None:
+        if facts.os_id != "almalinux" or facts.os_major_version not in {"8", "9"}:
+            return None
+        return "\n".join(
+            (
+                "[docker-ce-stable]",
+                "name=Docker CE Stable",
+                "baseurl=https://download.docker.com/linux/alma/$releasever/$basearch/stable",
+                "enabled=1",
+                "gpgcheck=1",
+                f"gpgkey=file://{RPM_GPG_KEY_PATH}",
+            )
+        )
+
+    @staticmethod
+    def _content_sha256(content: str) -> str:
+        return hashlib.sha256(f"{content}\n".encode()).hexdigest()
+
+    @staticmethod
+    def repository_evidence_probe_command() -> str:
+        repo = shlex.quote(RPM_REPOSITORY_PATH)
+        key = shlex.quote(RPM_GPG_KEY_PATH)
+        temporary_paths = " ".join(
+            shlex.quote(path)
+            for path in (
+                RPM_REPOSITORY_TEMP_PATH,
+                RPM_GPG_TEMP_PATH,
+                RPM_GPG_STAGE_PATH,
+            )
+        )
+        return (
+            "set -eu; "
+            f"repo={repo}; key={key}; "
+            'kind() { if [ -L "$1" ]; then printf symlink; '
+            'elif [ -f "$1" ]; then printf regular; '
+            'elif [ -e "$1" ]; then printf other; else printf missing; fi; }; '
+            'repo_kind=$(kind "$repo"); key_kind=$(kind "$key"); '
+            "repo_uid=-1; repo_sha256=; key_uid=-1; key_fingerprint=; "
+            'if [ "$repo_kind" = regular ]; then '
+            'repo_uid=$(stat -c %u "$repo"); '
+            'if [ "$(stat -c %s "$repo")" -le 16384 ]; then '
+            "repo_sha256=$(sha256sum \"$repo\" | awk '{print $1}'); fi; fi; "
+            'if [ "$key_kind" = regular ]; then '
+            'key_uid=$(stat -c %u "$key"); '
+            'if [ "$(stat -c %s "$key")" -le 262144 ] && '
+            "command -v gpg2 >/dev/null 2>&1; then "
+            'key_fingerprint=$(gpg2 --batch --with-colons --show-keys "$key" '
+            '2>/dev/null | awk -F: \'$1 == "pub" {primary=1; next} '
+            'primary && $1 == "fpr" {printf "%s", $10; primary=0}\'); fi; fi; '
+            "foreign_repository=0; "
+            "if find /etc/yum.repos.d -mindepth 1 -maxdepth 1 "
+            "\\( -type f -o -type l \\) -iname '*docker*.repo' "
+            '! -path "$repo" -print -quit 2>/dev/null | grep -q .; then '
+            "foreign_repository=1; fi; "
+            "if find /etc/yum.repos.d -mindepth 1 -maxdepth 1 -type f "
+            "! -path \"$repo\" -exec grep -q 'download.docker.com' {} \\; "
+            "-print -quit 2>/dev/null | grep -q .; then foreign_repository=1; fi; "
+            "temporary_artifact=0; "
+            f"for path in {temporary_paths}; do "
+            'if [ -e "$path" ] || [ -L "$path" ]; then temporary_artifact=1; fi; done; '
+            "printf 'repo_kind=%s\\nrepo_uid=%s\\nrepo_sha256=%s\\n' "
+            '"$repo_kind" "$repo_uid" "$repo_sha256"; '
+            "printf 'key_kind=%s\\nkey_uid=%s\\nkey_fingerprint=%s\\n' "
+            '"$key_kind" "$key_uid" "$key_fingerprint"; '
+            "printf 'foreign_repository=%s\\ntemporary_artifact=%s\\n' "
+            '"$foreign_repository" "$temporary_artifact"'
+        )
+
+    @classmethod
+    def classify_repository_evidence(
+        cls,
+        facts: SystemFacts,
+        output: str,
+    ) -> DnfRepositoryState:
+        if len(output) > 2048:
+            raise safe_failure("remote_command_failed")
+        values: dict[str, str] = {}
+        allowed = {
+            "repo_kind",
+            "repo_uid",
+            "repo_sha256",
+            "key_kind",
+            "key_uid",
+            "key_fingerprint",
+            "foreign_repository",
+            "temporary_artifact",
+        }
+        for line in output.splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key in allowed:
+                values[key] = value.strip()
+        try:
+            evidence = DnfRepositoryEvidence(
+                repo_kind=values["repo_kind"],
+                repo_uid=int(values["repo_uid"]),
+                repo_sha256=values["repo_sha256"].lower(),
+                key_kind=values["key_kind"],
+                key_uid=int(values["key_uid"]),
+                key_fingerprint=values["key_fingerprint"].upper(),
+                foreign_repository=values["foreign_repository"] == "1",
+                temporary_artifact=values["temporary_artifact"] == "1",
+            )
+        except (KeyError, ValueError) as exc:
+            raise safe_failure("remote_command_failed") from exc
+        if (
+            evidence.repo_kind not in {"missing", "regular", "symlink", "other"}
+            or evidence.key_kind not in {"missing", "regular", "symlink", "other"}
+            or values["foreign_repository"] not in {"0", "1"}
+            or values["temporary_artifact"] not in {"0", "1"}
+        ):
+            raise safe_failure("remote_command_failed")
+        if evidence.foreign_repository or evidence.temporary_artifact:
+            return DnfRepositoryState.UNSAFE
+        if evidence.repo_kind == "missing" and evidence.key_kind == "missing":
+            return DnfRepositoryState.CLEAN
+        exact_owned_files = (
+            evidence.repo_kind == "regular"
+            and evidence.repo_uid == 0
+            and evidence.key_kind == "regular"
+            and evidence.key_uid == 0
+            and evidence.key_fingerprint == DOCKER_GPG_FINGERPRINT
+        )
+        if not exact_owned_files:
+            return DnfRepositoryState.UNSAFE
+        if evidence.repo_sha256 == cls._content_sha256(cls.repository_content(facts)):
+            return DnfRepositoryState.MANAGED
+        legacy_content = cls.legacy_alma_repository_content(facts)
+        if legacy_content is not None and evidence.repo_sha256 == cls._content_sha256(
+            legacy_content
+        ):
+            return DnfRepositoryState.LEGACY_ADOJAPAN_FAILED_INSTALL
+        return DnfRepositoryState.UNSAFE
+
+    @staticmethod
+    def _approved_key_guard(path: str) -> str:
+        quoted = shlex.quote(path)
+        return (
+            f"test -f {quoted} && test ! -L {quoted} && "
+            f'test "$(stat -c %u {quoted})" = 0 && '
+            f"fingerprints=$(gpg2 --batch --with-colons --show-keys {quoted} "
+            '2>/dev/null | awk -F: \'$1 == "pub" {primary=1; next} '
+            'primary && $1 == "fpr" {printf "%s", $10; primary=0}\') && '
+            f'test "$fingerprints" = {DOCKER_GPG_FINGERPRINT}'
+        )
+
+    @classmethod
+    def _repository_file_guard(cls, content: str) -> str:
+        repo = shlex.quote(RPM_REPOSITORY_PATH)
+        expected_hash = cls._content_sha256(content)
+        return (
+            f"test -f {repo} && test ! -L {repo} && "
+            f'test "$(stat -c %u {repo})" = 0 && '
+            f"test \"$(sha256sum {repo} | awk '{{print $1}}')\" = {expected_hash}"
+        )
+
+    @classmethod
+    def _repository_state_guard(
+        cls,
+        facts: SystemFacts,
+        state: DnfRepositoryState,
+        *,
+        downloaded_key_present: bool,
+    ) -> str:
+        repo = shlex.quote(RPM_REPOSITORY_PATH)
+        key = shlex.quote(RPM_GPG_KEY_PATH)
+        if state is DnfRepositoryState.CLEAN:
+            final_guard = (
+                f"test ! -e {repo} && test ! -L {repo} && test ! -e {key} && test ! -L {key}"
+            )
+        elif state is DnfRepositoryState.MANAGED:
+            final_guard = (
+                f"{cls._repository_file_guard(cls.repository_content(facts))} && "
+                f"{cls._approved_key_guard(RPM_GPG_KEY_PATH)}"
+            )
+        elif state is DnfRepositoryState.LEGACY_ADOJAPAN_FAILED_INSTALL:
+            legacy = cls.legacy_alma_repository_content(facts)
+            if legacy is None:
+                raise safe_failure("unsupported_operating_system")
+            final_guard = (
+                f"{cls._repository_file_guard(legacy)} && "
+                f"{cls._approved_key_guard(RPM_GPG_KEY_PATH)}"
+            )
+        else:
+            raise safe_failure("unsupported_docker_installation")
+        temp_key_guard = (
+            cls._approved_key_guard(RPM_GPG_TEMP_PATH)
+            if downloaded_key_present
+            else (
+                f"test ! -e {shlex.quote(RPM_GPG_TEMP_PATH)} && "
+                f"test ! -L {shlex.quote(RPM_GPG_TEMP_PATH)}"
+            )
+        )
+        other_temps = " && ".join(
+            f"test ! -e {shlex.quote(path)} && test ! -L {shlex.quote(path)}"
+            for path in (RPM_REPOSITORY_TEMP_PATH, RPM_GPG_STAGE_PATH)
+        )
+        return (
+            f"( {cls.runtime_absence_check()} ) && "
+            f"( {cls._foreign_repository_absence_guard()} ) && "
+            f"{final_guard} && {temp_key_guard} && {other_temps}"
+        )
+
+    @classmethod
+    def _repository_commit_command(
+        cls,
+        facts: SystemFacts,
+        state: DnfRepositoryState,
+    ) -> str:
+        repo = shlex.quote(RPM_REPOSITORY_PATH)
+        repo_temp = shlex.quote(RPM_REPOSITORY_TEMP_PATH)
+        key = shlex.quote(RPM_GPG_KEY_PATH)
+        key_temp = shlex.quote(RPM_GPG_TEMP_PATH)
+        key_stage = shlex.quote(RPM_GPG_STAGE_PATH)
+        guard = cls._repository_state_guard(facts, state, downloaded_key_present=True)
+        content = shlex.quote(cls.repository_content(facts))
+        cleanup = f"rm -f -- {repo_temp} {key_temp} {key_stage}"
+        if state is DnfRepositoryState.MANAGED:
+            return f"set -eu; trap '{cleanup}' 0; {guard}; {cleanup}; trap - 0"
+        if state is DnfRepositoryState.LEGACY_ADOJAPAN_FAILED_INSTALL:
+            return (
+                f"set -eu; trap '{cleanup}' 0; {guard}; "
+                f"printf '%s\\n' {content} > {repo_temp}; "
+                f"chown 0:0 {repo_temp}; chmod 0644 {repo_temp}; "
+                f"mv -f -- {repo_temp} {repo}; {cleanup}; trap - 0"
+            )
+        if state is not DnfRepositoryState.CLEAN:
+            raise safe_failure("unsupported_docker_installation")
+        return (
+            "set -eu; committed=0; "
+            "cleanup() { "
+            f'if [ "$committed" = 0 ] && [ -e {key_stage} ] && [ -e {key} ] && '
+            f'[ "$(stat -c %d:%i {key_stage})" = "$(stat -c %d:%i {key})" ]; '
+            f"then rm -f -- {key}; fi; {cleanup}; }}; trap cleanup 0; "
+            f"{guard}; printf '%s\\n' {content} > {repo_temp}; "
+            f"chown 0:0 {repo_temp}; chmod 0644 {repo_temp}; "
+            f"install -o 0 -g 0 -m 0644 {key_temp} {key_stage}; "
+            f"ln {key_stage} {key}; ln {repo_temp} {repo}; committed=1; "
+            f"{cleanup}; trap - 0"
+        )
+
+    @classmethod
+    def repository_cleanup_command(cls, facts: SystemFacts) -> str:
+        guard = cls._repository_state_guard(
+            facts,
+            DnfRepositoryState.MANAGED,
+            downloaded_key_present=False,
+        )
+        return (
+            f"set -eu; {guard}; "
+            f"rm -f -- {shlex.quote(RPM_REPOSITORY_PATH)} "
+            f"{shlex.quote(RPM_GPG_KEY_PATH)}"
+        )
+
     def repository_probe_command(self, facts: SystemFacts) -> str:
-        distribution = self._repository_distribution(facts)
-        repository_url = f"https://download.docker.com/linux/{distribution}/docker-ce.repo"
+        profile = self.repository_profile(facts)
+        repository_url = f"https://download.docker.com/linux/{profile.distribution}/docker-ce.repo"
         return (
             "curl --fail --silent --show-error --proto '=https' --tlsv1.2 "
             "--connect-timeout 10 --max-time 20 "
             f"{repository_url} --output /dev/null"
         )
 
+    @staticmethod
+    def package_availability_gate() -> str:
+        return (
+            f"for package in {_RPM_OFFICIAL_PACKAGES}; do "
+            "dnf -q --disablerepo='*' --enablerepo=docker-ce-stable "
+            'list --available "$package" >/dev/null 2>&1 || exit 1; done'
+        )
+
     def install_plan(self, facts: SystemFacts) -> tuple[DockerInstallStep, ...]:
+        return self.install_plan_for_state(facts, DnfRepositoryState.CLEAN)
+
+    def install_plan_for_state(
+        self,
+        facts: SystemFacts,
+        state: DnfRepositoryState,
+    ) -> tuple[DockerInstallStep, ...]:
         if facts.platform_family is not PlatformFamily.RHEL:
             raise safe_failure("unsupported_operating_system")
-        distribution = self._repository_distribution(facts)
-        gpg_url = f"https://download.docker.com/linux/{distribution}/gpg"
-        repository = "\n".join(
-            (
-                "[docker-ce-stable]",
-                "name=Docker CE Stable",
-                f"baseurl=https://download.docker.com/linux/{distribution}/"
-                "$releasever/$basearch/stable",
-                "enabled=1",
-                "gpgcheck=1",
-                "gpgkey=file:///etc/pki/rpm-gpg/docker-ce.asc",
-            )
-        )
-        temporary_key = "/etc/pki/rpm-gpg/docker-ce.asc.adojapan-tmp"
+        profile = self.repository_profile(facts)
+        gpg_url = f"https://download.docker.com/linux/{profile.distribution}/gpg"
         verify_key = (
-            f"fingerprints=$(gpg2 --batch --with-colons --show-keys {temporary_key} "
+            f"fingerprints=$(gpg2 --batch --with-colons --show-keys {RPM_GPG_TEMP_PATH} "
             '2>/dev/null | awk -F: \'$1 == "pub" {primary=1; next} '
-            'primary && $1 == "fpr" {print $10; primary=0}\') && '
-            f'if [ "$fingerprints" = {DOCKER_GPG_FINGERPRINT} ]; then '
-            f"install -m 0644 {temporary_key} /etc/pki/rpm-gpg/docker-ce.asc && "
-            f"rm -f {temporary_key}; else rm -f {temporary_key}; exit 1; fi"
+            'primary && $1 == "fpr" {printf "%s", $10; primary=0}\') && '
+            f'if [ "$fingerprints" = {DOCKER_GPG_FINGERPRINT} ]; then :; '
+            f"else rm -f -- {RPM_GPG_TEMP_PATH}; exit 1; fi"
+        )
+        download_key = (
+            f"rm -f -- {RPM_GPG_TEMP_PATH} && "
+            "curl --fail --silent --show-error --proto '=https' --tlsv1.2 "
+            "--connect-timeout 10 --max-time 20 "
+            f"{gpg_url} --output {RPM_GPG_TEMP_PATH} || "
+            f"{{ rm -f -- {RPM_GPG_TEMP_PATH}; exit 1; }}"
         )
         return (
             DockerInstallStep(
@@ -533,21 +876,26 @@ class DnfDockerAdapter:
                 failure_code="docker_repository_unavailable",
             ),
             DockerInstallStep("install -d -m 0755 /etc/pki/rpm-gpg"),
-            DockerInstallStep(
-                f"rm -f {temporary_key} && "
-                "curl --fail --silent --show-error --proto '=https' --tlsv1.2 "
-                "--connect-timeout 10 --max-time 20 "
-                f"{gpg_url} --output {temporary_key}",
-                failure_code="docker_repository_unavailable",
-            ),
+            DockerInstallStep(download_key, failure_code="docker_repository_unavailable"),
             DockerInstallStep(verify_key, failure_code="docker_repository_key_invalid"),
             DockerInstallStep(
-                f"printf '%s\\n' {shlex.quote(repository)} > /etc/yum.repos.d/docker-ce.repo"
+                self._repository_commit_command(facts, state),
+                failure_code="docker_failed_install_recovery_unsafe",
+                repository_commit=True,
             ),
             DockerInstallStep(
                 "dnf -q --disablerepo='*' --enablerepo=docker-ce-stable makecache",
                 package_operation=True,
                 failure_code="docker_repository_unavailable",
+            ),
+            DockerInstallStep(
+                self.package_availability_gate(),
+                package_operation=True,
+                failure_code="docker_repository_incomplete",
+            ),
+            DockerInstallStep(
+                f"{self.conflicting_runtime_check()}; {self.runtime_absence_check()}",
+                failure_code="docker_failed_install_recovery_unsafe",
             ),
             DockerInstallStep(
                 "dnf -y --setopt=install_weak_deps=False install docker-ce docker-ce-cli "
@@ -608,6 +956,31 @@ class DockerBootstrap:
         if result.exit_status != 0:
             raise safe_failure("conflicting_container_runtime")
 
+    @staticmethod
+    async def _dnf_repository_state(
+        session: RemoteSession,
+        privilege: PrivilegeContext,
+        adapter: DnfDockerAdapter,
+        facts: SystemFacts,
+        *,
+        timeout: float,
+    ) -> DnfRepositoryState:
+        runtime_absence = await privilege.run(
+            session,
+            adapter.runtime_absence_check(),
+            timeout=timeout,
+        )
+        if runtime_absence.exit_status != 0:
+            return DnfRepositoryState.UNSAFE
+        evidence = await privilege.run(
+            session,
+            adapter.repository_evidence_probe_command(),
+            timeout=timeout,
+        )
+        if evidence.exit_status != 0:
+            return DnfRepositoryState.UNSAFE
+        return adapter.classify_repository_evidence(facts, evidence.stdout)
+
     async def inspect(
         self,
         session: RemoteSession,
@@ -625,14 +998,25 @@ class DockerBootstrap:
         )
         present = await session.run("command -v docker >/dev/null 2>&1", timeout=timeout)
         if present.exit_status != 0:
-            absence = await privilege.run(
-                session,
-                adapter.clean_absence_check(),
-                timeout=timeout,
-            )
-            if absence.exit_status != 0:
-                return DockerDisposition.UNSUPPORTED
             self.assert_install_manager_available(facts)
+            if isinstance(adapter, DnfDockerAdapter):
+                repository_state = await self._dnf_repository_state(
+                    session,
+                    privilege,
+                    adapter,
+                    facts,
+                    timeout=timeout,
+                )
+                if repository_state is DnfRepositoryState.UNSAFE:
+                    return DockerDisposition.UNSUPPORTED
+            else:
+                absence = await privilege.run(
+                    session,
+                    adapter.clean_absence_check(),
+                    timeout=timeout,
+                )
+                if absence.exit_status != 0:
+                    return DockerDisposition.UNSUPPORTED
             return DockerDisposition.ABSENT
         checks = (
             adapter.supported_packages_check(),
@@ -668,20 +1052,49 @@ class DockerBootstrap:
             adapter,
             timeout=timeouts.command_seconds,
         )
-        absence = await privilege.run(
-            session,
-            adapter.clean_absence_check(),
-            timeout=timeouts.command_seconds,
-        )
-        if absence.exit_status != 0:
-            raise safe_failure("unsupported_docker_installation")
-        for step in adapter.install_plan(facts):
-            timeout = (
-                timeouts.package_seconds if step.package_operation else timeouts.command_seconds
+        repository_state: DnfRepositoryState | None = None
+        if isinstance(adapter, DnfDockerAdapter):
+            repository_state = await self._dnf_repository_state(
+                session,
+                privilege,
+                adapter,
+                facts,
+                timeout=timeouts.command_seconds,
             )
-            result = await privilege.run(session, step.command, timeout=timeout)
-            if result.exit_status != 0:
-                raise safe_failure(step.failure_code)
+            if repository_state is DnfRepositoryState.UNSAFE:
+                raise safe_failure("unsupported_docker_installation")
+            plan = adapter.install_plan_for_state(facts, repository_state)
+        else:
+            absence = await privilege.run(
+                session,
+                adapter.clean_absence_check(),
+                timeout=timeouts.command_seconds,
+            )
+            if absence.exit_status != 0:
+                raise safe_failure("unsupported_docker_installation")
+            plan = adapter.install_plan(facts)
+
+        repository_owned = repository_state is DnfRepositoryState.MANAGED
+        try:
+            for step in plan:
+                timeout = (
+                    timeouts.package_seconds if step.package_operation else timeouts.command_seconds
+                )
+                result = await privilege.run(session, step.command, timeout=timeout)
+                if result.exit_status != 0:
+                    raise safe_failure(step.failure_code)
+                if step.repository_commit:
+                    repository_owned = True
+        except BootstrapError:
+            if repository_owned and isinstance(adapter, DnfDockerAdapter):
+                cleanup = await privilege.run(
+                    session,
+                    adapter.repository_cleanup_command(facts),
+                    timeout=timeouts.command_seconds,
+                )
+                if cleanup.exit_status != 0:
+                    raise safe_failure("docker_failed_install_recovery_unsafe") from None
+            raise
 
 
 @dataclass(slots=True)
@@ -1531,6 +1944,8 @@ __all__ = [
     "DOCKER_COMPOSE",
     "DOCKER_GPG_FINGERPRINT",
     "DnfDockerAdapter",
+    "DnfRepositoryProfile",
+    "DnfRepositoryState",
     "DockerBootstrap",
     "DockerInstallStep",
     "ENROLLMENT_TOKEN_PATH",
@@ -1542,6 +1957,7 @@ __all__ = [
     "NODE_ID_PATH",
     "PERMANENT_TOKEN_PATH",
     "PrivilegeContext",
+    "RPM_REPOSITORY_MARKER",
     "RemoteNodeInstaller",
     "detect_privilege",
     "parse_system_facts",
