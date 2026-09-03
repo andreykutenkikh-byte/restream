@@ -62,7 +62,7 @@ def test_installers_do_not_mutate_moblin_relay_or_use_secret_arguments() -> None
     assert "-type l -print -quit" in installer
     assert "relay_agent_ensure_config_dir /etc/sysusers.d" in installer
     assert "relay_agent_ensure_config_dir /etc/tmpfiles.d" in installer
-    assert "[ -L \"$relay_agent_config_dir\" ]" in installer
+    assert '[ -L "$relay_agent_config_dir" ]' in installer
     assert "stat -c '%u:%g'" in installer
     assert "?????w*|????????w*" in installer
     assert "Stop adojapan-relay-agent.service before install or update." in installer
