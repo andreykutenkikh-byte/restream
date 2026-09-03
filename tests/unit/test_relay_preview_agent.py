@@ -10,6 +10,7 @@ from relay_agent.client import ControlClient
 from relay_agent.errors import RelayAgentError
 from relay_agent.models import HostMetrics, RelaySnapshot
 from relay_agent.preview import (
+    LOCAL_HLS_PATH,
     MAX_PLAYLIST_BYTES,
     MAX_SEGMENT_BYTES,
     LocalHLSReader,
@@ -186,6 +187,81 @@ def test_local_hls_reader_fetches_exact_mediamtx_session_resources(
             "video/mp2t",
         ),
     ]
+
+
+def test_local_hls_reader_reuses_session_playlist_between_polls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    playlist_resource = f"video.m3u8?session={SESSION_UUID4}"
+    media_path = f"/relay-output/{playlist_resource}"
+    calls: list[str] = []
+    responses = {
+        LOCAL_HLS_PATH: (
+            f"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=4000000\n{playlist_resource}\n"
+        ).encode("ascii"),
+        media_path: iter(
+            (
+                media_playlist(f"seg7.ts?session={SESSION_UUID4}", sequence=7),
+                media_playlist(f"seg8.ts?session={SESSION_UUID4}", sequence=8),
+            )
+        ),
+    }
+    reader = LocalHLSReader(SensitiveToken.parse("p" * 32))
+
+    def fetch(path: str, _limit: int, *, playlist: bool) -> bytes:
+        assert playlist is True
+        calls.append(path)
+        response = responses[path]
+        return next(response) if not isinstance(response, bytes) else response
+
+    monkeypatch.setattr(reader, "_fetch", fetch)
+
+    assert reader.completed_segments()[0].sequence == 7
+    assert reader.completed_segments()[0].sequence == 8
+    assert calls == [LOCAL_HLS_PATH, media_path, media_path]
+
+
+def test_local_hls_reader_rebootstraps_after_session_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_resource = f"first.m3u8?session={SESSION_UUID4}"
+    second_session = "223e4567-e89b-42d3-a456-426614174000"
+    second_resource = f"second.m3u8?session={second_session}"
+    first_path = f"/relay-output/{first_resource}"
+    second_path = f"/relay-output/{second_resource}"
+    calls: list[str] = []
+    root_responses = iter(
+        (
+            (f"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n{first_resource}\n").encode(
+                "ascii"
+            ),
+            (f"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n{second_resource}\n").encode(
+                "ascii"
+            ),
+        )
+    )
+    first_media_calls = 0
+    reader = LocalHLSReader(SensitiveToken.parse("p" * 32))
+
+    def fetch(path: str, _limit: int, *, playlist: bool) -> bytes:
+        nonlocal first_media_calls
+        assert playlist is True
+        calls.append(path)
+        if path == LOCAL_HLS_PATH:
+            return next(root_responses)
+        if path == first_path:
+            first_media_calls += 1
+            if first_media_calls == 1:
+                return media_playlist(f"seg7.ts?session={SESSION_UUID4}", sequence=7)
+            raise RelayAgentError("preview_local_unavailable")
+        assert path == second_path
+        return media_playlist(f"seg8.ts?session={second_session}", sequence=8)
+
+    monkeypatch.setattr(reader, "_fetch", fetch)
+
+    assert reader.completed_segments()[0].sequence == 7
+    assert reader.completed_segments()[0].sequence == 8
+    assert calls == [LOCAL_HLS_PATH, first_path, first_path, LOCAL_HLS_PATH, second_path]
 
 
 @pytest.mark.parametrize(
@@ -371,7 +447,7 @@ def test_control_client_accepts_optional_preview_demand_and_uses_separate_media_
     assert method == "GET"
     assert path == "/relay-agent/v1/commands/next?wait=0"
     assert sent is None
-    assert headers["X-Relay-Agent-Version"] == "1.2.3"
+    assert headers["X-Relay-Agent-Version"] == "1.2.4"
 
     payload = ts_segment()
     client.upload_preview_segment(generation, 22, payload)

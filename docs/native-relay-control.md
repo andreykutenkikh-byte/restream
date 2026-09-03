@@ -51,7 +51,7 @@ Every request uses `Authorization: Bearer <node token>`:
 Agent version 1.1 adds a backward-compatible optional `preview_requested`
 boolean to a successful heartbeat response. Version 1.2 adds the separately
 gated key-only YouTube command and the optional LIVE input-bitrate sample.
-Agent 1.2.3 keeps that protocol unchanged while correlating the two local media
+Agent 1.2.4 keeps that protocol unchanged while correlating the two local media
 paths used by the audio-normalizing relay.
 Older agents receive the original response shape and cannot be leased a command
 they do not support. Preview media never uses the small control route: the agent

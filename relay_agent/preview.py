@@ -127,19 +127,45 @@ class LocalHLSReader:
             HTTPCookieProcessor(http.cookiejar.CookieJar()),
             HTTPBasicAuthHandler(password_manager),
         )
+        # MediaMTX returns a session-bound media-playlist URL.  Reusing it is
+        # essential: bootstrapping through index.m3u8 on every poll creates a
+        # fresh session and makes already published browser segment URLs stale.
+        self._media_path: str | None = None
 
     def completed_segments(self) -> list[LocalSegment]:
+        if self._media_path is not None:
+            try:
+                media = self._fetch(self._media_path, MAX_PLAYLIST_BYTES, playlist=True)
+            except RelayAgentError as exc:
+                if exc.code != "preview_local_unavailable":
+                    raise
+                self._media_path = None
+            else:
+                return parse_media_playlist(media)
+
         root = self._fetch(LOCAL_HLS_PATH, MAX_PLAYLIST_BYTES, playlist=True)
         nested = parse_master_playlist(root)
         media = root
         if nested is not None:
-            media = self._fetch(f"{_LOCAL_HLS_PREFIX}{nested}", MAX_PLAYLIST_BYTES, playlist=True)
+            self._media_path = f"{_LOCAL_HLS_PREFIX}{nested}"
+            try:
+                media = self._fetch(self._media_path, MAX_PLAYLIST_BYTES, playlist=True)
+            except RelayAgentError:
+                self._media_path = None
+                raise
         return parse_media_playlist(media)
 
     def read_segment(self, name: str) -> bytes:
         if _SEGMENT_RESOURCE.fullmatch(name) is None:
             raise RelayAgentError("preview_segment_invalid")
-        payload = self._fetch(f"{_LOCAL_HLS_PREFIX}{name}", MAX_SEGMENT_BYTES, playlist=False)
+        try:
+            payload = self._fetch(
+                f"{_LOCAL_HLS_PREFIX}{name}", MAX_SEGMENT_BYTES, playlist=False
+            )
+        except RelayAgentError as exc:
+            if exc.code == "preview_local_unavailable":
+                self._media_path = None
+            raise
         validate_mpegts(payload)
         return payload
 
