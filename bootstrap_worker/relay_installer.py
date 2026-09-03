@@ -123,6 +123,12 @@ _SELF_TEST_STAGE_CODES = {
     "decoder": "relay_self_test_decode_decoder_failed",
     "frames": "relay_self_test_decode_frames_failed",
     "timestamps": "relay_self_test_decode_timestamps_failed",
+    "ts-probe-pts": "relay_self_test_timestamp_probe_pts_failed",
+    "ts-packet-dts": "relay_self_test_timestamp_packet_dts_failed",
+    "ts-video-pts": "relay_self_test_timestamp_video_pts_failed",
+    "ts-audio-pts": "relay_self_test_timestamp_audio_pts_failed",
+    "ts-gaps": "relay_self_test_timestamp_gaps_failed",
+    "ts-av-sync": "relay_self_test_timestamp_av_sync_failed",
     "secrets": "relay_self_test_secrets_failed",
     "cleanup": "relay_self_test_cleanup_failed",
 }

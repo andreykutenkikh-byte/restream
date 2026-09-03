@@ -73,6 +73,12 @@ SELF_TEST_STAGES = frozenset(
         "decoder",
         "frames",
         "timestamps",
+        "ts-probe-pts",
+        "ts-packet-dts",
+        "ts-video-pts",
+        "ts-audio-pts",
+        "ts-gaps",
+        "ts-av-sync",
         "secrets",
         "cleanup",
     }
@@ -1205,6 +1211,85 @@ def analyze_decoded_audio_timestamps(capture: Path) -> dict:
     }
 
 
+def timestamp_failure_stage(
+    timestamps: dict,
+    decoded_frames: dict,
+    decoded_audio: dict,
+    max_bounded_audio_backward_steps: int,
+) -> str:
+    """Return one bounded, non-sensitive stage for a failed timestamp check."""
+
+    probe_and_pts_presence_ok = (
+        timestamps["pts_present_for_every_packet"]
+        and timestamps["ffprobe_exit"] == 0
+        and timestamps["stderr_empty"]
+        and decoded_frames["presentation_timestamp_count"] == decoded_frames["frame_count"]
+        and decoded_frames["maximum_presentation_timestamp_gap_seconds"] is not None
+        and decoded_audio["ffprobe_exit"] == 0
+        and decoded_audio["frame_count"] > 0
+        and decoded_audio["presentation_timestamp_count"] == decoded_audio["frame_count"]
+        and decoded_audio["maximum_presentation_timestamp_gap_seconds"] is not None
+        and decoded_audio["stderr_empty"]
+    )
+    packet_dts_ok = (
+        timestamps["dts_within_tolerance"]
+        and timestamps["negative_dts_steps"].get(0, 0) == 0
+        and timestamps["negative_dts_steps"].get(1, 0)
+        <= max_bounded_audio_backward_steps
+        and not timestamps["dts_backward_events_beyond_tolerance"]
+    )
+    video_pts_ok = (
+        timestamps["max_pts_dts_offset_seconds"].get(0, 999)
+        <= VIDEO_PTS_DTS_OFFSET_LIMIT_SECONDS
+        and timestamps["video_pts_dts_offset_clusters_over_normal_reorder"]
+        <= max_bounded_audio_backward_steps
+        and decoded_frames["strict_presentation_timestamps_monotonic"]
+    )
+    audio_pts_ok = (
+        decoded_audio["presentation_timestamp_steps_beyond_tolerance"] == 0
+        and decoded_audio["negative_presentation_timestamp_steps"]
+        <= max_bounded_audio_backward_steps
+        and timestamps["max_pts_dts_offset_seconds"].get(1, 999)
+        <= AUDIO_PTS_DTS_OFFSET_LIMIT_SECONDS
+    )
+    presentation_gaps_ok = (
+        timestamps["max_dts_gap_seconds"].get(0, 999)
+        <= VIDEO_PRESENTATION_GAP_LIMIT_SECONDS
+        and timestamps["max_dts_gap_seconds"].get(1, 999)
+        <= AUDIO_PRESENTATION_GAP_LIMIT_SECONDS
+        and timestamps["max_sorted_pts_gap_seconds"].get(0, 999)
+        <= VIDEO_PRESENTATION_GAP_LIMIT_SECONDS
+        and timestamps["max_sorted_pts_gap_seconds"].get(1, 999)
+        <= AUDIO_PRESENTATION_GAP_LIMIT_SECONDS
+        and decoded_frames["maximum_presentation_timestamp_gap_seconds"] is not None
+        and decoded_frames["maximum_presentation_timestamp_gap_seconds"]
+        <= VIDEO_PRESENTATION_GAP_LIMIT_SECONDS
+        and decoded_audio["maximum_presentation_timestamp_gap_seconds"] is not None
+        and decoded_audio["maximum_presentation_timestamp_gap_seconds"]
+        <= AUDIO_PRESENTATION_GAP_LIMIT_SECONDS
+    )
+    av_end_and_duration_ok = (
+        timestamps["audio_video_duration_difference_seconds"] is not None
+        and timestamps["audio_video_duration_difference_seconds"]
+        <= VIDEO_PRESENTATION_GAP_LIMIT_SECONDS
+        and timestamps["audio_video_end_difference_seconds"] is not None
+        and timestamps["audio_video_end_difference_seconds"]
+        <= AV_END_DIFFERENCE_LIMIT_SECONDS
+    )
+
+    for stage, passed in (
+        ("ts-probe-pts", probe_and_pts_presence_ok),
+        ("ts-packet-dts", packet_dts_ok),
+        ("ts-video-pts", video_pts_ok),
+        ("ts-audio-pts", audio_pts_ok),
+        ("ts-gaps", presentation_gaps_ok),
+        ("ts-av-sync", av_end_and_duration_ok),
+    ):
+        if not passed:
+            return stage
+    return "timestamps"
+
+
 def scan_for_markers(
         markers: list[bytes],
         work: Path,
@@ -1864,6 +1949,14 @@ def main() -> int:
         }
         result["timestamp_thresholds_passed"] = timestamp_ok
         if not timestamp_ok:
+            mark_self_test_stage(
+                timestamp_failure_stage(
+                    result["timestamps"],
+                    decoded_frames,
+                    decoded_audio,
+                    max_bounded_audio_backward_steps,
+                )
+            )
             raise TestFailure("capture timestamp validation failed")
 
         mark_self_test_stage("secrets")
@@ -1935,7 +2028,11 @@ def main() -> int:
                 except OSError as exc:
                     diagnostics[path.name] = [f"[unavailable: {type(exc).__name__}]"]
             result["sanitized_diagnostics"] = diagnostics
-            if capture.exists() and result.get("failure") == "capture decode/timestamp validation failed":
+            if capture.exists() and result.get("failure") in {
+                "capture decoder validation failed",
+                "capture frame validation failed",
+                "capture timestamp validation failed",
+            }:
                 try:
                     debug_capture = TEST_ROOT / "debug-capture.ts"
                     shutil.copyfile(capture, debug_capture)

@@ -166,6 +166,24 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_decode_timestamps_failed": (
             "Временные метки и синхронизация потока не прошли самопроверку."
         ),
+        "relay_self_test_timestamp_probe_pts_failed": (
+            "Проверка наличия PTS и данных медиапотока не пройдена."
+        ),
+        "relay_self_test_timestamp_packet_dts_failed": (
+            "Порядок пакетных DTS не прошёл самопроверку."
+        ),
+        "relay_self_test_timestamp_video_pts_failed": (
+            "Временные метки PTS видеопотока не прошли самопроверку."
+        ),
+        "relay_self_test_timestamp_audio_pts_failed": (
+            "Временные метки PTS аудиопотока не прошли самопроверку."
+        ),
+        "relay_self_test_timestamp_gaps_failed": (
+            "Интервалы между временными метками потока не прошли самопроверку."
+        ),
+        "relay_self_test_timestamp_av_sync_failed": (
+            "Длительность и окончание аудио и видео не прошли проверку синхронизации."
+        ),
         "relay_self_test_secrets_failed": "Защита тестовых секретов не прошла самопроверку.",
         "relay_self_test_cleanup_failed": "Очистка после самопроверки Moblin Relay не завершена.",
         "relay_final_check_failed": "Финальная проверка Moblin Relay не пройдена.",

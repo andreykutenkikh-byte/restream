@@ -42,6 +42,12 @@ def test_native_safe_failure_code_is_allowlisted() -> None:
         "relay_self_test_decode_decoder_failed",
         "relay_self_test_decode_frames_failed",
         "relay_self_test_decode_timestamps_failed",
+        "relay_self_test_timestamp_probe_pts_failed",
+        "relay_self_test_timestamp_packet_dts_failed",
+        "relay_self_test_timestamp_video_pts_failed",
+        "relay_self_test_timestamp_audio_pts_failed",
+        "relay_self_test_timestamp_gaps_failed",
+        "relay_self_test_timestamp_av_sync_failed",
     ):
         assert safe_bootstrap_diagnostic_code({"safe_error": {"code": code}}) == code
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import os
 import runpy
 import sys
 from pathlib import Path
@@ -12,6 +13,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 BUNDLE = ROOT / "deploy" / "moblin-relay"
 RELAYCTL = BUNDLE / "relayctl"
+SELF_TEST = BUNDLE / "self-test"
 
 
 def load_relayctl() -> dict[str, object]:
@@ -27,6 +29,16 @@ def load_relayctl() -> dict[str, object]:
     termios.tcsetattr = lambda *_args: None  # type: ignore[attr-defined]
     with patch.dict(sys.modules, {"fcntl": fcntl, "termios": termios}):
         return runpy.run_path(str(RELAYCTL), run_name="_moblin_relayctl_test")
+
+
+def load_self_test() -> dict[str, object]:
+    fcntl = ModuleType("fcntl")
+    resource = ModuleType("resource")
+    with (
+        patch.dict(sys.modules, {"fcntl": fcntl, "resource": resource}),
+        patch.dict(os.environ, {"MOBLIN_RELAY_SELF_TEST_STAGE_FILE": ""}),
+    ):
+        return runpy.run_path(str(SELF_TEST), run_name="_moblin_self_test")
 
 
 def node_config(
@@ -231,7 +243,7 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     assert '"dut_metrics_ok": False' in source
     assert 'sample["dut_metrics_ok"] = True' in source
     assert 'if sample.get("dut_metrics_ok") and sample.get(field) is expected:' in source
-    for stage in (
+    direct_stages = (
         "startup",
         "assets",
         "topology",
@@ -251,9 +263,22 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         "timestamps",
         "secrets",
         "cleanup",
-    ):
+    )
+    timestamp_diagnostic_stages = (
+        "ts-probe-pts",
+        "ts-packet-dts",
+        "ts-video-pts",
+        "ts-audio-pts",
+        "ts-gaps",
+        "ts-av-sync",
+    )
+    for stage in direct_stages:
         assert len(f"{stage}\n".encode("ascii")) <= 16
         assert f'mark_self_test_stage("{stage}")' in source
+    for stage in timestamp_diagnostic_stages:
+        assert len(f"{stage}\n".encode("ascii")) <= 16
+        assert f'("{stage}",' in source
+    assert "mark_self_test_stage(\n                timestamp_failure_stage(" in source
 
     outage_block = source.split('mark_self_test_stage("outages")', 1)[1].split(
         'mark_self_test_stage("continuity")', 1
@@ -335,3 +360,78 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         'result["decoded_audio_timestamps"] = analyze_decoded_audio_timestamps(capture)'
     )
     assert "capture decode/timestamp validation failed" not in decode_block
+    assert '"capture decoder validation failed",' in source
+    assert '"capture frame validation failed",' in source
+    assert '"capture timestamp validation failed",' in source
+
+
+@pytest.mark.parametrize(
+    ("scope", "field", "value", "expected"),
+    [
+        ("timestamps", "ffprobe_exit", 1, "ts-probe-pts"),
+        ("timestamps", "dts_within_tolerance", False, "ts-packet-dts"),
+        (
+            "decoded_frames",
+            "strict_presentation_timestamps_monotonic",
+            False,
+            "ts-video-pts",
+        ),
+        (
+            "decoded_audio",
+            "presentation_timestamp_steps_beyond_tolerance",
+            1,
+            "ts-audio-pts",
+        ),
+        ("timestamps", "max_dts_gap_seconds", {0: 3.0, 1: 0.02}, "ts-gaps"),
+        ("timestamps", "audio_video_end_difference_seconds", 0.3, "ts-av-sync"),
+    ],
+)
+def test_timestamp_failure_stage_is_bounded_and_category_specific(
+    scope: str,
+    field: str,
+    value: object,
+    expected: str,
+) -> None:
+    loaded = load_self_test()
+    classify = loaded["timestamp_failure_stage"]
+    timestamps = {
+        "pts_present_for_every_packet": True,
+        "ffprobe_exit": 0,
+        "stderr_empty": True,
+        "dts_within_tolerance": True,
+        "negative_dts_steps": {},
+        "dts_backward_events_beyond_tolerance": {},
+        "max_pts_dts_offset_seconds": {0: 0.1, 1: 0.01},
+        "video_pts_dts_offset_clusters_over_normal_reorder": 0,
+        "max_dts_gap_seconds": {0: 0.04, 1: 0.02},
+        "max_sorted_pts_gap_seconds": {0: 0.04, 1: 0.02},
+        "audio_video_duration_difference_seconds": 0.01,
+        "audio_video_end_difference_seconds": 0.01,
+    }
+    decoded_frames = {
+        "frame_count": 10,
+        "presentation_timestamp_count": 10,
+        "strict_presentation_timestamps_monotonic": True,
+        "maximum_presentation_timestamp_gap_seconds": 0.04,
+    }
+    decoded_audio = {
+        "ffprobe_exit": 0,
+        "frame_count": 10,
+        "presentation_timestamp_count": 10,
+        "presentation_timestamp_steps_beyond_tolerance": 0,
+        "negative_presentation_timestamp_steps": 0,
+        "maximum_presentation_timestamp_gap_seconds": 0.02,
+        "stderr_empty": True,
+    }
+    values = {
+        "timestamps": timestamps,
+        "decoded_frames": decoded_frames,
+        "decoded_audio": decoded_audio,
+    }
+    values[scope][field] = value
+
+    stage = classify(timestamps, decoded_frames, decoded_audio, 6)
+
+    assert stage == expected
+    assert stage.isascii()
+    assert len(f"{stage}\n".encode("ascii")) <= 16
