@@ -597,7 +597,9 @@ class RemoteRelayInstaller:
         await self._run_checked(
             session,
             privilege,
-            f"test -f {temp}/mediamtx/mediamtx && test -x {temp}/mediamtx/mediamtx",
+            f"test -f {temp}/mediamtx/mediamtx && "
+            f"test ! -L {temp}/mediamtx/mediamtx && "
+            f"test \"$(stat -c '%a' {temp}/mediamtx/mediamtx)\" = 755",
             timeout=timeouts.command_seconds,
             code="mediamtx_binary_invalid",
         )

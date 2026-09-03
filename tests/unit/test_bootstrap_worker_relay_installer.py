@@ -355,7 +355,7 @@ async def test_install_uses_pinned_mediamtx_and_never_mutates_host_networking() 
         ("sha256sum --check --status", "mediamtx_checksum_failed"),
         ("tar -xzf", "mediamtx_archive_invalid"),
         ("test -f /tmp/adojapan-relay-bootstrap-", "mediamtx_license_missing"),
-        ("test -x /tmp/adojapan-relay-bootstrap-", "mediamtx_binary_invalid"),
+        ("stat -c", "mediamtx_binary_invalid"),
     ],
 )
 async def test_install_reports_exact_safe_mediamtx_stage(
@@ -375,6 +375,22 @@ async def test_install_reports_exact_safe_mediamtx_stage(
         )
 
     assert captured.value.code == expected_code
+
+
+async def test_staged_mediamtx_validation_supports_a_noexec_temp_mount() -> None:
+    session = FakeSession()
+
+    await RemoteRelayInstaller().install(
+        session,
+        PrivilegeContext(PrivilegeMode.ROOT),
+        receipt(),
+        timeouts=TimeoutPolicy(),
+    )
+
+    validation = next(command for command, _, _ in session.commands if "stat -c" in command)
+    assert "test ! -L" in validation
+    assert '" = 755' in validation
+    assert "test -x" not in validation
 
 
 async def test_final_check_requires_agent_and_broker_but_relay_inactive_disabled() -> None:
