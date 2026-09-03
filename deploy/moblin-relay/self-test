@@ -70,6 +70,10 @@ SELF_TEST_STAGES = frozenset(
         "norm-publish",
         "norm-flap",
         "stall-slate",
+        "stall-pre",
+        "stall-pause",
+        "stall-switch",
+        "stall-capture",
         "stall-live",
         "stall-cont",
         "crash-death",
@@ -2224,6 +2228,7 @@ def main() -> int:
         mark_self_test_stage("outages")
         print("  checking a recoverable same-session media stall", flush=True)
         mark_self_test_stage("stall-slate")
+        mark_self_test_stage("stall-pre")
         before_pause = wait_healthy_live(
             "healthy LIVE before same-session stall",
             5,
@@ -2232,17 +2237,20 @@ def main() -> int:
         previous_normalizer_ids = list(before_pause["normalized_ids"])
         if len(previous_normalizer_ids) != 1:
             raise TestFailure("same-session stall precondition lacks one normalizer")
+        mark_self_test_stage("stall-pause")
         time.sleep(0.35)
         same_session_started = time.monotonic()
         publisher_paused = False
         try:
             os.kill(publisher.pid, signal.SIGSTOP)
             publisher_paused = True
+            mark_self_test_stage("stall-switch")
             same_session_slate = wait_slate_with_live_srt(
                 "same-session SLATE transition",
                 same_session_started,
                 initial_ingest_ids,
             )
+            mark_self_test_stage("stall-capture")
             wait_slate_capture_growth(
                 "same-session SLATE capture growth",
                 same_session_slate,

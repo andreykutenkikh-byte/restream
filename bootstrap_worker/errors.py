@@ -166,6 +166,18 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_stall_slate_failed": (
             "Переход на заставку при зависании LIVE не прошёл самопроверку."
         ),
+        "relay_self_test_stall_precondition_failed": (
+            "LIVE перед проверкой зависания не прошёл самопроверку."
+        ),
+        "relay_self_test_stall_pause_failed": (
+            "Тестовый LIVE-источник не удалось безопасно приостановить."
+        ),
+        "relay_self_test_stall_switch_failed": (
+            "Переключение с зависшего LIVE на заставку не прошло самопроверку."
+        ),
+        "relay_self_test_stall_capture_failed": (
+            "Рост видеопотока заставки после зависания LIVE не подтверждён."
+        ),
         "relay_self_test_stall_live_failed": (
             "Возврат LIVE в той же SRT-сессии не прошёл самопроверку."
         ),

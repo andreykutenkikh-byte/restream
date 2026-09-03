@@ -327,6 +327,8 @@ async def test_install_uses_pinned_mediamtx_and_never_mutates_host_networking() 
     assert "-profile:v main" in commands
     assert "-pix_fmt yuv420p" in commands
     assert "-g 60" in commands
+    assert "-b:v 8M -minrate 8M -maxrate 8M -bufsize 16M" in commands
+    assert "-x264-params nal-hrd=cbr:force-cfr=1:filler=1" in commands
     assert "-c:a aac" in commands and "-ar 48000 -ac 2" in commands
     assert "'drawtext=" in commands and "x=(w-text_w)/2" in commands
     assert "systemctl disable --now moblin-relay.service" in commands
@@ -469,6 +471,10 @@ async def test_agent_install_failure_rejects_an_unknown_diagnostic_stage() -> No
         ("norm-publish", "relay_self_test_normalizer_publish_failed"),
         ("norm-flap", "relay_self_test_normalizer_flap_failed"),
         ("stall-slate", "relay_self_test_stall_slate_failed"),
+        ("stall-pre", "relay_self_test_stall_precondition_failed"),
+        ("stall-pause", "relay_self_test_stall_pause_failed"),
+        ("stall-switch", "relay_self_test_stall_switch_failed"),
+        ("stall-capture", "relay_self_test_stall_capture_failed"),
         ("stall-live", "relay_self_test_stall_live_failed"),
         ("stall-cont", "relay_self_test_stall_continuity_failed"),
         ("crash-death", "relay_self_test_crash_death_failed"),
