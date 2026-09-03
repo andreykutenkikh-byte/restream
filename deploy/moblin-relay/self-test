@@ -69,6 +69,12 @@ SELF_TEST_STAGES = frozenset(
         "norm-child",
         "norm-publish",
         "norm-flap",
+        "stall-slate",
+        "stall-live",
+        "stall-cont",
+        "crash-death",
+        "crash-live",
+        "crash-cont",
         "outages",
         "outage-slate",
         "outage-normal",
@@ -2003,6 +2009,7 @@ def main() -> int:
 
         mark_self_test_stage("outages")
         print("  checking a recoverable same-session media stall", flush=True)
+        mark_self_test_stage("stall-slate")
         before_pause = wait_healthy_live(
             "healthy LIVE before same-session stall",
             5,
@@ -2026,6 +2033,7 @@ def main() -> int:
                 "same-session SLATE capture growth",
                 same_session_slate,
             )
+            mark_self_test_stage("stall-live")
             if time.monotonic() - same_session_started >= SRT_IDLE_LOWER_BOUND_SECONDS:
                 raise TestFailure("same-session source was not resumed before SRT idle expiry")
             recovery_started = time.monotonic()
@@ -2044,6 +2052,7 @@ def main() -> int:
             raise TestFailure("same-session recovery replaced the upstream processes")
         if same_session_live["normalized_ids"] == previous_normalizer_ids:
             raise TestFailure("same-session recovery did not replace the normalizer publisher")
+        mark_self_test_stage("stall-cont")
         same_session_samples = observer.samples_between(
             same_session_started,
             float(same_session_live["t"]),
@@ -2069,6 +2078,7 @@ def main() -> int:
         }
 
         print("  checking supervisor crash containment and automatic recovery", flush=True)
+        mark_self_test_stage("crash-death")
         before_crash = wait_healthy_live(
             "healthy LIVE before supervisor crash",
             5,
@@ -2103,6 +2113,7 @@ def main() -> int:
             "supervisor-crash SLATE capture growth",
             crash_slate,
         )
+        mark_self_test_stage("crash-live")
         crash_recovery_started = time.monotonic()
         crash_live = wait_healthy_live(
             "supervisor-crash LIVE recovery",
@@ -2112,6 +2123,7 @@ def main() -> int:
         )
         if crash_live["normalized_ids"] == old_normalizer_ids:
             raise TestFailure("supervisor crash reused the old normalizer connection")
+        mark_self_test_stage("crash-cont")
         replacement_supervisors = matching_process_ids(
             (str(NORMALIZER).encode(), b"--sanitized-supervisor")
         )

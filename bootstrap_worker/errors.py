@@ -163,6 +163,24 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_normalizer_flap_failed": (
             "Тестовый LIVE-поток нормализатора оказался нестабильным."
         ),
+        "relay_self_test_stall_slate_failed": (
+            "Переход на заставку при зависании LIVE не прошёл самопроверку."
+        ),
+        "relay_self_test_stall_live_failed": (
+            "Возврат LIVE в той же SRT-сессии не прошёл самопроверку."
+        ),
+        "relay_self_test_stall_continuity_failed": (
+            "Непрерывность выхода при зависании LIVE не подтверждена."
+        ),
+        "relay_self_test_crash_death_failed": (
+            "Изоляция падения supervisor нормализатора не прошла самопроверку."
+        ),
+        "relay_self_test_crash_live_failed": (
+            "LIVE не восстановился после падения supervisor нормализатора."
+        ),
+        "relay_self_test_crash_continuity_failed": (
+            "Непрерывность выхода после падения supervisor не подтверждена."
+        ),
         "relay_self_test_outages_failed": "Переключение LIVE и заставки не прошло самопроверку.",
         "relay_self_test_outage_slate_failed": (
             "Переход на заставку после обрыва LIVE не прошёл самопроверку."
