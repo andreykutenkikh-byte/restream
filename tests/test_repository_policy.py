@@ -74,10 +74,12 @@ def test_repository_policy_allows_only_the_documented_environment_example(
 ) -> None:
     (tmp_path / ".env.example").write_text("SETTING=replace-me\n", encoding="utf-8")
     (tmp_path / ".env.ci").write_text("SECRET=ephemeral-ci-value\n", encoding="utf-8")
+    (tmp_path / ".bootstrap-worker-secret.ci").write_text("ephemeral-ci-secret\n", encoding="utf-8")
     (tmp_path / ".env.production").write_text("SECRET=value\n", encoding="utf-8")
     (tmp_path / ".env.local").write_text("SECRET=value\n", encoding="utf-8")
 
     assert sorted(check(tmp_path)) == [
+        ".bootstrap-worker-secret.ci: runtime data belongs outside the public source repo",
         ".env.ci: runtime data belongs outside the public source repo",
         ".env.local: runtime data belongs outside the public source repo",
         ".env.production: runtime data belongs outside the public source repo",
@@ -91,8 +93,9 @@ def test_repository_policy_allows_only_gitignored_untracked_root_ci_environment(
         ["git", "init", "--quiet", str(tmp_path)],  # noqa: S607
         check=True,
     )
-    (tmp_path / ".gitignore").write_text(".env.*\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text(".env.*\n.bootstrap-worker-secret.*\n", encoding="utf-8")
     (tmp_path / ".env.ci").write_text("SECRET=ephemeral-ci-value\n", encoding="utf-8")
+    (tmp_path / ".bootstrap-worker-secret.ci").write_text("ephemeral-ci-secret\n", encoding="utf-8")
 
     assert check(tmp_path) == []
 
@@ -134,6 +137,7 @@ def test_repository_policy_checks_tracked_runtime_data_inside_ignored_directorie
     tmp_path: Path,
 ) -> None:
     artifacts = (
+        tmp_path / ".bootstrap-worker-secret.ci",
         tmp_path / ".env.ci",
         tmp_path / "data" / "runtime.db",
         tmp_path / "backups" / "snapshot.age",
@@ -153,6 +157,7 @@ def test_repository_policy_checks_tracked_runtime_data_inside_ignored_directorie
             str(tmp_path),
             "add",
             "--force",
+            ".bootstrap-worker-secret.ci",
             ".env.ci",
             "data",
             "backups",
@@ -162,6 +167,7 @@ def test_repository_policy_checks_tracked_runtime_data_inside_ignored_directorie
     )
 
     assert sorted(check(tmp_path)) == [
+        ".bootstrap-worker-secret.ci: runtime data belongs outside the public source repo",
         f"{Path('.env.ci')}: runtime data belongs outside the public source repo",
         f"{Path('backups/snapshot.age')}: runtime data belongs outside the public source repo",
         f"{Path('data/runtime.db')}: runtime data belongs outside the public source repo",

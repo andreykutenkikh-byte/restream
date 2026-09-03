@@ -105,6 +105,7 @@ GIT_PEM_PRIVATE_KEY_PATTERN = r"-----BEGIN( [A-Z0-9_-]+)* PRIVATE KEY-----"
 GIT_AGE_IDENTITY_PATTERN = r"(^|[^A-Z0-9-])AGE-SECRET-KEY-1[0-9A-Z]+"
 GIT_INSPECTION_TIMEOUT_SECONDS = 15
 GIT_INSPECTION_ERROR = "Git index inspection failed; repository policy cannot continue safely"
+EPHEMERAL_CI_SECRET_PATHS = frozenset({".env.ci", ".bootstrap-worker-secret.ci"})
 
 
 class GitInspectionError(RuntimeError):
@@ -184,6 +185,7 @@ def _is_runtime_environment(path: Path) -> bool:
 def _is_private_runtime_artifact(path: Path) -> bool:
     return (
         path.suffix.casefold() in PRIVATE_RUNTIME_SUFFIXES
+        or path.name.casefold().startswith(".bootstrap-worker-secret.")
         or PRIVATE_DATABASE_SIDECAR_PATTERN.search(path.name) is not None
         or PRIVATE_AGE_TEMP_PATTERN.search(path.name) is not None
     )
@@ -223,24 +225,26 @@ def check(root: Path) -> list[str]:
         except GitInspectionError:
             return [GIT_INSPECTION_ERROR]
 
-    ci_environment = root / ".env.ci"
-    allow_ci_environment = False
-    if (
-        git_repository
-        and ci_environment.is_file()
-        and not ci_environment.is_symlink()
-        and ci_environment not in tracked
-    ):
+    allowed_ci_secrets: set[str] = set()
+    if git_repository:
         try:
-            allow_ci_environment = _git_path_is_ignored(root, Path(".env.ci"))
+            for relative_name in EPHEMERAL_CI_SECRET_PATHS:
+                ci_secret = root / relative_name
+                if (
+                    ci_secret.is_file()
+                    and not ci_secret.is_symlink()
+                    and ci_secret not in tracked
+                    and _git_path_is_ignored(root, Path(relative_name))
+                ):
+                    allowed_ci_secrets.add(relative_name)
         except GitInspectionError:
             return [GIT_INSPECTION_ERROR]
 
     for path in _candidate_files(root, tracked):
         relative = path.relative_to(root)
+        if relative.as_posix() in allowed_ci_secrets:
+            continue
         if _is_private_runtime_artifact(path) or _is_runtime_environment(path):
-            if relative.as_posix() == ".env.ci" and allow_ci_environment:
-                continue
             errors.append(f"{relative}: runtime data belongs outside the public source repo")
             continue
         payload: bytes | None = None
