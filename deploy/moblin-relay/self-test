@@ -60,7 +60,10 @@ SELF_TEST_STAGES = frozenset(
         "assets",
         "topology",
         "auth",
+        "auth-source",
         "auth-live",
+        "auth-scan",
+        "auth-exclusive",
         "outages",
         "outage-slate",
         "outage-normal",
@@ -1872,7 +1875,7 @@ def main() -> int:
             "wrong_passphrase": passphrase_samples,
         }
 
-        mark_self_test_stage("auth-live")
+        mark_self_test_stage("auth-source")
         primary_config = write_source_config(
             work, "primary", user, password, passphrase,
             SOURCE_PRIMARY_RTMP_PORT, SOURCE_PRIMARY_METRICS_PORT,
@@ -1882,6 +1885,7 @@ def main() -> int:
         primary_helper = start_source_helper(primary_config, "primary", SOURCE_PRIMARY_METRICS_PORT)
         publisher = start_local_publisher(SOURCE_PRIMARY_RTMP_PORT)
         wait_helper_path(SOURCE_PRIMARY_METRICS_PORT)
+        mark_self_test_stage("auth-live")
         initial_live_started = time.monotonic()
         initial_live = wait_healthy_live(
             "initial healthy LIVE",
@@ -1898,6 +1902,7 @@ def main() -> int:
         if publisher.poll() is not None or primary_helper.poll() is not None:
             raise TestFailure("primary source path exited unexpectedly")
 
+        mark_self_test_stage("auth-scan")
         for handle in log_handles:
             handle.flush()
         result["secret_scan_while_live"] = scan_for_markers(
@@ -1908,6 +1913,7 @@ def main() -> int:
                 or live_scan["process_cmdline_hit"] or live_scan["process_environment_hit"]):
             raise TestFailure("test-token exposure was detected while LIVE was active")
 
+        mark_self_test_stage("auth-exclusive")
         second_config = write_source_config(
             work, "second", user, password, passphrase,
             SOURCE_AUX_RTMP_PORT, SOURCE_AUX_METRICS_PORT,
