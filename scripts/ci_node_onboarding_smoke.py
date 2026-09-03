@@ -93,6 +93,43 @@ SAFE_BOOTSTRAP_DIAGNOSTIC_CODES = frozenset(
         "unsupported_relay_operating_system",
     }
 )
+SAFE_HEARTBEAT_DIAGNOSTIC_CODES = frozenset(
+    {
+        "accepted",
+        "attempts_exhausted",
+        "http_auth_rejected",
+        "http_other",
+        "http_payload_rejected",
+        "http_protocol_conflict",
+        "http_rate_limited",
+        "http_server_error",
+        "network_error",
+        "response_invalid",
+        "revoked",
+        "starting",
+        "token_invalid",
+        "token_unreadable",
+        "unexpected_root",
+    }
+)
+SAFE_NODE_STATUSES = frozenset(
+    {"installing", "connecting", "ready", "degraded", "offline", "revoked", "failed"}
+)
+SAFE_NODE_KINDS = frozenset({"generic_node", "moblin_relay"})
+EXPECTED_RELAY_STATUS: dict[str, Any] = {
+    "service": "inactive",
+    "enabled": False,
+    "main_process": "stopped",
+    "srt_listener": "closed",
+    "source": "NONE",
+    "input_bitrate_bps": None,
+    "youtube_forward": "inactive",
+    "overall": "ok",
+    "youtube_url_configured": False,
+    "youtube_key_configured": False,
+    "portrait_profile": True,
+    "error_code": None,
+}
 SMOKE_STAGES = frozenset(
     {
         "bootstrap_job",
@@ -138,6 +175,228 @@ def safe_bootstrap_diagnostic_code(payload: Mapping[str, Any]) -> str:
     if isinstance(code, str) and code in SAFE_BOOTSTRAP_DIAGNOSTIC_CODES:
         return code
     return "unknown"
+
+
+def _safe_item_count(value: Any) -> str:
+    if not isinstance(value, list):
+        return "invalid"
+    if not value:
+        return "none"
+    return "one" if len(value) == 1 else "multiple"
+
+
+def safe_relay_api_diagnostic(
+    raw_nodes: Mapping[str, Any] | None,
+    raw_relays: Mapping[str, Any] | None,
+    *,
+    expected_node_id: str | None = None,
+    expected_host_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """Reduce API state to fixed fields and booleans safe for CI output."""
+
+    node_items = raw_nodes.get("items") if isinstance(raw_nodes, Mapping) else None
+    relay_items = raw_relays.get("items") if isinstance(raw_relays, Mapping) else None
+    diagnostic: dict[str, Any] = {
+        "node_count": _safe_item_count(node_items),
+        "relay_count": _safe_item_count(relay_items),
+    }
+    if isinstance(node_items, list) and len(node_items) == 1 and isinstance(node_items[0], Mapping):
+        node = node_items[0]
+        raw_status = node.get("status")
+        raw_kind = node.get("node_kind")
+        capabilities = node.get("capabilities")
+        diagnostic.update(
+            {
+                "node_status": (
+                    raw_status
+                    if isinstance(raw_status, str) and raw_status in SAFE_NODE_STATUSES
+                    else "unexpected"
+                ),
+                "node_kind": (
+                    raw_kind
+                    if isinstance(raw_kind, str) and raw_kind in SAFE_NODE_KINDS
+                    else "unexpected"
+                ),
+                "agent_version_match": node.get("agent_version") == "1.2.6",
+                "protocol_version_match": node.get("protocol_version") == 1,
+                "relay_capability_present": isinstance(capabilities, list)
+                and "moblin_relay" in capabilities,
+                "hostname_match": node.get("hostname") == "ci-native-moblin-relay",
+                "completed_node_identity_match": expected_node_id is None
+                or node.get("id") == expected_node_id,
+                "host_key_fingerprint_match": expected_host_fingerprint is None
+                or node.get("host_key_fingerprint") == expected_host_fingerprint,
+                "host_key_trust_mode_match": node.get("host_key_trust_mode") == "tofu",
+                "resolved_ip_present": bool(node.get("resolved_ip")),
+            }
+        )
+    if (
+        isinstance(relay_items, list)
+        and len(relay_items) == 1
+        and isinstance(relay_items[0], Mapping)
+    ):
+        relay = relay_items[0]
+        matching_node: Mapping[str, Any] | None = (
+            node_items[0]
+            if isinstance(node_items, list)
+            and len(node_items) == 1
+            and isinstance(node_items[0], Mapping)
+            else None
+        )
+        status = relay.get("status")
+        diagnostic.update(
+            {
+                "relay_identity_match": matching_node is not None
+                and relay.get("node_id") == matching_node.get("id"),
+                "relay_available": relay.get("available")
+                if isinstance(relay.get("available"), bool)
+                else "invalid",
+                "relay_status_shape": "mapping" if isinstance(status, Mapping) else "invalid",
+            }
+        )
+        if isinstance(status, Mapping):
+            diagnostic["relay_status_mismatches"] = [
+                field
+                for field, expected in EXPECTED_RELAY_STATUS.items()
+                if status.get(field) != expected
+            ]
+            diagnostic["relay_status_unexpected_fields"] = any(
+                field not in EXPECTED_RELAY_STATUS for field in status
+            )
+    return diagnostic
+
+
+def relay_fixture_diagnostic() -> dict[str, Any]:
+    """Read only fixed CI fixture facts; never return process args or file contents."""
+
+    try:
+        result = compose(
+            "exec",
+            "-T",
+            "ci-ssh-target",
+            "python3",
+            "-c",
+            """
+import json
+import os
+import subprocess
+from pathlib import Path
+
+allowed = {
+    'accepted', 'attempts_exhausted', 'http_auth_rejected', 'http_other',
+    'http_payload_rejected', 'http_protocol_conflict', 'http_rate_limited',
+    'http_server_error', 'network_error', 'response_invalid', 'revoked',
+    'starting', 'token_invalid', 'token_unreadable', 'unexpected_root',
+}
+state_root = Path('/run/adojapan-ci-relay-agent')
+status_path = state_root / 'heartbeat.status'
+try:
+    status = status_path.read_text(encoding='ascii').strip()
+except (OSError, UnicodeError):
+    status = 'missing'
+if status not in allowed:
+    status = 'unknown' if status != 'missing' else status
+pid_path = Path('/run/adojapan-ci-systemctl/relay-heartbeat.pid')
+try:
+    pid_text = pid_path.read_text(encoding='ascii').strip()
+except (OSError, UnicodeError):
+    pid_state = 'missing'
+else:
+    if not pid_text.isdecimal() or int(pid_text) < 2:
+        pid_state = 'invalid'
+    else:
+        try:
+            os.kill(int(pid_text), 0)
+        except ProcessLookupError:
+            pid_state = 'exited'
+        except PermissionError:
+            pid_state = 'alive'
+        else:
+            pid_state = 'alive'
+
+def succeeds(argv):
+    return subprocess.run(
+        argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, check=False, timeout=5,
+    ).returncode == 0
+
+print(json.dumps({
+    'fixture_probe': 'ok',
+    'heartbeat_marker': (state_root / 'heartbeat.ok').is_file(),
+    'heartbeat_process': pid_state,
+    'heartbeat_status': status,
+    'service_active': succeeds(['systemctl', 'is-active', '--quiet',
+                                'adojapan-relay-agent.service']),
+    'service_enabled': succeeds(['systemctl', 'is-enabled', '--quiet',
+                                 'adojapan-relay-agent.service']),
+    'token_readable_by_agent': succeeds([
+        'runuser', '-u', 'restream-agent', '--', 'test', '-r',
+        '/etc/adojapan-relay-agent/node.token',
+    ]),
+}, ensure_ascii=True, sort_keys=True))
+""",
+        )
+        payload = json.loads(result.stdout.decode("ascii", errors="strict"))
+    except (SmokeFailure, UnicodeError, ValueError):
+        return {"fixture_probe": "unavailable"}
+    if not isinstance(payload, dict):
+        return {"fixture_probe": "invalid"}
+    heartbeat_status = payload.get("heartbeat_status")
+    pid_state = payload.get("heartbeat_process")
+    if not isinstance(heartbeat_status, str) or heartbeat_status not in (
+        SAFE_HEARTBEAT_DIAGNOSTIC_CODES | {"missing", "unknown"}
+    ):
+        heartbeat_status = "unknown"
+    if not isinstance(pid_state, str) or pid_state not in {
+        "alive",
+        "exited",
+        "invalid",
+        "missing",
+    }:
+        pid_state = "invalid"
+    return {
+        "fixture_probe": "ok",
+        "heartbeat_marker": payload.get("heartbeat_marker") is True,
+        "heartbeat_process": pid_state,
+        "heartbeat_status": heartbeat_status,
+        "service_active": payload.get("service_active") is True,
+        "service_enabled": payload.get("service_enabled") is True,
+        "token_readable_by_agent": payload.get("token_readable_by_agent") is True,
+    }
+
+
+def print_relay_readiness_diagnostic(
+    client: APIClient,
+    *,
+    expected_node_id: str,
+    expected_host_fingerprint: str,
+) -> None:
+    """Emit one bounded allowlisted snapshot after a relay readiness failure."""
+
+    try:
+        raw_nodes = safe_api_payload(client.request("GET", "/api/nodes"), "node diagnostic API")
+        nodes = raw_nodes if isinstance(raw_nodes, Mapping) else None
+    except SmokeFailure:
+        nodes = None
+    try:
+        raw_relays = safe_api_payload(
+            client.request("GET", "/api/relay-nodes"), "relay diagnostic API"
+        )
+        relays = raw_relays if isinstance(raw_relays, Mapping) else None
+    except SmokeFailure:
+        relays = None
+    diagnostic = {
+        "api": safe_relay_api_diagnostic(
+            nodes,
+            relays,
+            expected_node_id=expected_node_id,
+            expected_host_fingerprint=expected_host_fingerprint,
+        ),
+        "fixture": relay_fixture_diagnostic(),
+    }
+    require_marker_absent(encoded(diagnostic), "relay readiness diagnostic")
+    rendered = json.dumps(diagnostic, ensure_ascii=True, sort_keys=True)
+    print(f"Relay readiness diagnostic: {rendered}")
 
 
 def set_smoke_stage(stage: str) -> None:
@@ -249,21 +508,7 @@ def ready_relay(client: APIClient) -> tuple[Mapping[str, Any], Mapping[str, Any]
         require(relay.get("available") is True, "relay heartbeat is not fresh")
         status = relay.get("status")
         require(isinstance(status, dict), "relay status is invalid")
-        expected_status = {
-            "service": "inactive",
-            "enabled": False,
-            "main_process": "stopped",
-            "srt_listener": "closed",
-            "source": "NONE",
-            "input_bitrate_bps": None,
-            "youtube_forward": "inactive",
-            "overall": "ok",
-            "youtube_url_configured": False,
-            "youtube_key_configured": False,
-            "portrait_profile": True,
-            "error_code": None,
-        }
-        require(status == expected_status, "fresh relay status is invalid")
+        require(status == EXPECTED_RELAY_STATUS, "fresh relay status is invalid")
         return cast(Mapping[str, Any], node), cast(Mapping[str, Any], relay)
 
     return wait_for("ready native relay heartbeat", READY_TIMEOUT_SECONDS, probe)
@@ -508,12 +753,20 @@ def main() -> None:
     set_smoke_stage("bootstrap_job")
     completed = poll_job(client, job_id)
     set_smoke_stage("relay_ready")
-    node, _relay = ready_relay(client)
-    node_id = str(node.get("id", ""))
-    require(bool(node_id) and completed.get("node_id") == node_id, "node id changed")
-    require(node.get("host_key_fingerprint") == expected_host_fingerprint, "host key changed")
-    require(node.get("host_key_trust_mode") == "tofu", "TOFU was not persisted")
-    require(bool(node.get("resolved_ip")), "resolved SSH target IP was not persisted")
+    try:
+        node, _relay = ready_relay(client)
+        node_id = str(node.get("id", ""))
+        require(bool(node_id) and completed.get("node_id") == node_id, "node id changed")
+        require(node.get("host_key_fingerprint") == expected_host_fingerprint, "host key changed")
+        require(node.get("host_key_trust_mode") == "tofu", "TOFU was not persisted")
+        require(bool(node.get("resolved_ip")), "resolved SSH target IP was not persisted")
+    except SmokeFailure:
+        print_relay_readiness_diagnostic(
+            client,
+            expected_node_id=str(completed.get("node_id", "")),
+            expected_host_fingerprint=expected_host_fingerprint,
+        )
+        raise
 
     set_smoke_stage("remote_lifecycle")
     verify_remote_lifecycle()

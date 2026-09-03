@@ -186,6 +186,107 @@ def bootstrap_components(
     return database, client, coordinator
 
 
+def test_worker_hostname_populates_before_agent_heartbeat(
+    bootstrap_components: tuple[Database, FakeBootstrapClient, BootstrapCoordinator],
+) -> None:
+    database, client, coordinator = bootstrap_components
+    job_id = str(uuid4())
+    node_id = str(uuid4())
+    coordinator.nodes.create_pending_bootstrap_node(
+        job_id=job_id,
+        install_profile="generic_node",
+        display_name="server-01",
+        address="example.test",
+        resolved_ip="",
+        ssh_port=22,
+        ssh_username="root",
+        node_id=node_id,
+    )
+    job = coordinator._job(job_id)
+    assert job is not None
+
+    coordinator._persist_worker_facts(job, client.view)
+
+    with database.connect() as connection:
+        node = connection.execute(
+            "SELECT hostname, status FROM restream_nodes WHERE id = ?", (node_id,)
+        ).fetchone()
+    assert dict(node) == {"hostname": "edge-01", "status": "installing"}
+
+
+def test_completed_worker_poll_preserves_heartbeat_owned_hostname(
+    bootstrap_components: tuple[Database, FakeBootstrapClient, BootstrapCoordinator],
+) -> None:
+    database, client, coordinator = bootstrap_components
+    job_id = str(uuid4())
+    node_id = str(uuid4())
+    coordinator.nodes.create_pending_bootstrap_node(
+        job_id=job_id,
+        install_profile="moblin_relay",
+        display_name="HK relay",
+        address="relay.example.test",
+        resolved_ip="",
+        ssh_port=22,
+        ssh_username="root",
+        node_id=node_id,
+    )
+    job = coordinator._job(job_id)
+    assert job is not None
+    node_token = coordinator.nodes.issue_relay_bootstrap_credential(node_id, job_id)
+    RelayService(database, generate_master_key()).record_heartbeat(
+        node_token,
+        {
+            "agent_version": "1.2.6",
+            "protocol_version": 1,
+            "hostname": "ci-native-moblin-relay",
+            "relay": {
+                "service_state": "inactive",
+                "enabled": False,
+                "main_process": "stopped",
+                "srt_listener": "closed",
+                "source": "NONE",
+                "youtube_forward": "inactive",
+                "overall": "ok",
+                "youtube_url_configured": False,
+                "youtube_key_configured": False,
+                "healthy": True,
+                "portrait_profile": True,
+                "error_code": None,
+            },
+            "host": {
+                "uptime_seconds": 100.0,
+                "load_1m": 0.1,
+                "cpu_percent": 2.5,
+                "memory_total_bytes": 2_147_483_648,
+                "memory_available_bytes": 1_073_741_824,
+                "disk_total_bytes": 21_474_836_480,
+                "disk_free_bytes": 10_737_418_240,
+            },
+            "current_command_id": None,
+        },
+    )
+
+    coordinator._persist_worker_view(
+        job,
+        {
+            **client.view,
+            "state": "completed",
+            "current_step": "completed",
+            "progress_percent": 100,
+        },
+    )
+
+    with database.connect() as connection:
+        node = connection.execute(
+            "SELECT hostname, status FROM restream_nodes WHERE id = ?", (node_id,)
+        ).fetchone()
+        persisted_job = connection.execute(
+            "SELECT state FROM node_install_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+    assert dict(node) == {"hostname": "ci-native-moblin-relay", "status": "ready"}
+    assert persisted_job["state"] == "completed"
+
+
 def test_secret_models_never_reveal_passwords_in_repr() -> None:
     marker = "CI_SSH_PASSWORD_MUST_NEVER_PERSIST_9F3A"
     request = BootstrapRequest(

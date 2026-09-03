@@ -7,6 +7,7 @@ import pytest
 from scripts.ci_node_onboarding_smoke import (
     safe_api_payload,
     safe_bootstrap_diagnostic_code,
+    safe_relay_api_diagnostic,
 )
 from scripts.ci_output_smoke import SmokeFailure
 
@@ -48,3 +49,88 @@ def test_api_payload_password_marker_fails_closed() -> None:
 
     clean: dict[str, Any] = {"install_profile": "moblin_relay"}
     assert safe_api_payload(clean, "unit test payload") is clean
+
+
+def test_relay_api_diagnostic_reports_only_allowlisted_readiness_facts() -> None:
+    marker = "CI_SSH_PASSWORD_MUST_NEVER_PERSIST_9F3A"
+    diagnostic = safe_relay_api_diagnostic(
+        {
+            "items": [
+                {
+                    "id": marker,
+                    "status": "connecting",
+                    "node_kind": "moblin_relay",
+                    "agent_version": "wrong-and-sensitive-" + marker,
+                    "protocol_version": 9,
+                    "capabilities": ["other", marker],
+                    "hostname": marker,
+                }
+            ]
+        },
+        {
+            "items": [
+                {
+                    "node_id": "different-" + marker,
+                    "available": False,
+                    "status": {
+                        "service": "active",
+                        "enabled": False,
+                        "main_process": "stopped",
+                        "srt_listener": "closed",
+                        "source": "NONE",
+                        "input_bitrate_bps": None,
+                        "youtube_forward": "inactive",
+                        "overall": "ok",
+                        "youtube_url_configured": False,
+                        "youtube_key_configured": False,
+                        "portrait_profile": True,
+                        "error_code": None,
+                        marker: marker,
+                    },
+                }
+            ]
+        },
+        expected_node_id="different-expected-" + marker,
+        expected_host_fingerprint="different-fingerprint-" + marker,
+    )
+
+    assert diagnostic == {
+        "node_count": "one",
+        "relay_count": "one",
+        "node_status": "connecting",
+        "node_kind": "moblin_relay",
+        "agent_version_match": False,
+        "protocol_version_match": False,
+        "relay_capability_present": False,
+        "hostname_match": False,
+        "completed_node_identity_match": False,
+        "host_key_fingerprint_match": False,
+        "host_key_trust_mode_match": False,
+        "resolved_ip_present": False,
+        "relay_identity_match": False,
+        "relay_available": False,
+        "relay_status_shape": "mapping",
+        "relay_status_mismatches": ["service"],
+        "relay_status_unexpected_fields": True,
+    }
+    assert marker not in repr(diagnostic)
+
+
+def test_relay_api_diagnostic_distinguishes_missing_and_invalid_state() -> None:
+    assert safe_relay_api_diagnostic({"items": []}, {"items": [{"status": "bad"}]}) == {
+        "node_count": "none",
+        "relay_count": "one",
+        "relay_identity_match": False,
+        "relay_available": "invalid",
+        "relay_status_shape": "invalid",
+    }
+    assert safe_relay_api_diagnostic(None, None) == {
+        "node_count": "invalid",
+        "relay_count": "invalid",
+    }
+    unhashable = safe_relay_api_diagnostic(
+        {"items": [{"status": [], "node_kind": {}}]},
+        {"items": []},
+    )
+    assert unhashable["node_status"] == "unexpected"
+    assert unhashable["node_kind"] == "unexpected"

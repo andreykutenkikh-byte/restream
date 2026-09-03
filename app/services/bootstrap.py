@@ -869,7 +869,9 @@ class BootstrapCoordinator:
                 host_key_algorithm = COALESCE(NULLIF(?, ''), host_key_algorithm),
                 host_key_fingerprint = COALESCE(NULLIF(?, ''), host_key_fingerprint),
                 host_key_trust_mode = COALESCE(NULLIF(?, ''), host_key_trust_mode),
-                hostname = COALESCE(NULLIF(?, ''), hostname),
+                hostname = CASE
+                    WHEN status = 'ready' THEN hostname
+                    ELSE COALESCE(NULLIF(?, ''), hostname) END,
                 os_name = COALESCE(NULLIF(?, ''), os_name),
                 os_version = COALESCE(NULLIF(?, ''), os_version),
                 architecture = COALESCE(NULLIF(?, ''), architecture),

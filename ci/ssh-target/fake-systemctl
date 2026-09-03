@@ -44,6 +44,10 @@ stop_heartbeat() {
 start_heartbeat() {
   stop_heartbeat
   install -d -o restream-agent -g restream-agent -m 0700 /run/adojapan-ci-relay-agent
+  rm -f -- /run/adojapan-ci-relay-agent/heartbeat.ok \
+    /run/adojapan-ci-relay-agent/heartbeat.status \
+    /run/adojapan-ci-relay-agent/heartbeat.tmp \
+    /run/adojapan-ci-relay-agent/quiescent.ok
   nohup runuser -u restream-agent -- \
     /usr/local/lib/adojapan-ci/relay-heartbeat.py \
     </dev/null >/dev/null 2>&1 &
