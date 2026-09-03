@@ -4,7 +4,7 @@
 {% block body_class %}dashboard-page relay-dashboard-page{% endblock %}
 {% block head %}
   <script src="/static/vendor/hls.min.js" defer></script>
-  <script src="/static/preview-player.js?v=20260902.3" defer></script>
+  <script src="/static/preview-player.js?v=20260903.1" defer></script>
 {% endblock %}
 
 {% block header %}
@@ -142,7 +142,7 @@
           <dl class="relay-live-metrics">
             <div><dt>Входящий битрейт</dt><dd data-relay-bitrate>—</dd></div>
             <div><dt>Отправка в YouTube</dt><dd data-relay-youtube-forward>—</dd></div>
-            <div><dt>Профиль видео</dt><dd data-relay-profile>720×1280 · 30 FPS</dd></div>
+            <div><dt>Разрешение LIVE</dt><dd data-relay-live-resolution>—</dd></div>
             <div><dt>Последнее обновление</dt><dd data-relay-updated>—</dd></div>
           </dl>
           <p class="relay-monitor__hint" data-relay-monitor-hint>После запуска приложения здесь появятся статус, битрейт и превью.</p>
@@ -171,6 +171,7 @@
             <div><dt>Relay</dt><dd data-relay-field="service">—</dd></div>
             <div><dt>SRT listener</dt><dd data-relay-field="srt-listener">—</dd></div>
             <div><dt>Источник</dt><dd data-relay-field="source">—</dd></div>
+            <div><dt>Серверная заставка</dt><dd data-relay-profile>1080×1920 · 30 FPS</dd></div>
             <div><dt>YouTube RTMPS URL</dt><dd data-relay-field="youtube-url">—</dd></div>
             <div><dt>YouTube stream key</dt><dd data-relay-field="youtube-key">—</dd></div>
             <div><dt>Связь с HK-сервером</dt><dd data-relay-field="last-seen">—</dd></div>
@@ -272,5 +273,5 @@
 {% endblock %}
 
 {% block scripts %}
-  <script src="/static/relay-dashboard.js?v=20260902.4" defer></script>
+  <script src="/static/relay-dashboard.js?v=20260903.1" defer></script>
 {% endblock %}

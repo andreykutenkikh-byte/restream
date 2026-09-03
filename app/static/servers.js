@@ -263,7 +263,7 @@
       badgeLabel = "Нужна проверка";
       badgeTone = "danger";
       notice = profileFault && !failed && !degraded && !inconsistent && !blockingError
-        ? "Вертикальный профиль 720×1280 не подтверждён. Запуск заблокирован до проверки профиля."
+        ? "Профиль серверной заставки 1080×1920 не подтверждён. Запуск заблокирован до проверки профиля."
         : inconsistent
           ? "Сервер прислал противоречивое состояние. Обновите статус; запуск заблокирован."
           : "Один из компонентов relay требует внимания. Запуск и изменение настроек заблокированы.";
@@ -322,7 +322,7 @@
     }
     else if (!safelyStopped) actionReason = "Настройки YouTube можно менять только после остановки relay.";
     else if (!settingsSafeStopped) actionReason = "Обновите статус и дождитесь полной остановки компонентов relay.";
-    else if (profileFault) actionReason = "Запуск заблокирован: профиль 720×1280 не подтверждён.";
+    else if (profileFault) actionReason = "Запуск заблокирован: профиль серверной заставки 1080×1920 не подтверждён.";
     else if (!fullyConfigured) actionReason = "Для запуска сначала настройте YouTube.";
 
     return {
@@ -336,7 +336,7 @@
       moblinLabel,
       notice,
       operable,
-      profileLabel: relay?.portraitProfile === true ? "720×1280 · 30 FPS" : "Профиль не подтверждён",
+      profileLabel: relay?.portraitProfile === true ? "1080×1920 · 30 FPS" : "Профиль не подтверждён",
       relayStateLabel,
       safelyStopped: settingsSafeStopped,
       startDisabled: !operable || !settingsSafeStopped || !fullyConfigured || profileFault,
@@ -679,7 +679,7 @@
     const titleGroup = document.createElement("div");
     const title = appendText(titleGroup, "h3", "", "Управление трансляцией");
     title.id = relayTitleId;
-    appendText(titleGroup, "p", "", "Moblin → SRT → HK relay → YouTube · 720×1280 · 30 FPS");
+    appendText(titleGroup, "p", "", "Moblin → SRT → HK relay → YouTube");
     const badge = appendText(heading, "span", "relay-badge relay-badge--neutral", "Проверяем…");
     badge.dataset.relayBadge = "";
     badge.setAttribute("role", "status");
@@ -696,7 +696,7 @@
     relaySummaryRow(summary, "Relay", "relay-state");
     relaySummaryRow(summary, "Moblin", "moblin-state");
     relaySummaryRow(summary, "YouTube", "youtube-state");
-    relaySummaryRow(summary, "Профиль", "profile-state");
+    relaySummaryRow(summary, "Серверная заставка", "profile-state");
     panel.append(summary);
 
     const technical = document.createElement("details");
@@ -711,7 +711,7 @@
     relayMetricRow(metrics, "SRT listener", "srt-listener");
     relayMetricRow(metrics, "YouTube RTMPS URL", "youtube-url");
     relayMetricRow(metrics, "YouTube stream key", "youtube-key");
-    relayMetricRow(metrics, "Профиль видео", "portrait-profile");
+    relayMetricRow(metrics, "Профиль заставки", "portrait-profile");
     technical.append(metrics);
     panel.append(technical);
 
@@ -822,7 +822,7 @@
     setRelayMetric(panel, "srt-listener", relayLabel(relay.srtListener));
     setRelayMetric(panel, "youtube-url", relay.youtubeUrlConfigured ? "Настроен" : "Не настроен");
     setRelayMetric(panel, "youtube-key", relay.youtubeKeyConfigured ? "Настроен" : "Не настроен");
-    setRelayMetric(panel, "portrait-profile", relay.portraitProfile ? "720×1280 · 30 FPS" : "Не подтверждён");
+    setRelayMetric(panel, "portrait-profile", relay.portraitProfile ? "1080×1920 · 30 FPS" : "Не подтверждён");
 
     for (const button of actionButtons) button.disabled = !view.operable;
     const start = panel.querySelector('[data-relay-action="start"]');

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import stat
 import struct
 import time
 from pathlib import Path
@@ -215,6 +216,57 @@ def broker_with_fake(monkeypatch: pytest.MonkeyPatch) -> tuple[RelayBroker, Fake
     broker = RelayBroker(fake.namespace())
     monkeypatch.setattr(broker, "_portrait_profile", lambda: True)
     return broker, fake
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "expected"),
+    [(1080, 1920, True), (720, 1280, False), (1920, 1080, False)],
+)
+def test_portrait_profile_requires_exact_1080x1920_main_level_4(
+    monkeypatch: pytest.MonkeyPatch,
+    width: int,
+    height: int,
+    expected: bool,
+) -> None:
+    fake = FakeRelayCtl()
+    namespace = fake.namespace()
+    calls: list[list[str]] = []
+
+    def run_quiet(args: list[str]) -> SimpleNamespace:
+        calls.append(args)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "streams": [
+                        {
+                            "codec_name": "h264",
+                            "profile": "Main",
+                            "level": 40,
+                            "width": width,
+                            "height": height,
+                            "pix_fmt": "yuv420p",
+                            "r_frame_rate": "30/1",
+                        }
+                    ]
+                }
+            ),
+        )
+
+    namespace["run_quiet"] = run_quiet
+    monkeypatch.setattr(
+        Path,
+        "lstat",
+        lambda _path: SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o640,
+            st_mtime_ns=1,
+            st_size=123,
+        ),
+    )
+
+    assert RelayBroker(namespace)._portrait_profile() is expected
+    assert len(calls) == 1
+    assert "stream=codec_name,profile,level,width,height,pix_fmt,r_frame_rate" in calls[0]
 
 
 @pytest.mark.parametrize(

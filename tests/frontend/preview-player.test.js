@@ -281,7 +281,7 @@ test("offline invalidates a queued retry", () => {
   assert.equal(FakeHls.instances.length, 1);
 });
 
-test("loaded video metadata supplies a resolution fallback", () => {
+test("metadata and resize events keep the actual LIVE resolution current", () => {
   const resolutions = [];
   const { controller, video } = makeController({
     onResolution: (width, height) => resolutions.push([width, height]),
@@ -291,10 +291,14 @@ test("loaded video metadata supplies a resolution fallback", () => {
   video.videoHeight = 1080;
 
   video.dispatch("loadedmetadata");
+  video.videoWidth = 1080;
+  video.videoHeight = 1920;
+  video.dispatch("resize");
   controller.setStreamState("offline");
 
   assert.deepEqual(resolutions, [
     [1920, 1080],
+    [1080, 1920],
     [null, null],
   ]);
 });

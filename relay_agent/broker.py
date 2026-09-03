@@ -604,7 +604,7 @@ class RelayBroker:
                     "-select_streams",
                     "v:0",
                     "-show_entries",
-                    "stream=codec_name,width,height,pix_fmt,r_frame_rate",
+                    "stream=codec_name,profile,level,width,height,pix_fmt,r_frame_rate",
                     "-of",
                     "json",
                     str(slate),
@@ -619,8 +619,10 @@ class RelayBroker:
                 portrait = bool(
                     isinstance(stream, dict)
                     and stream.get("codec_name") == "h264"
-                    and stream.get("width") == 720
-                    and stream.get("height") == 1280
+                    and stream.get("profile") == "Main"
+                    and stream.get("level") == 40
+                    and stream.get("width") == 1080
+                    and stream.get("height") == 1920
                     and stream.get("pix_fmt") == "yuv420p"
                     and stream.get("r_frame_rate") == "30/1"
                 )

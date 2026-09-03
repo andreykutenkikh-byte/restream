@@ -107,6 +107,20 @@
     return `${Math.round(bps)} бит/с`;
   }
 
+  function formatResolution(width, height) {
+    const normalizedWidth = Number(width);
+    const normalizedHeight = Number(height);
+    if (
+      !Number.isInteger(normalizedWidth)
+      || !Number.isInteger(normalizedHeight)
+      || normalizedWidth < 1
+      || normalizedHeight < 1
+      || normalizedWidth > 8192
+      || normalizedHeight > 8192
+    ) return "—";
+    return `${normalizedWidth}×${normalizedHeight}`;
+  }
+
   function formatAge(value, now = Date.now()) {
     const timestamp = typeof value === "string" ? Date.parse(value) : NaN;
     if (!Number.isFinite(timestamp)) return "—";
@@ -209,6 +223,7 @@
       buildYouTubePayload,
       formatAge,
       formatBitrate,
+      formatResolution,
       isCurrentDialogRequest,
       normalizeRelayStatus,
       previewUpdateIsCurrent,
@@ -424,6 +439,7 @@
       previewLeaseRenewedAt = 0;
       previewController?.suspend("offline");
       previewContainer.dataset.previewState = "offline";
+      setText("[data-relay-live-resolution]", "—");
       return;
     }
     const leaseReady = await renewPreviewLease();
@@ -440,11 +456,15 @@
     if (!previewController || previewNodeId !== relayNodeId) {
       previewController?.suspend("offline");
       previewNodeId = relayNodeId;
+      setText("[data-relay-live-resolution]", "Определяется…");
       previewController = new globalScope.IngestPreviewController({
         container: previewContainer,
         video: previewVideo,
         hlsClass: globalScope.Hls || null,
         sourceUrl: `/api/nodes/${encodeURIComponent(relayNodeId)}/relay/preview/index.m3u8`,
+        onResolution: (width, height) => {
+          setText("[data-relay-live-resolution]", formatResolution(width, height));
+        },
       });
     }
     previewController.resume();
@@ -499,7 +519,7 @@
     updateSignal(currentRelay);
     setText("[data-relay-bitrate]", currentRelay.source === "LIVE" ? formatBitrate(currentRelay.inputBitrateBps) : "—");
     setText("[data-relay-youtube-forward]", ({ active: "Отправляется", connecting: "Подключение…", inactive: "Остановлена", failed: "Ошибка" })[currentRelay.youtubeForward] || "Нет данных");
-    setText("[data-relay-profile]", currentRelay.portraitProfile ? "720×1280 · 30 FPS" : "Профиль не подтверждён");
+    setText("[data-relay-profile]", currentRelay.portraitProfile ? "1080×1920 · 30 FPS" : "Профиль не подтверждён");
     setText("[data-relay-updated]", formatAge(currentRelay.lastSeenAt));
     setTechnicalField("service", relayLabel(currentRelay.service));
     setTechnicalField("srt-listener", relayLabel(currentRelay.srtListener));

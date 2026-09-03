@@ -455,7 +455,7 @@ test("UI includes progress, sudo, revoke confirmation, and mobile layout", () =>
   assert.match(source, /button\.disabled = true/);
   assert.match(baseTemplate, /styles\.css[^"\n]*\?v=20260902\.3/);
   assert.match(baseTemplate, /app\.js[^"\n]*\?v=20260902\.3/);
-  assert.match(template, /servers\.js\?v=20260902\.4/);
+  assert.match(template, /servers\.js\?v=20260903\.1/);
   assert.match(source, /result\.safe_result\?\.status === "ok"/);
   assert.match(source, /Docker может остаться установленным на сервере/);
 });

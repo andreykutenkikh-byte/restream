@@ -11,6 +11,7 @@ const {
   buildYouTubePayload,
   formatAge,
   formatBitrate,
+  formatResolution,
   isCurrentDialogRequest,
   normalizeRelayStatus,
   previewUpdateIsCurrent,
@@ -163,6 +164,13 @@ test("bitrate and age labels are concise", () => {
   assert.equal(formatAge("2026-09-02T00:00:00Z", Date.parse("2026-09-02T00:00:04Z")), "только что");
 });
 
+test("LIVE resolution formatter accepts only bounded integer dimensions", () => {
+  assert.equal(formatResolution(1080, 1920), "1080×1920");
+  assert.equal(formatResolution(null, 1920), "—");
+  assert.equal(formatResolution(1080.5, 1920), "—");
+  assert.equal(formatResolution(1080, 9000), "—");
+});
+
 test("actions fail closed on inconsistent or failed relay state", () => {
   assert.equal(relayViewModel(status({ main_process: "running" })).startDisabled, true);
   assert.equal(relayViewModel(status({ overall: "failed", error_code: "relayctl_failed" })).configureDisabled, true);
@@ -205,7 +213,11 @@ test("routine setup omits step-up password while destructive clear keeps it", ()
   assert.doesNotMatch(dashboardTemplate, /data-dashboard-(?:youtube|moblin)-admin-password/);
   assert.equal((dashboardTemplate.match(/name="admin_password"/g) || []).length, 1);
   assert.match(dashboardTemplate, /data-dashboard-clear-admin-password/);
-  assert.match(dashboardTemplate, /relay-dashboard\.js\?v=20260902\.4/);
+  assert.match(dashboardTemplate, /relay-dashboard\.js\?v=20260903\.1/);
+  assert.match(dashboardTemplate, /preview-player\.js\?v=20260903\.1/);
+  assert.match(dashboardTemplate, /Разрешение LIVE[\s\S]*data-relay-live-resolution/);
+  assert.match(dashboardTemplate, /Серверная заставка[\s\S]*1080×1920 · 30 FPS/);
+  assert.match(dashboardJavascript, /onResolution:[\s\S]*formatResolution\(width, height\)/);
 
   const moblinSubmit = dashboardJavascript
     .split("async function submitMoblin", 2)[1]

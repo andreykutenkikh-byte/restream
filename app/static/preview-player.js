@@ -58,17 +58,22 @@
           this.setPreviewState("live");
         }
       };
-      this.handleLoadedMetadata = () => {
+      this.reportResolution = () => {
         if (this.suspended || !PLAYABLE_STATES.has(this.streamState) || !this.mode) return;
         const width = Number(this.video.videoWidth);
         const height = Number(this.video.videoHeight);
         if (Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0) {
           this.onResolution(Math.round(width), Math.round(height));
         }
+      };
+      this.handleLoadedMetadata = () => {
+        if (this.suspended || !PLAYABLE_STATES.has(this.streamState) || !this.mode) return;
+        this.reportResolution();
         // Metadata proves that the same-origin source is playable. Reveal the
         // native controls even when the browser declined muted autoplay.
         this.setPreviewState("live");
       };
+      this.handleResize = () => this.reportResolution();
       this.handleNativeError = () => {
         if (this.mode === "native" && PLAYABLE_STATES.has(this.streamState)) {
           this.scheduleNetworkRetry();
@@ -77,6 +82,7 @@
 
       this.video.addEventListener("playing", this.handlePlaying);
       this.video.addEventListener("loadedmetadata", this.handleLoadedMetadata);
+      this.video.addEventListener("resize", this.handleResize);
       this.video.addEventListener("error", this.handleNativeError);
       this.video.muted = true;
       this.setPreviewState("offline");

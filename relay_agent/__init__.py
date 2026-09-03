@@ -2,5 +2,5 @@
 
 from __future__ import annotations
 
-AGENT_VERSION = "1.2.4"
+AGENT_VERSION = "1.2.5"
 PROTOCOL_VERSION = 1
