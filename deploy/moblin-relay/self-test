@@ -60,6 +60,7 @@ SELF_TEST_STAGES = frozenset(
         "assets",
         "topology",
         "auth",
+        "auth-live",
         "outages",
         "outage-slate",
         "outage-normal",
@@ -1871,6 +1872,7 @@ def main() -> int:
             "wrong_passphrase": passphrase_samples,
         }
 
+        mark_self_test_stage("auth-live")
         primary_config = write_source_config(
             work, "primary", user, password, passphrase,
             SOURCE_PRIMARY_RTMP_PORT, SOURCE_PRIMARY_METRICS_PORT,

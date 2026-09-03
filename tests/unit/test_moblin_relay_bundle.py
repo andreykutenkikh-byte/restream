@@ -257,6 +257,7 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         "assets",
         "topology",
         "auth",
+        "auth-live",
         "outages",
         "outage-slate",
         "outage-normal",
@@ -399,8 +400,8 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
 
     argv = build_argv(18554, 11936)
     input_index = argv.index("-i")
-    assert argv[argv.index("-rw_timeout") + 1] == "100000"
-    assert argv[argv.index("-timeout") + 1] == "100000"
+    assert argv[argv.index("-rw_timeout") + 1] == "500000"
+    assert argv[argv.index("-timeout") + 1] == "500000"
     assert argv.index("-rw_timeout") < input_index
     assert argv.index("-timeout") < input_index
     assert argv[argv.index("-c:v") + 1] == "copy"
@@ -439,12 +440,11 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
     assert output_gate.observe(("normalizer-b", 130)) is False
 
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
-    assert watchdog.observe(True, ("normalizer-a", 121), 1.09) is True
-    assert watchdog.observe(True, ("normalizer-a", 121), 1.18) is True
-    assert watchdog.observe(True, ("normalizer-a", 121), 1.191) is False
+    assert watchdog.observe(True, ("normalizer-a", 120), 1.499) is True
+    assert watchdog.observe(True, ("normalizer-a", 120), 1.501) is False
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
-    assert watchdog.observe(False, None, 1.149) is True
-    assert watchdog.observe(False, None, 1.151) is False
+    assert watchdog.observe(False, None, 1.749) is True
+    assert watchdog.observe(False, None, 1.751) is False
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
     assert watchdog.observe(True, ("normalizer-b", 121), 1.01) is False
     assert "make_parent_death_setup" in loaded

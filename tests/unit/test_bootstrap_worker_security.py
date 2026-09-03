@@ -49,6 +49,7 @@ def test_native_relay_failures_have_stable_localized_messages() -> None:
         "relay_self_test_assets_failed",
         "relay_self_test_topology_failed",
         "relay_self_test_auth_failed",
+        "relay_self_test_auth_live_failed",
         "relay_self_test_outages_failed",
         "relay_self_test_outage_slate_failed",
         "relay_self_test_outage_normal_failed",

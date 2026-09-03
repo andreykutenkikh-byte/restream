@@ -110,6 +110,7 @@ _SELF_TEST_STAGE_CODES = {
     "assets": "relay_self_test_assets_failed",
     "topology": "relay_self_test_topology_failed",
     "auth": "relay_self_test_auth_failed",
+    "auth-live": "relay_self_test_auth_live_failed",
     "outages": "relay_self_test_outages_failed",
     "outage-slate": "relay_self_test_outage_slate_failed",
     "outage-normal": "relay_self_test_outage_normal_failed",
