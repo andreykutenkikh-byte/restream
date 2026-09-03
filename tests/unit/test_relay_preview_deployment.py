@@ -14,7 +14,43 @@ def test_nginx_media_body_override_is_exact_and_does_not_raise_global_limit() ->
     media_location = media_location.split("\n    }", 1)[0]
     assert "proxy_request_buffering off;" in media_location
     assert "proxy_buffering off;" in media_location
+    assert "proxy_max_temp_file_size 0;" in media_location
+    assert "proxy_http_version 1.1;" in media_location
+    assert "proxy_set_header Authorization $http_authorization;" in media_location
+    assert "proxy_connect_timeout 5s;" in media_location
+    assert "proxy_send_timeout 30s;" in media_location
+    assert "proxy_read_timeout 30s;" in media_location
     assert "/relay-agent/" not in media_location
+
+
+def test_nginx_guards_internal_and_strictly_scopes_browser_preview() -> None:
+    nginx = (ROOT / "deploy" / "nginx-restream.conf.example").read_text(encoding="utf-8")
+
+    assert "location = /internal {" in nginx
+    assert "location ^~ /internal/ {" in nginx
+    assert "location ~ ^/api/nodes/[0-9a-f-]+/" not in nginx
+    preview_location = nginx.split('location ~ "^/api/nodes/', 1)[1]
+    preview_location = preview_location.split("\n    }", 1)[0]
+    uuid_pattern = "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+    assert preview_location.count(uuid_pattern) == 2
+    assert "(?:0|[1-9][0-9]{0,18})\\.ts" in preview_location
+    assert "proxy_buffering off;" in preview_location
+    assert "proxy_max_temp_file_size 0;" in preview_location
+    assert "proxy_http_version 1.1;" in preview_location
+    assert "proxy_connect_timeout 5s;" in preview_location
+    assert "proxy_send_timeout 30s;" in preview_location
+    assert "proxy_read_timeout 30s;" in preview_location
+    assert "proxy_set_header Authorization" not in preview_location
+
+
+def test_nginx_general_proxy_has_bounded_timeouts() -> None:
+    nginx = (ROOT / "deploy" / "nginx-restream.conf.example").read_text(encoding="utf-8")
+    general_location = nginx.split("location / {", 1)[1].split("\n    }", 1)[0]
+
+    assert "proxy_http_version 1.1;" in general_location
+    assert "proxy_connect_timeout 5s;" in general_location
+    assert "proxy_send_timeout 60s;" in general_location
+    assert "proxy_read_timeout 60s;" in general_location
 
 
 def test_agent_preview_credential_is_optional_and_never_an_argument_or_environment() -> None:
