@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import ast
+import os
 import re
+import subprocess
 from pathlib import Path
 
 IGNORED_PARTS = {
@@ -44,7 +46,6 @@ FORBIDDEN = {
     "global system prune": "docker system" + " prune",
     "global volume prune": "docker volume" + " prune",
     "global network prune": "docker network" + " prune",
-    "committed private key": "BEGIN OPENSSH " + "PRIVATE KEY",
 }
 
 RUNTIME_POLICY_DIRECTORIES = {
@@ -84,6 +85,108 @@ DOCKER_DAEMON_FIREWALL_MARKERS = {
 }
 SELINUX_CONFIGURATION_MARKERS = {"/etc/selinux/" + "config"}
 PRIVATE_RUNTIME_SUFFIXES = {".age", ".db", ".sqlite", ".sqlite3"}
+PRIVATE_DATABASE_SIDECAR_PATTERN = re.compile(
+    r"\.(?:db|sqlite|sqlite3)-(?:wal|shm|journal)$",
+    re.IGNORECASE,
+)
+PRIVATE_AGE_TEMP_PATTERN = re.compile(
+    r"\.age[.-](?:tmp|temp|part|partial)(?:[.-].*)?$",
+    re.IGNORECASE,
+)
+PEM_PRIVATE_KEY_PATTERN = re.compile(
+    rb"-----BEGIN(?: [A-Z0-9_-]+)* PRIVATE KEY-----",
+    re.IGNORECASE,
+)
+AGE_SECRET_IDENTITY_PATTERN = re.compile(
+    rb"(?<![A-Z0-9-])AGE-SECRET-KEY-1[0-9A-Z]+",
+    re.IGNORECASE,
+)
+GIT_PEM_PRIVATE_KEY_PATTERN = r"-----BEGIN( [A-Z0-9_-]+)* PRIVATE KEY-----"
+GIT_AGE_IDENTITY_PATTERN = r"(^|[^A-Z0-9-])AGE-SECRET-KEY-1[0-9A-Z]+"
+GIT_INSPECTION_TIMEOUT_SECONDS = 15
+GIT_INSPECTION_ERROR = "Git index inspection failed; repository policy cannot continue safely"
+
+
+class GitInspectionError(RuntimeError):
+    """Raised when Git cannot prove the state of the repository index."""
+
+
+def _run_git(
+    root: Path,
+    arguments: list[str],
+    *,
+    allowed_returncodes: frozenset[int],
+) -> subprocess.CompletedProcess[bytes]:
+    try:
+        result = subprocess.run(  # noqa: S603 - fixed Git operation; root is a separate argv
+            ["git", "-C", str(root), *arguments],  # noqa: S607
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=GIT_INSPECTION_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise GitInspectionError from exc
+    if result.returncode not in allowed_returncodes:
+        raise GitInspectionError
+    return result
+
+
+def _tracked_files(root: Path) -> set[Path]:
+    result = _run_git(
+        root,
+        ["ls-files", "--cached", "-z", "--"],
+        allowed_returncodes=frozenset({0}),
+    )
+    return {
+        root / Path(os.fsdecode(raw_path)) for raw_path in result.stdout.split(b"\0") if raw_path
+    }
+
+
+def _tracked_secret_files(root: Path, pattern: str) -> set[Path]:
+    result = _run_git(
+        root,
+        ["grep", "--cached", "-a", "-i", "-l", "-z", "-E", "-e", pattern, "--"],
+        allowed_returncodes=frozenset({0, 1}),
+    )
+    if result.returncode == 1:
+        return set()
+    return {
+        root / Path(os.fsdecode(raw_path)) for raw_path in result.stdout.split(b"\0") if raw_path
+    }
+
+
+def _git_path_is_ignored(root: Path, relative: Path) -> bool:
+    result = _run_git(
+        root,
+        ["check-ignore", "--quiet", "--no-index", "--", relative.as_posix()],
+        allowed_returncodes=frozenset({0, 1}),
+    )
+    return result.returncode == 0
+
+
+def _candidate_files(root: Path, tracked: set[Path]) -> list[Path]:
+    discovered = {
+        path
+        for path in root.rglob("*")
+        if path.is_file() and not any(part in IGNORED_PARTS for part in path.parts)
+    }
+    return sorted(discovered | tracked, key=lambda path: path.as_posix())
+
+
+def _is_runtime_environment(path: Path) -> bool:
+    folded_name = path.name.casefold()
+    return folded_name == ".env" or (
+        folded_name.startswith(".env.") and path.name != ".env.example"
+    )
+
+
+def _is_private_runtime_artifact(path: Path) -> bool:
+    return (
+        path.suffix.casefold() in PRIVATE_RUNTIME_SUFFIXES
+        or PRIVATE_DATABASE_SIDECAR_PATTERN.search(path.name) is not None
+        or PRIVATE_AGE_TEMP_PATTERN.search(path.name) is not None
+    )
 
 
 def _is_runtime_policy_path(path: Path) -> bool:
@@ -108,18 +211,59 @@ def _function_source(text: str, name: str) -> str:
 
 def check(root: Path) -> list[str]:
     errors: list[str] = []
-    this_file = Path(__file__).resolve()
-    for path in root.rglob("*"):
-        if not path.is_file() or any(part in IGNORED_PARTS for part in path.parts):
-            continue
+    git_repository = (root / ".git").exists()
+    tracked: set[Path] = set()
+    tracked_pem_private_keys: set[Path] = set()
+    tracked_age_secret_identities: set[Path] = set()
+    if git_repository:
+        try:
+            tracked = _tracked_files(root)
+            tracked_pem_private_keys = _tracked_secret_files(root, GIT_PEM_PRIVATE_KEY_PATTERN)
+            tracked_age_secret_identities = _tracked_secret_files(root, GIT_AGE_IDENTITY_PATTERN)
+        except GitInspectionError:
+            return [GIT_INSPECTION_ERROR]
+
+    ci_environment = root / ".env.ci"
+    allow_ci_environment = False
+    if (
+        git_repository
+        and ci_environment.is_file()
+        and not ci_environment.is_symlink()
+        and ci_environment not in tracked
+    ):
+        try:
+            allow_ci_environment = _git_path_is_ignored(root, Path(".env.ci"))
+        except GitInspectionError:
+            return [GIT_INSPECTION_ERROR]
+
+    for path in _candidate_files(root, tracked):
         relative = path.relative_to(root)
-        if path.suffix.lower() in PRIVATE_RUNTIME_SUFFIXES or path.name == ".env":
+        if _is_private_runtime_artifact(path) or _is_runtime_environment(path):
+            if relative.as_posix() == ".env.ci" and allow_ci_environment:
+                continue
             errors.append(f"{relative}: runtime data belongs outside the public source repo")
             continue
-        if path.resolve() == this_file or path.suffix.lower() not in TEXT_SUFFIXES:
+        payload: bytes | None = None
+        if path.is_file() and not path.is_symlink():
+            try:
+                payload = path.read_bytes()
+            except OSError:
+                errors.append(f"{relative}: unable to inspect repository file safely")
+                continue
+        if path in tracked_pem_private_keys or (
+            payload is not None and PEM_PRIVATE_KEY_PATTERN.search(payload)
+        ):
+            errors.append(f"{relative}: forbidden committed private key")
+        if path in tracked_age_secret_identities or (
+            payload is not None and AGE_SECRET_IDENTITY_PATTERN.search(payload)
+        ):
+            errors.append(f"{relative}: forbidden committed age secret identity")
+        if relative.as_posix() == "scripts/check_repository.py":
+            continue
+        if payload is None or path.suffix.casefold() not in TEXT_SUFFIXES:
             continue
         try:
-            text = path.read_text(encoding="utf-8")
+            text = payload.decode("utf-8")
         except UnicodeDecodeError:
             continue
         for label, forbidden in FORBIDDEN.items():
