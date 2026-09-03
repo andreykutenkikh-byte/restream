@@ -398,6 +398,8 @@ async def test_staged_mediamtx_validation_supports_a_noexec_temp_mount() -> None
     [
         ("preflight", "relay_agent_preflight_failed"),
         ("accounts", "relay_agent_accounts_failed"),
+        ("sysusers", "relay_agent_sysusers_failed"),
+        ("tmpfiles", "relay_agent_tmpfiles_failed"),
         ("journal", "relay_agent_journal_failed"),
         ("copy", "relay_agent_copy_failed"),
         ("units", "relay_agent_units_failed"),

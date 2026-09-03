@@ -35,6 +35,8 @@ def test_native_relay_failures_have_stable_localized_messages() -> None:
         "relay_slate_generation_failed",
         "relay_install_failed",
         "relay_agent_accounts_failed",
+        "relay_agent_sysusers_failed",
+        "relay_agent_tmpfiles_failed",
         "relay_agent_broker_failed",
         "relay_agent_copy_failed",
         "relay_agent_install_failed",

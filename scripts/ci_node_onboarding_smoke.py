@@ -50,6 +50,8 @@ SAFE_BOOTSTRAP_DIAGNOSTIC_CODES = frozenset(
         "overall_timeout",
         "relay_active_during_install",
         "relay_agent_accounts_failed",
+        "relay_agent_sysusers_failed",
+        "relay_agent_tmpfiles_failed",
         "relay_agent_broker_failed",
         "relay_agent_copy_failed",
         "relay_agent_install_failed",

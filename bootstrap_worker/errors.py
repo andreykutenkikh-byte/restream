@@ -123,6 +123,10 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_agent_install_failed": "Не удалось установить агент управления Moblin Relay.",
         "relay_agent_preflight_failed": "Проверка пакета агента Moblin Relay не пройдена.",
         "relay_agent_accounts_failed": "Не удалось создать системного пользователя Relay Agent.",
+        "relay_agent_sysusers_failed": (
+            "Не удалось зарегистрировать системного пользователя Relay Agent."
+        ),
+        "relay_agent_tmpfiles_failed": "Не удалось создать защищённые каталоги Relay Agent.",
         "relay_agent_journal_failed": "Не удалось подготовить безопасный журнал Relay Agent.",
         "relay_agent_copy_failed": "Не удалось проверить и установить код Relay Agent.",
         "relay_agent_units_failed": "Не удалось установить службы Relay Agent.",

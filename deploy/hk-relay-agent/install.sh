@@ -80,9 +80,11 @@ systemctl is-enabled --quiet moblin-relay.service && relay_before_enabled=1 || t
 relay_agent_mark_stage accounts
 install -o root -g root -m 0644 "$relay_agent_script_dir/adojapan-relay-agent.sysusers" \
     /etc/sysusers.d/adojapan-relay-agent.conf
+relay_agent_mark_stage sysusers
 systemd-sysusers /etc/sysusers.d/adojapan-relay-agent.conf
 install -o root -g root -m 0644 "$relay_agent_script_dir/adojapan-relay-agent.tmpfiles" \
     /etc/tmpfiles.d/adojapan-relay-agent.conf
+relay_agent_mark_stage tmpfiles
 systemd-tmpfiles --create /etc/tmpfiles.d/adojapan-relay-agent.conf
 
 # Preserve a strict legacy-v1 journal before installing code that writes v2.

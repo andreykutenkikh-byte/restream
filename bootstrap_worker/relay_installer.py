@@ -98,6 +98,8 @@ _REMOTE_TEMP_PREFIX = "/tmp/adojapan-relay-bootstrap-"  # noqa: S108
 _AGENT_INSTALL_STAGE_CODES = {
     "preflight": "relay_agent_preflight_failed",
     "accounts": "relay_agent_accounts_failed",
+    "sysusers": "relay_agent_sysusers_failed",
+    "tmpfiles": "relay_agent_tmpfiles_failed",
     "journal": "relay_agent_journal_failed",
     "copy": "relay_agent_copy_failed",
     "units": "relay_agent_units_failed",
