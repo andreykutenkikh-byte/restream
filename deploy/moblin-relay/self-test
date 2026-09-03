@@ -65,6 +65,10 @@ SELF_TEST_STAGES = frozenset(
         "auth-exclusive",
         "live-ingest",
         "live-normalize",
+        "norm-hook",
+        "norm-child",
+        "norm-publish",
+        "norm-flap",
         "outages",
         "outage-slate",
         "outage-normal",
@@ -1902,12 +1906,37 @@ def main() -> int:
             not_before=initial_live_started,
         )
         mark_self_test_stage("live-normalize")
-        initial_live = wait_healthy_live(
-            "initial healthy LIVE",
-            max(0.0, initial_live_deadline - time.monotonic()),
-            not_before=float(accepted_ingest["t"]),
-            expected_ingest_ids=list(accepted_ingest["ingest_ids"]),
-        )
+        try:
+            initial_live = wait_healthy_live(
+                "initial healthy LIVE",
+                max(0.0, initial_live_deadline - time.monotonic()),
+                not_before=float(accepted_ingest["t"]),
+                expected_ingest_ids=list(accepted_ingest["ingest_ids"]),
+            )
+        except TestFailure:
+            normalization_interval = observer.samples_between(
+                float(accepted_ingest["t"]), time.monotonic()
+            )
+            if any(sample.get("normalized") for sample in normalization_interval):
+                mark_self_test_stage("norm-flap")
+            else:
+                supervisor_pids = matching_process_ids(
+                    (b"moblin-relay-normalize", b"--sanitized-supervisor")
+                )
+                child_pids = sorted(
+                    {
+                        child_pid
+                        for supervisor_pid in supervisor_pids
+                        for child_pid in direct_child_process_ids(supervisor_pid)
+                    }
+                )
+                if not supervisor_pids:
+                    mark_self_test_stage("norm-hook")
+                elif not child_pids:
+                    mark_self_test_stage("norm-child")
+                else:
+                    mark_self_test_stage("norm-publish")
+            raise
         initial_ingest_ids = list(initial_live["ingest_ids"])
         if len(initial_ingest_ids) != 1:
             raise TestFailure("initial LIVE did not expose exactly one SRT connection")

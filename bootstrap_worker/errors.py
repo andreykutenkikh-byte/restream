@@ -155,6 +155,14 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_live_normalize_failed": (
             "Нормализатор не сформировал тестовый LIVE-поток."
         ),
+        "relay_self_test_normalizer_hook_failed": ("Supervisor нормализатора не остался активным."),
+        "relay_self_test_normalizer_child_failed": ("FFmpeg нормализатора не остался активным."),
+        "relay_self_test_normalizer_publish_failed": (
+            "FFmpeg нормализатора не опубликовал тестовый LIVE-поток."
+        ),
+        "relay_self_test_normalizer_flap_failed": (
+            "Тестовый LIVE-поток нормализатора оказался нестабильным."
+        ),
         "relay_self_test_outages_failed": "Переключение LIVE и заставки не прошло самопроверку.",
         "relay_self_test_outage_slate_failed": (
             "Переход на заставку после обрыва LIVE не прошёл самопроверку."
