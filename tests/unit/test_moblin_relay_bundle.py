@@ -290,7 +290,15 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         "stall-pause",
         "stall-switch",
         "stall-capture",
+        "stall-resume",
         "stall-live",
+        "stall-core",
+        "stall-source",
+        "stall-ingest",
+        "stall-norm",
+        "stall-sink",
+        "stall-blind",
+        "stall-ident",
         "stall-cont",
         "crash-death",
         "crash-live",
@@ -743,7 +751,8 @@ def test_self_test_distinguishes_unknown_metrics_from_media_outage() -> None:
 
     main_source = SELF_TEST.read_text().split("def main()", 1)[1]
     assert "observer.snapshot()" not in main_source
-    assert main_source.count("observer.checked_snapshot(") == 4
+    assert main_source.count("observer.checked_snapshot(") == 5
+    assert '"same-session LIVE recovery diagnosis"' in main_source
     assert "capture_observer = CaptureObserver(capture)" in main_source
     assert main_source.count("capture_observer.checked_samples_since(") == 5
 

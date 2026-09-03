@@ -84,7 +84,15 @@ SELF_TEST_STAGES = frozenset(
         "stall-pause",
         "stall-switch",
         "stall-capture",
+        "stall-resume",
         "stall-live",
+        "stall-core",
+        "stall-source",
+        "stall-ingest",
+        "stall-norm",
+        "stall-sink",
+        "stall-blind",
+        "stall-ident",
         "stall-cont",
         "crash-death",
         "crash-live",
@@ -2530,23 +2538,64 @@ def main() -> int:
                 "same-session SLATE capture growth",
                 same_session_slate,
             )
-            mark_self_test_stage("stall-live")
+            mark_self_test_stage("stall-resume")
             if time.monotonic() - same_session_started >= SRT_IDLE_LOWER_BOUND_SECONDS:
                 raise TestFailure("same-session source was not resumed before SRT idle expiry")
             recovery_started = time.monotonic()
             os.kill(publisher.pid, signal.SIGCONT)
             publisher_paused = False
-            same_session_live = wait_healthy_live(
-                "same-session LIVE recovery",
-                SUPERVISOR_RESTART_TIMEOUT_SECONDS,
-                not_before=recovery_started,
-                expected_ingest_ids=initial_ingest_ids,
-            )
+            mark_self_test_stage("stall-live")
+            try:
+                same_session_live = wait_healthy_live(
+                    "same-session LIVE recovery",
+                    SUPERVISOR_RESTART_TIMEOUT_SECONDS,
+                    not_before=recovery_started,
+                    expected_ingest_ids=initial_ingest_ids,
+                )
+            except TestFailure:
+                if publisher.poll() is not None or primary_helper.poll() is not None:
+                    mark_self_test_stage("stall-source")
+                else:
+                    try:
+                        recovery_sample = observer.checked_snapshot(
+                            "same-session LIVE recovery diagnosis"
+                        )
+                    except TestFailure:
+                        mark_self_test_stage("stall-blind")
+                    else:
+                        if recovery_sample and not all(
+                            recovery_sample.get(name)
+                            for name in ("dut_alive", "sink_alive", "reader_alive")
+                        ):
+                            mark_self_test_stage("stall-core")
+                        elif not complete_metrics_sample(recovery_sample):
+                            mark_self_test_stage("stall-blind")
+                        elif (
+                            not recovery_sample.get("ingest_live")
+                            or recovery_sample.get("ingest_ids") != initial_ingest_ids
+                        ):
+                            mark_self_test_stage("stall-ingest")
+                        elif (
+                            not recovery_sample.get("normalized")
+                            or len(recovery_sample.get("normalized_ids", [])) != 1
+                        ):
+                            mark_self_test_stage("stall-norm")
+                        elif (
+                            not recovery_sample.get("path_ready")
+                            or not recovery_sample.get("forward")
+                            or recovery_sample.get("sink_ids") != [initial_sink_id]
+                        ):
+                            mark_self_test_stage("stall-sink")
+                        else:
+                            mark_self_test_stage("stall-live")
+                raise
         finally:
             if publisher_paused and publisher is not None and publisher.poll() is None:
                 os.kill(publisher.pid, signal.SIGCONT)
+        mark_self_test_stage("stall-source")
         if publisher.poll() is not None or primary_helper.poll() is not None:
             raise TestFailure("same-session recovery replaced the upstream processes")
+        mark_self_test_stage("stall-ident")
         if same_session_live["normalized_ids"] == previous_normalizer_ids:
             raise TestFailure("same-session recovery did not replace the normalizer publisher")
         mark_self_test_stage("stall-cont")

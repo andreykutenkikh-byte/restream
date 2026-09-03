@@ -58,6 +58,14 @@ def test_native_safe_failure_code_is_allowlisted() -> None:
         "relay_self_test_auth_exclusivity_progress_failed",
         "relay_self_test_auth_exclusivity_observability_failed",
         "relay_self_test_auth_exclusivity_proof_failed",
+        "relay_self_test_stall_resume_failed",
+        "relay_self_test_stall_core_failed",
+        "relay_self_test_stall_source_failed",
+        "relay_self_test_stall_ingest_failed",
+        "relay_self_test_stall_normalizer_failed",
+        "relay_self_test_stall_downstream_failed",
+        "relay_self_test_stall_observability_failed",
+        "relay_self_test_stall_identity_failed",
     ):
         assert safe_bootstrap_diagnostic_code({"safe_error": {"code": code}}) == code
 

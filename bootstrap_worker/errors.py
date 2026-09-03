@@ -208,8 +208,32 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_stall_capture_failed": (
             "Рост видеопотока заставки после зависания LIVE не подтверждён."
         ),
+        "relay_self_test_stall_resume_failed": (
+            "Тестовый LIVE-источник не удалось возобновить до разрыва SRT-сессии."
+        ),
         "relay_self_test_stall_live_failed": (
             "Возврат LIVE в той же SRT-сессии не прошёл самопроверку."
+        ),
+        "relay_self_test_stall_core_failed": (
+            "Основной медиатракт остановился при восстановлении LIVE."
+        ),
+        "relay_self_test_stall_source_failed": (
+            "Тестовый источник остановился при восстановлении LIVE."
+        ),
+        "relay_self_test_stall_ingest_failed": (
+            "Исходная SRT-сессия не сохранилась при восстановлении LIVE."
+        ),
+        "relay_self_test_stall_normalizer_failed": (
+            "Нормализатор не вернул LIVE после возобновления источника."
+        ),
+        "relay_self_test_stall_downstream_failed": (
+            "Выходной тракт изменился при восстановлении LIVE."
+        ),
+        "relay_self_test_stall_observability_failed": (
+            "Метрики стали недоступны при восстановлении LIVE."
+        ),
+        "relay_self_test_stall_identity_failed": (
+            "Нормализатор не заменил зависшее медиасоединение."
         ),
         "relay_self_test_stall_continuity_failed": (
             "Непрерывность выхода при зависании LIVE не подтверждена."
