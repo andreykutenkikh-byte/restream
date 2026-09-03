@@ -174,7 +174,7 @@ def test_local_hls_reader_fetches_exact_mediamtx_session_resources(
     assert reader.read_segment(segment_resource) == ts_segment()
     assert requests == [
         (
-            "http://127.0.0.1:8888/relay-output/index.m3u8",
+            "http://127.0.0.1:8888/relay-output/index.m3u8?cookieCheck=1",
             "application/vnd.apple.mpegurl",
         ),
         (
@@ -371,7 +371,7 @@ def test_control_client_accepts_optional_preview_demand_and_uses_separate_media_
     assert method == "GET"
     assert path == "/relay-agent/v1/commands/next?wait=0"
     assert sent is None
-    assert headers["X-Relay-Agent-Version"] == "1.2.2"
+    assert headers["X-Relay-Agent-Version"] == "1.2.3"
 
     payload = ts_segment()
     client.upload_preview_segment(generation, 22, payload)

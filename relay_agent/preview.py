@@ -27,7 +27,10 @@ from relay_agent.security import SensitiveToken
 
 LOCAL_HLS_ORIGIN = "http://127.0.0.1:8888"
 _LOCAL_HLS_PREFIX = "/relay-output/"
-LOCAL_HLS_PATH = f"{_LOCAL_HLS_PREFIX}index.m3u8"
+# MediaMTX uses this fixed query to perform its same-origin cookie capability
+# check.  Supplying it up front avoids following a redirect while still letting
+# the cookie jar authenticate the subsequent session playlist and segments.
+LOCAL_HLS_PATH = f"{_LOCAL_HLS_PREFIX}index.m3u8?cookieCheck=1"
 LOCAL_HLS_USERNAME = "relay-preview"
 MAX_PLAYLIST_BYTES = 64 * 1024
 MAX_SEGMENT_BYTES = 3 * 1024 * 1024
@@ -142,10 +145,12 @@ class LocalHLSReader:
 
     def _fetch(self, path: str, limit: int, *, playlist: bool) -> bytes:
         resource_pattern = _PLAYLIST_RESOURCE if playlist else _SEGMENT_RESOURCE
-        if (
-            not path.startswith(_LOCAL_HLS_PREFIX)
-            or resource_pattern.fullmatch(path[len(_LOCAL_HLS_PREFIX) :]) is None
-        ):
+        initial_cookie_check = playlist and path == LOCAL_HLS_PATH
+        regular_resource = (
+            path.startswith(_LOCAL_HLS_PREFIX)
+            and resource_pattern.fullmatch(path[len(_LOCAL_HLS_PREFIX) :]) is not None
+        )
+        if not initial_cookie_check and not regular_resource:
             raise RelayAgentError("preview_local_request_invalid")
         url = f"{LOCAL_HLS_ORIGIN}{path}"
         parsed = urlsplit(url)

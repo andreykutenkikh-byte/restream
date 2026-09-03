@@ -219,7 +219,7 @@ local synthetic preview test, and verify that the effective HLS listener is exac
 `127.0.0.1:8888`, MPEG-TS only, and readable only as `relay-preview` for `relay-output`. Verify the
 normalizer reads `iphone-live` over loopback RTSP, publishes to `relay-output` over loopback RTMP,
 and that ports 1935, 8554, 8888, and 9998 refuse non-loopback connections. Start or restart only
-`adojapan-relay-agent.service`; wait for an agent 1.2.2 heartbeat, status refresh, and a bounded
+`adojapan-relay-agent.service`; wait for an agent 1.2.3 heartbeat, status refresh, and a bounded
 nullable bitrate field. Confirm that a lone SRT ingress or lone RTMP normalizer publisher is not
 reported as LIVE; both must be present, while preview and YouTube-forward health use only
 `relay-output`. Leave `moblin-relay.service` inactive and disabled. The preview can remain empty
