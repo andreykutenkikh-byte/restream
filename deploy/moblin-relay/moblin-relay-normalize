@@ -41,7 +41,6 @@ OUTPUT_START_TIMEOUT_SECONDS = 6.0
 CHILD_STOP_GRACE_SECONDS = 0.025
 CHILD_RESTART_FLOOR_SECONDS = 0.1
 REQUIRED_GROWTH_OBSERVATIONS = 2
-RTSP_IO_TIMEOUT_MICROSECONDS = 500_000
 PR_SET_PDEATHSIG = 1
 
 PATH_METRIC_PATTERN = re.compile(
@@ -68,7 +67,6 @@ def validated_port(raw_value: str) -> int:
 def build_ffmpeg_argv(rtsp_port: int, rtmp_port: int) -> list[str]:
     if not 1 <= rtsp_port <= 65535 or not 1 <= rtmp_port <= 65535:
         raise ValueError("invalid loopback media port")
-    timeout = str(RTSP_IO_TIMEOUT_MICROSECONDS)
     return [
         FFMPEG,
         "-nostdin",
@@ -76,12 +74,8 @@ def build_ffmpeg_argv(rtsp_port: int, rtmp_port: int) -> list[str]:
         "-nostats",
         "-loglevel",
         "error",
-        "-rw_timeout",
-        timeout,
         "-rtsp_transport",
         "tcp",
-        "-timeout",
-        timeout,
         "-i",
         f"rtsp://127.0.0.1:{rtsp_port}/{INGEST_PATH}",
         "-map",

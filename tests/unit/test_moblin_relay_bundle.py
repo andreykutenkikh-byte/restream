@@ -407,11 +407,8 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
     sanitized_environment = loaded["sanitized_environment"]
 
     argv = build_argv(18554, 11936)
-    input_index = argv.index("-i")
-    assert argv[argv.index("-rw_timeout") + 1] == "500000"
-    assert argv[argv.index("-timeout") + 1] == "500000"
-    assert argv.index("-rw_timeout") < input_index
-    assert argv.index("-timeout") < input_index
+    assert "-rw_timeout" not in argv
+    assert "-timeout" not in argv
     assert argv[argv.index("-c:v") + 1] == "copy"
     assert "-copyinkf" not in argv
     assert "rtsp://127.0.0.1:18554/iphone-live" in argv
