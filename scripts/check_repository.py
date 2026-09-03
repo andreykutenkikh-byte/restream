@@ -7,7 +7,19 @@ import ast
 import re
 from pathlib import Path
 
-IGNORED_PARTS = {".git", ".venv", "__pycache__", "data", "logs", "backups"}
+IGNORED_PARTS = {
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "backups",
+    "build",
+    "data",
+    "dist",
+    "logs",
+}
 TEXT_SUFFIXES = {
     "",
     ".css",
@@ -71,6 +83,7 @@ DOCKER_DAEMON_FIREWALL_MARKERS = {
     "--ip6" + "tables",
 }
 SELINUX_CONFIGURATION_MARKERS = {"/etc/selinux/" + "config"}
+PRIVATE_RUNTIME_SUFFIXES = {".age", ".db", ".sqlite", ".sqlite3"}
 
 
 def _is_runtime_policy_path(path: Path) -> bool:
@@ -99,13 +112,16 @@ def check(root: Path) -> list[str]:
     for path in root.rglob("*"):
         if not path.is_file() or any(part in IGNORED_PARTS for part in path.parts):
             continue
+        relative = path.relative_to(root)
+        if path.suffix.lower() in PRIVATE_RUNTIME_SUFFIXES or path.name == ".env":
+            errors.append(f"{relative}: runtime data belongs outside the public source repo")
+            continue
         if path.resolve() == this_file or path.suffix.lower() not in TEXT_SUFFIXES:
             continue
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
-        relative = path.relative_to(root)
         for label, forbidden in FORBIDDEN.items():
             if forbidden.lower() in text.lower():
                 errors.append(f"{relative}: forbidden {label}")

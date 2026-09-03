@@ -18,3 +18,7 @@ logs/*
 !logs/.gitkeep
 backups/*
 !backups/.gitkeep
+*.age
+*.db
+*.sqlite
+*.sqlite3

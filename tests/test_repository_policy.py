@@ -46,6 +46,27 @@ def test_repository_policy_rejects_direct_selinux_changes(tmp_path: Path) -> Non
     assert any("SELinux host configuration" in error for error in errors)
 
 
+def test_repository_policy_rejects_encrypted_backup_in_public_source_repo(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "adojapan-restream-dr-test.tar.gz.age"
+    artifact.write_bytes(b"encrypted")
+
+    assert check(tmp_path) == [
+        "adojapan-restream-dr-test.tar.gz.age: runtime data belongs outside the public source repo"
+    ]
+
+
+def test_repository_policy_rejects_plaintext_database_and_environment(tmp_path: Path) -> None:
+    (tmp_path / "restream.db").write_bytes(b"sqlite")
+    (tmp_path / ".env").write_text("SECRET=value\n", encoding="utf-8")
+
+    assert sorted(check(tmp_path)) == [
+        ".env: runtime data belongs outside the public source repo",
+        "restream.db: runtime data belongs outside the public source repo",
+    ]
+
+
 def test_repository_policy_rejects_remote_agent_host_ports_and_host_network(
     tmp_path: Path,
 ) -> None:

@@ -389,6 +389,11 @@ command payloads to this public repository. A recoverable production installatio
 separately configured encrypted off-server backup; see
 [`docs/disaster-recovery.md`](docs/disaster-recovery.md).
 
+The repository includes a fail-closed `age` + private-Git publication command for that separate
+off-server copy. It is deliberately not enabled by default: the recovery-key custodian and private
+repository must be chosen first. The private recovery identity never belongs on the VPS, and this
+public repository rejects `.age` backup artifacts as well as plaintext runtime data.
+
 The application does not schedule production backups. To create a consistent, bounded project-only
 SQLite backup from the running backend and its named database volume:
 

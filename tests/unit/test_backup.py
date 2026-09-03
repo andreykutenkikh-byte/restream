@@ -1,4 +1,6 @@
+import os
 import sqlite3
+import stat
 from pathlib import Path
 
 import pytest
@@ -28,6 +30,8 @@ def test_backup_is_consistent_and_retention_is_project_scoped(tmp_path: Path) ->
     assert row == ("preserved",)
     assert not (output / "adojapan-restream-20200101T000000Z.db").exists()
     assert (output / "unrelated.db").exists()
+    if os.name == "posix":
+        assert stat.S_IMODE(result.stat().st_mode) == 0o600
 
 
 def test_restore_requires_explicit_confirmation(tmp_path: Path) -> None:
