@@ -41,6 +41,8 @@ SAFE_BOOTSTRAP_DIAGNOSTIC_CODES = frozenset(
         "invalid_target",
         "job_conflict",
         "job_not_found",
+        "mediamtx_archive_invalid",
+        "mediamtx_checksum_failed",
         "mediamtx_download_failed",
         "outbound_https_unavailable",
         "overall_timeout",

@@ -27,6 +27,8 @@ def test_native_relay_failures_have_stable_localized_messages() -> None:
         "invalid_enrollment_token",
         "relay_dependency_install_failed",
         "relay_dependency_check_failed",
+        "mediamtx_archive_invalid",
+        "mediamtx_checksum_failed",
         "mediamtx_download_failed",
         "relay_slate_generation_failed",
         "relay_install_failed",

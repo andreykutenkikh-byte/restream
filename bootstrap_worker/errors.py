@@ -113,9 +113,9 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_dependency_check_failed": (
             "FFmpeg на сервере не поддерживает необходимые H.264 или SRT-функции."
         ),
-        "mediamtx_download_failed": (
-            "Не удалось скачать и проверить закреплённую версию MediaMTX."
-        ),
+        "mediamtx_download_failed": ("Не удалось скачать закреплённую версию MediaMTX."),
+        "mediamtx_checksum_failed": "Контрольная сумма MediaMTX не прошла проверку.",
+        "mediamtx_archive_invalid": "Закреплённый архив MediaMTX повреждён или неполон.",
         "relay_slate_generation_failed": "Не удалось создать серверную заставку 1080×1920.",
         "relay_install_failed": "Не удалось безопасно установить Moblin Relay.",
         "relay_agent_install_failed": "Не удалось установить агент управления Moblin Relay.",

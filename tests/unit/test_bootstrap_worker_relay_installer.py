@@ -321,6 +321,7 @@ async def test_install_uses_pinned_mediamtx_and_never_mutates_host_networking() 
 
     assert MEDIA_MTX_URL in commands
     assert MEDIA_MTX_ARCHIVE_SHA256 in commands
+    assert "--retry 4 --retry-all-errors --retry-delay 2 --retry-max-time 240" in commands
     assert "sha256sum --check --status" in commands
     assert "color=c=0x111827:s=1080x1920:r=30:d=12" in commands
     assert "-profile:v main" in commands
@@ -345,6 +346,33 @@ async def test_install_uses_pinned_mediamtx_and_never_mutates_host_networking() 
         "amnezia",
     ):
         assert forbidden not in lowered
+
+
+@pytest.mark.parametrize(
+    ("failure_fragment", "expected_code"),
+    [
+        ("curl --fail --location", "mediamtx_download_failed"),
+        ("sha256sum --check --status", "mediamtx_checksum_failed"),
+        ("tar -xzf", "mediamtx_archive_invalid"),
+    ],
+)
+async def test_install_reports_exact_safe_mediamtx_stage(
+    failure_fragment: str,
+    expected_code: str,
+) -> None:
+    def responder(command: str, stdin: SecretStr | None) -> RemoteResult:
+        del stdin
+        return RemoteResult(1 if failure_fragment in command else 0)
+
+    with pytest.raises(BootstrapError) as captured:
+        await RemoteRelayInstaller().install(
+            FakeSession(responder),
+            PrivilegeContext(PrivilegeMode.ROOT),
+            receipt(),
+            timeouts=TimeoutPolicy(),
+        )
+
+    assert captured.value.code == expected_code
 
 
 async def test_final_check_requires_agent_and_broker_but_relay_inactive_disabled() -> None:

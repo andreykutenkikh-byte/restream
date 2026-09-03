@@ -566,13 +566,27 @@ class RemoteRelayInstaller:
             f"rm -f -- {temp}/mediamtx.tar.gz && rm -rf -- {temp}/mediamtx && "
             f"install -d -m 0700 -- {temp}/mediamtx && "
             "curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 "
-            f"--connect-timeout 15 --max-time 180 {media_url} --output {temp}/mediamtx.tar.gz && "
-            f"printf '%s  %s\\n' {archive_hash} {temp}/mediamtx.tar.gz | "
-            "sha256sum --check --status && "
-            f"tar -xzf {temp}/mediamtx.tar.gz -C {temp}/mediamtx mediamtx LICENSE && "
-            f"test -x {temp}/mediamtx/mediamtx && test -f {temp}/mediamtx/LICENSE",
+            "--connect-timeout 15 --max-time 180 --retry 4 --retry-all-errors "
+            "--retry-delay 2 --retry-max-time 240 "
+            f"{media_url} --output {temp}/mediamtx.tar.gz",
             timeout=timeouts.package_seconds,
             code="mediamtx_download_failed",
+        )
+        await self._run_checked(
+            session,
+            privilege,
+            f"printf '%s  %s\\n' {archive_hash} {temp}/mediamtx.tar.gz | "
+            "sha256sum --check --status",
+            timeout=timeouts.command_seconds,
+            code="mediamtx_checksum_failed",
+        )
+        await self._run_checked(
+            session,
+            privilege,
+            f"tar -xzf {temp}/mediamtx.tar.gz -C {temp}/mediamtx mediamtx LICENSE && "
+            f"test -x {temp}/mediamtx/mediamtx && test -f {temp}/mediamtx/LICENSE",
+            timeout=timeouts.command_seconds,
+            code="mediamtx_archive_invalid",
         )
 
         # Generate the immutable 12-second fallback before claiming any managed
