@@ -67,6 +67,12 @@ SELF_TEST_STAGES = frozenset(
         "outage-live",
         "continuity",
         "decode",
+        "streams",
+        "format",
+        "gop",
+        "decoder",
+        "frames",
+        "timestamps",
         "secrets",
         "cleanup",
     }
@@ -690,7 +696,7 @@ def video_gop_signature(path: Path) -> dict:
     }
 
 
-def stream_signature(path: Path) -> dict:
+def stream_signature(path: Path, *, include_gop: bool = True) -> dict:
     completed = run(
         [str(FFPROBE), "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
         stdin=subprocess.DEVNULL,
@@ -725,11 +731,13 @@ def stream_signature(path: Path) -> dict:
         duration = float(probe.get("format", {}).get("duration"))
     except (TypeError, ValueError):
         duration = None
-    return {
+    result = {
         "duration_seconds": duration,
         "streams": signature,
-        "video_gop": video_gop_signature(path),
     }
+    if include_gop:
+        result["video_gop"] = video_gop_signature(path)
+    return result
 
 
 def validate_portrait_asset(label: str, signature: dict, *, audio_channels: int = 2) -> None:
@@ -1711,11 +1719,13 @@ def main() -> int:
             handle.flush()
         mark_self_test_stage("decode")
         print("[6/8] Decoding capture and checking portrait frames, DTS/PTS and A/V continuity", flush=True)
-        normalized_signature = stream_signature(capture)
+        mark_self_test_stage("streams")
+        normalized_signature = stream_signature(capture, include_gop=False)
         normalized_streams = normalized_signature.get("streams", [])
         if len(normalized_streams) != 2:
             raise TestFailure("normalized capture does not contain exactly video and audio")
         normalized_video, normalized_audio = normalized_streams
+        mark_self_test_stage("format")
         if (
             normalized_video.get("codec_name") != "h264"
             or normalized_video.get("profile") != slate_sig["streams"][0].get("profile")
@@ -1732,6 +1742,8 @@ def main() -> int:
             or normalized_audio.get("channel_layout") != "stereo"
         ):
             raise TestFailure("mono ingress was not normalized to the required stereo output")
+        mark_self_test_stage("gop")
+        normalized_signature["video_gop"] = video_gop_signature(capture)
         normalized_gop_intervals = normalized_signature["video_gop"].get(
             "interval_frames", []
         )
@@ -1746,6 +1758,7 @@ def main() -> int:
             raise TestFailure("normalized output GOP exceeded the required 60-frame interval")
         result["normalized_output_streams"] = normalized_streams
         result["mono_to_stereo_normalization_passed"] = True
+        mark_self_test_stage("decoder")
         decode = run([
             str(FFMPEG), "-nostdin", "-hide_banner", "-v", "warning", "-xerror", "-err_detect", "explode",
             "-i", str(capture), "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-",
@@ -1758,11 +1771,12 @@ def main() -> int:
         )
         result["decode_exit"] = decode.returncode
         result["decode_error_pattern_found"] = bool(deny.search(decode_text))
+        if decode.returncode != 0 or result["decode_error_pattern_found"]:
+            raise TestFailure("capture decoder validation failed")
+
+        mark_self_test_stage("frames")
         result["decoded_video_frames"] = analyze_decoded_video_frames(capture)
-        result["decoded_audio_timestamps"] = analyze_decoded_audio_timestamps(capture)
-        result["timestamps"] = analyze_timestamps(capture)
         decoded_frames = result["decoded_video_frames"]
-        decoded_audio = result["decoded_audio_timestamps"]
         landscape_regression_absent = decoded_frames["landscape_1280x720_frames"] == 0
         legacy_portrait_regression_absent = (
             decoded_frames["legacy_portrait_720x1280_frames"] == 0
@@ -1782,6 +1796,13 @@ def main() -> int:
             and decoded_frames["stderr_empty"]
         )
         result["portrait_capture_guard_passed"] = portrait_frames_ok
+        if not portrait_frames_ok:
+            raise TestFailure("capture frame validation failed")
+
+        mark_self_test_stage("timestamps")
+        result["decoded_audio_timestamps"] = analyze_decoded_audio_timestamps(capture)
+        result["timestamps"] = analyze_timestamps(capture)
+        decoded_audio = result["decoded_audio_timestamps"]
         max_bounded_audio_backward_steps = 2 * len(durations) + 2
         bounded_splice_jitter_passed = (
             result["timestamps"]["dts_within_tolerance"]
@@ -1842,9 +1863,8 @@ def main() -> int:
             "video_pts_dts_offset_clusters_over_normal_reorder": max_bounded_audio_backward_steps,
         }
         result["timestamp_thresholds_passed"] = timestamp_ok
-        if (decode.returncode != 0 or result["decode_error_pattern_found"]
-                or not portrait_frames_ok or not timestamp_ok):
-            raise TestFailure("capture decode/timestamp validation failed")
+        if not timestamp_ok:
+            raise TestFailure("capture timestamp validation failed")
 
         mark_self_test_stage("secrets")
         print("[7/8] Scanning logs, files and process metadata for test-token residue", flush=True)

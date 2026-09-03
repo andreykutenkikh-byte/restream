@@ -152,6 +152,20 @@ def safe_failure(code: str) -> BootstrapError:
         ),
         "relay_self_test_continuity_failed": "Непрерывность выходного потока не подтверждена.",
         "relay_self_test_decode_failed": "Декодирование и временные метки не прошли проверку.",
+        "relay_self_test_decode_streams_failed": (
+            "Состав выходных медиапотоков не прошёл самопроверку."
+        ),
+        "relay_self_test_decode_format_failed": (
+            "Формат выходного видео и аудио не прошёл самопроверку."
+        ),
+        "relay_self_test_decode_gop_failed": ("Интервал ключевых кадров не прошёл самопроверку."),
+        "relay_self_test_decode_decoder_failed": (
+            "Декодирование выходного потока завершилось с ошибкой."
+        ),
+        "relay_self_test_decode_frames_failed": ("Кадры выходного видео не прошли самопроверку."),
+        "relay_self_test_decode_timestamps_failed": (
+            "Временные метки и синхронизация потока не прошли самопроверку."
+        ),
         "relay_self_test_secrets_failed": "Защита тестовых секретов не прошла самопроверку.",
         "relay_self_test_cleanup_failed": "Очистка после самопроверки Moblin Relay не завершена.",
         "relay_final_check_failed": "Финальная проверка Moblin Relay не пройдена.",

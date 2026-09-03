@@ -117,6 +117,12 @@ _SELF_TEST_STAGE_CODES = {
     "outage-live": "relay_self_test_outage_live_failed",
     "continuity": "relay_self_test_continuity_failed",
     "decode": "relay_self_test_decode_failed",
+    "streams": "relay_self_test_decode_streams_failed",
+    "format": "relay_self_test_decode_format_failed",
+    "gop": "relay_self_test_decode_gop_failed",
+    "decoder": "relay_self_test_decode_decoder_failed",
+    "frames": "relay_self_test_decode_frames_failed",
+    "timestamps": "relay_self_test_decode_timestamps_failed",
     "secrets": "relay_self_test_secrets_failed",
     "cleanup": "relay_self_test_cleanup_failed",
 }

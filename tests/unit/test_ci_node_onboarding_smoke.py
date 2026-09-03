@@ -34,10 +34,16 @@ def test_bootstrap_diagnostic_code_is_strictly_allowlisted() -> None:
 
 
 def test_native_safe_failure_code_is_allowlisted() -> None:
-    assert (
-        safe_bootstrap_diagnostic_code({"safe_error": {"code": "relay_self_test_failed"}})
-        == "relay_self_test_failed"
-    )
+    for code in (
+        "relay_self_test_failed",
+        "relay_self_test_decode_streams_failed",
+        "relay_self_test_decode_format_failed",
+        "relay_self_test_decode_gop_failed",
+        "relay_self_test_decode_decoder_failed",
+        "relay_self_test_decode_frames_failed",
+        "relay_self_test_decode_timestamps_failed",
+    ):
+        assert safe_bootstrap_diagnostic_code({"safe_error": {"code": code}}) == code
 
 
 def test_api_payload_password_marker_fails_closed() -> None:

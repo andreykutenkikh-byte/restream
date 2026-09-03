@@ -243,6 +243,12 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         "outage-live",
         "continuity",
         "decode",
+        "streams",
+        "format",
+        "gop",
+        "decoder",
+        "frames",
+        "timestamps",
         "secrets",
         "cleanup",
     ):
@@ -294,3 +300,38 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     assert 'stop_primary_srt_source("final continuity transition")' in continuity_block
     assert 'observer.wait_state("ingest_live", False, 20)' in continuity_block
     assert 'observer.wait_state("normalized", False, 20)' in continuity_block
+
+    decode_block = source.split('mark_self_test_stage("decode")', 1)[1].split(
+        'mark_self_test_stage("secrets")', 1
+    )[0]
+    ordered_decode_stages = (
+        "streams",
+        "format",
+        "gop",
+        "decoder",
+        "frames",
+        "timestamps",
+    )
+    positions = [
+        decode_block.index(f'mark_self_test_stage("{stage}")') for stage in ordered_decode_stages
+    ]
+    assert positions == sorted(positions)
+    assert decode_block.index('mark_self_test_stage("streams")') < decode_block.index(
+        "normalized_signature = stream_signature(capture, include_gop=False)"
+    )
+    assert decode_block.index('mark_self_test_stage("format")') < decode_block.index(
+        'normalized_video.get("codec_name")'
+    )
+    assert decode_block.index('mark_self_test_stage("gop")') < decode_block.index(
+        'normalized_signature["video_gop"] = video_gop_signature(capture)'
+    )
+    assert decode_block.index('mark_self_test_stage("decoder")') < decode_block.index(
+        "decode = run(["
+    )
+    assert decode_block.index('mark_self_test_stage("frames")') < decode_block.index(
+        'result["decoded_video_frames"] = analyze_decoded_video_frames(capture)'
+    )
+    assert decode_block.index('mark_self_test_stage("timestamps")') < decode_block.index(
+        'result["decoded_audio_timestamps"] = analyze_decoded_audio_timestamps(capture)'
+    )
+    assert "capture decode/timestamp validation failed" not in decode_block
