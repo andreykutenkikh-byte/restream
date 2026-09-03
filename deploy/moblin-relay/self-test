@@ -143,6 +143,12 @@ AUDIO_PRESENTATION_GAP_LIMIT_SECONDS = 0.25
 AV_END_DIFFERENCE_LIMIT_SECONDS = 0.25
 SRT_LATENCY_MILLISECONDS = 2000
 SRT_PAYLOAD_SIZE = 1316
+# MediaMTX's SRT forwarder otherwise inherits gosrt's 5-second peer-idle
+# default, which is shorter than the controlled same-session pause below.
+# Match the DUT's explicit 10-second read/peer-idle timeout so the test
+# exercises recovery of the same SRT connection instead of a client-side
+# timeout and reconnect.
+SOURCE_HELPER_PEER_IDLE_TIMEOUT_MILLISECONDS = 10_000
 SRT_IDLE_LOWER_BOUND_SECONDS = 8.0
 SRT_IDLE_UPPER_BOUND_SECONDS = 13.0
 LIVE_TO_SLATE_DEADLINE_SECONDS = 4.5
@@ -1202,7 +1208,8 @@ def write_source_config(
     destination = (
         f"srt://127.0.0.1:{DUT_SRT_PORT}?streamid=publish:{INGEST_PATH}:{user}:{password}"
         f"&passphrase={passphrase}&pbkeylen=32&latency={SRT_LATENCY_MILLISECONDS}"
-        f"&payloadsize={SRT_PAYLOAD_SIZE}&conntimeo=3000"
+        f"&payloadsize={SRT_PAYLOAD_SIZE}"
+        f"&peeridletimeo={SOURCE_HELPER_PEER_IDLE_TIMEOUT_MILLISECONDS}&conntimeo=3000"
     )
     config = {
         "logLevel": "warn", "logDestinations": ["stdout"], "dumpPackets": False,

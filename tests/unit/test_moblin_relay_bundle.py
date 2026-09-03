@@ -163,7 +163,53 @@ def test_build_moblin_urls_is_silent_and_uses_node_config(
             "&pbkeylen=32&latency=2000&payloadsize=1316"
         ],
     }
+    assert "peeridletimeo" not in result["public_url"]
+    assert all("peeridletimeo" not in url for url in result["fallback_urls"])
     assert capsys.readouterr() == ("", "")
+
+
+def test_self_test_source_helper_uses_explicit_peer_idle_timeout(tmp_path: Path) -> None:
+    loaded = load_self_test()
+    write_source_config = loaded["write_source_config"]
+    captured: dict[str, object] = {}
+
+    def capture_config(_path: Path, value: dict[str, object], _mode: int = 0o600) -> None:
+        captured.update(value)
+
+    globals_ = write_source_config.__globals__  # type: ignore[attr-defined]
+    with patch.dict(
+        globals_,
+        {
+            "atomic_json": capture_config,
+            "validate_secret_config": lambda *_args: None,
+        },
+    ):
+        write_source_config(
+            tmp_path,
+            "primary",
+            "synthetic_user",
+            "synthetic_password_1234",
+            "synthetic_passphrase_1234",
+            29350,
+            29351,
+        )
+
+    paths = captured["paths"]
+    assert isinstance(paths, dict)
+    source = paths[loaded["SOURCE_PATH"]]
+    assert isinstance(source, dict)
+    forward = source["forward"]
+    assert isinstance(forward, list)
+    assert forward == [
+        {
+            "dest": (
+                "srt://127.0.0.1:18890?streamid=publish:iphone-live:synthetic_user:"
+                "synthetic_password_1234&passphrase=synthetic_passphrase_1234"
+                "&pbkeylen=32&latency=2000&payloadsize=1316"
+                "&peeridletimeo=10000&conntimeo=3000"
+            )
+        }
+    ]
 
 
 def test_bundle_contains_only_portable_sources_and_no_instance_manifest() -> None:
@@ -264,8 +310,22 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     assert 'sample.get("t", 0.0) >= fresh_after' in source
     assert "and predicate(sample)" in source
     assert "not_before=transition_started" in source
-    assert 'f"&payloadsize={SRT_PAYLOAD_SIZE}&conntimeo=3000"' in source
+    assert 'f"&payloadsize={SRT_PAYLOAD_SIZE}"' in source
+    assert (
+        'f"&peeridletimeo={SOURCE_HELPER_PEER_IDLE_TIMEOUT_MILLISECONDS}&conntimeo=3000"' in source
+    )
     assert 'f"&passphrase={passphrase}&pbkeylen=32&latency={SRT_LATENCY_MILLISECONDS}"' in source
+    helper_idle_seconds = loaded["SOURCE_HELPER_PEER_IDLE_TIMEOUT_MILLISECONDS"] / 1000
+    assert loaded["SOURCE_HELPER_PEER_IDLE_TIMEOUT_MILLISECONDS"] == 10_000
+    assert (
+        loaded["SRT_IDLE_LOWER_BOUND_SECONDS"]
+        < helper_idle_seconds
+        <= loaded["SRT_IDLE_UPPER_BOUND_SECONDS"]
+    )
+    assert (
+        loaded["LIVE_TO_SLATE_DEADLINE_SECONDS"] + loaded["SLATE_CAPTURE_GROWTH_TIMEOUT_SECONDS"]
+        < loaded["SRT_IDLE_LOWER_BOUND_SECONDS"]
+    )
     direct_stages = (
         "startup",
         "assets",
