@@ -228,6 +228,9 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     assert "metadata.st_nlink != 1" in source
     assert "os.fchmod(descriptor, 0o600)" in source
     assert "os.ftruncate(descriptor, 0)" in source
+    assert '"dut_metrics_ok": False' in source
+    assert 'sample["dut_metrics_ok"] = True' in source
+    assert 'if sample.get("dut_metrics_ok") and sample.get(field) is expected:' in source
     for stage in (
         "startup",
         "assets",
@@ -252,6 +255,14 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     assert outage_block.index('mark_self_test_stage("outage-slate")') < outage_block.index(
         'observer.wait_state("live", False, 20)'
     )
+    assert 'stop_primary_srt_source(f"outage {index}")' in outage_block
+    assert outage_block.index('stop_primary_srt_source(f"outage {index}")') < outage_block.index(
+        'observer.wait_state("ingest_live", False, 20)'
+    )
+    assert outage_block.index('observer.wait_state("ingest_live", False, 20)') < (
+        outage_block.index('observer.wait_state("live", False, 20)')
+    )
+    assert "primary source helper exited during outage" not in outage_block
     assert outage_block.index('mark_self_test_stage("outage-normal")') < outage_block.index(
         'observer.wait_state("normalized", False, 20)'
     )
@@ -259,5 +270,27 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         "while time.monotonic() - outage_started < duration"
     )
     assert outage_block.index('mark_self_test_stage("outage-live")') < outage_block.index(
+        "primary_helper = start_source_helper("
+    )
+    assert outage_block.index("primary_helper = start_source_helper(") < outage_block.index(
         "publisher = start_local_publisher(SOURCE_PRIMARY_RTMP_PORT)"
     )
+
+    helper_block = source.split("def stop_primary_srt_source", 1)[1].split(
+        "def reject_with_helper", 1
+    )[0]
+    assert helper_block.index("safe_stop(primary_helper, force=True)") < helper_block.index(
+        "safe_stop(publisher, force=True)"
+    )
+    assert "primary_helper = None" in helper_block
+    assert "publisher = None" in helper_block
+    assert "wait_ports_released((" in helper_block
+    assert '("tcp", SOURCE_PRIMARY_RTMP_PORT)' in helper_block
+    assert '("tcp", SOURCE_PRIMARY_METRICS_PORT)' in helper_block
+
+    continuity_block = source.split('mark_self_test_stage("continuity")', 1)[1].split(
+        'mark_self_test_stage("decode")', 1
+    )[0]
+    assert 'stop_primary_srt_source("final continuity transition")' in continuity_block
+    assert 'observer.wait_state("ingest_live", False, 20)' in continuity_block
+    assert 'observer.wait_state("normalized", False, 20)' in continuity_block

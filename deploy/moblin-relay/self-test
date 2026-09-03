@@ -547,6 +547,7 @@ class Observer(threading.Thread):
                 "dut_alive": self.dut.poll() is None,
                 "sink_alive": self.sink.poll() is None,
                 "reader_alive": self.reader.poll() is None,
+                "dut_metrics_ok": False,
                 "path_ready": False,
                 "ingest_live": False,
                 "live": False,
@@ -557,6 +558,7 @@ class Observer(threading.Thread):
             }
             try:
                 dut_metrics = fetch_metrics(DUT_METRICS_PORT)
+                sample["dut_metrics_ok"] = True
                 sample["path_ready"] = any(
                     labels.get("name") == OUTPUT_PATH and labels.get("state") == "ready" and value == 1
                     for labels, value in parse_metrics(dut_metrics, "paths")
@@ -616,7 +618,7 @@ class Observer(threading.Thread):
         deadline = started + timeout
         while time.monotonic() < deadline:
             sample = self.snapshot()
-            if sample.get(field) is expected:
+            if sample.get("dut_metrics_ok") and sample.get(field) is expected:
                 return time.monotonic() - started
             if sample and not all(sample.get(name) for name in ("dut_alive", "sink_alive", "reader_alive")):
                 raise TestFailure("a core test process exited during a transition")
@@ -1499,6 +1501,21 @@ def main() -> int:
             processes.append(process)
             return process
 
+        def stop_primary_srt_source(label: str) -> None:
+            nonlocal primary_helper, publisher
+            if primary_helper is None or publisher is None:
+                raise TestFailure(f"primary source is missing before {label}")
+            if not safe_stop(primary_helper, force=True):
+                raise TestFailure(f"SRT source helper did not stop during {label}")
+            primary_helper = None
+            if not safe_stop(publisher, force=True):
+                raise TestFailure(f"publisher did not stop during {label}")
+            publisher = None
+            wait_ports_released((
+                ("tcp", SOURCE_PRIMARY_RTMP_PORT),
+                ("tcp", SOURCE_PRIMARY_METRICS_PORT),
+            ))
+
         def reject_with_helper(config: Path, label: str) -> int:
             helper = start_source_helper(config, label, SOURCE_AUX_METRICS_PORT)
             candidate = start_local_publisher(SOURCE_AUX_RTMP_PORT)
@@ -1631,12 +1648,13 @@ def main() -> int:
         to_slate_times, to_live_times = [], []
         for index, duration in enumerate(durations, start=1):
             outage_started = time.monotonic()
-            safe_stop(publisher, force=True)
-            publisher = None
             mark_self_test_stage("outage-slate")
-            to_slate = observer.wait_state("live", False, 20)
+            stop_primary_srt_source(f"outage {index}")
+            observer.wait_state("ingest_live", False, 20)
+            observer.wait_state("live", False, 20)
             mark_self_test_stage("outage-normal")
             observer.wait_state("normalized", False, 20)
+            to_slate = time.monotonic() - outage_started
             to_slate_times.append(round(to_slate, 3))
             print(f"  outage {index}/3: SLATE active; total SRT outage target {duration}s", flush=True)
             mark_self_test_stage("outage-hold")
@@ -1644,8 +1662,6 @@ def main() -> int:
                 sample = observer.snapshot()
                 if not all(sample.get(name) for name in ("dut_alive", "sink_alive", "reader_alive", "path_ready", "forward")):
                     raise TestFailure(f"continuity failed during outage {index}")
-                if primary_helper.poll() is not None:
-                    raise TestFailure(f"primary source helper exited during outage {index}")
                 if sample.get("sink_ids") != [initial_sink_id]:
                     raise TestFailure(f"downstream RTMP identity changed during outage {index}")
                 remaining = duration - (time.monotonic() - outage_started)
@@ -1653,6 +1669,9 @@ def main() -> int:
                     break
                 time.sleep(min(1.0, remaining))
             mark_self_test_stage("outage-live")
+            primary_helper = start_source_helper(
+                primary_config, f"primary-recovery-{index}", SOURCE_PRIMARY_METRICS_PORT
+            )
             publisher = start_local_publisher(SOURCE_PRIMARY_RTMP_PORT)
             wait_helper_path(SOURCE_PRIMARY_METRICS_PORT)
             to_live = observer.wait_state("live", True, 20)
@@ -1664,9 +1683,10 @@ def main() -> int:
 
         mark_self_test_stage("continuity")
         print("[5/8] Checking uninterrupted downstream identity and capture growth", flush=True)
-        safe_stop(publisher, force=True)
-        publisher = None
+        stop_primary_srt_source("final continuity transition")
+        observer.wait_state("ingest_live", False, 20)
         observer.wait_state("live", False, 20)
+        observer.wait_state("normalized", False, 20)
         time.sleep(1)
         observer.finish()
         samples = observer.samples
