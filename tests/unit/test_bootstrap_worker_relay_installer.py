@@ -393,6 +393,60 @@ async def test_staged_mediamtx_validation_supports_a_noexec_temp_mount() -> None
     assert "test -x" not in validation
 
 
+@pytest.mark.parametrize(
+    ("stage", "expected_code"),
+    [
+        ("preflight", "relay_agent_preflight_failed"),
+        ("accounts", "relay_agent_accounts_failed"),
+        ("journal", "relay_agent_journal_failed"),
+        ("copy", "relay_agent_copy_failed"),
+        ("units", "relay_agent_units_failed"),
+        ("broker", "relay_agent_broker_failed"),
+    ],
+)
+async def test_agent_install_failure_uses_only_allowlisted_safe_stage(
+    stage: str,
+    expected_code: str,
+) -> None:
+    def responder(command: str, stdin: SecretStr | None) -> RemoteResult:
+        del stdin
+        if "ADOJAPAN_RELAY_INSTALL_STAGE_FILE=" in command:
+            return RemoteResult(1)
+        if "stage_value=$(cat" in command:
+            return RemoteResult(0, stage)
+        return RemoteResult(0)
+
+    with pytest.raises(BootstrapError) as captured:
+        await RemoteRelayInstaller().install(
+            FakeSession(responder),
+            PrivilegeContext(PrivilegeMode.ROOT),
+            receipt(),
+            timeouts=TimeoutPolicy(),
+        )
+
+    assert captured.value.code == expected_code
+
+
+async def test_agent_install_failure_rejects_an_unknown_diagnostic_stage() -> None:
+    def responder(command: str, stdin: SecretStr | None) -> RemoteResult:
+        del stdin
+        if "ADOJAPAN_RELAY_INSTALL_STAGE_FILE=" in command:
+            return RemoteResult(1)
+        if "stage_value=$(cat" in command:
+            return RemoteResult(0, "untrusted-stage\nextra")
+        return RemoteResult(0)
+
+    with pytest.raises(BootstrapError) as captured:
+        await RemoteRelayInstaller().install(
+            FakeSession(responder),
+            PrivilegeContext(PrivilegeMode.ROOT),
+            receipt(),
+            timeouts=TimeoutPolicy(),
+        )
+
+    assert captured.value.code == "relay_agent_install_failed"
+
+
 async def test_final_check_requires_agent_and_broker_but_relay_inactive_disabled() -> None:
     session = FakeSession()
     prepared = receipt()
@@ -442,6 +496,7 @@ async def test_cleanup_uses_privilege_and_only_the_exact_job_path() -> None:
     )
     assert len(session.commands) == 1
     assert f"rm -rf -- {prepared.temp_root}" in session.commands[0][0]
+    assert f"/run/adojapan-relay-install.{prepared.job_id}.stage" in session.commands[0][0]
     assert session.commands[0][0].startswith("env LC_ALL=C sh -c")
 
     session.commands.clear()

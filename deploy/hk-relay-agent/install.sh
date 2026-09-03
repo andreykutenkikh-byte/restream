@@ -7,6 +7,20 @@ if [ "$#" -ne 0 ] || [ "$(id -u)" -ne 0 ]; then
     exit 2
 fi
 
+relay_agent_stage_file=${ADOJAPAN_RELAY_INSTALL_STAGE_FILE:-}
+relay_agent_mark_stage() {
+    [ -n "$relay_agent_stage_file" ] || return 0
+    case "$relay_agent_stage_file" in
+        /run/adojapan-relay-install.*.stage) ;;
+        *) exit 2 ;;
+    esac
+    if [ -L "$relay_agent_stage_file" ]; then
+        exit 1
+    fi
+    (umask 077; printf '%s\n' "$1" >"$relay_agent_stage_file")
+}
+
+relay_agent_mark_stage preflight
 relay_agent_script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 relay_agent_repo_root=$(CDPATH= cd -- "$relay_agent_script_dir/../.." && pwd)
 relay_agent_source="$relay_agent_repo_root/relay_agent"
@@ -63,6 +77,7 @@ relay_before_enabled=0
 systemctl is-active --quiet moblin-relay.service && relay_before_active=1 || true
 systemctl is-enabled --quiet moblin-relay.service && relay_before_enabled=1 || true
 
+relay_agent_mark_stage accounts
 install -o root -g root -m 0644 "$relay_agent_script_dir/adojapan-relay-agent.sysusers" \
     /etc/sysusers.d/adojapan-relay-agent.conf
 systemd-sysusers /etc/sysusers.d/adojapan-relay-agent.conf
@@ -73,10 +88,12 @@ systemd-tmpfiles --create /etc/tmpfiles.d/adojapan-relay-agent.conf
 # Preserve a strict legacy-v1 journal before installing code that writes v2.
 # The root-only helper validates both storage trees without following links and
 # never replaces an already valid rollback point.
+relay_agent_mark_stage journal
 /usr/bin/python3 -Es "$relay_agent_journal_helper" --prepare
 install -o root -g root -m 0700 "$relay_agent_journal_helper" \
     /usr/local/sbin/adojapan-relay-restore-v1-journal
 
+relay_agent_mark_stage copy
 install -d -o root -g root -m 0755 /usr/local/lib/adojapan-relay-agent
 rm -rf /usr/local/lib/adojapan-relay-agent/relay_agent.new
 install -d -o root -g root -m 0700 /usr/local/lib/adojapan-relay-agent/relay_agent.new
@@ -118,6 +135,7 @@ fi
 mv /usr/local/lib/adojapan-relay-agent/relay_agent.new \
     /usr/local/lib/adojapan-relay-agent/relay_agent
 
+relay_agent_mark_stage units
 install -o root -g root -m 0755 "$relay_agent_script_dir/agent-entry.py" \
     /usr/local/lib/adojapan-relay-agent/agent-entry.py
 install -o root -g root -m 0755 "$relay_agent_script_dir/broker-entry.py" \
@@ -133,6 +151,7 @@ install -o root -g root -m 0644 "$relay_agent_script_dir/adojapan-relay-broker.s
 install -o root -g root -m 0644 "$relay_agent_script_dir/adojapan-relay-broker.socket" \
     /etc/systemd/system/adojapan-relay-broker.socket
 
+relay_agent_mark_stage broker
 systemctl daemon-reload
 systemctl enable --now adojapan-relay-broker.socket
 
@@ -152,5 +171,8 @@ fi
 if [ ! -f /etc/adojapan-relay-agent/preview-reader.token ]; then
     printf '%s\n' \
         'Generate the preview reader token: sudo adojapan-relay-install-preview-token --generate'
+fi
+if [ -n "$relay_agent_stage_file" ]; then
+    rm -f -- "$relay_agent_stage_file"
 fi
 printf '%s\n' 'Relay agent files installed; agent remains inactive.'

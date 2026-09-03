@@ -95,6 +95,14 @@ _AGENT_MODULE_PAYLOADS = (
 _MAX_BUNDLE_BYTES = 2 * 1024 * 1024
 _RELAY_TOKEN = re.compile(rb"[A-Za-z0-9._~+/=-]{32,512}\Z")
 _REMOTE_TEMP_PREFIX = "/tmp/adojapan-relay-bootstrap-"  # noqa: S108
+_AGENT_INSTALL_STAGE_CODES = {
+    "preflight": "relay_agent_preflight_failed",
+    "accounts": "relay_agent_accounts_failed",
+    "journal": "relay_agent_journal_failed",
+    "copy": "relay_agent_copy_failed",
+    "units": "relay_agent_units_failed",
+    "broker": "relay_agent_broker_failed",
+}
 
 
 @dataclass(slots=True)
@@ -714,15 +722,34 @@ class RemoteRelayInstaller:
         # The existing reviewed agent installer performs its own source/copy
         # manifest verification and preserves relay enabled/active state.
         receipt.agent_start_attempted = True
-        await self._run_checked(
+        agent_stage = shlex.quote(f"/run/adojapan-relay-install.{receipt.job_id}.stage")
+        agent_install = await privilege.run(
             session,
-            privilege,
             "systemctl stop adojapan-relay-agent.service 2>/dev/null || true; "
             "systemctl stop adojapan-relay-broker.service 2>/dev/null || true; "
-            f"cd {repo} && sh deploy/hk-relay-agent/install.sh",
+            "agent_status=0; "
+            f"rm -f -- {agent_stage} && cd {repo} && "
+            f"ADOJAPAN_RELAY_INSTALL_STAGE_FILE={agent_stage} "
+            "sh deploy/hk-relay-agent/install.sh || agent_status=$?; "
+            'if test "$agent_status" -eq 0; then '
+            f"rm -f -- {agent_stage}; fi; "
+            'exit "$agent_status"',
             timeout=timeouts.package_seconds,
-            code="relay_agent_install_failed",
         )
+        if agent_install.exit_status != 0:
+            diagnostic = await privilege.run(
+                session,
+                "stage_value=; "
+                f"if test -f {agent_stage} && test ! -L {agent_stage} && "
+                f"test \"$(stat -c '%u:%a' {agent_stage})\" = '0:600' && "
+                f'test "$(wc -c < {agent_stage})" -le 16; then '
+                f"stage_value=$(cat {agent_stage}); fi; "
+                f"rm -f -- {agent_stage}; "
+                "printf '%s' \"$stage_value\"",
+                timeout=timeouts.command_seconds,
+            )
+            stage_code = _AGENT_INSTALL_STAGE_CODES.get(diagnostic.stdout.strip())
+            raise safe_failure(stage_code or "relay_agent_install_failed")
         await self._run_checked(
             session,
             privilege,
@@ -862,10 +889,11 @@ class RemoteRelayInstaller:
         # Package extraction creates root-owned children when SSH uses sudo, so
         # cleanup must use the already verified privilege context as well.
         token_temp = shlex.quote(f"{AGENT_ETC_ROOT}/.node.token.{receipt.job_id}.tmp")
+        agent_stage = shlex.quote(f"/run/adojapan-relay-install.{receipt.job_id}.stage")
         with suppress(BootstrapError):
             await privilege.run(
                 session,
-                f"rm -f -- {token_temp}; rm -rf -- {shlex.quote(receipt.temp_root)}",
+                f"rm -f -- {token_temp} {agent_stage}; rm -rf -- {shlex.quote(receipt.temp_root)}",
                 timeout=timeout,
             )
 

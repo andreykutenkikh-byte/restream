@@ -34,7 +34,13 @@ def test_native_relay_failures_have_stable_localized_messages() -> None:
         "mediamtx_license_missing",
         "relay_slate_generation_failed",
         "relay_install_failed",
+        "relay_agent_accounts_failed",
+        "relay_agent_broker_failed",
+        "relay_agent_copy_failed",
         "relay_agent_install_failed",
+        "relay_agent_journal_failed",
+        "relay_agent_preflight_failed",
+        "relay_agent_units_failed",
         "relay_self_test_failed",
         "relay_final_check_failed",
     }
