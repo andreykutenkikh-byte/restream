@@ -123,6 +123,8 @@ LIVE_TO_SLATE_DEADLINE_SECONDS = 4.5
 SLATE_CAPTURE_GROWTH_BYTES = 16_384
 SLATE_CAPTURE_GROWTH_TIMEOUT_SECONDS = 1.5
 CAPTURE_NO_GROWTH_LIMIT_SECONDS = 1.0
+CAPTURE_SAMPLE_INTERVAL_SECONDS = 0.1
+METRICS_BLIND_LIMIT_SECONDS = 3.0
 SUPERVISOR_RESTART_TIMEOUT_SECONDS = 12.0
 
 
@@ -574,6 +576,7 @@ class Observer(threading.Thread):
         self.cpu_previous: dict[str, tuple[float, int]] = {}
         self.cpu_first: dict[str, tuple[float, int]] = {}
         self.clock_ticks = os.sysconf("SC_CLK_TCK")
+        self.monitoring_started = time.monotonic()
 
     def run(self) -> None:
         while not self.stop_event.is_set():
@@ -584,6 +587,7 @@ class Observer(threading.Thread):
                 "sink_alive": self.sink.poll() is None,
                 "reader_alive": self.reader.poll() is None,
                 "dut_metrics_ok": False,
+                "sink_metrics_ok": False,
                 "path_ready": False,
                 "ingest_live": False,
                 "ingest_ids": [],
@@ -654,6 +658,7 @@ class Observer(threading.Thread):
                 pass
             try:
                 sink_metrics = fetch_metrics(SINK_METRICS_PORT)
+                sample["sink_metrics_ok"] = True
                 sample["sink_ids"] = sorted(
                     labels.get("id", "missing-id")
                     for labels, value in parse_metrics(sink_metrics, "rtmp_conns")
@@ -680,6 +685,19 @@ class Observer(threading.Thread):
         with self.lock:
             return dict(self.samples[-1]) if self.samples else {}
 
+    def checked_snapshot(self, description: str) -> dict:
+        with self.lock:
+            samples = [dict(sample) for sample in self.samples]
+        problem = observer_health_problem(
+            samples,
+            monitoring_started=self.monitoring_started,
+            now=time.monotonic(),
+            alive=self.is_alive(),
+        )
+        if problem:
+            raise TestFailure(f"{problem} during {description}")
+        return samples[-1] if samples else {}
+
     def samples_between(self, started: float, finished: float) -> list[dict]:
         with self.lock:
             return [dict(sample) for sample in self.samples if started <= sample["t"] <= finished]
@@ -694,16 +712,19 @@ class Observer(threading.Thread):
     ) -> dict:
         started = time.monotonic()
         deadline = started + timeout
+        fresh_after = max(started, not_before)
         while time.monotonic() < deadline:
-            sample = self.snapshot()
+            sample = self.checked_snapshot(description)
+            if sample and not all(
+                sample.get(name) for name in ("dut_alive", "sink_alive", "reader_alive")
+            ):
+                raise TestFailure("a core test process exited during a transition")
             if (
-                sample.get("t", 0.0) >= not_before
-                and sample.get("dut_metrics_ok")
+                sample.get("t", 0.0) >= fresh_after
+                and complete_metrics_sample(sample)
                 and predicate(sample)
             ):
                 return sample
-            if sample and not all(sample.get(name) for name in ("dut_alive", "sink_alive", "reader_alive")):
-                raise TestFailure("a core test process exited during a transition")
             time.sleep(0.05)
         raise TestFailure(f"timed out waiting for {description}")
 
@@ -718,6 +739,158 @@ class Observer(threading.Thread):
             if latest and latest[0] > first[0]:
                 averages[name] = (latest[1] - first[1]) / self.clock_ticks / (latest[0] - first[0]) * 100.0
         return averages
+
+
+class CaptureObserver(threading.Thread):
+    """Sample downstream file growth independently from metrics HTTP requests."""
+
+    def __init__(self, capture: Path):
+        super().__init__(daemon=True)
+        self.capture = capture
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+        self.samples: list[dict] = []
+
+    def read_sample(self) -> dict:
+        capture_ok = False
+        capture_size = 0
+        try:
+            capture_size = self.capture.stat().st_size
+            capture_ok = True
+        except OSError:
+            pass
+        return {
+            "t": time.monotonic(),
+            "capture_ok": capture_ok,
+            "capture_size": capture_size,
+        }
+
+    def append_sample(self) -> dict:
+        sample = self.read_sample()
+        with self.lock:
+            self.samples.append(sample)
+        return sample
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            self.append_sample()
+            self.stop_event.wait(CAPTURE_SAMPLE_INTERVAL_SECONDS)
+
+    def checked_samples_since(self, started: float, description: str) -> list[dict]:
+        if not self.is_alive():
+            raise TestFailure(f"capture observer stopped during {description}")
+        boundary = self.append_sample()
+        with self.lock:
+            samples = [
+                dict(sample)
+                for sample in self.samples
+                if started <= float(sample["t"]) <= float(boundary["t"])
+            ]
+        samples.sort(key=lambda sample: float(sample["t"]))
+        if not samples or any(not sample.get("capture_ok") for sample in samples):
+            raise TestFailure(f"capture observer failed during {description}")
+        if not self.is_alive():
+            raise TestFailure(f"capture observer stopped during {description}")
+        return samples
+
+    def wait_growth(
+        self,
+        description: str,
+        minimum_growth: int,
+        timeout: float,
+    ) -> dict:
+        if not self.is_alive():
+            raise TestFailure(f"capture observer stopped during {description}")
+        baseline = self.append_sample()
+        if not baseline.get("capture_ok"):
+            raise TestFailure(f"capture observer failed during {description}")
+        minimum_size = int(baseline["capture_size"]) + minimum_growth
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            sample = self.append_sample()
+            if not sample.get("capture_ok"):
+                raise TestFailure(f"capture observer failed during {description}")
+            if int(sample["capture_size"]) >= minimum_size:
+                return sample
+            if not self.is_alive():
+                raise TestFailure(f"capture observer stopped during {description}")
+            time.sleep(0.05)
+        raise TestFailure(f"timed out waiting for {description}")
+
+    def finish(self) -> None:
+        self.stop_event.set()
+        self.join(timeout=3)
+
+
+def complete_metrics_sample(sample: dict) -> bool:
+    return bool(sample.get("dut_metrics_ok") and sample.get("sink_metrics_ok"))
+
+
+def observer_health_problem(
+    samples: list[dict],
+    *,
+    monitoring_started: float,
+    now: float,
+    alive: bool,
+) -> str | None:
+    if not alive:
+        return "observer stopped"
+    if not samples:
+        if now - monitoring_started > METRICS_BLIND_LIMIT_SECONDS:
+            return "observer produced no fresh samples"
+        return None
+    try:
+        latest_finished = float(samples[-1]["finished"])
+    except (KeyError, TypeError, ValueError):
+        return "observer produced an invalid sample"
+    if now - latest_finished > METRICS_BLIND_LIMIT_SECONDS:
+        return "observer samples became stale"
+    last_complete = monitoring_started
+    for sample in reversed(samples):
+        if complete_metrics_sample(sample):
+            try:
+                last_complete = float(sample["finished"])
+            except (KeyError, TypeError, ValueError):
+                return "observer produced an invalid sample"
+            break
+    if now - last_complete > METRICS_BLIND_LIMIT_SECONDS:
+        return "metrics observability was lost"
+    return None
+
+
+def maximum_metrics_blind_seconds(
+    samples: list[dict],
+    started: float,
+    finished: float,
+) -> float:
+    """Measure leading, internal and trailing gaps between complete scrapes."""
+    if finished < started:
+        raise ValueError("metrics observation window is invalid")
+    checkpoints = [started]
+    for sample in samples:
+        if not complete_metrics_sample(sample):
+            continue
+        try:
+            observed = float(sample["finished"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if started < observed < finished:
+            checkpoints.append(observed)
+    checkpoints.append(finished)
+    checkpoints = sorted(set(checkpoints))
+    return max((right - left for left, right in zip(checkpoints, checkpoints[1:])), default=0.0)
+
+
+def require_metrics_coverage(
+    samples: list[dict],
+    started: float,
+    finished: float,
+    description: str,
+) -> float:
+    blind_seconds = maximum_metrics_blind_seconds(samples, started, finished)
+    if blind_seconds > METRICS_BLIND_LIMIT_SECONDS:
+        raise TestFailure(f"metrics observability was lost during {description}")
+    return blind_seconds
 
 
 def maximum_capture_no_growth_seconds(samples: list[dict]) -> float:
@@ -1560,7 +1733,7 @@ def main() -> int:
     }
     processes: list[subprocess.Popen] = []
     process_group_pids: set[int] = set()
-    sink = dut = reader = publisher = primary_helper = observer = None
+    sink = dut = reader = publisher = primary_helper = observer = capture_observer = None
     log_handles = []
     secret_configs: set[Path] = set()
     authorized_configs: set[Path] = set()
@@ -1669,14 +1842,23 @@ def main() -> int:
         processes.append(reader)
         wait_file_growth(capture, 200_000)
         observer = Observer(dut, sink, reader, capture)
+        capture_observer = CaptureObserver(capture)
         observer.start()
-        time.sleep(1)
-        initial = observer.snapshot()
-        if (not initial.get("path_ready") or initial.get("ingest_live")
-                or initial.get("normalized") or initial.get("live")
-                or not initial.get("forward") or len(initial.get("sink_ids", [])) != 1):
-            raise TestFailure("initial SLATE state is unhealthy")
+        capture_observer.start()
+        initial = observer.wait_sample(
+            "initial healthy SLATE",
+            lambda sample: (
+                sample.get("path_ready")
+                and not sample.get("ingest_live")
+                and not sample.get("normalized")
+                and not sample.get("live")
+                and sample.get("forward")
+                and len(sample.get("sink_ids", [])) == 1
+            ),
+            5,
+        )
         initial_sink_id = initial["sink_ids"][0]
+        observer_coverage_started = float(initial["finished"])
 
         def assert_clean_process_metadata(command: list[str]) -> None:
             command_blob = b"\0".join(item.encode() for item in command)
@@ -1783,19 +1965,12 @@ def main() -> int:
             return sample
 
         def wait_slate_capture_growth(description: str, slate_sample: dict) -> dict:
-            minimum_size = int(slate_sample["capture_size"]) + SLATE_CAPTURE_GROWTH_BYTES
-            return observer.wait_sample(
+            if not complete_metrics_sample(slate_sample):
+                raise TestFailure(f"invalid SLATE sample while waiting for {description}")
+            return capture_observer.wait_growth(
                 description,
-                lambda item: (
-                    not item.get("normalized")
-                    and not item.get("live")
-                    and item.get("path_ready")
-                    and item.get("forward")
-                    and item.get("sink_ids") == [initial_sink_id]
-                    and int(item.get("capture_size", 0)) >= minimum_size
-                ),
+                SLATE_CAPTURE_GROWTH_BYTES,
                 SLATE_CAPTURE_GROWTH_TIMEOUT_SECONDS,
-                not_before=float(slate_sample["t"]),
             )
 
         def wait_srt_idle_expiry(
@@ -1835,19 +2010,38 @@ def main() -> int:
                 deadline = time.monotonic() + 12
                 while time.monotonic() < deadline:
                     forward_error_seen = forward_error_seen or helper_forward_error(SOURCE_AUX_METRICS_PORT)
-                    sample = observer.snapshot()
+                    sample = observer.checked_snapshot(label)
+                    if sample and not all(
+                        sample.get(name) for name in ("dut_alive", "sink_alive", "reader_alive")
+                    ):
+                        raise TestFailure(f"continuity failed while checking {label}")
+                    if candidate.poll() is not None or helper.poll() is not None:
+                        raise TestFailure(f"local source path exited while checking {label}")
+                    if not complete_metrics_sample(sample):
+                        time.sleep(0.1)
+                        continue
                     if sample.get("live"):
                         raise TestFailure(f"{label} caused a transient LIVE state")
-                    if not all(sample.get(name) for name in
-                               ("dut_alive", "sink_alive", "reader_alive", "path_ready", "forward")):
+                    if not all(sample.get(name) for name in ("path_ready", "forward")):
                         raise TestFailure(f"continuity failed while checking {label}")
                     if sample.get("sink_ids") != [initial_sink_id]:
                         raise TestFailure(f"downstream identity changed while checking {label}")
-                    if candidate.poll() is not None or helper.poll() is not None:
-                        raise TestFailure(f"local source path exited while checking {label}")
                     time.sleep(0.1)
                 observation_finished = time.monotonic()
-                interval = observer.samples_between(observation_started, observation_finished)
+                observed_interval = observer.samples_between(
+                    observation_started, observation_finished
+                )
+                require_metrics_coverage(
+                    observed_interval,
+                    observation_started,
+                    observation_finished,
+                    label,
+                )
+                interval = [
+                    sample
+                    for sample in observed_interval
+                    if complete_metrics_sample(sample)
+                ]
                 if not interval or any(sample.get("live") for sample in interval):
                     raise TestFailure(f"{label} was not rejected for the full observer interval")
                 if not forward_error_seen:
@@ -1980,16 +2174,36 @@ def main() -> int:
             deadline = time.monotonic() + 12
             while time.monotonic() < deadline:
                 second_error_seen = second_error_seen or helper_forward_error(SOURCE_AUX_METRICS_PORT)
-                sample = observer.snapshot()
-                if not sample.get("live") or sample.get("sink_ids") != [initial_sink_id]:
-                    raise TestFailure("second SRT publisher disrupted the primary publisher")
+                sample = observer.checked_snapshot("second-publisher test")
+                if sample and not all(
+                    sample.get(name) for name in ("dut_alive", "sink_alive", "reader_alive")
+                ):
+                    raise TestFailure("a core process exited during second-publisher test")
                 if second.poll() is not None or second_helper.poll() is not None:
                     raise TestFailure("second local source path exited before DUT rejection was verified")
                 if publisher.poll() is not None or primary_helper.poll() is not None:
                     raise TestFailure("primary source path exited during second-publisher test")
+                if not complete_metrics_sample(sample):
+                    time.sleep(0.1)
+                    continue
+                if not sample.get("live") or sample.get("sink_ids") != [initial_sink_id]:
+                    raise TestFailure("second SRT publisher disrupted the primary publisher")
                 time.sleep(0.1)
             second_finished = time.monotonic()
-            second_interval = observer.samples_between(second_started, second_finished)
+            second_observed_interval = observer.samples_between(
+                second_started, second_finished
+            )
+            require_metrics_coverage(
+                second_observed_interval,
+                second_started,
+                second_finished,
+                "second-publisher test",
+            )
+            second_interval = [
+                sample
+                for sample in second_observed_interval
+                if complete_metrics_sample(sample)
+            ]
             result["second_publisher_observer_samples"] = len(second_interval)
             result["second_publisher_rejected"] = (
                 bool(second_interval)
@@ -2053,9 +2267,9 @@ def main() -> int:
         if same_session_live["normalized_ids"] == previous_normalizer_ids:
             raise TestFailure("same-session recovery did not replace the normalizer publisher")
         mark_self_test_stage("stall-cont")
-        same_session_samples = observer.samples_between(
+        same_session_samples = capture_observer.checked_samples_since(
             same_session_started,
-            float(same_session_live["t"]),
+            "same-session recovery",
         )
         same_session_no_growth = maximum_capture_no_growth_seconds(
             same_session_samples
@@ -2129,9 +2343,9 @@ def main() -> int:
         )
         if len(replacement_supervisors) != 1 or replacement_supervisors[0] == old_supervisor_pid:
             raise TestFailure("normalizer supervisor was not replaced cleanly")
-        crash_samples = observer.samples_between(
+        crash_samples = capture_observer.checked_samples_since(
             supervisor_crash_started,
-            float(crash_live["t"]),
+            "supervisor recovery",
         )
         crash_no_growth = maximum_capture_no_growth_seconds(crash_samples)
         if crash_no_growth > CAPTURE_NO_GROWTH_LIMIT_SECONDS:
@@ -2177,8 +2391,18 @@ def main() -> int:
             print(f"  outage {index}/3: SLATE active; total SRT outage target {duration}s", flush=True)
             mark_self_test_stage("outage-hold")
             while time.monotonic() - outage_started < duration:
-                sample = observer.snapshot()
-                if not all(sample.get(name) for name in ("dut_alive", "sink_alive", "reader_alive", "path_ready", "forward")):
+                sample = observer.checked_snapshot(f"outage {index}")
+                if sample and not all(
+                    sample.get(name) for name in ("dut_alive", "sink_alive", "reader_alive")
+                ):
+                    raise TestFailure(f"continuity failed during outage {index}")
+                if not complete_metrics_sample(sample):
+                    remaining = duration - (time.monotonic() - outage_started)
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(1.0, remaining))
+                    continue
+                if not all(sample.get(name) for name in ("path_ready", "forward")):
                     raise TestFailure(f"continuity failed during outage {index}")
                 if sample.get("ingest_live") or sample.get("normalized") or sample.get("live"):
                     raise TestFailure(f"LIVE state returned unexpectedly during outage {index}")
@@ -2189,9 +2413,15 @@ def main() -> int:
                     break
                 time.sleep(min(1.0, remaining))
             recovery_started = time.monotonic()
-            outage_samples = observer.samples_between(
-                float(detached["t"]),
+            require_metrics_coverage(
+                observer.samples_between(outage_started, recovery_started),
+                outage_started,
                 recovery_started,
+                f"outage {index}",
+            )
+            outage_samples = capture_observer.checked_samples_since(
+                float(detached["t"]),
+                f"outage {index}",
             )
             outage_no_growth = maximum_capture_no_growth_seconds(outage_samples)
             if outage_no_growth > CAPTURE_NO_GROWTH_LIMIT_SECONDS:
@@ -2237,11 +2467,26 @@ def main() -> int:
         )
         time.sleep(1)
         final_finished = time.monotonic()
+        observer.checked_snapshot("final transition")
+        final_samples = capture_observer.checked_samples_since(
+            float(final_slate["t"]),
+            "final transition",
+        )
+        capture_samples = capture_observer.checked_samples_since(
+            observer_coverage_started,
+            "complete self-test",
+        )
+        capture_observer.finish()
         observer.finish()
         samples = observer.samples
-        final_samples = observer.samples_between(
-            float(final_slate["t"]),
-            final_finished,
+        result["max_metrics_blind_seconds"] = round(
+            require_metrics_coverage(
+                samples,
+                observer_coverage_started,
+                final_finished,
+                "complete self-test",
+            ),
+            3,
         )
         final_no_growth = maximum_capture_no_growth_seconds(final_samples)
         if final_no_growth > CAPTURE_NO_GROWTH_LIMIT_SECONDS:
@@ -2252,8 +2497,20 @@ def main() -> int:
             "max_capture_no_growth_seconds": round(final_no_growth, 3),
         }
         result["observer_samples"] = len(samples)
-        result["downstream_unique_rtmp_ids"] = sorted({item for sample in samples for item in sample["sink_ids"]})
-        result["downstream_missing_samples"] = sum(1 for sample in samples if sample["sink_ids"] != [initial_sink_id])
+        result["capture_observer_samples"] = len(capture_samples)
+        result["overall_max_capture_no_growth_seconds"] = round(
+            maximum_capture_no_growth_seconds(capture_samples),
+            3,
+        )
+        if result["overall_max_capture_no_growth_seconds"] > CAPTURE_NO_GROWTH_LIMIT_SECONDS:
+            raise TestFailure("downstream media stalled during the complete self-test")
+        valid_sink_samples = [sample for sample in samples if sample.get("sink_metrics_ok")]
+        result["downstream_unique_rtmp_ids"] = sorted(
+            {item for sample in valid_sink_samples for item in sample["sink_ids"]}
+        )
+        result["downstream_missing_samples"] = sum(
+            1 for sample in valid_sink_samples if sample["sink_ids"] != [initial_sink_id]
+        )
         result["reader_survived_all_switches"] = reader.poll() is None
         result["max_rss_kib"] = observer.max_rss_kib
         result["max_cpu_percent"] = {key: round(value, 2) for key, value in observer.max_cpu_percent.items()}
@@ -2473,6 +2730,10 @@ def main() -> int:
             observer.finish()
             if observer.is_alive():
                 cleanup_errors.append("observer: ThreadDidNotStop")
+        if capture_observer is not None and capture_observer.is_alive():
+            capture_observer.finish()
+            if capture_observer.is_alive():
+                cleanup_errors.append("capture-observer: ThreadDidNotStop")
         for process in reversed(processes):
             if not safe_stop(
                 process,

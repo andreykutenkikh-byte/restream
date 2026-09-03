@@ -247,7 +247,10 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     assert "os.ftruncate(descriptor, 0)" in source
     assert '"dut_metrics_ok": False' in source
     assert 'sample["dut_metrics_ok"] = True' in source
-    assert 'sample.get("t", 0.0) >= not_before' in source
+    assert '"sink_metrics_ok": False' in source
+    assert 'sample["sink_metrics_ok"] = True' in source
+    assert "fresh_after = max(started, not_before)" in source
+    assert 'sample.get("t", 0.0) >= fresh_after' in source
     assert "and predicate(sample)" in source
     assert "not_before=transition_started" in source
     assert 'f"&payloadsize={SRT_PAYLOAD_SIZE}&conntimeo=3000"' in source
@@ -400,6 +403,103 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     assert '"capture decoder validation failed",' in source
     assert '"capture frame validation failed",' in source
     assert '"capture timestamp validation failed",' in source
+
+
+def test_self_test_distinguishes_unknown_metrics_from_media_outage() -> None:
+    loaded = load_self_test()
+    complete = loaded["complete_metrics_sample"]
+    observer_problem = loaded["observer_health_problem"]
+    maximum_blind = loaded["maximum_metrics_blind_seconds"]
+    require_coverage = loaded["require_metrics_coverage"]
+    maximum_no_growth = loaded["maximum_capture_no_growth_seconds"]
+    failure = loaded["TestFailure"]
+    blind_limit = loaded["METRICS_BLIND_LIMIT_SECONDS"]
+
+    assert complete({"dut_metrics_ok": True, "sink_metrics_ok": True}) is True
+    for dut_ok, sink_ok in ((False, True), (True, False), (False, False)):
+        assert complete({"dut_metrics_ok": dut_ok, "sink_metrics_ok": sink_ok}) is False
+    assert blind_limit == pytest.approx(3.0)
+    assert blind_limit < loaded["LIVE_TO_SLATE_DEADLINE_SECONDS"]
+
+    transient_samples = [
+        {"finished": 0.2, "dut_metrics_ok": True, "sink_metrics_ok": True},
+        {"finished": 0.4, "dut_metrics_ok": True, "sink_metrics_ok": True},
+        {"finished": 1.6, "dut_metrics_ok": False, "sink_metrics_ok": True},
+        {"finished": 2.8, "dut_metrics_ok": True, "sink_metrics_ok": True},
+        {"finished": 3.0, "dut_metrics_ok": True, "sink_metrics_ok": True},
+    ]
+    assert maximum_blind(transient_samples, 0.2, 3.0) == pytest.approx(2.4)
+    assert require_coverage(transient_samples, 0.2, 3.0, "transient scrape") == (pytest.approx(2.4))
+
+    for sustained_samples, started, finished in (
+        ([], 0.0, 3.1),
+        ([{"finished": 3.1, "dut_metrics_ok": True, "sink_metrics_ok": True}], 0.0, 3.1),
+        (
+            [
+                {"finished": 0.1, "dut_metrics_ok": True, "sink_metrics_ok": True},
+                {"finished": 3.2, "dut_metrics_ok": True, "sink_metrics_ok": True},
+            ],
+            0.1,
+            3.2,
+        ),
+        ([{"finished": 0.2, "dut_metrics_ok": True, "sink_metrics_ok": True}], 0.2, 3.3),
+    ):
+        assert maximum_blind(sustained_samples, started, finished) == pytest.approx(3.1)
+        with pytest.raises(failure, match="metrics observability was lost"):
+            require_coverage(sustained_samples, started, finished, "sustained scrape failure")
+
+    healthy = {"finished": 9.9, "dut_metrics_ok": True, "sink_metrics_ok": True}
+    incomplete = {"finished": 10.0, "dut_metrics_ok": False, "sink_metrics_ok": True}
+    assert (
+        observer_problem([healthy, incomplete], monitoring_started=0.0, now=10.0, alive=True)
+        is None
+    )
+    assert observer_problem([], monitoring_started=0.0, now=3.1, alive=True) == (
+        "observer produced no fresh samples"
+    )
+    assert observer_problem([healthy], monitoring_started=0.0, now=13.0, alive=True) == (
+        "observer samples became stale"
+    )
+    assert observer_problem([healthy], monitoring_started=0.0, now=10.0, alive=False) == (
+        "observer stopped"
+    )
+    sustained_incomplete = {
+        "finished": 10.0,
+        "dut_metrics_ok": False,
+        "sink_metrics_ok": True,
+    }
+    assert (
+        observer_problem(
+            [
+                {"finished": 6.9, "dut_metrics_ok": True, "sink_metrics_ok": True},
+                sustained_incomplete,
+            ],
+            monitoring_started=0.0,
+            now=10.0,
+            alive=True,
+        )
+        == "metrics observability was lost"
+    )
+
+    assert maximum_no_growth(
+        [
+            {"t": 1.0, "capture_size": 100},
+            {"t": 1.1, "capture_size": 200},
+            {"t": 1.5, "capture_size": 200},
+        ]
+    ) == pytest.approx(0.4)
+    assert maximum_no_growth(
+        [
+            {"t": 1.0, "capture_size": 100},
+            {"t": 3.0, "capture_size": 200},
+        ]
+    ) == pytest.approx(2.0)
+
+    main_source = SELF_TEST.read_text().split("def main()", 1)[1]
+    assert "observer.snapshot()" not in main_source
+    assert main_source.count("observer.checked_snapshot(") == 4
+    assert "capture_observer = CaptureObserver(capture)" in main_source
+    assert main_source.count("capture_observer.checked_samples_since(") == 5
 
 
 def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
