@@ -266,7 +266,6 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         "auth-x-core",
         "auth-x-second",
         "auth-x-primary",
-        "auth-x-flow",
         "auth-x-blind",
         "auth-x-attempt",
         "live-ingest",
@@ -309,12 +308,22 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         "ts-gaps",
         "ts-av-sync",
     )
+    dynamic_exclusivity_stages = (
+        "auth-x-live",
+        "auth-x-ingest",
+        "auth-x-norm",
+        "auth-x-sink",
+        "auth-x-bytes",
+    )
     for stage in direct_stages:
         assert len(f"{stage}\n".encode("ascii")) <= 16
         assert f'mark_self_test_stage("{stage}")' in source
     for stage in timestamp_diagnostic_stages:
         assert len(f"{stage}\n".encode("ascii")) <= 16
         assert f'("{stage}",' in source
+    for stage in dynamic_exclusivity_stages:
+        assert len(f"{stage}\n".encode("ascii")) <= 16
+        assert f'return "{stage}"' in source
     assert "mark_self_test_stage(\n                timestamp_failure_stage(" in source
 
     outage_block = source.split('mark_self_test_stage("outages")', 1)[1].split(
@@ -418,8 +427,10 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
 def test_self_test_publisher_exclusivity_uses_server_proof_and_stable_ids() -> None:
     loaded = load_self_test()
     prove = loaded["publisher_exclusivity_proved"]
+    problem = loaded["publisher_exclusivity_sample_problem"]
     outbound_bytes = loaded["helper_forward_outbound_bytes"]
     assert callable(prove)
+    assert callable(problem)
     assert callable(outbound_bytes)
     stable_sample = {
         "live": True,
@@ -457,15 +468,25 @@ def test_self_test_publisher_exclusivity_uses_server_proof_and_stable_ids() -> N
         False,
     )
 
-    for field, replacement in (
-        ("ingest_ids", ["replacement-ingest"]),
-        ("normalized_ids", ["replacement-normalizer"]),
-        ("sink_ids", ["replacement-downstream"]),
-        ("live", False),
-        ("ingest_bytes", 100),
+    for field, replacement, expected_problem in (
+        ("ingest_ids", ["replacement-ingest"], "auth-x-ingest"),
+        ("normalized_ids", ["replacement-normalizer"], "auth-x-norm"),
+        ("sink_ids", ["replacement-downstream"], "auth-x-sink"),
+        ("live", False, "auth-x-live"),
+        ("ingest_bytes", 99, "auth-x-bytes"),
     ):
         changed = dict(stable_sample)
         changed[field] = replacement
+        assert (
+            problem(
+                changed,
+                ["primary-ingest"],
+                ["primary-normalizer"],
+                "downstream",
+                100,
+            )
+            == expected_problem
+        )
         assert not prove(
             [changed],
             ["primary-ingest"],
@@ -475,6 +496,27 @@ def test_self_test_publisher_exclusivity_uses_server_proof_and_stable_ids() -> N
             4096,
             True,
         )
+
+    no_progress = dict(stable_sample, ingest_bytes=100)
+    assert (
+        problem(
+            no_progress,
+            ["primary-ingest"],
+            ["primary-normalizer"],
+            "downstream",
+            100,
+        )
+        is None
+    )
+    assert not prove(
+        [no_progress],
+        ["primary-ingest"],
+        ["primary-normalizer"],
+        "downstream",
+        100,
+        4096,
+        True,
+    )
 
     metrics = (
         "# Forward destinations\n"

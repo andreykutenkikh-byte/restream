@@ -66,7 +66,11 @@ SELF_TEST_STAGES = frozenset(
         "auth-x-core",
         "auth-x-second",
         "auth-x-primary",
-        "auth-x-flow",
+        "auth-x-live",
+        "auth-x-ingest",
+        "auth-x-norm",
+        "auth-x-sink",
+        "auth-x-bytes",
         "auth-x-blind",
         "auth-x-attempt",
         "live-ingest",
@@ -1334,6 +1338,27 @@ def log_tail_contains_marker(
     return marker in b"".join(chunks)
 
 
+def publisher_exclusivity_sample_problem(
+    sample: dict,
+    initial_ingest_ids: list[str],
+    initial_normalized_ids: list[str],
+    initial_sink_id: str,
+    initial_ingest_bytes: int,
+) -> str | None:
+    ingest_bytes = sample.get("ingest_bytes")
+    if not sample.get("live"):
+        return "auth-x-live"
+    if sample.get("ingest_ids") != initial_ingest_ids:
+        return "auth-x-ingest"
+    if sample.get("normalized_ids") != initial_normalized_ids:
+        return "auth-x-norm"
+    if sample.get("sink_ids") != [initial_sink_id]:
+        return "auth-x-sink"
+    if type(ingest_bytes) is not int or ingest_bytes < initial_ingest_bytes:
+        return "auth-x-bytes"
+    return None
+
+
 def publisher_exclusivity_sample_valid(
     sample: dict,
     initial_ingest_ids: list[str],
@@ -1341,15 +1366,13 @@ def publisher_exclusivity_sample_valid(
     initial_sink_id: str,
     initial_ingest_bytes: int,
 ) -> bool:
-    ingest_bytes = sample.get("ingest_bytes")
-    return bool(
-        sample.get("live")
-        and sample.get("ingest_ids") == initial_ingest_ids
-        and sample.get("normalized_ids") == initial_normalized_ids
-        and sample.get("sink_ids") == [initial_sink_id]
-        and type(ingest_bytes) is int
-        and ingest_bytes >= initial_ingest_bytes
-    )
+    return publisher_exclusivity_sample_problem(
+        sample,
+        initial_ingest_ids,
+        initial_normalized_ids,
+        initial_sink_id,
+        initial_ingest_bytes,
+    ) is None
 
 
 def publisher_exclusivity_proved(
@@ -2367,14 +2390,15 @@ def main() -> int:
                 if not complete_metrics_sample(sample):
                     time.sleep(0.1)
                     continue
-                if not publisher_exclusivity_sample_valid(
+                sample_problem = publisher_exclusivity_sample_problem(
                     sample,
                     initial_ingest_ids,
                     initial_normalized_ids,
                     initial_sink_id,
                     initial_ingest_bytes,
-                ):
-                    mark_self_test_stage("auth-x-flow")
+                )
+                if sample_problem:
+                    mark_self_test_stage(sample_problem)
                     raise TestFailure("second SRT publisher disrupted the primary publisher")
                 time.sleep(0.1)
             final_outbound_bytes = helper_forward_outbound_bytes(SOURCE_AUX_METRICS_PORT)
@@ -2445,7 +2469,18 @@ def main() -> int:
             ]:
                 mark_self_test_stage("auth-x-attempt")
             else:
-                mark_self_test_stage("auth-x-flow")
+                interval_problem = None
+                for sample in second_interval:
+                    interval_problem = publisher_exclusivity_sample_problem(
+                        sample,
+                        initial_ingest_ids,
+                        initial_normalized_ids,
+                        initial_sink_id,
+                        initial_ingest_bytes,
+                    )
+                    if interval_problem:
+                        break
+                mark_self_test_stage(interval_problem or "auth-x-bytes")
             raise TestFailure("second publisher rejection failed")
 
         mark_self_test_stage("outages")

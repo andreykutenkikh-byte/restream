@@ -51,7 +51,11 @@ def test_native_safe_failure_code_is_allowlisted() -> None:
         "relay_self_test_auth_exclusivity_core_failed",
         "relay_self_test_auth_exclusivity_candidate_failed",
         "relay_self_test_auth_exclusivity_primary_failed",
-        "relay_self_test_auth_exclusivity_continuity_failed",
+        "relay_self_test_auth_exclusivity_live_failed",
+        "relay_self_test_auth_exclusivity_ingest_failed",
+        "relay_self_test_auth_exclusivity_normalizer_failed",
+        "relay_self_test_auth_exclusivity_downstream_failed",
+        "relay_self_test_auth_exclusivity_progress_failed",
         "relay_self_test_auth_exclusivity_observability_failed",
         "relay_self_test_auth_exclusivity_proof_failed",
     ):

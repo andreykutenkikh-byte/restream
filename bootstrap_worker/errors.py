@@ -158,8 +158,20 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_auth_exclusivity_primary_failed": (
             "Основной SRT-источник остановился во время проверки эксклюзивности."
         ),
-        "relay_self_test_auth_exclusivity_continuity_failed": (
-            "Второй SRT-издатель нарушил непрерывность основного медиатракта."
+        "relay_self_test_auth_exclusivity_live_failed": (
+            "LIVE-состояние изменилось во время проверки второго SRT-издателя."
+        ),
+        "relay_self_test_auth_exclusivity_ingest_failed": (
+            "Основное SRT-соединение изменилось во время проверки эксклюзивности."
+        ),
+        "relay_self_test_auth_exclusivity_normalizer_failed": (
+            "Нормализатор изменился во время проверки второго SRT-издателя."
+        ),
+        "relay_self_test_auth_exclusivity_downstream_failed": (
+            "Выходной поток изменился во время проверки второго SRT-издателя."
+        ),
+        "relay_self_test_auth_exclusivity_progress_failed": (
+            "Основной SRT-поток не подтвердил передачу данных при проверке эксклюзивности."
         ),
         "relay_self_test_auth_exclusivity_observability_failed": (
             "Метрики стали недоступны во время проверки второго SRT-издателя."
