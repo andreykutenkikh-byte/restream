@@ -344,6 +344,10 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     assert "signal.SIGSTOP" in outage_block
     assert "signal.SIGCONT" in outage_block
     assert "signal.SIGKILL" in outage_block
+    same_session_recovery = outage_block.split('"same-session LIVE recovery"', 1)[1].split(
+        "expected_ingest_ids=initial_ingest_ids", 1
+    )[0]
+    assert "SUPERVISOR_RESTART_TIMEOUT_SECONDS" in same_session_recovery
     assert "wait_process_exit(old_child_pid, 1.0)" in outage_block
     assert "maximum_capture_no_growth_seconds(" in outage_block
     assert "primary source helper exited during outage" not in outage_block
@@ -714,6 +718,7 @@ def test_self_test_distinguishes_unknown_metrics_from_media_outage() -> None:
 
 def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
     loaded = load_normalizer()
+    self_test = load_self_test()
     build_argv = loaded["build_ffmpeg_argv"]
     parse_inbound_bytes = loaded["parse_inbound_bytes"]
     parse_output_sample = loaded["parse_output_sample"]
@@ -721,6 +726,10 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
     output_growth_gate = loaded["OutputGrowthGate"]
     watchdog_type = loaded["MediaWatchdog"]
     sanitized_environment = loaded["sanitized_environment"]
+
+    assert self_test["SUPERVISOR_RESTART_TIMEOUT_SECONDS"] > (
+        loaded["OUTPUT_START_TIMEOUT_SECONDS"] + self_test["GOP_DURATION_SECONDS"] + 1.0
+    )
 
     argv = build_argv(18554, 11936)
     assert "-rw_timeout" not in argv

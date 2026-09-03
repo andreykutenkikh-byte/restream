@@ -47,14 +47,11 @@ def load_normalizer():
 def assert_normalizer_contract(normalizer) -> None:
     argv = normalizer.build_ffmpeg_argv(18554, 11936)
     joined = " ".join(argv)
-    input_index = argv.index("-i")
     assert argv[0] == "/usr/bin/ffmpeg"
     assert "rtsp://127.0.0.1:18554/iphone-live" in argv
     assert "rtmp://127.0.0.1:11936/relay-output" in argv
-    assert argv[argv.index("-rw_timeout") + 1] == "100000"
-    assert argv[argv.index("-timeout") + 1] == "100000"
-    assert argv.index("-rw_timeout") < input_index
-    assert argv.index("-timeout") < input_index
+    assert "-rw_timeout" not in argv
+    assert "-timeout" not in argv
     assert argv[argv.index("-c:v") + 1] == "copy"
     assert "-copyinkf" not in argv
     assert argv[argv.index("-c:a") + 1] == "aac"
@@ -109,12 +106,13 @@ def assert_normalizer_contract(normalizer) -> None:
     assert output_gate.observe(("connection-b", 130)) is False
 
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
-    assert watchdog.observe(True, ("connection-a", 121), 1.09) is True
-    assert watchdog.observe(True, ("connection-a", 121), 1.18) is True
-    assert watchdog.observe(True, ("connection-a", 121), 1.191) is False
+    idle_limit = normalizer.MEDIA_IDLE_TIMEOUT_SECONDS
+    assert watchdog.observe(True, ("connection-a", 120), 1.0 + idle_limit - 0.001) is True
+    assert watchdog.observe(True, ("connection-a", 120), 1.0 + idle_limit + 0.001) is False
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
-    assert watchdog.observe(False, None, 1.149) is True
-    assert watchdog.observe(False, None, 1.151) is False
+    blind_limit = normalizer.METRICS_BLIND_TIMEOUT_SECONDS
+    assert watchdog.observe(False, None, 1.0 + blind_limit - 0.001) is True
+    assert watchdog.observe(False, None, 1.0 + blind_limit + 0.001) is False
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     assert watchdog.observe(True, ("connection-b", 121), 1.01) is False
     assert hasattr(normalizer, "make_parent_death_setup")

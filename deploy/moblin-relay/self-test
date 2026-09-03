@@ -2521,7 +2521,7 @@ def main() -> int:
             publisher_paused = False
             same_session_live = wait_healthy_live(
                 "same-session LIVE recovery",
-                6,
+                SUPERVISOR_RESTART_TIMEOUT_SECONDS,
                 not_before=recovery_started,
                 expected_ingest_ids=initial_ingest_ids,
             )
