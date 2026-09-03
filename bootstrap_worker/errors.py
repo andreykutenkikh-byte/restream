@@ -56,6 +56,9 @@ def safe_failure(code: str) -> BootstrapError:
         "ssh_authentication_failed": "SSH-аутентификация не выполнена.",
         "sudo_password_invalid": "Пароль sudo не подошёл.",
         "unsupported_operating_system": "Операционная система сервера не поддерживается.",
+        "unsupported_relay_operating_system": (
+            "Для Moblin Relay нужен amd64-сервер с Ubuntu 22.04/24.04 или Debian 12/13."
+        ),
         "unsupported_package_manager": (
             "На сервере отсутствует поддерживаемый системный менеджер пакетов."
         ),
@@ -88,6 +91,36 @@ def safe_failure(code: str) -> BootstrapError:
         "agent_enrollment_failed": (
             "Node Agent установлен, но не смог подключиться к панели. Изменения откатаны."
         ),
+        "relay_bundle_invalid": "Пакет Moblin Relay повреждён или неполон.",
+        "remote_relay_conflict": (
+            "На сервере уже есть файлы или службы, конфликтующие с Moblin Relay."
+        ),
+        "remote_relay_account_conflict": (
+            "Системные пользователи Moblin Relay уже существуют с небезопасными параметрами."
+        ),
+        "relay_active_during_install": (
+            "Moblin Relay уже запущен или включён. Установка остановлена без изменений."
+        ),
+        "relay_port_conflict": ("Один из портов Moblin Relay уже занят другой службой на сервере."),
+        "invalid_relay_control_origin": "Адрес панели управления Relay не прошёл проверку.",
+        "invalid_relay_target": (
+            "Не удалось определить публичный IPv4-адрес нового Relay-сервера."
+        ),
+        "invalid_enrollment_token": "Защищённый ключ подключения Relay не прошёл проверку.",
+        "relay_dependency_install_failed": (
+            "Не удалось установить системные компоненты Moblin Relay."
+        ),
+        "relay_dependency_check_failed": (
+            "FFmpeg на сервере не поддерживает необходимые H.264 или SRT-функции."
+        ),
+        "mediamtx_download_failed": (
+            "Не удалось скачать и проверить закреплённую версию MediaMTX."
+        ),
+        "relay_slate_generation_failed": "Не удалось создать серверную заставку 1080×1920.",
+        "relay_install_failed": "Не удалось безопасно установить Moblin Relay.",
+        "relay_agent_install_failed": "Не удалось установить агент управления Moblin Relay.",
+        "relay_self_test_failed": "Локальная самопроверка Moblin Relay не пройдена.",
+        "relay_final_check_failed": "Финальная проверка Moblin Relay не пройдена.",
         "overall_timeout": "Время подключения сервера истекло. Изменения откатаны.",
         "bootstrap_worker_restarted": (
             "Сервис установки был перезапущен. Введите SSH-пароль повторно."

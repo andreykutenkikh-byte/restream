@@ -41,6 +41,7 @@ class FakeBootstrap:
             "port": 22,
             "username": "root",
             "expected_host_fingerprint": None,
+            "install_profile": "moblin_relay",
         }
         self.active_job_id = "11111111-1111-4111-8111-111111111111"
         return {"job_id": self.active_job_id, "state": "queued"}
@@ -190,4 +191,16 @@ def test_bootstrap_request_rejects_url_and_invalid_port(
             headers=headers,
         )
         assert invalid_port.status_code == 422
+        client_selected_profile = client.post(
+            "/api/nodes/bootstrap",
+            json={
+                "address": "example.test",
+                "port": 22,
+                "username": "root",
+                "password": "temporary",
+                "install_profile": "generic_node",
+            },
+            headers=headers,
+        )
+        assert client_selected_profile.status_code == 422
         assert bootstrap.password_seen is False

@@ -391,7 +391,7 @@ def test_ci_media_helpers_are_absent_from_production_and_strictly_isolated() -> 
         "ENVIRONMENT": "test",
         "COOKIE_SECURE": "false",
         "NODE_AGENT_IMAGE": ("ghcr.io/adojapan/ci-node-agent@sha256:" + "1" * 64),
-        "PUBLIC_CONTROL_URL": "http://backend:8000",
+        "PUBLIC_CONTROL_URL": "https://restream.adojapan.ru",
         "TEST_DESTINATION_ALLOWLIST": "rtmp://ci-rtmp-receiver:1935/ci-output",
     }
     assert backend["depends_on"]["ci-rtmp-receiver"] == {"condition": "service_healthy"}
@@ -406,7 +406,7 @@ def test_ci_media_helpers_are_absent_from_production_and_strictly_isolated() -> 
     }
 
 
-def test_ci_ssh_and_real_agent_fixtures_are_internal_and_non_production() -> None:
+def test_ci_native_ssh_and_legacy_agent_fixtures_are_non_production() -> None:
     base_services = load_compose()["services"]
     production_services = load_production_override()["services"]
     for service_name in ("ci-ssh-target", "ci-node-agent"):
@@ -419,14 +419,21 @@ def test_ci_ssh_and_real_agent_fixtures_are_internal_and_non_production() -> Non
     agent = services["ci-node-agent"]
 
     assert "ports" not in target
-    assert target["networks"] == ["bootstrap-egress"]
+    assert target["networks"] == ["bootstrap-egress", "internal"]
     assert target.get("privileged") is not True
-    assert target["read_only"] is True
+    # This container represents a disposable fresh server, so the real native
+    # installer must be able to populate its root filesystem. It has no host
+    # bind mounts, Docker socket, added capabilities, or production presence.
+    assert target["read_only"] is False
     assert "/var/run/" + "docker.sock" not in str(target)
     assert target["restart"] == "no"
     # The worker accepts this exact empty mountpoint only in its explicit test
     # mode; production still rejects every unmarked pre-existing directory.
     assert target["volumes"] == ["ci_node_data:/opt/adojapan-restream-node"]
+    assert target["cpus"] == "1.50"
+    assert target["mem_limit"] == "1536m"
+    assert target["pids_limit"] == 512
+    assert "/tmp:size=256m,mode=1777" in target["tmpfs"]  # noqa: S108 - CI tmpfs
     assert target["logging"]["options"] == {"max-size": "10m", "max-file": "3"}
 
     assert "ports" not in agent
@@ -455,8 +462,11 @@ def test_ci_ssh_target_emulates_only_exact_docker_package_queries() -> None:
     source = shim.read_text(encoding="utf-8")
 
     assert "COPY ci/ssh-target/fake-dpkg-query /usr/local/bin/dpkg-query" in dockerfile
+    assert "COPY ci/ssh-target/fake-apt-get /usr/local/bin/apt-get" in dockerfile
     assert 'ENV PATH="/usr/local/bin:${PATH}"' in dockerfile
     assert "/usr/local/bin/dpkg-query" in dockerfile
+    assert "COPY ci/ssh-target/relay-heartbeat.py" in dockerfile
+    assert "cp /usr/local/bin/systemctl /usr/bin/systemctl" in dockerfile
     key_cleanup = dockerfile.index("rm -f /etc/ssh/ssh_host_ed25519_key")
     key_generation = dockerfile.index("ssh-keygen -q -t ed25519")
     assert key_cleanup < key_generation
@@ -478,6 +488,11 @@ def test_ci_ssh_target_emulates_only_exact_docker_package_queries() -> None:
     ):
         assert package in source
     assert 'if [ "$#" -ne 3 ]' in source
+
+    apt_shim = (root / "ci" / "ssh-target" / "fake-apt-get").read_text(encoding="utf-8")
+    assert "--no-install-recommends" in apt_shim
+    assert "ca-certificates curl ffmpeg fonts-dejavu-core iproute2 python3" in apt_shim
+    assert "exit 64" in apt_shim
     assert "exit 64" in source
 
     shell = shutil.which("sh")
@@ -611,13 +626,19 @@ def test_ci_runtime_always_uses_test_override_and_cleans_up() -> None:
     ) in workflow
     assert "Real RTMP rotation and output end-to-end smoke" in workflow
     assert "python scripts/ci_output_smoke.py" in workflow
-    assert "SSH bootstrap and Node Agent end-to-end smoke" in workflow
+    assert "SSH bootstrap and native Moblin Relay end-to-end smoke" in workflow
     assert "python scripts/ci_node_onboarding_smoke.py" in workflow
     assert "Post-onboarding runtime limits" in workflow
     assert workflow.count("sh scripts/check_runtime_limits.sh") >= 3
     assert workflow.index("python scripts/ci_node_onboarding_smoke.py") < workflow.index(
         "Post-onboarding runtime limits"
     )
+    onboarding_smoke = (root / "scripts" / "ci_node_onboarding_smoke.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'accepted.get("install_profile") == "moblin_relay"' in onboarding_smoke
+    assert 'client.request("GET", "/api/relay-nodes")' in onboarding_smoke
+    assert "/var/lib/moblin-relay/tests/last-quick-result.json" in onboarding_smoke
     assert "generate-bootstrap-worker-secret" in workflow
     assert "printf '%s' \"$BOOTSTRAP_WORKER_SECRET\" > .bootstrap-worker-secret.ci" in workflow
     assert "sudo chown 10001:10001 .bootstrap-worker-secret.ci" in workflow

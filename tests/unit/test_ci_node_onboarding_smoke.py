@@ -1,10 +1,13 @@
-"""Secret-safe diagnostics for the real Node onboarding smoke."""
+"""Secret-safe diagnostics for the native relay onboarding smoke."""
 
 from typing import Any
 
 import pytest
 
-from scripts.ci_node_onboarding_smoke import complete_command, safe_bootstrap_diagnostic_code
+from scripts.ci_node_onboarding_smoke import (
+    safe_api_payload,
+    safe_bootstrap_diagnostic_code,
+)
 from scripts.ci_output_smoke import SmokeFailure
 
 
@@ -29,33 +32,19 @@ def test_bootstrap_diagnostic_code_is_strictly_allowlisted() -> None:
     assert safe_bootstrap_diagnostic_code({"safe_error": "invalid"}) == "unknown"
 
 
-class _CompletedSelfTestClient:
-    def request(self, method: str, path: str, *args: object, **kwargs: object) -> dict[str, Any]:
-        if method == "POST":
-            return {"id": "command-id"}
-        return {
-            "state": "completed",
-            "safe_result": {
-                "status": "failed",
-                "checks": {
-                    "control_https": False,
-                    "dns": True,
-                    "ffmpeg": True,
-                    "ffprobe": True,
-                    "memory": True,
-                    "disk": True,
-                    "data_writable": True,
-                    "no_inbound_ports": True,
-                },
-            },
-        }
+def test_native_safe_failure_code_is_allowlisted() -> None:
+    assert (
+        safe_bootstrap_diagnostic_code({"safe_error": {"code": "relay_self_test_failed"}})
+        == "relay_self_test_failed"
+    )
 
 
-def test_self_test_diagnostic_prints_only_fixed_check_name(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
+def test_api_payload_password_marker_fails_closed() -> None:
     with pytest.raises(SmokeFailure):
-        complete_command(_CompletedSelfTestClient(), "node-id", "SELF_TEST")  # type: ignore[arg-type]
+        safe_api_payload(
+            {"unexpected": "CI_SSH_PASSWORD_MUST_NEVER_PERSIST_9F3A"},
+            "unit test payload",
+        )
 
-    output = capsys.readouterr().out
-    assert output == "SELF_TEST failed safe checks: control_https\n"
+    clean: dict[str, Any] = {"install_profile": "moblin_relay"}
+    assert safe_api_payload(clean, "unit test payload") is clean

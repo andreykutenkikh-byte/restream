@@ -1,0 +1,190 @@
+#!/usr/bin/python3
+"""Source-level contract tests for the production MediaMTX renderer."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import types
+from pathlib import Path
+
+if os.name != "posix":
+    account = types.SimpleNamespace(pw_uid=0, pw_gid=0)
+    sys.modules.setdefault("grp", types.SimpleNamespace(getgrnam=lambda _name: account))
+    sys.modules.setdefault("pwd", types.SimpleNamespace(getpwnam=lambda _name: account))
+
+
+def load_renderer():
+    path = Path(__file__).with_name("moblin-relay-render-config")
+    loader = importlib.machinery.SourceFileLoader("moblin_relay_render_config", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise AssertionError("unable to load renderer source")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def load_normalizer():
+    path = Path(__file__).with_name("moblin-relay-normalize")
+    loader = importlib.machinery.SourceFileLoader("moblin_relay_normalize", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise AssertionError("unable to load normalizer source")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def assert_normalizer_contract(normalizer) -> None:
+    argv = normalizer.build_ffmpeg_argv(18554, 11936)
+    joined = " ".join(argv)
+    assert argv[0] == "/usr/bin/ffmpeg"
+    assert "rtsp://127.0.0.1:18554/iphone-live" in argv
+    assert "rtmp://127.0.0.1:11936/relay-output" in argv
+    assert argv[argv.index("-c:v") + 1] == "copy"
+    assert argv[argv.index("-c:a") + 1] == "aac"
+    assert argv[argv.index("-profile:a") + 1] == "aac_low"
+    assert argv[argv.index("-af") + 1] == "aresample=48000:async=1:first_pts=0"
+    assert argv[argv.index("-ar") + 1] == "48000"
+    assert argv[argv.index("-ac") + 1] == "2"
+    assert argv[argv.index("-max_muxing_queue_size") + 1] == "2048"
+    assert "-nostats" in argv
+    assert "rtmps://" not in joined
+    assert "passphrase=" not in joined
+
+
+def assert_preview_contract(renderer) -> None:
+    token = b"renderer-preview-test-token-0123456789AB"
+    config = renderer.build_runtime_config(
+        "test_publisher",
+        "publisher-password-0123456789",
+        "passphrase-0123456789",
+        "rtmps://example.invalid/live2",
+        "test-youtube-key",
+        token,
+    )
+    assert config["hls"] is True
+    assert config["hlsAddress"] == "127.0.0.1:8888"
+    assert config["hlsVariant"] == "mpegts"
+    assert config["hlsSegmentDuration"] == "2s"
+    assert config["hlsSegmentCount"] == 4
+    assert config["hlsSegmentMaxSize"] == "3M"
+    assert config["hlsAlwaysRemux"] is False
+    assert config["hlsAllowOrigins"] == []
+    assert config["hlsTrustedProxies"] == []
+    assert config["srt"] is True
+    assert config["srtAddress"] == "0.0.0.0:8890"
+    assert config["rtsp"] is True
+    assert config["rtspAddress"] == "127.0.0.1:8554"
+    assert config["rtspTransports"] == ["tcp"]
+    assert config["rtmp"] is True
+    assert config["rtmpAddress"] == "127.0.0.1:1935"
+    for feature in ("api", "playback", "webrtc"):
+        assert config[feature] is False
+
+    ingest = config["paths"]["iphone-live"]
+    output = config["paths"]["relay-output"]
+    assert ingest["runOnAvailable"] == renderer.NORMALIZER
+    assert ingest["runOnAvailableRestart"] is True
+    assert "alwaysAvailable" not in ingest
+    assert "forward" not in ingest
+    assert output["alwaysAvailable"] is True
+    assert output["alwaysAvailableFile"] == renderer.SLATE_FILE
+    assert output["forward"] == [{"dest": "rtmps://example.invalid/live2#test-youtube-key"}]
+
+    users = [item for item in config["authInternalUsers"] if item["user"] == "relay-preview"]
+    assert len(users) == 1
+    expected_hash = base64.b64encode(hashlib.sha256(token).digest()).decode("ascii")
+    assert users[0] == {
+        "user": "relay-preview",
+        "pass": f"sha256:{expected_hash}",
+        "ips": ["127.0.0.1", "::1"],
+        "permissions": [{"action": "read", "path": "relay-output"}],
+    }
+    assert token.decode("ascii") not in json.dumps(config, sort_keys=True)
+
+    disabled = renderer.build_runtime_config(
+        "test_publisher",
+        "publisher-password-0123456789",
+        "passphrase-0123456789",
+        "rtmps://example.invalid/live2",
+        "test-youtube-key",
+        None,
+    )
+    assert disabled["hls"] is False
+    assert "hlsAddress" not in disabled
+    assert not any(item["user"] == "relay-preview" for item in disabled["authInternalUsers"])
+
+
+def assert_token_reader_contract(renderer) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        renderer.PREVIEW_TOKEN_FILE = Path(temporary) / "missing-preview-reader.token"
+        assert renderer.read_preview_token() is None
+    if os.name != "posix":
+        return
+    try:
+        account = renderer.pwd.getpwnam("restream-agent")
+    except KeyError:
+        return
+    if os.geteuid() != 0:
+        return
+
+    with tempfile.TemporaryDirectory() as temporary:
+        parent = Path(temporary) / "adojapan-relay-agent"
+        parent.mkdir(mode=0o750)
+        parent.chmod(0o750)
+        token_file = parent / "preview-reader.token"
+        if os.name == "posix":
+            os.chown(parent, 0, account.pw_gid)
+        renderer.PREVIEW_TOKEN_FILE = token_file
+
+        token = b"renderer-preview-test-token-0123456789AB"
+        token_file.write_bytes(token + b"\n")
+        token_file.chmod(0o600)
+        if os.name == "posix":
+            os.chown(token_file, account.pw_uid, account.pw_gid)
+        assert renderer.read_preview_token() == token
+
+        # Keep the metadata length valid so this exercises content validation,
+        # not the earlier unsafe-file-size gate.
+        token_file.write_bytes(b"invalid token with spaces but long enough 123456\n")
+        token_file.chmod(0o600)
+        if os.name == "posix":
+            os.chown(token_file, account.pw_uid, account.pw_gid)
+        try:
+            renderer.read_preview_token()
+        except SystemExit as exc:
+            assert str(exc) == "preview reader credential is invalid"
+        else:
+            raise AssertionError("invalid preview token was accepted")
+
+        token_file.write_bytes(token + b"\n")
+        token_file.chmod(0o644)
+        if os.name == "posix":
+            os.chown(token_file, account.pw_uid, account.pw_gid)
+        try:
+            renderer.read_preview_token()
+        except SystemExit as exc:
+            assert str(exc) == "preview reader credential is unsafe"
+        else:
+            raise AssertionError("unsafe preview token permissions were accepted")
+
+
+def main() -> int:
+    renderer = load_renderer()
+    assert_preview_contract(renderer)
+    assert_token_reader_contract(renderer)
+    assert_normalizer_contract(load_normalizer())
+    print("Renderer and audio normalizer contract: PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

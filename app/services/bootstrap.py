@@ -107,6 +107,7 @@ class BootstrapSubmission:
     control_url: str
     node_agent_image: str
     node_agent_environment: str = "production"
+    install_profile: str = "generic_node"
     recover_failed_install: bool = False
     adopt_empty_managed_root_for_test: bool = False
 
@@ -123,6 +124,7 @@ class BootstrapSubmission:
             "control_url": self.control_url,
             "node_agent_image": self.node_agent_image,
             "node_agent_environment": self.node_agent_environment,
+            "install_profile": self.install_profile,
             "recover_failed_install": self.recover_failed_install,
             "adopt_empty_managed_root_for_test": self.adopt_empty_managed_root_for_test,
         }
@@ -445,6 +447,7 @@ class BootstrapCoordinator:
         address: str,
         port: int,
         username: str,
+        install_profile: str,
     ) -> dict[str, Any] | None:
         """Reuse only a failed record so host-key pinning survives a retry."""
 
@@ -462,6 +465,10 @@ class BootstrapCoordinator:
             node = dict(row)
             if node["status"] != "failed":
                 raise BootstrapJobConflict("This server is already registered")
+            if node["node_kind"] != install_profile:
+                raise BootstrapJobConflict(
+                    "This server was registered with a different install profile"
+                )
             now = _now()
             connection.execute(
                 """
@@ -475,17 +482,17 @@ class BootstrapCoordinator:
         node["ssh_username"] = username
         return node
 
-    def _insert_job(self, job_id: str, node_id: str) -> None:
+    def _insert_job(self, job_id: str, node_id: str, install_profile: str) -> None:
         now = _now()
         with self.database.connect() as connection:
             connection.execute(
                 """
                 INSERT INTO node_install_jobs(
-                    id, node_id, state, current_step, progress_percent,
+                    id, node_id, install_profile, state, current_step, progress_percent,
                     created_at, updated_at
-                ) VALUES (?, ?, 'queued', 'queued', 0, ?, ?)
+                ) VALUES (?, ?, ?, 'queued', 'queued', 0, ?, ?)
                 """,
-                (job_id, node_id, now, now),
+                (job_id, node_id, install_profile, now, now),
             )
 
     def _job(self, job_id: str) -> dict[str, Any] | None:
@@ -618,46 +625,14 @@ class BootstrapCoordinator:
         self._uncertain_creates.pop(job_id, None)
         return worker_job_id, worker_instance_id
 
-    @staticmethod
     def _revoke_incomplete_install(
+        self,
         connection: sqlite3.Connection,
         node_id: str,
         now: str,
     ) -> None:
         """Make a rolled-back enrollment unusable in the same transaction."""
-
-        connection.execute(
-            """
-            UPDATE restream_nodes
-            SET status = CASE WHEN status = 'revoked' THEN status ELSE 'failed' END,
-                current_command_id = NULL, updated_at = ?
-            WHERE id = ?
-            """,
-            (now, node_id),
-        )
-        connection.execute(
-            """
-            UPDATE node_enrollment_tokens SET used_at = COALESCE(used_at, ?)
-            WHERE node_id = ?
-            """,
-            (now, node_id),
-        )
-        connection.execute(
-            """
-            UPDATE node_credentials SET revoked_at = COALESCE(revoked_at, ?)
-            WHERE node_id = ?
-            """,
-            (now, node_id),
-        )
-        connection.execute(
-            """
-            UPDATE node_commands
-            SET state = 'cancelled', lease_until = NULL, completed_at = ?,
-                safe_result_json = '{"code":"bootstrap_not_completed","status":"failed"}'
-            WHERE node_id = ? AND state IN ('queued', 'leased', 'acknowledged')
-            """,
-            (now, node_id),
-        )
+        self.nodes.revoke_incomplete_bootstrap(connection, node_id, now)
 
     def _fail_job(self, job_id: str, code: str, message: str) -> None:
         now = _now()
@@ -743,6 +718,7 @@ class BootstrapCoordinator:
         return {
             "job_id": str(job["id"]),
             "node_id": str(job["node_id"]),
+            "install_profile": str(job.get("install_profile", "generic_node")),
             "state": state,
             "current_step": str((worker_view or {}).get("current_step") or job["current_step"]),
             "progress_percent": int(
@@ -767,8 +743,11 @@ class BootstrapCoordinator:
         username: str,
         password: SecretStr,
         expected_host_fingerprint: str | None,
+        install_profile: str = "generic_node",
     ) -> dict[str, Any]:
         async with self._create_lock:
+            if install_profile not in {"generic_node", "moblin_relay"}:
+                raise BootstrapRejected("invalid_install_profile", "Install profile is invalid")
             try:
                 address = canonicalize_ssh_address(address)
             except ValueError as exc:
@@ -780,23 +759,27 @@ class BootstrapCoordinator:
                 raise BootstrapJobConflict("Another bootstrap job is already active")
             job_id = str(uuid4())
             try:
-                node = self._retryable_node(address=address, port=port, username=username)
+                node = self._retryable_node(
+                    address=address,
+                    port=port,
+                    username=username,
+                    install_profile=install_profile,
+                )
                 retrying_failed_node = node is not None
                 if node is None:
-                    node = self.nodes.create_pending_node(
+                    node = self.nodes.create_pending_bootstrap_node(
+                        job_id=job_id,
+                        install_profile=cast(Any, install_profile),
                         display_name=self._next_display_name(),
                         address=address,
                         resolved_ip="",
                         ssh_port=port,
                         ssh_username=username,
-                        # The operator-supplied expectation is not a verified host key. Only
-                        # facts returned after the worker's SSH verification may be pinned.
-                        host_key_fingerprint=None,
-                        host_key_trust_mode=None,
                         node_id=str(uuid4()),
                     )
                 node_id = str(node["id"])
-                self._insert_job(job_id, node_id)
+                if retrying_failed_node:
+                    self._insert_job(job_id, node_id, install_profile)
             except (BootstrapError, sqlite3.Error, RuntimeError, ValueError, TypeError) as exc:
                 persisted = self._job(job_id)
                 if persisted is not None:
@@ -824,6 +807,7 @@ class BootstrapCoordinator:
                 control_url=self.control_url,
                 node_agent_image=self.node_agent_image,
                 node_agent_environment=self.node_agent_environment,
+                install_profile=install_profile,
                 recover_failed_install=retrying_failed_node,
                 adopt_empty_managed_root_for_test=self.node_agent_environment == "test",
             )
@@ -841,16 +825,28 @@ class BootstrapCoordinator:
                         try:
                             accepted = await self.client.create_job(submission)
                         except BootstrapUnavailable:
-                            return {"job_id": job_id, "state": "queued"}
+                            return {
+                                "job_id": job_id,
+                                "state": "queued",
+                                "install_profile": install_profile,
+                            }
                     except BootstrapUnavailable:
-                        return {"job_id": job_id, "state": "queued"}
+                        return {
+                            "job_id": job_id,
+                            "state": "queued",
+                            "install_profile": install_profile,
+                        }
                 worker_job_id, worker_instance_id = self._attach_worker_identity(job_id, accepted)
             except BootstrapError as exc:
                 self._fail_job(job_id, exc.code, str(exc))
                 raise
             finally:
                 submission.password = SecretStr("")
-            return {"job_id": job_id, "state": "queued"}
+            return {
+                "job_id": job_id,
+                "state": "queued",
+                "install_profile": install_profile,
+            }
 
     @staticmethod
     def _update_node_from_worker(
@@ -1014,7 +1010,13 @@ class BootstrapCoordinator:
             ):
                 return latest
 
-            raw_token = self.nodes.issue_enrollment(str(job["node_id"]))
+            if str(job.get("install_profile", "generic_node")) == "moblin_relay":
+                raw_token = self.nodes.issue_relay_bootstrap_credential(
+                    str(job["node_id"]),
+                    str(job["id"]),
+                )
+            else:
+                raw_token = self.nodes.issue_enrollment(str(job["node_id"]))
             enrollment_token = SecretStr(raw_token)
             raw_token = ""
             try:

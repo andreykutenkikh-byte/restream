@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import io
+import ipaddress
 import json
 import math
 import os
+import re
 import runpy
 import select
 import socket
@@ -82,12 +84,12 @@ _RELAYCTL_REQUIRED = frozenset(
         "service_is_enabled",
         "validate_youtube",
         "youtube_state",
-        "PUBLIC_HOST",
-        "VPN_HOST",
         "SRT_PATH",
         "SRT_PORT",
     }
 )
+_RELAYCTL_LEGACY_MOBLIN_REQUIRED = frozenset({"PUBLIC_HOST", "VPN_HOST"})
+_MAX_FALLBACK_SRT_URLS = 4
 
 
 class RelayCtlNamespace(Protocol):
@@ -312,9 +314,13 @@ def _safe_relayctl_namespace(path: Path = RELAYCTL_PATH) -> Mapping[str, object]
         raise RelayAgentError("relayctl_failed")
     if not _RELAYCTL_REQUIRED.issubset(loaded):
         raise RelayAgentError("relayctl_failed")
-    for name in _RELAYCTL_REQUIRED - {"PUBLIC_HOST", "VPN_HOST", "SRT_PATH", "SRT_PORT"}:
+    for name in _RELAYCTL_REQUIRED - {"SRT_PATH", "SRT_PORT"}:
         if not callable(loaded[name]):
             raise RelayAgentError("relayctl_failed")
+    if not callable(loaded.get("build_moblin_urls")) and not (
+        _RELAYCTL_LEGACY_MOBLIN_REQUIRED.issubset(loaded)
+    ):
+        raise RelayAgentError("relayctl_failed")
     return MappingProxyType(loaded)
 
 
@@ -955,6 +961,18 @@ class RelayBroker:
         )
 
     def _reveal_moblin_url(self) -> JsonObject:
+        builder = self._relayctl.get("build_moblin_urls")
+        if callable(builder):
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            try:
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    structured = builder()
+            except (KeyError, OSError, TypeError, ValueError, SystemExit) as exc:
+                raise RelayAgentError("relayctl_failed") from exc
+            secret_result = self._validate_moblin_urls(structured)
+            return self._result("ok", self.snapshot(), secret_result)
+
         stdout = io.StringIO()
         stderr = io.StringIO()
         try:
@@ -966,6 +984,95 @@ class RelayBroker:
             raise RelayAgentError("relayctl_failed")
         secret_result = self._validate_moblin_output(stdout.getvalue())
         return self._result("ok", self.snapshot(), secret_result)
+
+    def _validate_moblin_urls(self, value: object) -> str:
+        if not isinstance(value, dict) or set(value) != {"public_url", "fallback_urls"}:
+            raise RelayAgentError("relayctl_failed")
+        public_url = value["public_url"]
+        fallback_urls = value["fallback_urls"]
+        if (
+            not isinstance(public_url, str)
+            or not isinstance(fallback_urls, list)
+            or len(fallback_urls) > _MAX_FALLBACK_SRT_URLS
+            or any(not isinstance(candidate, str) for candidate in fallback_urls)
+        ):
+            raise RelayAgentError("relayctl_failed")
+        candidates = [public_url, *fallback_urls]
+        if len(set(candidates)) != len(candidates):
+            raise RelayAgentError("relayctl_failed")
+        for candidate in candidates:
+            self._validate_srt_url(candidate)
+        encoded = json.dumps(
+            {"public_url": public_url, "fallback_urls": fallback_urls},
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if not 1 <= len(encoded) <= MAX_SECRET_RESULT_CHARS:
+            raise RelayAgentError("relayctl_failed")
+        return encoded
+
+    def _validate_srt_url(self, candidate: str) -> None:
+        if (
+            not 1 <= len(candidate) <= 2048
+            or not candidate.isascii()
+            or any(ord(character) < 0x20 or character.isspace() for character in candidate)
+        ):
+            raise RelayAgentError("relayctl_failed")
+        port = self._relayctl["SRT_PORT"]
+        path = self._relayctl["SRT_PATH"]
+        if (
+            not isinstance(port, int)
+            or isinstance(port, bool)
+            or not 1 <= port <= 65535
+            or not isinstance(path, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", path)
+        ):
+            raise RelayAgentError("relayctl_failed")
+        try:
+            parsed = urlsplit(candidate)
+            parsed_port = parsed.port
+        except ValueError as exc:
+            raise RelayAgentError("relayctl_failed") from exc
+        hostname = parsed.hostname
+        if (
+            parsed.scheme != "srt"
+            or hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed_port != port
+            or parsed.path not in {"", "/"}
+            or parsed.fragment
+        ):
+            raise RelayAgentError("relayctl_failed")
+        if ":" in hostname:
+            try:
+                canonical_host = f"[{ipaddress.IPv6Address(hostname).compressed}]"
+            except ipaddress.AddressValueError as exc:
+                raise RelayAgentError("relayctl_failed") from exc
+        else:
+            try:
+                canonical_host = str(ipaddress.IPv4Address(hostname))
+            except ipaddress.AddressValueError:
+                if (
+                    hostname.endswith(".")
+                    or all(character.isdigit() or character == "." for character in hostname)
+                    or any(
+                        not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                        for label in hostname.split(".")
+                    )
+                ):
+                    raise RelayAgentError("relayctl_failed") from None
+                canonical_host = hostname.lower()
+        if parsed.netloc != f"{canonical_host}:{port}":
+            raise RelayAgentError("relayctl_failed")
+        query_pattern = re.compile(
+            rf"streamid=publish:{re.escape(path)}:[A-Za-z0-9_-]{{1,64}}:"
+            r"[A-Za-z0-9_-]{16,128}&passphrase=[A-Za-z0-9_-]{10,79}"
+            r"&pbkeylen=32&latency=2000&payloadsize=1316\Z"
+        )
+        if query_pattern.fullmatch(parsed.query) is None:
+            raise RelayAgentError("relayctl_failed")
 
     def _validate_moblin_output(self, output: str) -> str:
         normalized = output.strip()

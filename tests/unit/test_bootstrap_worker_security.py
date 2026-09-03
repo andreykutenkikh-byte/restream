@@ -7,11 +7,40 @@ from uuid import uuid4
 import pytest
 from pydantic import SecretStr, ValidationError
 
-from bootstrap_worker.errors import BootstrapError, InvalidTransitionError
+from bootstrap_worker.errors import BootstrapError, InvalidTransitionError, safe_failure
 from bootstrap_worker.host_keys import HostKeyVerifier, normalize_fingerprint
 from bootstrap_worker.models import BootstrapRequest, HostTrustMode, JobState
 from bootstrap_worker.state_machine import JobStateMachine
 from bootstrap_worker.targets import TargetPolicy
+
+
+def test_native_relay_failures_have_stable_localized_messages() -> None:
+    codes = {
+        "unsupported_relay_operating_system",
+        "relay_bundle_invalid",
+        "remote_relay_conflict",
+        "remote_relay_account_conflict",
+        "relay_active_during_install",
+        "relay_port_conflict",
+        "invalid_relay_control_origin",
+        "invalid_relay_target",
+        "invalid_enrollment_token",
+        "relay_dependency_install_failed",
+        "relay_dependency_check_failed",
+        "mediamtx_download_failed",
+        "relay_slate_generation_failed",
+        "relay_install_failed",
+        "relay_agent_install_failed",
+        "relay_self_test_failed",
+        "relay_final_check_failed",
+    }
+    fallback = safe_failure("unknown_test_failure").safe_message
+    for code in codes:
+        failure = safe_failure(code)
+        assert failure.code == code
+        assert failure.safe_message != fallback
+        assert "\n" not in failure.safe_message
+
 
 IMAGE = f"ghcr.io/andreykutenkikh-byte/restream-node@sha256:{'a' * 64}"
 FINGERPRINT = "SHA256:" + base64.b64encode(bytes(range(32))).decode().rstrip("=")

@@ -122,7 +122,7 @@ jobs:
       - name: Post-preview runtime limits
         run: sh scripts/check_runtime_limits.sh
 
-      - name: SSH bootstrap and Node Agent end-to-end smoke
+      - name: SSH bootstrap and native Moblin Relay end-to-end smoke
         run: uv run --locked python scripts/ci_node_onboarding_smoke.py
 
       - name: Post-onboarding runtime limits

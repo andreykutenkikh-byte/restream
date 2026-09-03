@@ -1,0 +1,82 @@
+#!/usr/bin/python3
+"""Normalize Moblin audio before publishing the internal relay program path."""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+
+
+FFMPEG = "/usr/bin/ffmpeg"
+INGEST_PATH = "iphone-live"
+OUTPUT_PATH = "relay-output"
+DEFAULT_RTMP_PORT = 1935
+TEST_RTMP_PORT_ENV = "MOBLIN_RELAY_OUTPUT_RTMP_PORT"
+
+
+def build_ffmpeg_argv(rtsp_port: int, rtmp_port: int) -> list[str]:
+    if not 1 <= rtsp_port <= 65535 or not 1 <= rtmp_port <= 65535:
+        raise ValueError("invalid loopback media port")
+    return [
+        FFMPEG,
+        "-nostdin",
+        "-hide_banner",
+        "-nostats",
+        "-loglevel",
+        "error",
+        "-rtsp_transport",
+        "tcp",
+        "-i",
+        f"rtsp://127.0.0.1:{rtsp_port}/{INGEST_PATH}",
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-profile:a",
+        "aac_low",
+        "-af",
+        "aresample=48000:async=1:first_pts=0",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        "-b:a",
+        "128k",
+        "-max_muxing_queue_size",
+        "2048",
+        "-f",
+        "flv",
+        f"rtmp://127.0.0.1:{rtmp_port}/{OUTPUT_PATH}",
+    ]
+
+
+def main() -> int:
+    if len(sys.argv) != 1 or os.environ.get("MTX_PATH") != INGEST_PATH:
+        return 2
+    raw_rtsp_port = os.environ.get("RTSP_PORT", "")
+    raw_rtmp_port = os.environ.get(TEST_RTMP_PORT_ENV, str(DEFAULT_RTMP_PORT))
+    if not re.fullmatch(r"[0-9]{1,5}", raw_rtsp_port) or not re.fullmatch(
+        r"[0-9]{1,5}", raw_rtmp_port
+    ):
+        return 2
+    try:
+        argv = build_ffmpeg_argv(int(raw_rtsp_port), int(raw_rtmp_port))
+    except ValueError:
+        return 2
+
+    # MediaMTX hook metadata is not needed by FFmpeg.  Replace the environment
+    # entirely so publisher-controlled query data cannot survive in /proc.
+    safe_environment = {"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"}
+    try:
+        os.execve(FFMPEG, argv, safe_environment)
+    except OSError:
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

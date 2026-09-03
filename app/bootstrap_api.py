@@ -145,6 +145,9 @@ async def create_bootstrap_job(
             username=payload.username,
             password=payload.password,
             expected_host_fingerprint=payload.expected_host_fingerprint,
+            # This public workflow always creates a complete native relay.  The
+            # browser cannot downgrade or switch the privileged install plan.
+            install_profile="moblin_relay",
         )
     except (
         BootstrapJobConflict,

@@ -1,8 +1,172 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -eq 3 ] && [ "$1" = "is-active" ] && [ "$2" = "--quiet" ] && [ "$3" = "docker" ]; then
-  exit 0
-fi
+# Disposable-CI systemd state emulator. The SSH target has no systemd PID 1,
+# but the native installer must still exercise its exact unit transitions.
+state_root=/run/adojapan-ci-systemctl
+install -d -m 0755 "$state_root"
 
-exit 2
+unit_state_file() {
+  printf '%s/%s.%s\n' "$state_root" "$1" "$2"
+}
+
+read_state() {
+  unit="$1"
+  property="$2"
+  fallback="$3"
+  file=$(unit_state_file "$unit" "$property")
+  if [ -f "$file" ]; then
+    sed -n '1p' "$file"
+  else
+    printf '%s\n' "$fallback"
+  fi
+}
+
+write_state() {
+  unit="$1"
+  property="$2"
+  value="$3"
+  printf '%s\n' "$value" >"$(unit_state_file "$unit" "$property")"
+}
+
+stop_heartbeat() {
+  pid_file="$state_root/relay-heartbeat.pid"
+  if [ -f "$pid_file" ]; then
+    pid=$(sed -n '1p' "$pid_file")
+    case "$pid" in
+      ''|*[!0-9]*) ;;
+      *) kill "$pid" 2>/dev/null || true ;;
+    esac
+    rm -f -- "$pid_file"
+  fi
+}
+
+start_heartbeat() {
+  stop_heartbeat
+  install -d -o restream-agent -g restream-agent -m 0700 /run/adojapan-ci-relay-agent
+  nohup runuser -u restream-agent -- \
+    /usr/local/lib/adojapan-ci/relay-heartbeat.py \
+    </dev/null >/dev/null 2>&1 &
+  printf '%s\n' "$!" >"$state_root/relay-heartbeat.pid"
+}
+
+set_active() {
+  write_state "$1" active active
+  write_state "$1" main_pid 1
+}
+
+set_inactive() {
+  write_state "$1" active inactive
+  write_state "$1" main_pid 0
+  if [ "$1" = adojapan-relay-agent.service ]; then
+    stop_heartbeat
+  fi
+}
+
+set_enabled() {
+  write_state "$1" enabled enabled
+}
+
+set_disabled() {
+  write_state "$1" enabled disabled
+}
+
+case "${1:-}" in
+  daemon-reload|reset-failed)
+    exit 0
+    ;;
+  is-active)
+    shift
+    [ "${1:-}" = --quiet ] && shift
+    [ "$#" -eq 1 ] || exit 64
+    [ "$(read_state "$1" active inactive)" = active ]
+    ;;
+  is-enabled)
+    shift
+    [ "${1:-}" = --quiet ] && shift
+    [ "$#" -eq 1 ] || exit 64
+    [ "$(read_state "$1" enabled disabled)" = enabled ]
+    ;;
+  stop)
+    shift
+    [ "$#" -ge 1 ] || exit 64
+    for unit in "$@"; do
+      set_inactive "$unit"
+    done
+    ;;
+  start|restart)
+    shift
+    [ "$#" -ge 1 ] || exit 64
+    for unit in "$@"; do
+      set_active "$unit"
+      if [ "$unit" = adojapan-relay-agent.service ]; then
+        start_heartbeat
+      fi
+    done
+    ;;
+  enable)
+    shift
+    start_now=0
+    if [ "${1:-}" = --now ]; then
+      start_now=1
+      shift
+    fi
+    [ "$#" -ge 1 ] || exit 64
+    for unit in "$@"; do
+      set_enabled "$unit"
+      if [ "$start_now" -eq 1 ]; then
+        set_active "$unit"
+        if [ "$unit" = adojapan-relay-agent.service ]; then
+          start_heartbeat
+        fi
+      fi
+    done
+    ;;
+  disable)
+    shift
+    stop_now=0
+    if [ "${1:-}" = --now ]; then
+      stop_now=1
+      shift
+    fi
+    [ "$#" -ge 1 ] || exit 64
+    for unit in "$@"; do
+      set_disabled "$unit"
+      if [ "$stop_now" -eq 1 ]; then
+        set_inactive "$unit"
+      fi
+    done
+    ;;
+  show)
+    shift
+    unit=
+    properties=
+    value_only=0
+    for argument in "$@"; do
+      case "$argument" in
+        --property=*) properties="$properties ${argument#--property=}" ;;
+        --value) value_only=1 ;;
+        --no-pager) ;;
+        -*) exit 64 ;;
+        *) unit="$argument" ;;
+      esac
+    done
+    [ -n "$unit" ] || exit 64
+    [ -n "$properties" ] || properties=' ActiveState MainPID'
+    for property in $properties; do
+      case "$property" in
+        ActiveState) value=$(read_state "$unit" active inactive) ;;
+        MainPID) value=$(read_state "$unit" main_pid 0) ;;
+        *) exit 64 ;;
+      esac
+      if [ "$value_only" -eq 1 ]; then
+        printf '%s\n' "$value"
+      else
+        printf '%s=%s\n' "$property" "$value"
+      fi
+    done
+    ;;
+  *)
+    exit 64
+    ;;
+esac

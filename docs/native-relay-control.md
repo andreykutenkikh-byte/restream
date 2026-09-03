@@ -1,11 +1,17 @@
 # Native Moblin relay control protocol
 
-The native relay is represented by one `restream_nodes` identity with the
-`moblin_relay` capability and one extension row in `relay_nodes`. It initiates
-all control-plane connections over HTTPS. The integration does not require an
-inbound management port or access to Docker from the web application.
+The native relay is represented by one `restream_nodes` identity with durable
+`node_kind=moblin_relay`, the `moblin_relay` capability, and one extension row
+in `relay_nodes`. It initiates all control-plane connections over HTTPS. The
+integration does not require an inbound management port or access to Docker
+from the web application.
 
-## Provisioning
+## Manual provisioning and credential rotation
+
+New servers are normally installed through **Servers → Connect server** as
+documented in [Moblin Relay onboarding](moblin-relay-onboarding.md). The CLI
+below remains for an existing/custom relay where the runtime is managed
+separately; it does not run the SSH installer.
 
 Provision a new identity from the backend container/environment:
 
@@ -52,7 +58,9 @@ Agent version 1.1 adds a backward-compatible optional `preview_requested`
 boolean to a successful heartbeat response. Version 1.2 adds the separately
 gated key-only YouTube command and the optional LIVE input-bitrate sample.
 Agent 1.2.5 keeps that protocol unchanged while correlating the two local media
-paths used by the audio-normalizing relay.
+paths used by the audio-normalizing relay. Agent 1.2.6 keeps protocol v1 and
+adds the portable structured SRT-address contract used by newly provisioned
+relays; existing 1.2.5 agents remain compatible.
 Older agents receive the original response shape and cannot be leased a command
 they do not support. Preview media never uses the small control route: the agent
 uploads completed MPEG-TS segments to the separate, node-authenticated
@@ -186,7 +194,7 @@ Keep these three values separate:
    first-step dialog. The exact **YouTube RTMPS URL** from Live
    Control Room is required only during initial setup or when its endpoint must
    be replaced; it stays collapsed under the dialog's additional settings once
-   configured. Both values are written to the HK relay's existing root-owned
+   configured. Both values are written to the selected relay's root-owned
    secret store and are never shown back. A reusable stream key normally needs
    to be set once; use the same dialog to replace only the key whenever YouTube
    issues a new one.
