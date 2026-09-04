@@ -745,7 +745,9 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     timestamp_diagnostic_stages = (
         "ts-probe-pts",
         "ts-packet-dts",
-        "ts-video-pts",
+        "ts-v-offset",
+        "ts-v-cluster",
+        "ts-v-order",
         "ts-audio-pts",
         "ts-gaps",
         "ts-av-sync",
@@ -1526,11 +1528,18 @@ def test_normalizer_reexec_discards_hook_secrets() -> None:
     [
         ("timestamps", "ffprobe_exit", 1, "ts-probe-pts"),
         ("timestamps", "dts_within_tolerance", False, "ts-packet-dts"),
+        ("timestamps", "max_pts_dts_offset_seconds", {0: 3.0, 1: 0.01}, "ts-v-offset"),
+        (
+            "timestamps",
+            "video_pts_dts_offset_clusters_over_normal_reorder",
+            7,
+            "ts-v-cluster",
+        ),
         (
             "decoded_frames",
             "strict_presentation_timestamps_monotonic",
             False,
-            "ts-video-pts",
+            "ts-v-order",
         ),
         (
             "decoded_audio",

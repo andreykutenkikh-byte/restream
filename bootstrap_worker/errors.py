@@ -324,6 +324,15 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_timestamp_video_pts_failed": (
             "Временные метки PTS видеопотока не прошли самопроверку."
         ),
+        "relay_self_test_timestamp_video_pts_offset_failed": (
+            "Смещение PTS относительно DTS видеопотока не прошло самопроверку."
+        ),
+        "relay_self_test_timestamp_video_pts_clusters_failed": (
+            "Переходные смещения PTS видеопотока не прошли самопроверку."
+        ),
+        "relay_self_test_timestamp_video_pts_order_failed": (
+            "Порядок декодированных PTS видеопотока не прошёл самопроверку."
+        ),
         "relay_self_test_timestamp_audio_pts_failed": (
             "Временные метки PTS аудиопотока не прошли самопроверку."
         ),
