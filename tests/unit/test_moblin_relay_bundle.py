@@ -1488,11 +1488,9 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
     assert "rtsp://127.0.0.1:18554/iphone-live" in argv
     assert "rtmp://127.0.0.1:11936/relay-output" in argv
     assert argv.count("-flush_packets") == 1
-    assert argv.count("-tcp_nodelay") == 1
-    assert argv[-7:] == [
+    assert "-tcp_nodelay" not in argv
+    assert argv[-5:] == [
         "-flush_packets",
-        "1",
-        "-tcp_nodelay",
         "1",
         "-f",
         "flv",
@@ -1529,41 +1527,132 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
     assert output_gate.observe(("normalizer-a", 120)) is True
     assert output_gate.observe(("normalizer-b", 130)) is False
 
-    assert loaded["MEDIA_IDLE_TIMEOUT_SECONDS"] == 0.10
+    assert loaded["VERIFIED_STALL_TIMEOUT_SECONDS"] == 0.075
+    assert loaded["OUTPUT_IDLE_FALLBACK_SECONDS"] == 0.5
     assert loaded["REQUIRED_IDLE_OBSERVATIONS"] == 2
     assert loaded["METRICS_BLIND_TIMEOUT_SECONDS"] == 0.75
     assert (
-        loaded["MEDIA_IDLE_TIMEOUT_SECONDS"]
+        loaded["VERIFIED_STALL_TIMEOUT_SECONDS"]
         + (2 * loaded["MEDIA_POLL_INTERVAL_SECONDS"])
         + loaded["CHILD_STOP_GRACE_SECONDS"]
         + (1024 / 48000)
         < self_test["AUDIO_PRESENTATION_GAP_LIMIT_SECONDS"]
     )
+    assert (
+        loaded["OUTPUT_IDLE_FALLBACK_SECONDS"]
+        + loaded["MEDIA_POLL_INTERVAL_SECONDS"]
+        + loaded["CHILD_STOP_GRACE_SECONDS"]
+        + (1024 / 48000)
+        < self_test["CAPTURE_NO_GROWTH_LIMIT_SECONDS"]
+    )
 
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
-    assert watchdog.observe(True, ("normalizer-a", 120), 1.101) is True
-    assert watchdog.observe(True, ("normalizer-a", 120), 1.151) is True
-    assert watchdog.observe(True, ("normalizer-a", 120), 1.202) is False
+    assert watchdog.observe_output(True, ("normalizer-a", 120), 1.05) == (True, True)
+    assert watchdog.observe_ingest(True, 500, 1.05, 1.051) is True
+    assert watchdog.observe_output(True, ("normalizer-a", 120), 1.10) == (True, True)
+    assert watchdog.observe_ingest(True, 500, 1.10, 1.101) is True
+    assert watchdog.observe_output(True, ("normalizer-a", 120), 1.15) == (True, True)
+    assert watchdog.observe_ingest(True, 500, 1.15, 1.152) is False
+
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
-    assert watchdog.observe(True, ("normalizer-a", 120), 1.2) is True
-    assert watchdog.observe(True, ("normalizer-a", 120), 1.25) is True
-    assert watchdog.observe(True, ("normalizer-a", 121), 1.26) is True
-    assert watchdog.observe(True, ("normalizer-a", 121), 1.31) is True
-    assert watchdog.observe(True, ("normalizer-a", 121), 1.36) is True
-    assert watchdog.observe(True, ("normalizer-a", 121), 1.411) is False
+    for observed_at, ingest_counter in ((1.05, 500), (1.10, 501), (1.15, 502)):
+        assert watchdog.observe_output(True, ("normalizer-a", 120), observed_at) == (True, True)
+        assert (
+            watchdog.observe_ingest(
+                True,
+                ingest_counter,
+                observed_at,
+                observed_at + 0.001,
+            )
+            is True
+        )
+    assert watchdog.observe_output(True, ("normalizer-a", 121), 1.16) == (True, False)
+
+    assert watchdog.observe_output(True, ("normalizer-a", 121), 1.21) == (True, True)
+    assert watchdog.observe_ingest(True, 502, 1.21, 1.211) is True
+    assert watchdog.observe_output(True, ("normalizer-a", 121), 1.26) == (True, True)
+    assert watchdog.observe_ingest(True, 502, 1.26, 1.261) is True
+    assert watchdog.observe_output(True, ("normalizer-a", 121), 1.31) == (True, True)
+    assert watchdog.observe_ingest(True, 502, 1.31, 1.311) is False
+
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
-    assert watchdog.observe(True, ("normalizer-a", 120), 1.2) is True
-    assert watchdog.observe(False, None, 1.21) is True
-    assert watchdog.observe(True, ("normalizer-a", 120), 1.22) is True
-    assert watchdog.observe(True, ("normalizer-a", 120), 1.301) is False
+    for observed_at, ingest_counter in (
+        (1.05, 500),
+        (1.15, 501),
+        (1.25, 502),
+        (1.35, 503),
+        (1.45, 504),
+        (1.499, 505),
+    ):
+        assert watchdog.observe_output(True, ("normalizer-a", 120), observed_at) == (
+            True,
+            True,
+        )
+        assert (
+            watchdog.observe_ingest(
+                True,
+                ingest_counter,
+                observed_at,
+                observed_at + 0.001,
+            )
+            is True
+        )
+    assert watchdog.observe_output(True, ("normalizer-a", 120), 1.501) == (False, False)
+
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
-    assert watchdog.observe(False, None, 1.749) is True
-    assert watchdog.observe(False, None, 1.751) is False
+    assert watchdog.observe_output(True, ("normalizer-a", 120), 1.05) == (True, True)
+    assert watchdog.observe_ingest(True, 500, 1.05, 1.051) is True
+    assert watchdog.observe_output(True, ("normalizer-a", 120), 1.10) == (True, True)
+    assert watchdog.observe_ingest(True, 500, 1.10, 1.30) is True
+    assert watchdog.observe_output(True, ("normalizer-a", 120), 1.31) == (True, True)
+    assert watchdog.observe_ingest(True, 500, 1.31, 1.311) is False
+
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
-    assert watchdog.observe(True, ("normalizer-b", 121), 1.01) is False
+    assert watchdog.observe_output(True, ("normalizer-a", 120), 1.05) == (True, True)
+    assert watchdog.observe_ingest(True, 500, 1.05, 1.051) is True
+    assert watchdog.observe_output(True, ("normalizer-a", 120), 1.10) == (True, True)
+    assert watchdog.observe_ingest(False, None, 1.10, 1.11) is True
+    assert watchdog.observe_output(True, ("normalizer-a", 120), 1.15) == (True, True)
+    assert watchdog.observe_ingest(True, 500, 1.15, 1.151) is False
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
-    assert watchdog.observe(True, ("normalizer-a", 119), 1.01) is False
+    assert watchdog.observe_output(True, ("normalizer-a", 120), 1.05) == (True, True)
+    assert watchdog.observe_ingest(True, None, 1.05, 1.051) is False
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe_output(False, None, 1.749) == (True, False)
+    assert watchdog.observe_output(False, None, 1.751) == (False, False)
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe_output(True, None, 1.749) == (True, False)
+    assert watchdog.observe_output(True, None, 1.751) == (False, False)
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe_output(True, ("normalizer-b", 121), 1.01) == (False, False)
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe_output(True, ("normalizer-a", 119), 1.01) == (False, False)
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe_output(True, ("normalizer-a", 120), 1.05) == (True, True)
+    assert watchdog.observe_ingest(True, 500, 1.05, 1.051) is True
+    assert watchdog.observe_output(True, ("normalizer-a", 120), 1.10) == (True, True)
+    assert watchdog.observe_ingest(True, 499, 1.10, 1.101) is False
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe_ingest(True, 500, 1.20, 1.19) is False
     assert "make_parent_death_setup" in loaded
+
+    supervisor_source = (
+        NORMALIZER.read_text(encoding="utf-8")
+        .split("def run_supervisor", 1)[1]
+        .split("def main", 1)[0]
+    )
+    assert supervisor_source.count("ingest_reader.sample()") == 2
+    assert "keep_child, probe_ingest = watchdog.observe_output(" in supervisor_source
+    assert "if keep_child and probe_ingest:" in supervisor_source
+    assert "ingest_started = time.monotonic()" in supervisor_source
+    assert "ingest_finished = time.monotonic()" in supervisor_source
+    assert "keep_child = watchdog.observe_ingest(" in supervisor_source
+    assert (
+        "watchdog = MediaWatchdog(counter, now)\n                    ingest_reader.close()"
+        in supervisor_source
+    )
+    assert "if not probe_ingest:\n                ingest_reader.close()" in supervisor_source
+    assert "if not keep_child:\n                ingest_reader.close()" in supervisor_source
 
     assert sanitized_environment(18554, 11936, 19998) == {
         "LANG": "C",

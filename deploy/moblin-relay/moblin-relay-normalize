@@ -32,11 +32,11 @@ OUTPUT_METRICS_PATH = "/metrics?type=rtmp_conns"
 METRICS_RESPONSE_LIMIT_BYTES = 65_536
 METRICS_REQUEST_TIMEOUT_SECONDS = 0.2
 MEDIA_POLL_INTERVAL_SECONDS = 0.05
-# A verified output stall must hand back to the always-available slate before an
-# AAC frame gap reaches 250 ms.  Start the confirmation window at the first
-# unchanged observation so one late scheduler/metrics sample cannot tear down a
-# healthy publisher.
-MEDIA_IDLE_TIMEOUT_SECONDS = 0.10
+# Corroborate a fast output stall with the ingest counter.  RTMP transport bytes
+# can briefly plateau while healthy; the longer output-only fallback still
+# catches a wedged normalizer without treating that batching as a source outage.
+VERIFIED_STALL_TIMEOUT_SECONDS = 0.075
+OUTPUT_IDLE_FALLBACK_SECONDS = 0.5
 METRICS_BLIND_TIMEOUT_SECONDS = 0.75
 OUTPUT_START_TIMEOUT_SECONDS = 6.0
 CHILD_STOP_GRACE_SECONDS = 0.025
@@ -101,8 +101,6 @@ def build_ffmpeg_argv(rtsp_port: int, rtmp_port: int) -> list[str]:
         "-max_muxing_queue_size",
         "2048",
         "-flush_packets",
-        "1",
-        "-tcp_nodelay",
         "1",
         "-f",
         "flv",
@@ -235,35 +233,77 @@ class MediaWatchdog:
 
     def __init__(self, sample: CounterSample, now: float) -> None:
         self.connection_id, self.counter = sample
+        self.output_last_growth = now
         self.last_valid_observation = now
-        self.idle_candidate_since: float | None = None
-        self.unchanged_observations = 0
+        self.output_unchanged_observations = 0
+        self.ingest_counter: int | None = None
+        self.joint_idle_since: float | None = None
+        self.joint_unchanged_observations = 0
 
-    def observe(
+    def observe_output(
         self,
         successful: bool,
         sample: CounterSample | None,
         now: float,
-    ) -> bool:
+    ) -> tuple[bool, bool]:
         if not successful or sample is None:
-            return now - self.last_valid_observation < METRICS_BLIND_TIMEOUT_SECONDS
+            return (
+                now - self.last_valid_observation < METRICS_BLIND_TIMEOUT_SECONDS,
+                False,
+            )
         self.last_valid_observation = now
         connection_id, counter = sample
         if connection_id != self.connection_id:
-            return False
+            return False, False
         if counter < self.counter:
-            return False
+            return False, False
         if counter > self.counter:
             self.counter = counter
-            self.idle_candidate_since = None
-            self.unchanged_observations = 0
+            self.output_last_growth = now
+            self.output_unchanged_observations = 0
+            self.ingest_counter = None
+            self.joint_idle_since = None
+            self.joint_unchanged_observations = 0
+            return True, False
+        self.output_unchanged_observations += 1
+        if (
+            now - self.output_last_growth >= OUTPUT_IDLE_FALLBACK_SECONDS
+            and self.output_unchanged_observations >= REQUIRED_IDLE_OBSERVATIONS
+        ):
+            return False, False
+        return True, True
+
+    def observe_ingest(
+        self,
+        successful: bool,
+        counter: int | None,
+        started_at: float,
+        finished_at: float,
+    ) -> bool:
+        if finished_at < started_at:
+            return False
+        if not successful:
             return True
-        if self.idle_candidate_since is None:
-            self.idle_candidate_since = now
-        self.unchanged_observations += 1
+        if counter is None:
+            return False
+        if self.ingest_counter is None:
+            self.ingest_counter = counter
+            self.joint_idle_since = finished_at
+            self.joint_unchanged_observations = 1
+            return True
+        if counter < self.ingest_counter:
+            return False
+        if counter > self.ingest_counter:
+            self.ingest_counter = counter
+            self.joint_idle_since = None
+            self.joint_unchanged_observations = 0
+            return True
+        if self.joint_idle_since is None:
+            self.joint_idle_since = finished_at
+        self.joint_unchanged_observations += 1
         return (
-            now - self.idle_candidate_since < MEDIA_IDLE_TIMEOUT_SECONDS
-            or self.unchanged_observations < REQUIRED_IDLE_OBSERVATIONS
+            started_at - self.joint_idle_since < VERIFIED_STALL_TIMEOUT_SECONDS
+            or self.joint_unchanged_observations < REQUIRED_IDLE_OBSERVATIONS
         )
 
 
@@ -389,6 +429,7 @@ def run_supervisor(rtsp_port: int, rtmp_port: int, metrics_port: int) -> int:
             if watchdog is None:
                 if successful and counter is not None and output_gate.observe(counter):
                     watchdog = MediaWatchdog(counter, now)
+                    ingest_reader.close()
                 elif now - child_started >= OUTPUT_START_TIMEOUT_SECONDS:
                     stop_child(child, force=True)
                     child = None
@@ -397,7 +438,21 @@ def run_supervisor(rtsp_port: int, rtmp_port: int, metrics_port: int) -> int:
                 time.sleep(MEDIA_POLL_INTERVAL_SECONDS)
                 continue
 
-            if not watchdog.observe(successful, counter, now):
+            keep_child, probe_ingest = watchdog.observe_output(successful, counter, now)
+            if not probe_ingest:
+                ingest_reader.close()
+            if keep_child and probe_ingest:
+                ingest_started = time.monotonic()
+                ingest_successful, ingest_counter = ingest_reader.sample()
+                ingest_finished = time.monotonic()
+                keep_child = watchdog.observe_ingest(
+                    ingest_successful,
+                    ingest_counter,
+                    ingest_started,
+                    ingest_finished,
+                )
+            if not keep_child:
+                ingest_reader.close()
                 stop_child(child, force=True)
                 child = None
                 watchdog = None

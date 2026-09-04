@@ -64,11 +64,9 @@ def assert_normalizer_contract(normalizer) -> None:
     assert "rtmps://" not in joined
     assert "passphrase=" not in joined
     assert argv.count("-flush_packets") == 1
-    assert argv.count("-tcp_nodelay") == 1
-    assert argv[-7:] == [
+    assert "-tcp_nodelay" not in argv
+    assert argv[-5:] == [
         "-flush_packets",
-        "1",
-        "-tcp_nodelay",
         "1",
         "-f",
         "flv",
@@ -116,42 +114,114 @@ def assert_normalizer_contract(normalizer) -> None:
     assert output_gate.observe(("connection-a", 120)) is True
     assert output_gate.observe(("connection-b", 130)) is False
 
-    assert normalizer.MEDIA_IDLE_TIMEOUT_SECONDS == 0.10
+    assert normalizer.VERIFIED_STALL_TIMEOUT_SECONDS == 0.075
+    assert normalizer.OUTPUT_IDLE_FALLBACK_SECONDS == 0.5
     assert normalizer.REQUIRED_IDLE_OBSERVATIONS == 2
     assert normalizer.METRICS_BLIND_TIMEOUT_SECONDS == 0.75
     assert (
-        normalizer.MEDIA_IDLE_TIMEOUT_SECONDS
+        normalizer.VERIFIED_STALL_TIMEOUT_SECONDS
         + (2 * normalizer.MEDIA_POLL_INTERVAL_SECONDS)
         + normalizer.CHILD_STOP_GRACE_SECONDS
         + (1024 / 48000)
         < 0.25
     )
+    assert (
+        normalizer.OUTPUT_IDLE_FALLBACK_SECONDS
+        + normalizer.MEDIA_POLL_INTERVAL_SECONDS
+        + normalizer.CHILD_STOP_GRACE_SECONDS
+        + (1024 / 48000)
+        < 1.0
+    )
 
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
-    idle_limit = normalizer.MEDIA_IDLE_TIMEOUT_SECONDS
-    assert watchdog.observe(True, ("connection-a", 120), 1.0 + idle_limit + 0.001) is True
-    assert watchdog.observe(True, ("connection-a", 120), 1.0 + idle_limit + 0.051) is True
-    assert watchdog.observe(True, ("connection-a", 120), 1.0 + idle_limit + 0.102) is False
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
+    assert watchdog.observe_ingest(True, 500, 1.05, 1.051) is True
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.10) == (True, True)
+    assert watchdog.observe_ingest(True, 500, 1.10, 1.101) is True
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.15) == (True, True)
+    assert watchdog.observe_ingest(True, 500, 1.15, 1.152) is False
+
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
-    assert watchdog.observe(True, ("connection-a", 120), 1.2) is True
-    assert watchdog.observe(True, ("connection-a", 120), 1.25) is True
-    assert watchdog.observe(True, ("connection-a", 121), 1.26) is True
-    assert watchdog.observe(True, ("connection-a", 121), 1.31) is True
-    assert watchdog.observe(True, ("connection-a", 121), 1.36) is True
-    assert watchdog.observe(True, ("connection-a", 121), 1.411) is False
+    for observed_at, ingest_counter in ((1.05, 500), (1.10, 501), (1.15, 502)):
+        assert watchdog.observe_output(True, ("connection-a", 120), observed_at) == (True, True)
+        assert (
+            watchdog.observe_ingest(
+                True,
+                ingest_counter,
+                observed_at,
+                observed_at + 0.001,
+            )
+            is True
+        )
+    assert watchdog.observe_output(True, ("connection-a", 121), 1.16) == (True, False)
+
+    assert watchdog.observe_output(True, ("connection-a", 121), 1.21) == (True, True)
+    assert watchdog.observe_ingest(True, 502, 1.21, 1.211) is True
+    assert watchdog.observe_output(True, ("connection-a", 121), 1.26) == (True, True)
+    assert watchdog.observe_ingest(True, 502, 1.26, 1.261) is True
+    assert watchdog.observe_output(True, ("connection-a", 121), 1.31) == (True, True)
+    assert watchdog.observe_ingest(True, 502, 1.31, 1.311) is False
+
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
-    assert watchdog.observe(True, ("connection-a", 120), 1.2) is True
-    assert watchdog.observe(False, None, 1.21) is True
-    assert watchdog.observe(True, ("connection-a", 120), 1.22) is True
-    assert watchdog.observe(True, ("connection-a", 120), 1.301) is False
+    for observed_at, ingest_counter in (
+        (1.05, 500),
+        (1.15, 501),
+        (1.25, 502),
+        (1.35, 503),
+        (1.45, 504),
+        (1.499, 505),
+    ):
+        assert watchdog.observe_output(True, ("connection-a", 120), observed_at) == (
+            True,
+            True,
+        )
+        assert (
+            watchdog.observe_ingest(
+                True,
+                ingest_counter,
+                observed_at,
+                observed_at + 0.001,
+            )
+            is True
+        )
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.501) == (False, False)
+
+    watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
+    assert watchdog.observe_ingest(True, 500, 1.05, 1.051) is True
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.10) == (True, True)
+    assert watchdog.observe_ingest(True, 500, 1.10, 1.30) is True
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.31) == (True, True)
+    assert watchdog.observe_ingest(True, 500, 1.31, 1.311) is False
+
+    watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
+    assert watchdog.observe_ingest(True, 500, 1.05, 1.051) is True
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.10) == (True, True)
+    assert watchdog.observe_ingest(False, None, 1.10, 1.11) is True
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.15) == (True, True)
+    assert watchdog.observe_ingest(True, 500, 1.15, 1.151) is False
+    watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
+    assert watchdog.observe_ingest(True, None, 1.05, 1.051) is False
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     blind_limit = normalizer.METRICS_BLIND_TIMEOUT_SECONDS
-    assert watchdog.observe(False, None, 1.0 + blind_limit - 0.001) is True
-    assert watchdog.observe(False, None, 1.0 + blind_limit + 0.001) is False
+    assert watchdog.observe_output(False, None, 1.0 + blind_limit - 0.001) == (True, False)
+    assert watchdog.observe_output(False, None, 1.0 + blind_limit + 0.001) == (False, False)
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
-    assert watchdog.observe(True, ("connection-b", 121), 1.01) is False
+    assert watchdog.observe_output(True, None, 1.0 + blind_limit - 0.001) == (True, False)
+    assert watchdog.observe_output(True, None, 1.0 + blind_limit + 0.001) == (False, False)
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
-    assert watchdog.observe(True, ("connection-a", 119), 1.01) is False
+    assert watchdog.observe_output(True, ("connection-b", 121), 1.01) == (False, False)
+    watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
+    assert watchdog.observe_output(True, ("connection-a", 119), 1.01) == (False, False)
+    watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
+    assert watchdog.observe_ingest(True, 500, 1.05, 1.051) is True
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.10) == (True, True)
+    assert watchdog.observe_ingest(True, 499, 1.10, 1.101) is False
+    watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
+    assert watchdog.observe_ingest(True, 500, 1.20, 1.19) is False
     assert hasattr(normalizer, "make_parent_death_setup")
 
     environment = normalizer.sanitized_environment(18554, 11936, 19998)
