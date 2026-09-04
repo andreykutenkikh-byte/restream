@@ -73,10 +73,13 @@ jobs:
         run: |
           node --check app/static/app.js
           node --check app/static/preview-player.js
+          node --check app/static/relay-dashboard.js
           node --check app/static/servers.js
+          node --check app/static/moblin-hud-admin.js
+          node --check app/static/moblin-hud.js
 
       - name: JavaScript tests
-        run: node --test tests/frontend/preview-player.test.js tests/frontend/relay-dashboard.test.js tests/frontend/servers.test.js
+        run: node --test tests/frontend/preview-player.test.js tests/frontend/relay-dashboard.test.js tests/frontend/servers.test.js tests/frontend/moblin-hud.test.js tests/frontend/moblin-hud-admin.test.js
 
       - name: Shell syntax
         shell: bash
