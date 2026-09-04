@@ -33,8 +33,9 @@ METRICS_RESPONSE_LIMIT_BYTES = 65_536
 METRICS_REQUEST_TIMEOUT_SECONDS = 0.2
 MEDIA_POLL_INTERVAL_SECONDS = 0.05
 # A verified output stall must hand back to the always-available slate before an
-# AAC frame gap reaches 250 ms.  Require two unchanged observations so one late
-# scheduler/metrics sample cannot tear down a healthy publisher.
+# AAC frame gap reaches 250 ms.  Start the confirmation window at the first
+# unchanged observation so one late scheduler/metrics sample cannot tear down a
+# healthy publisher.
 MEDIA_IDLE_TIMEOUT_SECONDS = 0.10
 METRICS_BLIND_TIMEOUT_SECONDS = 0.75
 OUTPUT_START_TIMEOUT_SECONDS = 6.0
@@ -230,8 +231,8 @@ class MediaWatchdog:
 
     def __init__(self, sample: CounterSample, now: float) -> None:
         self.connection_id, self.counter = sample
-        self.last_growth = now
         self.last_valid_observation = now
+        self.idle_candidate_since: float | None = None
         self.unchanged_observations = 0
 
     def observe(
@@ -250,12 +251,14 @@ class MediaWatchdog:
             return False
         if counter > self.counter:
             self.counter = counter
-            self.last_growth = now
+            self.idle_candidate_since = None
             self.unchanged_observations = 0
             return True
+        if self.idle_candidate_since is None:
+            self.idle_candidate_since = now
         self.unchanged_observations += 1
         return (
-            now - self.last_growth < MEDIA_IDLE_TIMEOUT_SECONDS
+            now - self.idle_candidate_since < MEDIA_IDLE_TIMEOUT_SECONDS
             or self.unchanged_observations < REQUIRED_IDLE_OBSERVATIONS
         )
 

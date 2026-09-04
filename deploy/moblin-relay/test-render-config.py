@@ -110,7 +110,7 @@ def assert_normalizer_contract(normalizer) -> None:
     assert normalizer.METRICS_BLIND_TIMEOUT_SECONDS == 0.75
     assert (
         normalizer.MEDIA_IDLE_TIMEOUT_SECONDS
-        + normalizer.MEDIA_POLL_INTERVAL_SECONDS
+        + (2 * normalizer.MEDIA_POLL_INTERVAL_SECONDS)
         + normalizer.CHILD_STOP_GRACE_SECONDS
         + (1024 / 48000)
         < 0.25
@@ -119,15 +119,20 @@ def assert_normalizer_contract(normalizer) -> None:
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     idle_limit = normalizer.MEDIA_IDLE_TIMEOUT_SECONDS
     assert watchdog.observe(True, ("connection-a", 120), 1.0 + idle_limit + 0.001) is True
-    assert watchdog.observe(True, ("connection-a", 120), 1.0 + idle_limit + 0.051) is False
+    assert watchdog.observe(True, ("connection-a", 120), 1.0 + idle_limit + 0.051) is True
+    assert watchdog.observe(True, ("connection-a", 120), 1.0 + idle_limit + 0.102) is False
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     assert watchdog.observe(True, ("connection-a", 120), 1.2) is True
-    assert watchdog.observe(True, ("connection-a", 121), 1.25) is True
-    assert watchdog.observe(True, ("connection-a", 121), 1.30) is True
+    assert watchdog.observe(True, ("connection-a", 120), 1.25) is True
+    assert watchdog.observe(True, ("connection-a", 121), 1.26) is True
+    assert watchdog.observe(True, ("connection-a", 121), 1.31) is True
+    assert watchdog.observe(True, ("connection-a", 121), 1.36) is True
+    assert watchdog.observe(True, ("connection-a", 121), 1.411) is False
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     assert watchdog.observe(True, ("connection-a", 120), 1.2) is True
     assert watchdog.observe(False, None, 1.21) is True
-    assert watchdog.observe(True, ("connection-a", 120), 1.22) is False
+    assert watchdog.observe(True, ("connection-a", 120), 1.22) is True
+    assert watchdog.observe(True, ("connection-a", 120), 1.301) is False
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     blind_limit = normalizer.METRICS_BLIND_TIMEOUT_SECONDS
     assert watchdog.observe(False, None, 1.0 + blind_limit - 0.001) is True

@@ -1523,7 +1523,7 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
     assert loaded["METRICS_BLIND_TIMEOUT_SECONDS"] == 0.75
     assert (
         loaded["MEDIA_IDLE_TIMEOUT_SECONDS"]
-        + loaded["MEDIA_POLL_INTERVAL_SECONDS"]
+        + (2 * loaded["MEDIA_POLL_INTERVAL_SECONDS"])
         + loaded["CHILD_STOP_GRACE_SECONDS"]
         + (1024 / 48000)
         < self_test["AUDIO_PRESENTATION_GAP_LIMIT_SECONDS"]
@@ -1531,15 +1531,20 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
 
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
     assert watchdog.observe(True, ("normalizer-a", 120), 1.101) is True
-    assert watchdog.observe(True, ("normalizer-a", 120), 1.151) is False
+    assert watchdog.observe(True, ("normalizer-a", 120), 1.151) is True
+    assert watchdog.observe(True, ("normalizer-a", 120), 1.202) is False
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
     assert watchdog.observe(True, ("normalizer-a", 120), 1.2) is True
-    assert watchdog.observe(True, ("normalizer-a", 121), 1.25) is True
-    assert watchdog.observe(True, ("normalizer-a", 121), 1.30) is True
+    assert watchdog.observe(True, ("normalizer-a", 120), 1.25) is True
+    assert watchdog.observe(True, ("normalizer-a", 121), 1.26) is True
+    assert watchdog.observe(True, ("normalizer-a", 121), 1.31) is True
+    assert watchdog.observe(True, ("normalizer-a", 121), 1.36) is True
+    assert watchdog.observe(True, ("normalizer-a", 121), 1.411) is False
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
     assert watchdog.observe(True, ("normalizer-a", 120), 1.2) is True
     assert watchdog.observe(False, None, 1.21) is True
-    assert watchdog.observe(True, ("normalizer-a", 120), 1.22) is False
+    assert watchdog.observe(True, ("normalizer-a", 120), 1.22) is True
+    assert watchdog.observe(True, ("normalizer-a", 120), 1.301) is False
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
     assert watchdog.observe(False, None, 1.749) is True
     assert watchdog.observe(False, None, 1.751) is False
