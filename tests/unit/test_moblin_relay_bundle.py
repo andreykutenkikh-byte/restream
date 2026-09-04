@@ -306,6 +306,7 @@ def test_self_test_primary_live_fixture_uses_backpressured_paced_transport_bridg
     )
     assert "return output" in generator
     assert "-stream_loop" not in generator
+    assert "nal-hrd=cbr:force-cfr=1:filler=1:bframes=3:b-pyramid=normal" in generator
 
 
 def test_self_test_paced_feeder_pauses_without_skipping_or_catching_up() -> None:
@@ -470,6 +471,51 @@ def test_self_test_paced_feeder_kills_and_reaps_term_ignoring_remux() -> None:
         assert time.monotonic() - started < 2.0
         assert not feeder.is_alive()
         assert feeder.remux_pid is None
+
+
+@pytest.mark.parametrize(
+    ("offsets", "expected"),
+    [
+        ([0.3, 0.1, 0.3], 1),
+        ([0.3, 0.1, 0.1, 0.3], 1),
+        ([0.3, 0.1, 0.1, 0.1, 0.3], 2),
+        ([0.25, 0.250001], 1),
+        ([0.3, 0.4, 0.5], 1),
+        ([0.3], 1),
+    ],
+)
+def test_self_test_video_offset_cluster_counter_requires_sustained_recovery(
+    offsets: list[float],
+    expected: int,
+) -> None:
+    loaded = load_self_test()
+    count = loaded["count_video_pts_dts_offset_clusters"]
+
+    assert loaded["VIDEO_REORDER_SETTLE_PACKETS"] == 3
+    assert count([(0, offset) for offset in offsets]) == expected
+
+
+def test_self_test_video_offset_cluster_counter_ignores_audio_packets() -> None:
+    loaded = load_self_test()
+    count = loaded["count_video_pts_dts_offset_clusters"]
+
+    assert count([(0, 0.3), (0, 0.1), (1, 0.1), (0, 0.1), (0, 0.3)]) == 1
+
+
+def test_self_test_video_offset_cluster_counter_requires_contiguous_known_packets() -> None:
+    loaded = load_self_test()
+    count = loaded["count_video_pts_dts_offset_clusters"]
+
+    assert count([(0, 0.3), (0, 0.1), (0, None), (0, 0.1), (0, 0.1), (0, 0.3)]) == 1
+
+
+def test_self_test_video_offset_cluster_counter_preserves_quick_transition_cap() -> None:
+    loaded = load_self_test()
+    count = loaded["count_video_pts_dts_offset_clusters"]
+    one_incident = [(0, 0.3), (0, 0.1), (0, 0.1), (0, 0.1)]
+
+    assert count(one_incident * 12) == 12
+    assert count(one_incident * 12 + [(0, 0.3)]) == 13
 
 
 def test_self_test_primary_live_feeder_has_strict_lifecycle_guards() -> None:

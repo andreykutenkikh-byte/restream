@@ -719,7 +719,7 @@ class RemoteRelayInstaller:
             "-map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -profile:v main "
             "-level:v 4.0 -pix_fmt yuv420p -r 30 -g 60 -keyint_min 60 -sc_threshold 0 "
             "-b:v 8M -minrate 8M -maxrate 8M -bufsize 16M "
-            "-x264-params nal-hrd=cbr:force-cfr=1:filler=1 "
+            "-x264-params nal-hrd=cbr:force-cfr=1:filler=1:bframes=3:b-pyramid=normal "
             "-c:a aac -profile:a aac_low "
             "-ar 48000 -ac 2 -b:a 128k -t 12 -shortest -movflags +faststart "
             f"{temp}/slate.mp4",

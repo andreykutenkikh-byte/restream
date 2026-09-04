@@ -328,7 +328,7 @@ async def test_install_uses_pinned_mediamtx_and_never_mutates_host_networking() 
     assert "-pix_fmt yuv420p" in commands
     assert "-g 60" in commands
     assert "-b:v 8M -minrate 8M -maxrate 8M -bufsize 16M" in commands
-    assert "-x264-params nal-hrd=cbr:force-cfr=1:filler=1" in commands
+    assert "-x264-params nal-hrd=cbr:force-cfr=1:filler=1:bframes=3:b-pyramid=normal" in commands
     assert "-c:a aac" in commands and "-ar 48000 -ac 2" in commands
     assert "'drawtext=" in commands and "x=(w-text_w)/2" in commands
     assert "systemctl disable --now moblin-relay.service" in commands
