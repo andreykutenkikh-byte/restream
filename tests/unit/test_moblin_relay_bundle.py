@@ -3,7 +3,9 @@ from __future__ import annotations
 import ast
 import os
 import runpy
+import socket
 import sys
+import time
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
@@ -219,7 +221,7 @@ def test_self_test_source_helper_aligns_peer_idle_budget(tmp_path: Path) -> None
     )
 
 
-def test_self_test_primary_live_fixture_uses_bounded_loss_udp_bridge() -> None:
+def test_self_test_primary_live_fixture_uses_backpressured_paced_transport_bridge() -> None:
     loaded = load_self_test()
     live = ROOT / "synthetic-live.mp4"
     ffmpeg = str(loaded["FFMPEG"])
@@ -227,20 +229,22 @@ def test_self_test_primary_live_fixture_uses_bounded_loss_udp_bridge() -> None:
     udp_port = loaded["SOURCE_PRIMARY_FEED_PORT"]
     rtmp_port = loaded["SOURCE_PRIMARY_RTMP_PORT"]
 
-    feeder = loaded["local_mpegts_feeder_command"](live, udp_port)
+    remux = loaded["local_mpegts_remux_command"](live)
     primary = loaded["local_primary_rtmp_publisher_command"](udp_port, rtmp_port)
     auxiliary = loaded["local_rtmp_publisher_command"](live, rtmp_port)
 
     assert udp_port == 31937
     assert loaded["LIVE_FEED_FIFO_UNITS"] == 512
     assert loaded["LIVE_FEED_SOCKET_BUFFER_BYTES"] == 65_536
-    assert feeder == [
+    assert loaded["LIVE_FEED_CHUNK_BYTES"] == loaded["SRT_PAYLOAD_SIZE"] == 1316
+    assert loaded["LIVE_FEED_CHUNK_BYTES"] % loaded["MPEGTS_PACKET_SIZE_BYTES"] == 0
+    assert loaded["LIVE_TRANSPORT_MUX_RATE_BITS_PER_SECOND"] == 9_000_000
+    assert remux == [
         ffmpeg,
         "-nostdin",
         "-hide_banner",
         "-loglevel",
         "quiet",
-        "-re",
         "-stream_loop",
         "-1",
         "-i",
@@ -255,11 +259,13 @@ def test_self_test_primary_live_fixture_uses_bounded_loss_udp_bridge() -> None:
         "+resend_headers",
         "-pat_period",
         "0.1",
+        "-muxrate",
+        "9000000",
         "-flush_packets",
         "1",
         "-f",
         "mpegts",
-        f"udp://127.0.0.1:{udp_port}?pkt_size=1316",
+        "pipe:1",
     ]
     assert primary == [
         ffmpeg,
@@ -267,10 +273,8 @@ def test_self_test_primary_live_fixture_uses_bounded_loss_udp_bridge() -> None:
         "-hide_banner",
         "-loglevel",
         "quiet",
-        "-fflags",
-        "+discardcorrupt",
         "-i",
-        (f"udp://127.0.0.1:{udp_port}?fifo_size=512&overrun_nonfatal=1&buffer_size=65536"),
+        f"udp://127.0.0.1:{udp_port}?fifo_size=512&buffer_size=65536",
         "-map",
         "0:v:0",
         "-map",
@@ -283,17 +287,140 @@ def test_self_test_primary_live_fixture_uses_bounded_loss_udp_bridge() -> None:
     ]
     assert "-re" not in primary
     assert "-stream_loop" not in primary
+    assert "overrun_nonfatal" not in primary[6]
+    assert "+discardcorrupt" not in primary
+    assert "-re" not in remux
     assert "-re" in auxiliary
     assert str(live) in auxiliary
 
-    maximum_buffered_bytes = (
-        loaded["LIVE_FEED_FIFO_UNITS"] * loaded["MPEGTS_PACKET_SIZE_BYTES"]
-        + 2 * loaded["LIVE_FEED_SOCKET_BUFFER_BYTES"]
+    generator = (
+        SELF_TEST.read_text(encoding="utf-8")
+        .split("def generate_live", 1)[1]
+        .split("def video_gop_signature", 1)[0]
     )
-    assert maximum_buffered_bytes <= (
-        loaded["LIVE_FEED_MAX_BUFFERED_SRT_PACKETS"] * loaded["SRT_PAYLOAD_SIZE"]
+    assert "return output" in generator
+    assert "-stream_loop" not in generator
+
+
+def test_self_test_paced_feeder_pauses_without_skipping_or_catching_up() -> None:
+    loaded = load_self_test()
+    feeder_class = loaded["PacedMPEGTSFeeder"]
+    chunk_size = loaded["LIVE_FEED_CHUNK_BYTES"]
+    packet_size = loaded["MPEGTS_PACKET_SIZE_BYTES"]
+    packets_per_chunk = chunk_size // packet_size
+    producer = (
+        "import os, time\n"
+        "index = 0\n"
+        "while True:\n"
+        "    packet = bytes((0x47, index % 251)) + bytes((index % 251,)) * 186\n"
+        f"    for _ in range({packets_per_chunk}):\n"
+        "        os.write(1, packet)\n"
+        "        time.sleep(0.002)\n"
+        "    index += 1\n"
     )
-    assert loaded["LIVE_FEED_MAX_BUFFERED_SRT_PACKETS"] < 1024
+    command = [sys.executable, "-c", producer]
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
+        receiver.bind(("127.0.0.1", 0))
+        receiver.settimeout(0.5)
+        feeder = feeder_class(
+            command,
+            receiver.getsockname()[1],
+            bytes_per_second=chunk_size / 0.2,
+        )
+        feeder.start()
+        try:
+            assert feeder.wait_ready(1.0)
+            initial_remux_pid = feeder.remux_pid
+            assert initial_remux_pid is not None
+            observed = [receiver.recvfrom(chunk_size)[0]]
+            assert feeder.pause()
+
+            receiver.settimeout(0.05)
+            while True:
+                try:
+                    observed.append(receiver.recvfrom(chunk_size)[0])
+                except TimeoutError:
+                    break
+            observed_indexes = [chunk[1] for chunk in observed]
+            assert observed_indexes == list(range(len(observed)))
+
+            time.sleep(0.65)
+            with pytest.raises(TimeoutError):
+                receiver.recvfrom(chunk_size)
+
+            assert feeder.resume()
+            receiver.settimeout(0.25)
+            resumed = receiver.recvfrom(chunk_size)[0]
+            assert resumed[1] == len(observed)
+            receiver.settimeout(0.1)
+            with pytest.raises(TimeoutError):
+                receiver.recvfrom(chunk_size)
+            assert feeder.healthy()
+            assert feeder.failure_kind is None
+            assert feeder.remux_pid == initial_remux_pid
+        finally:
+            assert feeder.finish()
+        assert not feeder.is_alive()
+        assert feeder.remux_pid is None
+
+
+def test_self_test_paced_feeder_fails_closed_when_remux_exits() -> None:
+    loaded = load_self_test()
+    feeder_class = loaded["PacedMPEGTSFeeder"]
+    chunk_size = loaded["LIVE_FEED_CHUNK_BYTES"]
+    packet_size = loaded["MPEGTS_PACKET_SIZE_BYTES"]
+    packets_per_chunk = chunk_size // packet_size
+    producer = (
+        "import os\n"
+        "packet = b'\\x47' + b'\\x00' * 187\n"
+        f"os.write(1, packet * {packets_per_chunk})\n"
+    )
+    command = [sys.executable, "-c", producer]
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
+        receiver.bind(("127.0.0.1", 0))
+        receiver.settimeout(0.5)
+        feeder = feeder_class(
+            command,
+            receiver.getsockname()[1],
+            bytes_per_second=chunk_size / 0.05,
+        )
+        feeder.start()
+        try:
+            assert feeder.wait_ready(1.0)
+            assert len(receiver.recvfrom(chunk_size)[0]) == chunk_size
+            deadline = time.monotonic() + 1.0
+            while feeder.is_alive() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert not feeder.is_alive()
+            assert feeder.failure_kind == "remux"
+            assert not feeder.healthy()
+        finally:
+            assert feeder.finish()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX SIGTERM behavior only")
+def test_self_test_paced_feeder_kills_and_reaps_term_ignoring_remux() -> None:
+    loaded = load_self_test()
+    feeder_class = loaded["PacedMPEGTSFeeder"]
+    producer = (
+        "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(30)\n"
+    )
+    command = [sys.executable, "-c", producer]
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
+        receiver.bind(("127.0.0.1", 0))
+        feeder = feeder_class(command, receiver.getsockname()[1])
+        feeder.start()
+        assert feeder.wait_ready(1.0)
+        assert feeder.remux_pid is not None
+        time.sleep(0.1)
+        started = time.monotonic()
+        assert feeder.finish(1.5)
+        assert time.monotonic() - started < 2.0
+        assert not feeder.is_alive()
+        assert feeder.remux_pid is None
 
 
 def test_self_test_primary_live_feeder_has_strict_lifecycle_guards() -> None:
@@ -312,8 +439,13 @@ def test_self_test_primary_live_feeder_has_strict_lifecycle_guards() -> None:
     feeder_start = source.split("def start_live_feeder", 1)[1].split(
         "def stop_primary_srt_source", 1
     )[0]
-    assert "local_mpegts_feeder_command(live, SOURCE_PRIMARY_FEED_PORT)" in feeder_start
+    assert 'port_is_free("udp", SOURCE_PRIMARY_FEED_PORT)' in feeder_start
+    assert "local_mpegts_remux_command(live)" in feeder_start
     assert "assert_clean_process_metadata(command)" in feeder_start
+    assert "PacedMPEGTSFeeder(" in feeder_start
+    assert "live_feeder.start()" in feeder_start
+    assert "live_feeder.wait_ready(LIVE_FEED_CONTROL_TIMEOUT_SECONDS)" in feeder_start
+    assert "processes.append" not in feeder_start
     assert 'raise TestFailure("local live feeder exited during startup")' in feeder_start
 
     initial_start = source.split('mark_self_test_stage("auth-source")', 1)[1].split(
@@ -329,15 +461,18 @@ def test_self_test_primary_live_feeder_has_strict_lifecycle_guards() -> None:
     same_session = source.split('mark_self_test_stage("stall-pre")', 1)[1].split(
         'mark_self_test_stage("stall-ident")', 1
     )[0]
-    assert "same_session_upstream_pids = (publisher.pid, primary_helper.pid, feeder.pid)" in (
-        same_session
-    )
-    assert "os.kill(publisher.pid, signal.SIGSTOP)" in same_session
-    assert "os.kill(publisher.pid, signal.SIGCONT)" in same_session
-    assert "os.kill(feeder.pid" not in same_session
-    assert "(publisher.pid, primary_helper.pid, feeder.pid) != same_session_upstream_pids" in (
-        same_session
-    )
+    assert "same_session_upstream_pids = (publisher.pid, primary_helper.pid)" in same_session
+    assert "same_session_feeder = feeder" in same_session
+    assert "same_session_feeder_ident = feeder.ident" in same_session
+    assert "same_session_remux_pid = feeder.remux_pid" in same_session
+    assert "if not feeder.pause():" in same_session
+    assert "if not feeder.resume():" in same_session
+    assert "signal.SIGSTOP" not in same_session
+    assert "signal.SIGCONT" not in same_session
+    assert "feeder is not same_session_feeder" in same_session
+    assert "feeder.ident != same_session_feeder_ident" in same_session
+    assert "feeder.remux_pid != same_session_remux_pid" in same_session
+    assert "(publisher.pid, primary_helper.pid) != same_session_upstream_pids" in same_session
 
     outage_loop = source.split("for index, duration in enumerate(durations, start=1):", 1)[1].split(
         'mark_self_test_stage("continuity")', 1
@@ -353,9 +488,13 @@ def test_self_test_primary_live_feeder_has_strict_lifecycle_guards() -> None:
     assert outage_loop.index(stop) < outage_loop.index(helper)
     assert outage_loop.index(helper) < outage_loop.index(publisher) < outage_loop.index(feeder)
     assert "feeder is stopped_feeder" in outage_loop
-    assert "recovered_feeder_pid = feeder.pid" in outage_loop
-    assert "feeder.pid != recovered_feeder_pid" in outage_loop
-    assert "stopped_feeder.pid" not in outage_loop
+    assert "stopped_feeder.is_alive()" in outage_loop
+    assert "stopped_feeder.remux_pid is not None" in outage_loop
+    assert "recovered_feeder = feeder" in outage_loop
+    assert "recovered_feeder_ident = feeder.ident" in outage_loop
+    assert "recovered_remux_pid = feeder.remux_pid" in outage_loop
+    assert "feeder is not recovered_feeder" in outage_loop
+    assert ".pid" not in "\n".join(line for line in outage_loop.splitlines() if "feeder" in line)
 
     continuity = source.split('mark_self_test_stage("continuity")', 1)[1].split(
         'mark_self_test_stage("decode")', 1
@@ -367,7 +506,7 @@ def test_self_test_primary_live_feeder_has_strict_lifecycle_guards() -> None:
 
     cleanup = source.split("finally:\n        cleanup_errors = []", 1)[1]
     assert (
-        cleanup.index("safe_stop(feeder, force=True)")
+        cleanup.index("feeder.finish()")
         < cleanup.index("safe_stop(primary_helper, force=True)")
         < cleanup.index("safe_stop(publisher, force=True)")
     )
@@ -588,8 +727,10 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     )
     assert "wait_slate_capture_growth(" in outage_block
     assert "expected_ingest_ids=initial_ingest_ids" in outage_block
-    assert "signal.SIGSTOP" in outage_block
-    assert "signal.SIGCONT" in outage_block
+    assert "if not feeder.pause():" in outage_block
+    assert "if not feeder.resume():" in outage_block
+    assert "signal.SIGSTOP" not in outage_block
+    assert "signal.SIGCONT" not in outage_block
     assert "signal.SIGKILL" in outage_block
     same_session_recovery = outage_block.split('"same-session LIVE recovery"', 1)[1].split(
         "expected_ingest_ids=initial_ingest_ids", 1
@@ -618,7 +759,7 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         "def reject_with_helper", 1
     )[0]
     assert (
-        helper_block.index("safe_stop(feeder, force=True)")
+        helper_block.index("feeder.finish()")
         < helper_block.index("safe_stop(primary_helper, force=True)")
         < helper_block.index("safe_stop(publisher, force=True)")
     )
@@ -977,7 +1118,7 @@ def test_self_test_takes_fresh_same_session_baseline_before_resume() -> None:
     byte_baseline = 'resume_ingest_bytes = resume_baseline.get("ingest_bytes")'
     idle_guard = "time.monotonic() - same_session_started >= SRT_IDLE_LOWER_BOUND_SECONDS"
     recovery_start = "recovery_started = time.monotonic()"
-    resume = "os.kill(publisher.pid, signal.SIGCONT)"
+    resume = "if not feeder.resume():"
     assert (
         block.index(capture_proof)
         < block.index(baseline)
