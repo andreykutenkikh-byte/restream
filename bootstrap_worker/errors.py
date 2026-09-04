@@ -229,6 +229,12 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_stall_ingest_identity_failed": (
             "Входная SRT-сессия была заменена при восстановлении LIVE."
         ),
+        "relay_self_test_stall_ingest_identity_pre_resume_failed": (
+            "Входная SRT-сессия была заменена до возобновления тестового LIVE-источника."
+        ),
+        "relay_self_test_stall_ingest_identity_recovery_failed": (
+            "Входная SRT-сессия была заменена после возобновления тестового LIVE-источника."
+        ),
         "relay_self_test_stall_ingest_progress_failed": (
             "Входная SRT-сессия сохранилась, но поток входящих байтов не возобновился."
         ),

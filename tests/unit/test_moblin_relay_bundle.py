@@ -168,6 +168,57 @@ def test_build_moblin_urls_is_silent_and_uses_node_config(
     assert capsys.readouterr() == ("", "")
 
 
+def test_self_test_source_helper_aligns_peer_idle_budget(tmp_path: Path) -> None:
+    loaded = load_self_test()
+    write_source_config = loaded["write_source_config"]
+    captured: dict[str, object] = {}
+
+    def capture_config(_path: Path, value: dict[str, object], _mode: int = 0o600) -> None:
+        captured.update(value)
+
+    globals_ = write_source_config.__globals__  # type: ignore[attr-defined]
+    with patch.dict(
+        globals_,
+        {
+            "atomic_json": capture_config,
+            "validate_secret_config": lambda *_args: None,
+        },
+    ):
+        write_source_config(
+            tmp_path,
+            "primary",
+            "synthetic_user",
+            "synthetic_password_1234",
+            "synthetic_passphrase_1234",
+            29350,
+            29351,
+        )
+
+    paths = captured["paths"]
+    assert isinstance(paths, dict)
+    source = paths[loaded["SOURCE_PATH"]]
+    assert isinstance(source, dict)
+    forward = source["forward"]
+    assert isinstance(forward, list)
+    assert forward == [
+        {
+            "dest": (
+                "srt://127.0.0.1:18890?streamid=publish:iphone-live:synthetic_user:"
+                "synthetic_password_1234&passphrase=synthetic_passphrase_1234"
+                "&pbkeylen=32&latency=2000&payloadsize=1316"
+                "&peeridletimeo=10000&conntimeo=3000"
+            )
+        }
+    ]
+    helper_idle_seconds = loaded["SOURCE_HELPER_PEER_IDLE_TIMEOUT_MILLISECONDS"] / 1000
+    assert loaded["SOURCE_HELPER_PEER_IDLE_TIMEOUT_MILLISECONDS"] == 10_000
+    assert (
+        loaded["SRT_IDLE_LOWER_BOUND_SECONDS"]
+        < helper_idle_seconds
+        <= loaded["SRT_IDLE_UPPER_BOUND_SECONDS"]
+    )
+
+
 def test_self_test_primary_live_fixture_uses_bounded_loss_udp_bridge() -> None:
     loaded = load_self_test()
     live = ROOT / "synthetic-live.mp4"
@@ -420,7 +471,10 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     assert 'sample.get("t", 0.0) >= fresh_after' in source
     assert "and predicate(sample)" in source
     assert "not_before=transition_started" in source
-    assert 'f"&payloadsize={SRT_PAYLOAD_SIZE}&conntimeo=3000"' in source
+    assert 'f"&payloadsize={SRT_PAYLOAD_SIZE}"' in source
+    assert (
+        'f"&peeridletimeo={SOURCE_HELPER_PEER_IDLE_TIMEOUT_MILLISECONDS}&conntimeo=3000"' in source
+    )
     assert 'f"&passphrase={passphrase}&pbkeylen=32&latency={SRT_LATENCY_MILLISECONDS}"' in source
     assert (
         loaded["LIVE_TO_SLATE_DEADLINE_SECONDS"] + loaded["SLATE_CAPTURE_GROWTH_TIMEOUT_SECONDS"]
@@ -454,6 +508,7 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         "stall-live",
         "stall-core",
         "stall-source",
+        "stall-id-pre",
         "stall-blind",
         "stall-ident",
         "stall-cont",
@@ -493,7 +548,7 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     )
     dynamic_stall_stages = (
         "stall-i-off",
-        "stall-i-id",
+        "stall-id-rec",
         "stall-i-byte",
         "stall-h-blind",
         "stall-h-path",
@@ -513,6 +568,9 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     for stage in dynamic_stall_stages:
         assert f'return "{stage}"' in source
     assert "stall-ingest" in loaded["SELF_TEST_STAGES"]
+    assert "stall-i-id" in loaded["SELF_TEST_STAGES"]
+    assert 'return "stall-i-id"' not in source
+    assert 'mark_self_test_stage("stall-i-id")' not in source
     assert "mark_self_test_stage(\n                timestamp_failure_stage(" in source
 
     outage_block = source.split('mark_self_test_stage("outages")', 1)[1].split(
@@ -893,7 +951,7 @@ def test_self_test_same_session_failure_classifier_is_fixed_and_secret_free() ->
         "stall-h-state"
     )
     identity_stage = stage([sample(1.2, 101, ingest_ids=[secret])])
-    assert identity_stage == "stall-i-id"
+    assert identity_stage == "stall-id-rec"
     assert secret not in identity_stage
     assert stage([sample(1.2, 101, ingest_live=False, ingest_ids=[])]) == "stall-i-off"
     assert stage([sample(1.2, 100)]) == "stall-i-byte"
@@ -903,7 +961,9 @@ def test_self_test_same_session_failure_classifier_is_fixed_and_secret_free() ->
     assert stage([sample(1.2, 101)]) == "stall-live"
     assert stage([sample(1.2, None)]) == "stall-blind"
     assert stage([sample(1.2, 101), sample(1.3, 100)]) == "stall-blind"
-    assert stage([sample(1.2, 101, ingest_ids=["replacement"]), sample(1.3, 102)]) == "stall-i-id"
+    assert stage([sample(1.2, 101, ingest_ids=["replacement"]), sample(1.3, 102)]) == (
+        "stall-id-rec"
+    )
 
 
 def test_self_test_takes_fresh_same_session_baseline_before_resume() -> None:
@@ -927,6 +987,7 @@ def test_self_test_takes_fresh_same_session_baseline_before_resume() -> None:
         < block.index(resume)
     )
     assert 'resume_baseline.get("ingest_ids") != initial_ingest_ids' in block
+    assert 'mark_self_test_stage("stall-id-pre")' in block
     assert "resume_ingest_bytes" in block.split(resume, 1)[1]
 
 

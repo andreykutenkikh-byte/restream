@@ -64,6 +64,8 @@ def test_native_safe_failure_code_is_allowlisted() -> None:
         "relay_self_test_stall_ingest_failed",
         "relay_self_test_stall_ingest_offline_failed",
         "relay_self_test_stall_ingest_identity_failed",
+        "relay_self_test_stall_ingest_identity_pre_resume_failed",
+        "relay_self_test_stall_ingest_identity_recovery_failed",
         "relay_self_test_stall_ingest_progress_failed",
         "relay_self_test_stall_helper_observability_failed",
         "relay_self_test_stall_helper_path_failed",

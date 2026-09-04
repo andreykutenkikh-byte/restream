@@ -92,6 +92,8 @@ SELF_TEST_STAGES = frozenset(
         "stall-ingest",
         "stall-i-off",
         "stall-i-id",
+        "stall-id-pre",
+        "stall-id-rec",
         "stall-i-byte",
         "stall-h-blind",
         "stall-h-path",
@@ -151,6 +153,7 @@ AUDIO_PRESENTATION_GAP_LIMIT_SECONDS = 0.25
 AV_END_DIFFERENCE_LIMIT_SECONDS = 0.25
 SRT_LATENCY_MILLISECONDS = 2000
 SRT_PAYLOAD_SIZE = 1316
+SOURCE_HELPER_PEER_IDLE_TIMEOUT_MILLISECONDS = 10_000
 MPEGTS_PACKET_SIZE_BYTES = 188
 # Linux can double SO_RCVBUF. Keep the UDP socket plus FFmpeg's MPEG-TS
 # packet FIFO below this conservative SRT-packet equivalent so SIGCONT
@@ -1228,7 +1231,8 @@ def write_source_config(
     destination = (
         f"srt://127.0.0.1:{DUT_SRT_PORT}?streamid=publish:{INGEST_PATH}:{user}:{password}"
         f"&passphrase={passphrase}&pbkeylen=32&latency={SRT_LATENCY_MILLISECONDS}"
-        f"&payloadsize={SRT_PAYLOAD_SIZE}&conntimeo=3000"
+        f"&payloadsize={SRT_PAYLOAD_SIZE}"
+        f"&peeridletimeo={SOURCE_HELPER_PEER_IDLE_TIMEOUT_MILLISECONDS}&conntimeo=3000"
     )
     config = {
         "logLevel": "warn", "logDestinations": ["stdout"], "dumpPackets": False,
@@ -1405,7 +1409,7 @@ def same_session_recovery_failure_stage(
         if not isinstance(ingest_ids, list):
             return "stall-blind"
         if ingest_ids and ingest_ids != expected_ingest_ids:
-            return "stall-i-id"
+            return "stall-id-rec"
     if any(not sample.get("ingest_live") or not sample.get("ingest_ids") for sample in complete):
         return "stall-i-off"
 
@@ -2768,7 +2772,7 @@ def main() -> int:
                 mark_self_test_stage("stall-i-off")
                 raise TestFailure("same-session SRT ingest became unavailable before resume")
             if resume_baseline.get("ingest_ids") != initial_ingest_ids:
-                mark_self_test_stage("stall-i-id")
+                mark_self_test_stage("stall-id-pre")
                 raise TestFailure("same-session SRT ingest identity changed before resume")
             resume_ingest_bytes = resume_baseline.get("ingest_bytes")
             if type(resume_ingest_bytes) is not int:

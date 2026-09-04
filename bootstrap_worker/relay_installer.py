@@ -142,6 +142,8 @@ _SELF_TEST_STAGE_CODES = {
     "stall-ingest": "relay_self_test_stall_ingest_failed",
     "stall-i-off": "relay_self_test_stall_ingest_offline_failed",
     "stall-i-id": "relay_self_test_stall_ingest_identity_failed",
+    "stall-id-pre": "relay_self_test_stall_ingest_identity_pre_resume_failed",
+    "stall-id-rec": "relay_self_test_stall_ingest_identity_recovery_failed",
     "stall-i-byte": "relay_self_test_stall_ingest_progress_failed",
     "stall-h-blind": "relay_self_test_stall_helper_observability_failed",
     "stall-h-path": "relay_self_test_stall_helper_path_failed",

@@ -102,6 +102,8 @@ SAFE_BOOTSTRAP_DIAGNOSTIC_CODES = frozenset(
         "relay_self_test_stall_ingest_failed",
         "relay_self_test_stall_ingest_offline_failed",
         "relay_self_test_stall_ingest_identity_failed",
+        "relay_self_test_stall_ingest_identity_pre_resume_failed",
+        "relay_self_test_stall_ingest_identity_recovery_failed",
         "relay_self_test_stall_ingest_progress_failed",
         "relay_self_test_stall_helper_observability_failed",
         "relay_self_test_stall_helper_path_failed",
