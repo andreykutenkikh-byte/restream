@@ -798,6 +798,7 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         "ts-v-offset",
         "ts-v-cluster",
         "ts-v-order",
+        "ts-v-fps",
         "ts-audio-pts",
         "ts-g-vdts",
         "ts-g-adts",
@@ -1005,6 +1006,7 @@ def test_self_test_validates_actual_decoded_pts_on_native_flv_capture() -> None:
     assert result["presentation_timestamp_count"] == result["frame_count"] == 3
     assert not result["strict_presentation_timestamps_monotonic"]
     assert result["maximum_presentation_timestamp_backward_step_seconds"] == pytest.approx(0.013333)
+    assert result["presentation_frame_rate_matches"]
     assert result["strict_best_effort_timestamps_monotonic"]
 
     timestamp_gate = source.split("timestamp_ok = (", 1)[1].split(
@@ -1029,7 +1031,7 @@ def test_self_test_format_diagnostics_identify_each_safe_predicate() -> None:
         "height": loaded["PORTRAIT_HEIGHT"],
         "pix_fmt": "yuv420p",
         "r_frame_rate": f"{loaded['VIDEO_FPS']}/1",
-        "avg_frame_rate": f"{loaded['VIDEO_FPS']}/1",
+        "avg_frame_rate": "0/0",
     }
     audio = {
         "codec_name": "aac",
@@ -1049,7 +1051,6 @@ def test_self_test_format_diagnostics_identify_each_safe_predicate() -> None:
         ("video", "height", 1280, "fmt-v-size"),
         ("video", "pix_fmt", "yuv444p", "fmt-v-pixfmt"),
         ("video", "r_frame_rate", "60/1", "fmt-v-rfps"),
-        ("video", "avg_frame_rate", "0/0", "fmt-v-afps"),
         ("audio", "codec_name", "mp3", "fmt-a-codec"),
         ("audio", "profile", "HE-AAC", "fmt-a-prof"),
         ("audio", "sample_rate", "44100", "fmt-a-rate"),
@@ -2000,6 +2001,12 @@ def test_normalizer_reexec_rejects_an_unbound_source(
             "ts-v-order",
         ),
         (
+            "decoded_frames",
+            "presentation_frame_rate_matches",
+            False,
+            "ts-v-fps",
+        ),
+        (
             "decoded_audio",
             "presentation_timestamp_steps_beyond_tolerance",
             1,
@@ -2050,6 +2057,7 @@ def test_timestamp_failure_stage_is_bounded_and_category_specific(
         "frame_count": 10,
         "presentation_timestamp_count": 10,
         "strict_presentation_timestamps_monotonic": True,
+        "presentation_frame_rate_matches": True,
         "maximum_presentation_timestamp_gap_seconds": 0.04,
     }
     decoded_audio = {

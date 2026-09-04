@@ -19,6 +19,7 @@ import shutil
 import signal
 import socket
 import stat
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -139,7 +140,6 @@ SELF_TEST_STAGES = frozenset(
         "fmt-v-size",
         "fmt-v-pixfmt",
         "fmt-v-rfps",
-        "fmt-v-afps",
         "fmt-a-codec",
         "fmt-a-prof",
         "fmt-a-rate",
@@ -155,6 +155,7 @@ SELF_TEST_STAGES = frozenset(
         "ts-v-offset",
         "ts-v-cluster",
         "ts-v-order",
+        "ts-v-fps",
         "ts-audio-pts",
         "ts-gaps",
         "ts-g-vdts",
@@ -177,6 +178,7 @@ PORTRAIT_HEIGHT = 1920
 VIDEO_FPS = 30
 VIDEO_GOP_FRAMES = 60
 ASSET_DURATION_SECONDS = 12
+VIDEO_FRAME_INTERVAL_TOLERANCE_SECONDS = 0.002
 # The synthetic LIVE input must not wrap while publisher exclusivity is observed.
 # A loop boundary is not representative of Moblin and can briefly starve the
 # normalizer exactly at the end of the 12-second exclusivity window.
@@ -2182,6 +2184,10 @@ def analyze_decoded_video_frames(capture: Path) -> dict:
         right - left for left, right in zip(presentation_timestamps, presentation_timestamps[1:])
     ]
     negative_presentation_steps = [step for step in presentation_steps if step < 0]
+    positive_presentation_steps = [step for step in presentation_steps if step > 0.000001]
+    median_presentation_step = (
+        statistics.median(positive_presentation_steps) if positive_presentation_steps else None
+    )
     best_effort_steps = [
         right - left
         for left, right in zip(best_effort_timestamps, best_effort_timestamps[1:])
@@ -2210,6 +2216,12 @@ def analyze_decoded_video_frames(capture: Path) -> dict:
         ),
         "minimum_presentation_timestamp_step_seconds": min(presentation_steps, default=None),
         "maximum_presentation_timestamp_gap_seconds": max(presentation_steps, default=None),
+        "median_presentation_timestamp_step_seconds": median_presentation_step,
+        "presentation_frame_rate_matches": (
+            median_presentation_step is not None
+            and abs(median_presentation_step - (1 / VIDEO_FPS))
+            <= VIDEO_FRAME_INTERVAL_TOLERANCE_SECONDS
+        ),
         "best_effort_timestamp_count": len(best_effort_timestamps),
         "strict_best_effort_timestamps_monotonic": not any(
             step < -0.000001 for step in best_effort_steps
@@ -2287,7 +2299,6 @@ def output_format_failure_stage(
         ),
         ("fmt-v-pixfmt", normalized_video.get("pix_fmt") == "yuv420p"),
         ("fmt-v-rfps", normalized_video.get("r_frame_rate") == f"{VIDEO_FPS}/1"),
-        ("fmt-v-afps", normalized_video.get("avg_frame_rate") == f"{VIDEO_FPS}/1"),
         ("fmt-a-codec", normalized_audio.get("codec_name") == "aac"),
         ("fmt-a-prof", normalized_audio.get("profile") == "LC"),
         ("fmt-a-rate", normalized_audio.get("sample_rate") == "48000"),
@@ -2336,6 +2347,7 @@ def timestamp_failure_stage(
         <= max_bounded_audio_backward_steps
     )
     video_pts_order_ok = decoded_frames["strict_presentation_timestamps_monotonic"]
+    video_frame_rate_ok = decoded_frames["presentation_frame_rate_matches"]
     audio_pts_ok = (
         decoded_audio["presentation_timestamp_steps_beyond_tolerance"] == 0
         and decoded_audio["negative_presentation_timestamp_steps"]
@@ -2384,6 +2396,7 @@ def timestamp_failure_stage(
         ("ts-v-offset", video_pts_offset_ok),
         ("ts-v-cluster", video_pts_clusters_ok),
         ("ts-v-order", video_pts_order_ok),
+        ("ts-v-fps", video_frame_rate_ok),
         ("ts-audio-pts", audio_pts_ok),
         ("ts-g-vdts", packet_video_dts_gap_ok),
         ("ts-g-adts", packet_audio_dts_gap_ok),
@@ -3778,6 +3791,7 @@ def main() -> int:
                 <= max_bounded_audio_backward_steps
             and decoded_frames["presentation_timestamp_count"] == decoded_frames["frame_count"]
             and decoded_frames["strict_presentation_timestamps_monotonic"]
+            and decoded_frames["presentation_frame_rate_matches"]
             and decoded_frames["maximum_presentation_timestamp_gap_seconds"] is not None
             and decoded_frames["maximum_presentation_timestamp_gap_seconds"]
                 <= VIDEO_PRESENTATION_GAP_LIMIT_SECONDS
@@ -3797,6 +3811,7 @@ def main() -> int:
         )
         result["timestamp_limits_seconds"] = {
             "dts_backward_tolerance": TIMESTAMP_BACKWARD_TOLERANCE_SECONDS,
+            "video_frame_interval_tolerance": VIDEO_FRAME_INTERVAL_TOLERANCE_SECONDS,
             "video_pts_dts_offset": VIDEO_PTS_DTS_OFFSET_LIMIT_SECONDS,
             "audio_pts_dts_offset": AUDIO_PTS_DTS_OFFSET_LIMIT_SECONDS,
             "decoded_video_pts_gap": VIDEO_PRESENTATION_GAP_LIMIT_SECONDS,

@@ -364,9 +364,6 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_decode_format_video_r_frame_rate_failed": (
             "Заявленная частота кадров выходного видео не прошла самопроверку."
         ),
-        "relay_self_test_decode_format_video_average_frame_rate_failed": (
-            "Средняя частота кадров выходного видео не прошла самопроверку."
-        ),
         "relay_self_test_decode_format_audio_codec_failed": (
             "Аудиокодек выходного потока не прошёл самопроверку."
         ),
@@ -407,6 +404,9 @@ def safe_failure(code: str) -> BootstrapError:
         ),
         "relay_self_test_timestamp_video_pts_order_failed": (
             "Порядок декодированных PTS видеопотока не прошёл самопроверку."
+        ),
+        "relay_self_test_timestamp_video_frame_rate_failed": (
+            "Фактическая частота кадров выходного видео не прошла самопроверку."
         ),
         "relay_self_test_timestamp_audio_pts_failed": (
             "Временные метки PTS аудиопотока не прошли самопроверку."
