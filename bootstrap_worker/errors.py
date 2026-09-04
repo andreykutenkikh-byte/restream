@@ -223,6 +223,27 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_stall_ingest_failed": (
             "Исходная SRT-сессия не сохранилась при восстановлении LIVE."
         ),
+        "relay_self_test_stall_ingest_offline_failed": (
+            "Тестовый SRT helper работает, но входная SRT-сессия стала недоступна."
+        ),
+        "relay_self_test_stall_ingest_identity_failed": (
+            "Входная SRT-сессия была заменена при восстановлении LIVE."
+        ),
+        "relay_self_test_stall_ingest_progress_failed": (
+            "Входная SRT-сессия сохранилась, но поток входящих байтов не возобновился."
+        ),
+        "relay_self_test_stall_helper_observability_failed": (
+            "Метрики тестового SRT helper стали недоступны при восстановлении LIVE."
+        ),
+        "relay_self_test_stall_helper_path_failed": (
+            "Входной медиапуть тестового SRT helper стал недоступен."
+        ),
+        "relay_self_test_stall_helper_forward_failed": (
+            "SRT-forward тестового helper перешёл в состояние ошибки."
+        ),
+        "relay_self_test_stall_helper_state_failed": (
+            "SRT-forward тестового helper не вернулся в рабочее состояние."
+        ),
         "relay_self_test_stall_normalizer_failed": (
             "Нормализатор не вернул LIVE после возобновления источника."
         ),

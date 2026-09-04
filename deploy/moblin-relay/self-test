@@ -47,6 +47,7 @@ SINK_API_PORT = 29997
 SINK_METRICS_PORT = 29998
 SOURCE_PRIMARY_RTMP_PORT = 31935
 SOURCE_AUX_RTMP_PORT = 31936
+SOURCE_PRIMARY_FEED_PORT = 31937
 SOURCE_PRIMARY_METRICS_PORT = 31997
 SOURCE_AUX_METRICS_PORT = 31998
 SOURCE_PATH = "source/live"
@@ -89,6 +90,13 @@ SELF_TEST_STAGES = frozenset(
         "stall-core",
         "stall-source",
         "stall-ingest",
+        "stall-i-off",
+        "stall-i-id",
+        "stall-i-byte",
+        "stall-h-blind",
+        "stall-h-path",
+        "stall-h-error",
+        "stall-h-state",
         "stall-norm",
         "stall-sink",
         "stall-blind",
@@ -143,12 +151,13 @@ AUDIO_PRESENTATION_GAP_LIMIT_SECONDS = 0.25
 AV_END_DIFFERENCE_LIMIT_SECONDS = 0.25
 SRT_LATENCY_MILLISECONDS = 2000
 SRT_PAYLOAD_SIZE = 1316
-# MediaMTX's SRT forwarder otherwise inherits gosrt's 5-second peer-idle
-# default, which is shorter than the controlled same-session pause below.
-# Match the DUT's explicit 10-second read/peer-idle timeout so the test
-# exercises recovery of the same SRT connection instead of a client-side
-# timeout and reconnect.
-SOURCE_HELPER_PEER_IDLE_TIMEOUT_MILLISECONDS = 10_000
+MPEGTS_PACKET_SIZE_BYTES = 188
+# Linux can double SO_RCVBUF. Keep the UDP socket plus FFmpeg's MPEG-TS
+# packet FIFO below this conservative SRT-packet equivalent so SIGCONT
+# cannot replay the multi-second paused interval into gosrt's fixed queue.
+LIVE_FEED_FIFO_UNITS = 512
+LIVE_FEED_SOCKET_BUFFER_BYTES = 65_536
+LIVE_FEED_MAX_BUFFERED_SRT_PACKETS = 256
 SRT_IDLE_LOWER_BOUND_SECONDS = 8.0
 SRT_IDLE_UPPER_BOUND_SECONDS = 13.0
 LIVE_TO_SLATE_DEADLINE_SECONDS = 4.5
@@ -512,6 +521,17 @@ def wait_tcp(port: int, timeout: float = 15.0) -> None:
         except OSError:
             time.sleep(0.1)
     raise TestFailure(f"TCP/{port} did not become ready")
+
+
+def wait_udp_bound(process: subprocess.Popen, port: int, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise TestFailure(f"local primary publisher exited before binding UDP/{port}")
+        if not port_is_free("udp", port):
+            return
+        time.sleep(0.05)
+    raise TestFailure(f"UDP/{port} did not become ready")
 
 
 def wait_file_growth(path: Path, minimum: int, timeout: float = 20.0) -> None:
@@ -1208,8 +1228,7 @@ def write_source_config(
     destination = (
         f"srt://127.0.0.1:{DUT_SRT_PORT}?streamid=publish:{INGEST_PATH}:{user}:{password}"
         f"&passphrase={passphrase}&pbkeylen=32&latency={SRT_LATENCY_MILLISECONDS}"
-        f"&payloadsize={SRT_PAYLOAD_SIZE}"
-        f"&peeridletimeo={SOURCE_HELPER_PEER_IDLE_TIMEOUT_MILLISECONDS}&conntimeo=3000"
+        f"&payloadsize={SRT_PAYLOAD_SIZE}&conntimeo=3000"
     )
     config = {
         "logLevel": "warn", "logDestinations": ["stdout"], "dumpPackets": False,
@@ -1243,10 +1262,36 @@ def write_source_config(
 
 
 def local_rtmp_publisher_command(live: Path, rtmp_port: int) -> list[str]:
-    """Return an ffmpeg command containing only a non-secret loopback RTMP URL."""
+    """Return the direct-file publisher used only by auxiliary auth checks."""
     return [
         str(FFMPEG), "-nostdin", "-hide_banner", "-loglevel", "quiet",
         "-re", "-stream_loop", "-1", "-i", str(live),
+        "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-f", "flv",
+        f"rtmp://127.0.0.1:{rtmp_port}/{SOURCE_PATH}",
+    ]
+
+
+def local_mpegts_feeder_command(live: Path, udp_port: int) -> list[str]:
+    """Continuously pace the fixture into a recoverable local MPEG-TS feed."""
+    return [
+        str(FFMPEG), "-nostdin", "-hide_banner", "-loglevel", "quiet",
+        "-re", "-stream_loop", "-1", "-i", str(live),
+        "-map", "0:v:0", "-map", "0:a:0", "-c", "copy",
+        "-mpegts_flags", "+resend_headers", "-pat_period", "0.1",
+        "-flush_packets", "1", "-f", "mpegts",
+        f"udp://127.0.0.1:{udp_port}?pkt_size={SRT_PAYLOAD_SIZE}",
+    ]
+
+
+def local_primary_rtmp_publisher_command(udp_port: int, rtmp_port: int) -> list[str]:
+    """Read a bounded lossy live feed without replaying a paused interval."""
+    input_url = (
+        f"udp://127.0.0.1:{udp_port}?fifo_size={LIVE_FEED_FIFO_UNITS}"
+        f"&overrun_nonfatal=1&buffer_size={LIVE_FEED_SOCKET_BUFFER_BYTES}"
+    )
+    return [
+        str(FFMPEG), "-nostdin", "-hide_banner", "-loglevel", "quiet",
+        "-fflags", "+discardcorrupt", "-i", input_url,
         "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-f", "flv",
         f"rtmp://127.0.0.1:{rtmp_port}/{SOURCE_PATH}",
     ]
@@ -1289,6 +1334,106 @@ def helper_forward_outbound_bytes(metrics_port: int) -> int | None:
         and value.is_integer()
     ]
     return counters[0] if len(counters) == 1 else None
+
+
+def parse_source_helper_status(metrics: str) -> dict:
+    """Collapse helper metrics to fixed, secret-free diagnostic fields."""
+    path_ready = any(
+        labels.get("name") == SOURCE_PATH
+        and labels.get("state") == "ready"
+        and value == 1
+        for labels, value in parse_metrics(metrics, "paths")
+    )
+    states = [
+        labels.get("state", "")
+        for labels, value in parse_metrics(metrics, "forward_dests")
+        if labels.get("path") == SOURCE_PATH
+        and labels.get("protocol") == "srt"
+        and value == 1
+    ]
+    state = states[0] if len(states) == 1 else "unknown"
+    if state not in {"forwarding", "ready", "error"}:
+        state = "unknown"
+    return {
+        "metrics_ok": True,
+        "path_ready": path_ready,
+        "forward_state": state,
+    }
+
+
+def source_helper_status(metrics_port: int) -> dict:
+    try:
+        metrics = fetch_metrics(metrics_port)
+    except OSError:
+        return {
+            "metrics_ok": False,
+            "path_ready": False,
+            "forward_state": "unknown",
+        }
+    return parse_source_helper_status(metrics)
+
+
+def same_session_recovery_failure_stage(
+    samples: list[dict],
+    expected_ingest_ids: list[str],
+    baseline_ingest_bytes: int,
+    baseline_timestamp: float,
+    initial_sink_id: str,
+    helper_status: dict,
+) -> str:
+    """Classify a failed recovery without returning metrics values or identities."""
+    if not helper_status.get("metrics_ok"):
+        return "stall-h-blind"
+    if not helper_status.get("path_ready"):
+        return "stall-h-path"
+    helper_state = helper_status.get("forward_state")
+    if helper_state == "error":
+        return "stall-h-error"
+    if helper_state != "forwarding":
+        return "stall-h-state"
+
+    complete = [sample for sample in samples if complete_metrics_sample(sample)]
+    try:
+        complete.sort(key=lambda sample: float(sample["t"]))
+    except (KeyError, TypeError, ValueError):
+        return "stall-blind"
+    if not complete:
+        return "stall-blind"
+
+    for sample in complete:
+        ingest_ids = sample.get("ingest_ids")
+        if not isinstance(ingest_ids, list):
+            return "stall-blind"
+        if ingest_ids and ingest_ids != expected_ingest_ids:
+            return "stall-i-id"
+    if any(not sample.get("ingest_live") or not sample.get("ingest_ids") for sample in complete):
+        return "stall-i-off"
+
+    previous_bytes = baseline_ingest_bytes
+    last_growth = baseline_timestamp
+    for sample in complete:
+        ingest_bytes = sample.get("ingest_bytes")
+        if type(ingest_bytes) is not int or ingest_bytes < previous_bytes:
+            return "stall-blind"
+        if ingest_bytes > previous_bytes:
+            previous_bytes = ingest_bytes
+            last_growth = float(sample["t"])
+    latest = complete[-1]
+    if (
+        previous_bytes <= baseline_ingest_bytes
+        or float(latest["t"]) - last_growth > CAPTURE_NO_GROWTH_LIMIT_SECONDS
+    ):
+        return "stall-i-byte"
+
+    if not latest.get("normalized") or len(latest.get("normalized_ids", [])) != 1:
+        return "stall-norm"
+    if (
+        not latest.get("path_ready")
+        or not latest.get("forward")
+        or latest.get("sink_ids") != [initial_sink_id]
+    ):
+        return "stall-sink"
+    return "stall-live"
 
 
 def open_validated_log_tail(
@@ -1879,6 +2024,7 @@ def main() -> int:
              ("tcp", DUT_RTSP_PORT), ("tcp", DUT_RTMP_PORT), ("tcp", DUT_API_PORT),
              ("tcp", DUT_METRICS_PORT), ("tcp", SINK_API_PORT), ("tcp", SINK_METRICS_PORT),
              ("tcp", SOURCE_PRIMARY_RTMP_PORT), ("tcp", SOURCE_AUX_RTMP_PORT),
+             ("udp", SOURCE_PRIMARY_FEED_PORT),
              ("tcp", SOURCE_PRIMARY_METRICS_PORT), ("tcp", SOURCE_AUX_METRICS_PORT))
 
     busy = [f"{kind}/{port}" for kind, port in ports if not port_is_free(kind, port)]
@@ -1929,7 +2075,7 @@ def main() -> int:
     }
     processes: list[subprocess.Popen] = []
     process_group_pids: set[int] = set()
-    sink = dut = reader = publisher = primary_helper = observer = capture_observer = None
+    sink = dut = reader = publisher = feeder = primary_helper = observer = capture_observer = None
     log_handles = []
     secret_configs: set[Path] = set()
     authorized_configs: set[Path] = set()
@@ -2100,20 +2246,57 @@ def main() -> int:
             processes.append(process)
             return process
 
+        def start_primary_publisher() -> subprocess.Popen:
+            command = local_primary_rtmp_publisher_command(
+                SOURCE_PRIMARY_FEED_PORT,
+                SOURCE_PRIMARY_RTMP_PORT,
+            )
+            assert_clean_process_metadata(command)
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            processes.append(process)
+            wait_udp_bound(process, SOURCE_PRIMARY_FEED_PORT)
+            return process
+
+        def start_live_feeder() -> subprocess.Popen:
+            command = local_mpegts_feeder_command(live, SOURCE_PRIMARY_FEED_PORT)
+            assert_clean_process_metadata(command)
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            processes.append(process)
+            time.sleep(0.25)
+            if process.poll() is not None:
+                raise TestFailure("local live feeder exited during startup")
+            return process
+
         def stop_primary_srt_source(label: str) -> None:
-            nonlocal primary_helper, publisher
-            if primary_helper is None or publisher is None:
+            nonlocal feeder, primary_helper, publisher
+            if feeder is None or publisher is None or primary_helper is None:
                 raise TestFailure(f"primary source is missing before {label}")
+            if not safe_stop(feeder, force=True):
+                raise TestFailure(f"live feeder did not stop during {label}")
+            feeder = None
             if not safe_stop(primary_helper, force=True):
                 raise TestFailure(f"SRT source helper did not stop during {label}")
             primary_helper = None
             if not safe_stop(publisher, force=True):
                 raise TestFailure(f"publisher did not stop during {label}")
             publisher = None
-            wait_ports_released((
-                ("tcp", SOURCE_PRIMARY_RTMP_PORT),
-                ("tcp", SOURCE_PRIMARY_METRICS_PORT),
-            ))
+            wait_ports_released(
+                (
+                    ("tcp", SOURCE_PRIMARY_RTMP_PORT),
+                    ("udp", SOURCE_PRIMARY_FEED_PORT),
+                    ("tcp", SOURCE_PRIMARY_METRICS_PORT),
+                )
+            )
 
         def wait_healthy_live(
             description: str,
@@ -2292,7 +2475,8 @@ def main() -> int:
         secret_configs.add(primary_config)
         authorized_configs.add(primary_config)
         primary_helper = start_source_helper(primary_config, "primary", SOURCE_PRIMARY_METRICS_PORT)
-        publisher = start_local_publisher(SOURCE_PRIMARY_RTMP_PORT)
+        publisher = start_primary_publisher()
+        feeder = start_live_feeder()
         wait_helper_path(SOURCE_PRIMARY_METRICS_PORT)
         initial_live_started = time.monotonic()
         initial_live_deadline = initial_live_started + 20
@@ -2352,7 +2536,11 @@ def main() -> int:
             float(initial_live["t"]) - initial_live_started,
             3,
         )
-        if publisher.poll() is not None or primary_helper.poll() is not None:
+        if (
+            publisher.poll() is not None
+            or primary_helper.poll() is not None
+            or feeder.poll() is not None
+        ):
             raise TestFailure("primary source path exited unexpectedly")
 
         mark_self_test_stage("auth-scan")
@@ -2424,7 +2612,11 @@ def main() -> int:
                 if second.poll() is not None or second_helper.poll() is not None:
                     mark_self_test_stage("auth-x-second")
                     raise TestFailure("second local source path exited before DUT rejection was verified")
-                if publisher.poll() is not None or primary_helper.poll() is not None:
+                if (
+                    publisher.poll() is not None
+                    or primary_helper.poll() is not None
+                    or feeder.poll() is not None
+                ):
                     mark_self_test_stage("auth-x-primary")
                     raise TestFailure("primary source path exited during second-publisher test")
                 if not complete_metrics_sample(sample):
@@ -2456,7 +2648,11 @@ def main() -> int:
             if second.poll() is not None or second_helper.poll() is not None:
                 mark_self_test_stage("auth-x-second")
                 raise TestFailure("second local source path exited at the end of its test")
-            if publisher.poll() is not None or primary_helper.poll() is not None:
+            if (
+                publisher.poll() is not None
+                or primary_helper.poll() is not None
+                or feeder.poll() is not None
+            ):
                 mark_self_test_stage("auth-x-primary")
                 raise TestFailure("primary source path exited at the end of second-publisher test")
             second_finished = time.monotonic()
@@ -2527,6 +2723,16 @@ def main() -> int:
         print("  checking a recoverable same-session media stall", flush=True)
         mark_self_test_stage("stall-slate")
         mark_self_test_stage("stall-pre")
+        if (
+            publisher is None
+            or primary_helper is None
+            or feeder is None
+            or publisher.poll() is not None
+            or primary_helper.poll() is not None
+            or feeder.poll() is not None
+        ):
+            raise TestFailure("same-session stall precondition lacks its upstream processes")
+        same_session_upstream_pids = (publisher.pid, primary_helper.pid, feeder.pid)
         before_pause = wait_healthy_live(
             "healthy LIVE before same-session stall",
             5,
@@ -2554,6 +2760,20 @@ def main() -> int:
                 same_session_slate,
             )
             mark_self_test_stage("stall-resume")
+            resume_baseline = observer.checked_snapshot("same-session resume baseline")
+            if not complete_metrics_sample(resume_baseline):
+                mark_self_test_stage("stall-blind")
+                raise TestFailure("same-session resume baseline lacks complete metrics")
+            if not resume_baseline.get("ingest_live") or not resume_baseline.get("ingest_ids"):
+                mark_self_test_stage("stall-i-off")
+                raise TestFailure("same-session SRT ingest became unavailable before resume")
+            if resume_baseline.get("ingest_ids") != initial_ingest_ids:
+                mark_self_test_stage("stall-i-id")
+                raise TestFailure("same-session SRT ingest identity changed before resume")
+            resume_ingest_bytes = resume_baseline.get("ingest_bytes")
+            if type(resume_ingest_bytes) is not int:
+                mark_self_test_stage("stall-blind")
+                raise TestFailure("same-session resume baseline lacks its SRT byte counter")
             if time.monotonic() - same_session_started >= SRT_IDLE_LOWER_BOUND_SECONDS:
                 raise TestFailure("same-session source was not resumed before SRT idle expiry")
             recovery_started = time.monotonic()
@@ -2568,7 +2788,11 @@ def main() -> int:
                     expected_ingest_ids=initial_ingest_ids,
                 )
             except TestFailure:
-                if publisher.poll() is not None or primary_helper.poll() is not None:
+                if (
+                    publisher.poll() is not None
+                    or primary_helper.poll() is not None
+                    or feeder.poll() is not None
+                ):
                     mark_self_test_stage("stall-source")
                 else:
                     try:
@@ -2583,32 +2807,32 @@ def main() -> int:
                             for name in ("dut_alive", "sink_alive", "reader_alive")
                         ):
                             mark_self_test_stage("stall-core")
-                        elif not complete_metrics_sample(recovery_sample):
-                            mark_self_test_stage("stall-blind")
-                        elif (
-                            not recovery_sample.get("ingest_live")
-                            or recovery_sample.get("ingest_ids") != initial_ingest_ids
-                        ):
-                            mark_self_test_stage("stall-ingest")
-                        elif (
-                            not recovery_sample.get("normalized")
-                            or len(recovery_sample.get("normalized_ids", [])) != 1
-                        ):
-                            mark_self_test_stage("stall-norm")
-                        elif (
-                            not recovery_sample.get("path_ready")
-                            or not recovery_sample.get("forward")
-                            or recovery_sample.get("sink_ids") != [initial_sink_id]
-                        ):
-                            mark_self_test_stage("stall-sink")
                         else:
-                            mark_self_test_stage("stall-live")
+                            recovery_samples = observer.samples_between(
+                                recovery_started,
+                                time.monotonic(),
+                            )
+                            mark_self_test_stage(
+                                same_session_recovery_failure_stage(
+                                    recovery_samples,
+                                    initial_ingest_ids,
+                                    resume_ingest_bytes,
+                                    float(resume_baseline["t"]),
+                                    initial_sink_id,
+                                    source_helper_status(SOURCE_PRIMARY_METRICS_PORT),
+                                )
+                            )
                 raise
         finally:
             if publisher_paused and publisher is not None and publisher.poll() is None:
                 os.kill(publisher.pid, signal.SIGCONT)
         mark_self_test_stage("stall-source")
-        if publisher.poll() is not None or primary_helper.poll() is not None:
+        if (
+            publisher.poll() is not None
+            or primary_helper.poll() is not None
+            or feeder.poll() is not None
+            or (publisher.pid, primary_helper.pid, feeder.pid) != same_session_upstream_pids
+        ):
             raise TestFailure("same-session recovery replaced the upstream processes")
         mark_self_test_stage("stall-ident")
         if same_session_live["normalized_ids"] == previous_normalizer_ids:
@@ -2708,6 +2932,8 @@ def main() -> int:
         to_slate_times, to_live_times, srt_idle_times = [], [], []
         outage_capture_stalls = []
         for index, duration in enumerate(durations, start=1):
+            if feeder is None or feeder.poll() is not None:
+                raise TestFailure(f"live feeder is unavailable before outage {index}")
             before_outage = wait_healthy_live(
                 f"healthy LIVE before outage {index}",
                 5,
@@ -2715,9 +2941,18 @@ def main() -> int:
             outage_ingest_ids = list(before_outage["ingest_ids"])
             if len(outage_ingest_ids) != 1:
                 raise TestFailure(f"outage {index} precondition lacks one SRT connection")
+            stopped_feeder = feeder
             outage_started = time.monotonic()
             mark_self_test_stage("outage-slate")
             stop_primary_srt_source(f"outage {index}")
+            if (
+                stopped_feeder.poll() is None
+                or feeder is not None
+                or publisher is not None
+                or primary_helper is not None
+                or not port_is_free("udp", SOURCE_PRIMARY_FEED_PORT)
+            ):
+                raise TestFailure(f"primary source survived outage {index} shutdown")
             mark_self_test_stage("outage-normal")
             detached = wait_slate_with_live_srt(
                 f"outage {index} SLATE transition",
@@ -2738,6 +2973,13 @@ def main() -> int:
             print(f"  outage {index}/3: SLATE active; total SRT outage target {duration}s", flush=True)
             mark_self_test_stage("outage-hold")
             while time.monotonic() - outage_started < duration:
+                if (
+                    feeder is not None
+                    or publisher is not None
+                    or primary_helper is not None
+                    or not port_is_free("udp", SOURCE_PRIMARY_FEED_PORT)
+                ):
+                    raise TestFailure(f"primary source remained active during outage {index}")
                 sample = observer.checked_snapshot(f"outage {index}")
                 if sample and not all(
                     sample.get(name) for name in ("dut_alive", "sink_alive", "reader_alive")
@@ -2778,7 +3020,9 @@ def main() -> int:
             primary_helper = start_source_helper(
                 primary_config, f"primary-recovery-{index}", SOURCE_PRIMARY_METRICS_PORT
             )
-            publisher = start_local_publisher(SOURCE_PRIMARY_RTMP_PORT)
+            publisher = start_primary_publisher()
+            feeder = start_live_feeder()
+            recovered_feeder_pid = feeder.pid
             wait_helper_path(SOURCE_PRIMARY_METRICS_PORT)
             recovered = wait_healthy_live(
                 f"outage {index} LIVE recovery",
@@ -2786,6 +3030,13 @@ def main() -> int:
                 not_before=recovery_started,
             )
             to_live = float(recovered["t"]) - recovery_started
+            if (
+                feeder is None
+                or feeder is stopped_feeder
+                or feeder.poll() is not None
+                or feeder.pid != recovered_feeder_pid
+            ):
+                raise TestFailure(f"fresh live feeder failed after outage {index}")
             to_live_times.append(round(to_live, 3))
             print(f"  outage {index}/3: LIVE restored", flush=True)
             time.sleep(3 if not args.quick else 1)
@@ -2796,6 +3047,8 @@ def main() -> int:
 
         mark_self_test_stage("continuity")
         print("[5/8] Checking uninterrupted downstream identity and capture growth", flush=True)
+        if feeder is None or feeder.poll() is not None:
+            raise TestFailure("live feeder is unavailable before final transition")
         before_final = wait_healthy_live("healthy LIVE before final transition", 5)
         final_ingest_ids = list(before_final["ingest_ids"])
         if len(final_ingest_ids) != 1:
@@ -3035,8 +3288,8 @@ def main() -> int:
 
         mark_self_test_stage("secrets")
         print("[7/8] Scanning logs, files and process metadata for test-token residue", flush=True)
-        safe_stop(primary_helper)
-        primary_helper = None
+        if feeder is not None or publisher is not None or primary_helper is not None:
+            raise TestFailure("primary source remained active before the secret scan")
         safe_stop(dut, process_group=True)
         dut = None
         safe_stop(sink)
@@ -3081,6 +3334,18 @@ def main() -> int:
             capture_observer.finish()
             if capture_observer.is_alive():
                 cleanup_errors.append("capture-observer: ThreadDidNotStop")
+        if feeder is not None:
+            if not safe_stop(feeder, force=True):
+                cleanup_errors.append(f"process-{feeder.pid}: DidNotStop")
+            feeder = None
+        if primary_helper is not None:
+            if not safe_stop(primary_helper, force=True):
+                cleanup_errors.append(f"process-{primary_helper.pid}: DidNotStop")
+            primary_helper = None
+        if publisher is not None:
+            if not safe_stop(publisher, force=True):
+                cleanup_errors.append(f"process-{publisher.pid}: DidNotStop")
+            publisher = None
         for process in reversed(processes):
             if not safe_stop(
                 process,

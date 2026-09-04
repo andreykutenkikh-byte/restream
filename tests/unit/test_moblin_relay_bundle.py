@@ -168,48 +168,158 @@ def test_build_moblin_urls_is_silent_and_uses_node_config(
     assert capsys.readouterr() == ("", "")
 
 
-def test_self_test_source_helper_uses_explicit_peer_idle_timeout(tmp_path: Path) -> None:
+def test_self_test_primary_live_fixture_uses_bounded_loss_udp_bridge() -> None:
     loaded = load_self_test()
-    write_source_config = loaded["write_source_config"]
-    captured: dict[str, object] = {}
+    live = ROOT / "synthetic-live.mp4"
+    ffmpeg = str(loaded["FFMPEG"])
+    source_path = loaded["SOURCE_PATH"]
+    udp_port = loaded["SOURCE_PRIMARY_FEED_PORT"]
+    rtmp_port = loaded["SOURCE_PRIMARY_RTMP_PORT"]
 
-    def capture_config(_path: Path, value: dict[str, object], _mode: int = 0o600) -> None:
-        captured.update(value)
+    feeder = loaded["local_mpegts_feeder_command"](live, udp_port)
+    primary = loaded["local_primary_rtmp_publisher_command"](udp_port, rtmp_port)
+    auxiliary = loaded["local_rtmp_publisher_command"](live, rtmp_port)
 
-    globals_ = write_source_config.__globals__  # type: ignore[attr-defined]
-    with patch.dict(
-        globals_,
-        {
-            "atomic_json": capture_config,
-            "validate_secret_config": lambda *_args: None,
-        },
-    ):
-        write_source_config(
-            tmp_path,
-            "primary",
-            "synthetic_user",
-            "synthetic_password_1234",
-            "synthetic_passphrase_1234",
-            29350,
-            29351,
-        )
-
-    paths = captured["paths"]
-    assert isinstance(paths, dict)
-    source = paths[loaded["SOURCE_PATH"]]
-    assert isinstance(source, dict)
-    forward = source["forward"]
-    assert isinstance(forward, list)
-    assert forward == [
-        {
-            "dest": (
-                "srt://127.0.0.1:18890?streamid=publish:iphone-live:synthetic_user:"
-                "synthetic_password_1234&passphrase=synthetic_passphrase_1234"
-                "&pbkeylen=32&latency=2000&payloadsize=1316"
-                "&peeridletimeo=10000&conntimeo=3000"
-            )
-        }
+    assert udp_port == 31937
+    assert loaded["LIVE_FEED_FIFO_UNITS"] == 512
+    assert loaded["LIVE_FEED_SOCKET_BUFFER_BYTES"] == 65_536
+    assert feeder == [
+        ffmpeg,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "quiet",
+        "-re",
+        "-stream_loop",
+        "-1",
+        "-i",
+        str(live),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0",
+        "-c",
+        "copy",
+        "-mpegts_flags",
+        "+resend_headers",
+        "-pat_period",
+        "0.1",
+        "-flush_packets",
+        "1",
+        "-f",
+        "mpegts",
+        f"udp://127.0.0.1:{udp_port}?pkt_size=1316",
     ]
+    assert primary == [
+        ffmpeg,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "quiet",
+        "-fflags",
+        "+discardcorrupt",
+        "-i",
+        (f"udp://127.0.0.1:{udp_port}?fifo_size=512&overrun_nonfatal=1&buffer_size=65536"),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0",
+        "-c",
+        "copy",
+        "-f",
+        "flv",
+        f"rtmp://127.0.0.1:{rtmp_port}/{source_path}",
+    ]
+    assert "-re" not in primary
+    assert "-stream_loop" not in primary
+    assert "-re" in auxiliary
+    assert str(live) in auxiliary
+
+    maximum_buffered_bytes = (
+        loaded["LIVE_FEED_FIFO_UNITS"] * loaded["MPEGTS_PACKET_SIZE_BYTES"]
+        + 2 * loaded["LIVE_FEED_SOCKET_BUFFER_BYTES"]
+    )
+    assert maximum_buffered_bytes <= (
+        loaded["LIVE_FEED_MAX_BUFFERED_SRT_PACKETS"] * loaded["SRT_PAYLOAD_SIZE"]
+    )
+    assert loaded["LIVE_FEED_MAX_BUFFERED_SRT_PACKETS"] < 1024
+
+
+def test_self_test_primary_live_feeder_has_strict_lifecycle_guards() -> None:
+    source = SELF_TEST.read_text(encoding="utf-8")
+
+    port_guard = source.split("ports = (", 1)[1].split("busy =", 1)[0]
+    assert '("udp", SOURCE_PRIMARY_FEED_PORT)' in port_guard
+
+    primary_start = source.split("def start_primary_publisher", 1)[1].split(
+        "def start_live_feeder", 1
+    )[0]
+    assert "local_primary_rtmp_publisher_command(" in primary_start
+    assert "assert_clean_process_metadata(command)" in primary_start
+    assert "wait_udp_bound(process, SOURCE_PRIMARY_FEED_PORT)" in primary_start
+
+    feeder_start = source.split("def start_live_feeder", 1)[1].split(
+        "def stop_primary_srt_source", 1
+    )[0]
+    assert "local_mpegts_feeder_command(live, SOURCE_PRIMARY_FEED_PORT)" in feeder_start
+    assert "assert_clean_process_metadata(command)" in feeder_start
+    assert 'raise TestFailure("local live feeder exited during startup")' in feeder_start
+
+    initial_start = source.split('mark_self_test_stage("auth-source")', 1)[1].split(
+        'mark_self_test_stage("live-ingest")', 1
+    )[0]
+    helper = "primary_helper = start_source_helper("
+    publisher = "publisher = start_primary_publisher()"
+    feeder = "feeder = start_live_feeder()"
+    assert (
+        initial_start.index(helper) < initial_start.index(publisher) < initial_start.index(feeder)
+    )
+
+    same_session = source.split('mark_self_test_stage("stall-pre")', 1)[1].split(
+        'mark_self_test_stage("stall-ident")', 1
+    )[0]
+    assert "same_session_upstream_pids = (publisher.pid, primary_helper.pid, feeder.pid)" in (
+        same_session
+    )
+    assert "os.kill(publisher.pid, signal.SIGSTOP)" in same_session
+    assert "os.kill(publisher.pid, signal.SIGCONT)" in same_session
+    assert "os.kill(feeder.pid" not in same_session
+    assert "(publisher.pid, primary_helper.pid, feeder.pid) != same_session_upstream_pids" in (
+        same_session
+    )
+
+    outage_loop = source.split("for index, duration in enumerate(durations, start=1):", 1)[1].split(
+        'mark_self_test_stage("continuity")', 1
+    )[0]
+    stop = 'stop_primary_srt_source(f"outage {index}")'
+    helper = "primary_helper = start_source_helper("
+    publisher = "publisher = start_primary_publisher()"
+    feeder = "feeder = start_live_feeder()"
+    assert "stopped_feeder = feeder" in outage_loop
+    assert "primary source survived outage" in outage_loop
+    assert "primary source remained active during outage" in outage_loop
+    assert 'not port_is_free("udp", SOURCE_PRIMARY_FEED_PORT)' in outage_loop
+    assert outage_loop.index(stop) < outage_loop.index(helper)
+    assert outage_loop.index(helper) < outage_loop.index(publisher) < outage_loop.index(feeder)
+    assert "feeder is stopped_feeder" in outage_loop
+    assert "recovered_feeder_pid = feeder.pid" in outage_loop
+    assert "feeder.pid != recovered_feeder_pid" in outage_loop
+    assert "stopped_feeder.pid" not in outage_loop
+
+    continuity = source.split('mark_self_test_stage("continuity")', 1)[1].split(
+        'mark_self_test_stage("decode")', 1
+    )[0]
+    assert 'stop_primary_srt_source("final continuity transition")' in continuity
+    assert source.index('stop_primary_srt_source("final continuity transition")') < source.index(
+        'mark_self_test_stage("secrets")'
+    )
+
+    cleanup = source.split("finally:\n        cleanup_errors = []", 1)[1]
+    assert (
+        cleanup.index("safe_stop(feeder, force=True)")
+        < cleanup.index("safe_stop(primary_helper, force=True)")
+        < cleanup.index("safe_stop(publisher, force=True)")
+    )
 
 
 def test_bundle_contains_only_portable_sources_and_no_instance_manifest() -> None:
@@ -310,18 +420,8 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     assert 'sample.get("t", 0.0) >= fresh_after' in source
     assert "and predicate(sample)" in source
     assert "not_before=transition_started" in source
-    assert 'f"&payloadsize={SRT_PAYLOAD_SIZE}"' in source
-    assert (
-        'f"&peeridletimeo={SOURCE_HELPER_PEER_IDLE_TIMEOUT_MILLISECONDS}&conntimeo=3000"' in source
-    )
+    assert 'f"&payloadsize={SRT_PAYLOAD_SIZE}&conntimeo=3000"' in source
     assert 'f"&passphrase={passphrase}&pbkeylen=32&latency={SRT_LATENCY_MILLISECONDS}"' in source
-    helper_idle_seconds = loaded["SOURCE_HELPER_PEER_IDLE_TIMEOUT_MILLISECONDS"] / 1000
-    assert loaded["SOURCE_HELPER_PEER_IDLE_TIMEOUT_MILLISECONDS"] == 10_000
-    assert (
-        loaded["SRT_IDLE_LOWER_BOUND_SECONDS"]
-        < helper_idle_seconds
-        <= loaded["SRT_IDLE_UPPER_BOUND_SECONDS"]
-    )
     assert (
         loaded["LIVE_TO_SLATE_DEADLINE_SECONDS"] + loaded["SLATE_CAPTURE_GROWTH_TIMEOUT_SECONDS"]
         < loaded["SRT_IDLE_LOWER_BOUND_SECONDS"]
@@ -354,9 +454,6 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         "stall-live",
         "stall-core",
         "stall-source",
-        "stall-ingest",
-        "stall-norm",
-        "stall-sink",
         "stall-blind",
         "stall-ident",
         "stall-cont",
@@ -394,15 +491,28 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         "auth-x-sink",
         "auth-x-bytes",
     )
-    for stage in direct_stages:
+    dynamic_stall_stages = (
+        "stall-i-off",
+        "stall-i-id",
+        "stall-i-byte",
+        "stall-h-blind",
+        "stall-h-path",
+        "stall-h-error",
+        "stall-h-state",
+        "stall-norm",
+        "stall-sink",
+    )
+    for stage in loaded["SELF_TEST_STAGES"]:
         assert len(f"{stage}\n".encode("ascii")) <= 16
+    for stage in direct_stages:
         assert f'mark_self_test_stage("{stage}")' in source
     for stage in timestamp_diagnostic_stages:
-        assert len(f"{stage}\n".encode("ascii")) <= 16
         assert f'("{stage}",' in source
     for stage in dynamic_exclusivity_stages:
-        assert len(f"{stage}\n".encode("ascii")) <= 16
         assert f'return "{stage}"' in source
+    for stage in dynamic_stall_stages:
+        assert f'return "{stage}"' in source
+    assert "stall-ingest" in loaded["SELF_TEST_STAGES"]
     assert "mark_self_test_stage(\n                timestamp_failure_stage(" in source
 
     outage_block = source.split('mark_self_test_stage("outages")', 1)[1].split(
@@ -440,19 +550,26 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         "primary_helper = start_source_helper("
     )
     assert outage_block.index("primary_helper = start_source_helper(") < outage_block.index(
-        "publisher = start_local_publisher(SOURCE_PRIMARY_RTMP_PORT)"
+        "publisher = start_primary_publisher()"
+    )
+    assert outage_block.index("publisher = start_primary_publisher()") < outage_block.index(
+        "feeder = start_live_feeder()"
     )
 
     helper_block = source.split("def stop_primary_srt_source", 1)[1].split(
         "def reject_with_helper", 1
     )[0]
-    assert helper_block.index("safe_stop(primary_helper, force=True)") < helper_block.index(
-        "safe_stop(publisher, force=True)"
+    assert (
+        helper_block.index("safe_stop(feeder, force=True)")
+        < helper_block.index("safe_stop(primary_helper, force=True)")
+        < helper_block.index("safe_stop(publisher, force=True)")
     )
+    assert "feeder = None" in helper_block
     assert "primary_helper = None" in helper_block
     assert "publisher = None" in helper_block
-    assert "wait_ports_released((" in helper_block
+    assert "wait_ports_released(" in helper_block
     assert '("tcp", SOURCE_PRIMARY_RTMP_PORT)' in helper_block
+    assert '("udp", SOURCE_PRIMARY_FEED_PORT)' in helper_block
     assert '("tcp", SOURCE_PRIMARY_METRICS_PORT)' in helper_block
 
     continuity_block = source.split('mark_self_test_stage("continuity")', 1)[1].split(
@@ -685,6 +802,134 @@ def test_self_test_publisher_exclusivity_uses_server_proof_and_stable_ids() -> N
         assert outbound_bytes(31998) is None
 
 
+def test_self_test_same_session_failure_classifier_is_fixed_and_secret_free() -> None:
+    loaded = load_self_test()
+    parse_helper = loaded["parse_source_helper_status"]
+    read_helper = loaded["source_helper_status"]
+    classify = loaded["same_session_recovery_failure_stage"]
+    assert callable(parse_helper)
+    assert callable(read_helper)
+    assert callable(classify)
+
+    forwarding_metrics = (
+        'paths{name="source/live",state="ready"} 1\n'
+        'forward_dests{path="source/live",protocol="srt",state="forwarding"} 1\n'
+    )
+    healthy_helper = {
+        "metrics_ok": True,
+        "path_ready": True,
+        "forward_state": "forwarding",
+    }
+    assert parse_helper(forwarding_metrics) == healthy_helper
+    assert parse_helper(forwarding_metrics.replace('state="forwarding"', 'state="error"')) == {
+        **healthy_helper,
+        "forward_state": "error",
+    }
+    assert parse_helper(forwarding_metrics.replace('state="forwarding"', 'state="ready"')) == {
+        **healthy_helper,
+        "forward_state": "ready",
+    }
+
+    secret = "SRT_SECRET_MUST_NOT_ESCAPE"
+    untrusted_metrics = forwarding_metrics.replace('state="forwarding"', f'state="{secret}"')
+    sanitized = parse_helper(untrusted_metrics)
+    assert sanitized == {**healthy_helper, "forward_state": "unknown"}
+    assert secret not in repr(sanitized)
+    assert parse_helper(forwarding_metrics + forwarding_metrics) == {
+        **healthy_helper,
+        "forward_state": "unknown",
+    }
+
+    def unavailable_metrics(_port: int) -> str:
+        raise OSError("metrics unavailable")
+
+    with patch.dict(read_helper.__globals__, {"fetch_metrics": unavailable_metrics}):
+        assert read_helper(31998) == {
+            "metrics_ok": False,
+            "path_ready": False,
+            "forward_state": "unknown",
+        }
+
+    def sample(
+        timestamp: float,
+        ingest_bytes: int | None,
+        **updates: object,
+    ) -> dict[str, object]:
+        value: dict[str, object] = {
+            "t": timestamp,
+            "dut_metrics_ok": True,
+            "sink_metrics_ok": True,
+            "ingest_live": True,
+            "ingest_ids": ["primary-ingest"],
+            "ingest_bytes": ingest_bytes,
+            "normalized": True,
+            "normalized_ids": ["normalizer"],
+            "path_ready": True,
+            "forward": True,
+            "sink_ids": ["downstream"],
+        }
+        value.update(updates)
+        return value
+
+    def stage(
+        samples: list[dict[str, object]],
+        helper: dict[str, object] | None = None,
+    ) -> str:
+        return classify(
+            samples,
+            ["primary-ingest"],
+            100,
+            1.0,
+            "downstream",
+            healthy_helper if helper is None else helper,
+        )
+
+    assert stage([sample(1.2, 101)], {**healthy_helper, "metrics_ok": False}) == ("stall-h-blind")
+    assert stage([sample(1.2, 101)], {**healthy_helper, "path_ready": False}) == ("stall-h-path")
+    assert stage([sample(1.2, 101)], {**healthy_helper, "forward_state": "error"}) == (
+        "stall-h-error"
+    )
+    assert stage([sample(1.2, 101)], {**healthy_helper, "forward_state": "ready"}) == (
+        "stall-h-state"
+    )
+    identity_stage = stage([sample(1.2, 101, ingest_ids=[secret])])
+    assert identity_stage == "stall-i-id"
+    assert secret not in identity_stage
+    assert stage([sample(1.2, 101, ingest_live=False, ingest_ids=[])]) == "stall-i-off"
+    assert stage([sample(1.2, 100)]) == "stall-i-byte"
+    assert stage([sample(1.2, 101), sample(2.3, 101)]) == "stall-i-byte"
+    assert stage([sample(1.2, 101, normalized=False, normalized_ids=[])]) == "stall-norm"
+    assert stage([sample(1.2, 101, forward=False)]) == "stall-sink"
+    assert stage([sample(1.2, 101)]) == "stall-live"
+    assert stage([sample(1.2, None)]) == "stall-blind"
+    assert stage([sample(1.2, 101), sample(1.3, 100)]) == "stall-blind"
+    assert stage([sample(1.2, 101, ingest_ids=["replacement"]), sample(1.3, 102)]) == "stall-i-id"
+
+
+def test_self_test_takes_fresh_same_session_baseline_before_resume() -> None:
+    source = SELF_TEST.read_text(encoding="utf-8")
+    block = source.split('mark_self_test_stage("stall-capture")', 1)[1].split(
+        'mark_self_test_stage("stall-ident")', 1
+    )[0]
+
+    capture_proof = "wait_slate_capture_growth("
+    baseline = 'observer.checked_snapshot("same-session resume baseline")'
+    byte_baseline = 'resume_ingest_bytes = resume_baseline.get("ingest_bytes")'
+    idle_guard = "time.monotonic() - same_session_started >= SRT_IDLE_LOWER_BOUND_SECONDS"
+    recovery_start = "recovery_started = time.monotonic()"
+    resume = "os.kill(publisher.pid, signal.SIGCONT)"
+    assert (
+        block.index(capture_proof)
+        < block.index(baseline)
+        < block.index(byte_baseline)
+        < block.index(idle_guard)
+        < block.index(recovery_start)
+        < block.index(resume)
+    )
+    assert 'resume_baseline.get("ingest_ids") != initial_ingest_ids' in block
+    assert "resume_ingest_bytes" in block.split(resume, 1)[1]
+
+
 def test_self_test_refreshes_exclusivity_baseline_immediately_before_challenge() -> None:
     source = SELF_TEST.read_text(encoding="utf-8")
     block = source.split('mark_self_test_stage("auth-exclusive")', 1)[1].split(
@@ -886,7 +1131,8 @@ def test_self_test_distinguishes_unknown_metrics_from_media_outage() -> None:
 
     main_source = SELF_TEST.read_text().split("def main()", 1)[1]
     assert "observer.snapshot()" not in main_source
-    assert main_source.count("observer.checked_snapshot(") == 5
+    assert main_source.count("observer.checked_snapshot(") == 6
+    assert 'observer.checked_snapshot("same-session resume baseline")' in main_source
     assert '"same-session LIVE recovery diagnosis"' in main_source
     assert "capture_observer = CaptureObserver(capture)" in main_source
     assert main_source.count("capture_observer.checked_samples_since(") == 5
