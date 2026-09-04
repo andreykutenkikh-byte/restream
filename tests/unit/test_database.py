@@ -16,7 +16,7 @@ def test_migrations_are_idempotent(tmp_path: Path) -> None:
         relay_columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(relay_nodes)")
         }
-    assert version == SCHEMA_VERSION == 5
+    assert version == SCHEMA_VERSION == 7
     assert "input_bitrate_bps" in relay_columns
 
 
@@ -199,7 +199,7 @@ def test_schema_v3_database_is_upgraded_with_nullable_bitrate(tmp_path: Path) ->
                 """
             )
     assert "input_bitrate_bps" in columns
-    assert value == 5
+    assert value == SCHEMA_VERSION == 7
     assert "CONFIGURE_YOUTUBE_KEY" in command_schema
     assert after == before
     assert "idx_relay_commands_delivery" in delivery_index
