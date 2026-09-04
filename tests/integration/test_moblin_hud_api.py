@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+import pytest
 from fastapi.testclient import TestClient
 
 import app.moblin_hud_api as hud_api
@@ -124,6 +125,7 @@ def test_pairing_hud_quality_and_revoke_end_to_end(
     settings: Settings,
     admin_password: str,
     monkeypatch: Any,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     secure_settings = replace(
         settings,
@@ -131,6 +133,7 @@ def test_pairing_hud_quality_and_revoke_end_to_end(
         cookie_secure=True,
     )
     clock = {"now": 0.0}
+    caplog.set_level("DEBUG")
     monkeypatch.setattr(hud_api, "monotonic", lambda: clock["now"])
     app = create_app(secure_settings, mediamtx=FakeMediaMTX())  # type: ignore[arg-type]
 
@@ -272,6 +275,7 @@ def test_pairing_hud_quality_and_revoke_end_to_end(
         assert raw_pairing_token not in dump
         audit = app.state.database.list_audit_events(limit=100)
         assert raw_pairing_token not in json.dumps(audit)
+        assert raw_pairing_token not in caplog.text
         assert {item["event_type"] for item in audit} >= {
             "moblin_hud.pairing_created",
             "moblin_hud.device_paired",
