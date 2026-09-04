@@ -105,16 +105,37 @@ def assert_normalizer_contract(normalizer) -> None:
     assert output_gate.observe(("connection-a", 120)) is True
     assert output_gate.observe(("connection-b", 130)) is False
 
+    assert normalizer.MEDIA_IDLE_TIMEOUT_SECONDS == 0.10
+    assert normalizer.REQUIRED_IDLE_OBSERVATIONS == 2
+    assert normalizer.METRICS_BLIND_TIMEOUT_SECONDS == 0.75
+    assert (
+        normalizer.MEDIA_IDLE_TIMEOUT_SECONDS
+        + normalizer.MEDIA_POLL_INTERVAL_SECONDS
+        + normalizer.CHILD_STOP_GRACE_SECONDS
+        + (1024 / 48000)
+        < 0.25
+    )
+
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     idle_limit = normalizer.MEDIA_IDLE_TIMEOUT_SECONDS
-    assert watchdog.observe(True, ("connection-a", 120), 1.0 + idle_limit - 0.001) is True
-    assert watchdog.observe(True, ("connection-a", 120), 1.0 + idle_limit + 0.001) is False
+    assert watchdog.observe(True, ("connection-a", 120), 1.0 + idle_limit + 0.001) is True
+    assert watchdog.observe(True, ("connection-a", 120), 1.0 + idle_limit + 0.051) is False
+    watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
+    assert watchdog.observe(True, ("connection-a", 120), 1.2) is True
+    assert watchdog.observe(True, ("connection-a", 121), 1.25) is True
+    assert watchdog.observe(True, ("connection-a", 121), 1.30) is True
+    watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
+    assert watchdog.observe(True, ("connection-a", 120), 1.2) is True
+    assert watchdog.observe(False, None, 1.21) is True
+    assert watchdog.observe(True, ("connection-a", 120), 1.22) is False
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     blind_limit = normalizer.METRICS_BLIND_TIMEOUT_SECONDS
     assert watchdog.observe(False, None, 1.0 + blind_limit - 0.001) is True
     assert watchdog.observe(False, None, 1.0 + blind_limit + 0.001) is False
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     assert watchdog.observe(True, ("connection-b", 121), 1.01) is False
+    watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
+    assert watchdog.observe(True, ("connection-a", 119), 1.01) is False
     assert hasattr(normalizer, "make_parent_death_setup")
 
     environment = normalizer.sanitized_environment(18554, 11936, 19998)

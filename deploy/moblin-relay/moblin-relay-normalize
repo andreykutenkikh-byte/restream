@@ -32,15 +32,16 @@ OUTPUT_METRICS_PATH = "/metrics?type=rtmp_conns"
 METRICS_RESPONSE_LIMIT_BYTES = 65_536
 METRICS_REQUEST_TIMEOUT_SECONDS = 0.2
 MEDIA_POLL_INTERVAL_SECONDS = 0.05
-# The runner and small VPS targets can occasionally pause a userspace process for
-# well over 100 ms.  Keep the watchdog comfortably below the 4.5 s failover
-# budget without treating one scheduler/metrics hiccup as a dead media path.
-MEDIA_IDLE_TIMEOUT_SECONDS = 0.5
+# A verified output stall must hand back to the always-available slate before an
+# AAC frame gap reaches 250 ms.  Require two unchanged observations so one late
+# scheduler/metrics sample cannot tear down a healthy publisher.
+MEDIA_IDLE_TIMEOUT_SECONDS = 0.10
 METRICS_BLIND_TIMEOUT_SECONDS = 0.75
 OUTPUT_START_TIMEOUT_SECONDS = 6.0
 CHILD_STOP_GRACE_SECONDS = 0.025
 CHILD_RESTART_FLOOR_SECONDS = 0.1
 REQUIRED_GROWTH_OBSERVATIONS = 2
+REQUIRED_IDLE_OBSERVATIONS = 2
 PR_SET_PDEATHSIG = 1
 
 PATH_METRIC_PATTERN = re.compile(
@@ -231,6 +232,7 @@ class MediaWatchdog:
         self.connection_id, self.counter = sample
         self.last_growth = now
         self.last_valid_observation = now
+        self.unchanged_observations = 0
 
     def observe(
         self,
@@ -249,7 +251,13 @@ class MediaWatchdog:
         if counter > self.counter:
             self.counter = counter
             self.last_growth = now
-        return now - self.last_growth < MEDIA_IDLE_TIMEOUT_SECONDS
+            self.unchanged_observations = 0
+            return True
+        self.unchanged_observations += 1
+        return (
+            now - self.last_growth < MEDIA_IDLE_TIMEOUT_SECONDS
+            or self.unchanged_observations < REQUIRED_IDLE_OBSERVATIONS
+        )
 
 
 def sanitized_environment(rtsp_port: int, rtmp_port: int, metrics_port: int) -> dict[str, str]:

@@ -1518,14 +1518,35 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
     assert output_gate.observe(("normalizer-a", 120)) is True
     assert output_gate.observe(("normalizer-b", 130)) is False
 
+    assert loaded["MEDIA_IDLE_TIMEOUT_SECONDS"] == 0.10
+    assert loaded["REQUIRED_IDLE_OBSERVATIONS"] == 2
+    assert loaded["METRICS_BLIND_TIMEOUT_SECONDS"] == 0.75
+    assert (
+        loaded["MEDIA_IDLE_TIMEOUT_SECONDS"]
+        + loaded["MEDIA_POLL_INTERVAL_SECONDS"]
+        + loaded["CHILD_STOP_GRACE_SECONDS"]
+        + (1024 / 48000)
+        < self_test["AUDIO_PRESENTATION_GAP_LIMIT_SECONDS"]
+    )
+
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
-    assert watchdog.observe(True, ("normalizer-a", 120), 1.499) is True
-    assert watchdog.observe(True, ("normalizer-a", 120), 1.501) is False
+    assert watchdog.observe(True, ("normalizer-a", 120), 1.101) is True
+    assert watchdog.observe(True, ("normalizer-a", 120), 1.151) is False
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe(True, ("normalizer-a", 120), 1.2) is True
+    assert watchdog.observe(True, ("normalizer-a", 121), 1.25) is True
+    assert watchdog.observe(True, ("normalizer-a", 121), 1.30) is True
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe(True, ("normalizer-a", 120), 1.2) is True
+    assert watchdog.observe(False, None, 1.21) is True
+    assert watchdog.observe(True, ("normalizer-a", 120), 1.22) is False
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
     assert watchdog.observe(False, None, 1.749) is True
     assert watchdog.observe(False, None, 1.751) is False
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
     assert watchdog.observe(True, ("normalizer-b", 121), 1.01) is False
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe(True, ("normalizer-a", 119), 1.01) is False
     assert "make_parent_death_setup" in loaded
 
     assert sanitized_environment(18554, 11936, 19998) == {
