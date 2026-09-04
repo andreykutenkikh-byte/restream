@@ -343,6 +343,45 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_decode_format_failed": (
             "Формат выходного видео и аудио не прошёл самопроверку."
         ),
+        "relay_self_test_decode_format_video_codec_failed": (
+            "Видеокодек выходного потока не прошёл самопроверку."
+        ),
+        "relay_self_test_decode_format_video_profile_failed": (
+            "Профиль выходного видео не прошёл самопроверку."
+        ),
+        "relay_self_test_decode_format_video_level_failed": (
+            "Уровень выходного видео не прошёл самопроверку."
+        ),
+        "relay_self_test_decode_format_video_b_frames_failed": (
+            "B-кадры выходного видео не прошли самопроверку."
+        ),
+        "relay_self_test_decode_format_video_dimensions_failed": (
+            "Разрешение выходного видео не прошло самопроверку."
+        ),
+        "relay_self_test_decode_format_video_pixel_format_failed": (
+            "Формат пикселей выходного видео не прошёл самопроверку."
+        ),
+        "relay_self_test_decode_format_video_r_frame_rate_failed": (
+            "Заявленная частота кадров выходного видео не прошла самопроверку."
+        ),
+        "relay_self_test_decode_format_video_average_frame_rate_failed": (
+            "Средняя частота кадров выходного видео не прошла самопроверку."
+        ),
+        "relay_self_test_decode_format_audio_codec_failed": (
+            "Аудиокодек выходного потока не прошёл самопроверку."
+        ),
+        "relay_self_test_decode_format_audio_profile_failed": (
+            "Профиль выходного аудио не прошёл самопроверку."
+        ),
+        "relay_self_test_decode_format_audio_sample_rate_failed": (
+            "Частота дискретизации выходного аудио не прошла самопроверку."
+        ),
+        "relay_self_test_decode_format_audio_channels_failed": (
+            "Количество каналов выходного аудио не прошло самопроверку."
+        ),
+        "relay_self_test_decode_format_audio_layout_failed": (
+            "Схема каналов выходного аудио не прошла самопроверку."
+        ),
         "relay_self_test_decode_gop_failed": ("Интервал ключевых кадров не прошёл самопроверку."),
         "relay_self_test_decode_decoder_failed": (
             "Декодирование выходного потока завершилось с ошибкой."

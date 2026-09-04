@@ -932,7 +932,7 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         "normalized_signature = stream_signature(capture, include_gop=False)"
     )
     assert decode_block.index('mark_self_test_stage("format")') < decode_block.index(
-        'normalized_video.get("codec_name")'
+        "format_failure = output_format_failure_stage("
     )
     assert decode_block.index('mark_self_test_stage("gop")') < decode_block.index(
         'normalized_signature["video_gop"] = video_gop_signature(capture)'
@@ -1012,6 +1012,56 @@ def test_self_test_validates_actual_decoded_pts_on_native_flv_capture() -> None:
     )[0]
     assert 'decoded_frames["strict_presentation_timestamps_monotonic"]' in timestamp_gate
     assert 'decoded_frames["strict_best_effort_timestamps_monotonic"]' not in timestamp_gate
+
+
+def test_self_test_format_diagnostics_identify_each_safe_predicate() -> None:
+    loaded = load_self_test()
+    classify = loaded["output_format_failure_stage"]
+    assert callable(classify)
+
+    expected_video = {"profile": "High", "level": 40}
+    video = {
+        "codec_name": "h264",
+        "profile": "High",
+        "level": 40,
+        "has_b_frames": 2,
+        "width": loaded["PORTRAIT_WIDTH"],
+        "height": loaded["PORTRAIT_HEIGHT"],
+        "pix_fmt": "yuv420p",
+        "r_frame_rate": f"{loaded['VIDEO_FPS']}/1",
+        "avg_frame_rate": f"{loaded['VIDEO_FPS']}/1",
+    }
+    audio = {
+        "codec_name": "aac",
+        "profile": "LC",
+        "sample_rate": "48000",
+        "channels": 2,
+        "channel_layout": "stereo",
+    }
+    assert classify(video, audio, expected_video) is None
+
+    cases = (
+        ("video", "codec_name", "hevc", "fmt-v-codec"),
+        ("video", "profile", "Main", "fmt-v-prof"),
+        ("video", "level", 41, "fmt-v-level"),
+        ("video", "has_b_frames", 0, "fmt-v-bframes"),
+        ("video", "width", 720, "fmt-v-size"),
+        ("video", "height", 1280, "fmt-v-size"),
+        ("video", "pix_fmt", "yuv444p", "fmt-v-pixfmt"),
+        ("video", "r_frame_rate", "60/1", "fmt-v-rfps"),
+        ("video", "avg_frame_rate", "0/0", "fmt-v-afps"),
+        ("audio", "codec_name", "mp3", "fmt-a-codec"),
+        ("audio", "profile", "HE-AAC", "fmt-a-prof"),
+        ("audio", "sample_rate", "44100", "fmt-a-rate"),
+        ("audio", "channels", 1, "fmt-a-chans"),
+        ("audio", "channel_layout", "mono", "fmt-a-layout"),
+    )
+    for target, key, value, expected_stage in cases:
+        changed_video = dict(video)
+        changed_audio = dict(audio)
+        changed = changed_video if target == "video" else changed_audio
+        changed[key] = value
+        assert classify(changed_video, changed_audio, expected_video) == expected_stage
 
 
 def test_self_test_publisher_exclusivity_uses_server_proof_and_stable_ids() -> None:

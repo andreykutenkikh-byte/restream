@@ -132,6 +132,19 @@ SELF_TEST_STAGES = frozenset(
         "decode",
         "streams",
         "format",
+        "fmt-v-codec",
+        "fmt-v-prof",
+        "fmt-v-level",
+        "fmt-v-bframes",
+        "fmt-v-size",
+        "fmt-v-pixfmt",
+        "fmt-v-rfps",
+        "fmt-v-afps",
+        "fmt-a-codec",
+        "fmt-a-prof",
+        "fmt-a-rate",
+        "fmt-a-chans",
+        "fmt-a-layout",
         "gop",
         "decoder",
         "frames",
@@ -2255,6 +2268,38 @@ def analyze_decoded_audio_timestamps(capture: Path) -> dict:
     }
 
 
+def output_format_failure_stage(
+    normalized_video: dict,
+    normalized_audio: dict,
+    expected_video: dict,
+) -> str | None:
+    """Return a bounded, non-sensitive stage for an output format mismatch."""
+
+    checks = (
+        ("fmt-v-codec", normalized_video.get("codec_name") == "h264"),
+        ("fmt-v-prof", normalized_video.get("profile") == expected_video.get("profile")),
+        ("fmt-v-level", normalized_video.get("level") == expected_video.get("level")),
+        ("fmt-v-bframes", normalized_video.get("has_b_frames") == 2),
+        (
+            "fmt-v-size",
+            (normalized_video.get("width"), normalized_video.get("height"))
+            == (PORTRAIT_WIDTH, PORTRAIT_HEIGHT),
+        ),
+        ("fmt-v-pixfmt", normalized_video.get("pix_fmt") == "yuv420p"),
+        ("fmt-v-rfps", normalized_video.get("r_frame_rate") == f"{VIDEO_FPS}/1"),
+        ("fmt-v-afps", normalized_video.get("avg_frame_rate") == f"{VIDEO_FPS}/1"),
+        ("fmt-a-codec", normalized_audio.get("codec_name") == "aac"),
+        ("fmt-a-prof", normalized_audio.get("profile") == "LC"),
+        ("fmt-a-rate", normalized_audio.get("sample_rate") == "48000"),
+        ("fmt-a-chans", normalized_audio.get("channels") == 2),
+        ("fmt-a-layout", normalized_audio.get("channel_layout") == "stereo"),
+    )
+    for stage, passed in checks:
+        if not passed:
+            return stage
+    return None
+
+
 def timestamp_failure_stage(
     timestamps: dict,
     decoded_frames: dict,
@@ -3629,22 +3674,13 @@ def main() -> int:
             raise TestFailure("normalized capture does not contain exactly video and audio")
         normalized_video, normalized_audio = normalized_streams
         mark_self_test_stage("format")
-        if (
-            normalized_video.get("codec_name") != "h264"
-            or normalized_video.get("profile") != slate_sig["streams"][0].get("profile")
-            or normalized_video.get("level") != slate_sig["streams"][0].get("level")
-            or normalized_video.get("has_b_frames") != 2
-            or normalized_video.get("width") != PORTRAIT_WIDTH
-            or normalized_video.get("height") != PORTRAIT_HEIGHT
-            or normalized_video.get("pix_fmt") != "yuv420p"
-            or normalized_video.get("r_frame_rate") != f"{VIDEO_FPS}/1"
-            or normalized_video.get("avg_frame_rate") != f"{VIDEO_FPS}/1"
-            or normalized_audio.get("codec_name") != "aac"
-            or normalized_audio.get("profile") != "LC"
-            or normalized_audio.get("sample_rate") != "48000"
-            or normalized_audio.get("channels") != 2
-            or normalized_audio.get("channel_layout") != "stereo"
-        ):
+        format_failure = output_format_failure_stage(
+            normalized_video,
+            normalized_audio,
+            slate_sig["streams"][0],
+        )
+        if format_failure is not None:
+            mark_self_test_stage(format_failure)
             raise TestFailure("mono ingress was not normalized to the required stereo output")
         mark_self_test_stage("gop")
         normalized_signature["video_gop"] = video_gop_signature(capture)
