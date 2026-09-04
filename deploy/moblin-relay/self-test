@@ -2120,7 +2120,7 @@ def analyze_timestamps(capture: Path) -> dict:
 def analyze_decoded_video_frames(capture: Path) -> dict:
     command = [
         str(FFPROBE), "-v", "error", "-select_streams", "v:0", "-show_frames",
-        "-show_entries", "frame=width,height,pix_fmt,key_frame,pict_type,decode_error_flags,best_effort_timestamp_time",
+        "-show_entries", "frame=width,height,pix_fmt,key_frame,pict_type,decode_error_flags,pts_time,best_effort_timestamp_time",
         "-of", "compact=p=0:nk=0", str(capture),
     ]
     process = subprocess.Popen(
@@ -2131,6 +2131,7 @@ def analyze_decoded_video_frames(capture: Path) -> dict:
     pixel_formats: dict[str, int] = {}
     decode_error_flags: dict[str, int] = {}
     presentation_timestamps: list[float] = []
+    best_effort_timestamps: list[float] = []
     assert process.stdout is not None
     for line in process.stdout:
         fields = {}
@@ -2150,20 +2151,28 @@ def analyze_decoded_video_frames(capture: Path) -> dict:
         error_flags = fields.get("decode_error_flags")
         if error_flags not in (None, "0", "0x0"):
             decode_error_flags[error_flags] = decode_error_flags.get(error_flags, 0) + 1
-        timestamp = fields.get("best_effort_timestamp_time")
-        if timestamp not in (None, "N/A"):
-            match = re.match(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", timestamp)
-            if match:
-                try:
-                    presentation_timestamps.append(float(match.group(0)))
-                except ValueError:
-                    pass
+        for field, target in (
+            ("pts_time", presentation_timestamps),
+            ("best_effort_timestamp_time", best_effort_timestamps),
+        ):
+            timestamp = fields.get(field)
+            if timestamp not in (None, "N/A"):
+                match = re.match(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", timestamp)
+                if match:
+                    try:
+                        target.append(float(match.group(0)))
+                    except ValueError:
+                        pass
     stderr = process.communicate(timeout=60)[1]
     required_size = f"{PORTRAIT_WIDTH}x{PORTRAIT_HEIGHT}"
     presentation_steps = [
         right - left for left, right in zip(presentation_timestamps, presentation_timestamps[1:])
     ]
     negative_presentation_steps = [step for step in presentation_steps if step < 0]
+    best_effort_steps = [
+        right - left
+        for left, right in zip(best_effort_timestamps, best_effort_timestamps[1:])
+    ]
     return {
         "ffprobe_exit": process.returncode,
         "frame_count": frame_count,
@@ -2188,6 +2197,13 @@ def analyze_decoded_video_frames(capture: Path) -> dict:
         ),
         "minimum_presentation_timestamp_step_seconds": min(presentation_steps, default=None),
         "maximum_presentation_timestamp_gap_seconds": max(presentation_steps, default=None),
+        "best_effort_timestamp_count": len(best_effort_timestamps),
+        "strict_best_effort_timestamps_monotonic": not any(
+            step < -0.000001 for step in best_effort_steps
+        ),
+        "maximum_best_effort_timestamp_backward_step_seconds": max(
+            (-step for step in best_effort_steps if step < 0), default=0.0
+        ),
         "stderr_empty": not bool(stderr.strip()),
     }
 
@@ -2493,7 +2509,7 @@ def main() -> int:
     log_handles = []
     secret_configs: set[Path] = set()
     authorized_configs: set[Path] = set()
-    capture = work / "capture.ts"
+    capture = work / "capture.flv"
     result_save_failed = False
     handled_signals = (signal.SIGHUP, signal.SIGTERM)
     previous_signal_handlers = {item: signal.getsignal(item) for item in handled_signals}
@@ -2601,7 +2617,7 @@ def main() -> int:
         reader = subprocess.Popen([
             str(FFMPEG), "-nostdin", "-hide_banner", "-loglevel", "warning", "-y",
             "-i", f"rtmp://127.0.0.1:{SINK_RTMP_PORT}/live/sink",
-            "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-f", "mpegts", str(capture),
+            "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-f", "flv", str(capture),
         ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=reader_log)
         processes.append(reader)
         wait_file_growth(capture, 200_000)
@@ -3706,6 +3722,9 @@ def main() -> int:
         result["strict_timestamp_monotonicity"] = {
             "packet_dts": result["timestamps"]["strict_dts_monotonic"],
             "decoded_video_pts": decoded_frames["strict_presentation_timestamps_monotonic"],
+            "decoded_video_best_effort": decoded_frames[
+                "strict_best_effort_timestamps_monotonic"
+            ],
             "decoded_audio_pts": decoded_audio["strict_presentation_timestamps_monotonic"],
         }
         timestamp_ok = (
@@ -3855,7 +3874,7 @@ def main() -> int:
                 "capture timestamp validation failed",
             }:
                 try:
-                    debug_capture = TEST_ROOT / "debug-capture.ts"
+                    debug_capture = TEST_ROOT / "debug-capture.flv"
                     shutil.copyfile(capture, debug_capture)
                     os.chmod(debug_capture, 0o600)
                     result["debug_capture"] = str(debug_capture)

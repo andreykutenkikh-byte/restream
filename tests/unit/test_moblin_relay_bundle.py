@@ -952,6 +952,68 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     assert '"capture timestamp validation failed",' in source
 
 
+def test_self_test_validates_actual_decoded_pts_on_native_flv_capture() -> None:
+    source = SELF_TEST.read_text(encoding="utf-8")
+    loaded = load_self_test()
+    analyze = loaded["analyze_decoded_video_frames"]
+    assert callable(analyze)
+
+    assert 'capture = work / "capture.flv"' in source
+    assert 'debug_capture = TEST_ROOT / "debug-capture.flv"' in source
+    reader_block = source.split("reader = subprocess.Popen([", 1)[1].split(
+        "processes.append(reader)", 1
+    )[0]
+    assert '"-c", "copy", "-f", "flv", str(capture)' in reader_block
+    assert '"-f", "mpegts", str(capture)' not in reader_block
+
+    analyzer_block = source.split("def analyze_decoded_video_frames", 1)[1].split(
+        "def analyze_decoded_audio_timestamps", 1
+    )[0]
+    assert (
+        '"frame=width,height,pix_fmt,key_frame,pict_type,decode_error_flags,'
+        'pts_time,best_effort_timestamp_time"' in analyzer_block
+    )
+    assert '("pts_time", presentation_timestamps)' in analyzer_block
+    assert '("best_effort_timestamp_time", best_effort_timestamps)' in analyzer_block
+
+    width = loaded["PORTRAIT_WIDTH"]
+    height = loaded["PORTRAIT_HEIGHT"]
+    frame_prefix = (
+        f"width={width}|height={height}|pix_fmt=yuv420p|key_frame=0|"
+        "pict_type=P|decode_error_flags=0|"
+    )
+
+    class FakeProbe:
+        returncode = 0
+        stdout = iter(
+            [
+                frame_prefix + "pts_time=0.000000|best_effort_timestamp_time=0.000000\n",
+                frame_prefix + "pts_time=0.033333|best_effort_timestamp_time=0.033333\n",
+                frame_prefix + "pts_time=0.020000|best_effort_timestamp_time=0.066667\n",
+            ]
+        )
+
+        def communicate(self, *, timeout: int) -> tuple[str, str]:
+            assert timeout == 60
+            return "", ""
+
+    with patch("subprocess.Popen", return_value=FakeProbe()) as popen:
+        result = analyze(Path("native-downstream.flv"))
+
+    command = popen.call_args.args[0]
+    assert any("pts_time,best_effort_timestamp_time" in item for item in command)
+    assert result["presentation_timestamp_count"] == result["frame_count"] == 3
+    assert not result["strict_presentation_timestamps_monotonic"]
+    assert result["maximum_presentation_timestamp_backward_step_seconds"] == pytest.approx(0.013333)
+    assert result["strict_best_effort_timestamps_monotonic"]
+
+    timestamp_gate = source.split("timestamp_ok = (", 1)[1].split(
+        'result["timestamp_check"] = timestamp_ok', 1
+    )[0]
+    assert 'decoded_frames["strict_presentation_timestamps_monotonic"]' in timestamp_gate
+    assert 'decoded_frames["strict_best_effort_timestamps_monotonic"]' not in timestamp_gate
+
+
 def test_self_test_publisher_exclusivity_uses_server_proof_and_stable_ids() -> None:
     loaded = load_self_test()
     prove = loaded["publisher_exclusivity_proved"]
