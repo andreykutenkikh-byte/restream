@@ -1487,6 +1487,17 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
     assert "-copyinkf" not in argv
     assert "rtsp://127.0.0.1:18554/iphone-live" in argv
     assert "rtmp://127.0.0.1:11936/relay-output" in argv
+    assert argv.count("-flush_packets") == 1
+    assert argv.count("-tcp_nodelay") == 1
+    assert argv[-7:] == [
+        "-flush_packets",
+        "1",
+        "-tcp_nodelay",
+        "1",
+        "-f",
+        "flv",
+        "rtmp://127.0.0.1:11936/relay-output",
+    ]
 
     metric = 'paths_inbound_bytes{state="ready",name="iphone-live"} 100\n'
     assert parse_inbound_bytes(metric) == 100

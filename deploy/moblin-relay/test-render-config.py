@@ -63,6 +63,17 @@ def assert_normalizer_contract(normalizer) -> None:
     assert "-nostats" in argv
     assert "rtmps://" not in joined
     assert "passphrase=" not in joined
+    assert argv.count("-flush_packets") == 1
+    assert argv.count("-tcp_nodelay") == 1
+    assert argv[-7:] == [
+        "-flush_packets",
+        "1",
+        "-tcp_nodelay",
+        "1",
+        "-f",
+        "flv",
+        "rtmp://127.0.0.1:11936/relay-output",
+    ]
 
     metric = 'paths_inbound_bytes{state="ready",name="iphone-live"} 123456\n'
     assert normalizer.parse_inbound_bytes(metric) == 123456
