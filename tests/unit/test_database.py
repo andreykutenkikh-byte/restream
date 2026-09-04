@@ -22,7 +22,7 @@ def test_migrations_are_idempotent(tmp_path: Path) -> None:
         job_columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(node_install_jobs)")
         }
-    assert version == SCHEMA_VERSION == 6
+    assert version == SCHEMA_VERSION == 7
     assert "input_bitrate_bps" in relay_columns
     assert "node_kind" in node_columns
     assert "install_profile" in job_columns
@@ -259,7 +259,7 @@ def test_schema_v3_database_is_upgraded_with_nullable_bitrate(tmp_path: Path) ->
                 """
             )
     assert "input_bitrate_bps" in columns
-    assert value == 6
+    assert value == SCHEMA_VERSION == 7
     assert node["node_kind"] == "moblin_relay"
     assert "CONFIGURE_YOUTUBE_KEY" in command_schema
     assert after == before
