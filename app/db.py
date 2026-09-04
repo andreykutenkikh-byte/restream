@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def utc_now() -> str:
@@ -58,6 +58,46 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_sessions_expires_at
                     ON sessions(expires_at);
+                CREATE TABLE IF NOT EXISTS moblin_hud_devices (
+                    id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL CHECK (
+                        length(display_name) BETWEEN 1 AND 80
+                    ),
+                    session_digest TEXT UNIQUE CHECK (
+                        session_digest IS NULL OR length(session_digest) = 64
+                    ),
+                    scope TEXT NOT NULL DEFAULT 'stream_monitor' CHECK (
+                        scope = 'stream_monitor'
+                    ),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_seen_at TEXT,
+                    expires_at TEXT,
+                    revoked_at TEXT,
+                    CHECK (
+                        (session_digest IS NULL AND expires_at IS NULL) OR
+                        (session_digest IS NOT NULL AND expires_at IS NOT NULL)
+                    )
+                );
+                CREATE INDEX IF NOT EXISTS idx_moblin_hud_devices_active
+                    ON moblin_hud_devices(revoked_at, expires_at);
+                CREATE INDEX IF NOT EXISTS idx_moblin_hud_devices_last_seen
+                    ON moblin_hud_devices(last_seen_at DESC);
+                CREATE TABLE IF NOT EXISTS moblin_hud_pairings (
+                    id TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL UNIQUE
+                        REFERENCES moblin_hud_devices(id) ON DELETE CASCADE,
+                    token_digest TEXT NOT NULL UNIQUE CHECK (
+                        length(token_digest) = 64
+                    ),
+                    expires_at TEXT NOT NULL,
+                    used_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_moblin_hud_pairings_active
+                    ON moblin_hud_pairings(used_at, expires_at);
+                CREATE INDEX IF NOT EXISTS idx_moblin_hud_pairings_expiry
+                    ON moblin_hud_pairings(expires_at);
                 CREATE TABLE IF NOT EXISTS destinations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL,
@@ -470,6 +510,12 @@ class Database:
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
                 "VALUES (6, CURRENT_TIMESTAMP)"
+            )
+            connection.execute("COMMIT")
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                "VALUES (7, CURRENT_TIMESTAMP)"
             )
             connection.execute("COMMIT")
 
