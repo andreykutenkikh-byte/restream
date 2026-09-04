@@ -339,6 +339,24 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_timestamp_gaps_failed": (
             "Интервалы между временными метками потока не прошли самопроверку."
         ),
+        "relay_self_test_timestamp_gap_video_dts_failed": (
+            "Интервалы DTS видеопотока не прошли самопроверку."
+        ),
+        "relay_self_test_timestamp_gap_audio_dts_failed": (
+            "Интервалы DTS аудиопотока не прошли самопроверку."
+        ),
+        "relay_self_test_timestamp_gap_video_pts_failed": (
+            "Интервалы пакетных PTS видеопотока не прошли самопроверку."
+        ),
+        "relay_self_test_timestamp_gap_audio_pts_failed": (
+            "Интервалы пакетных PTS аудиопотока не прошли самопроверку."
+        ),
+        "relay_self_test_timestamp_gap_decoded_video_failed": (
+            "Интервалы декодированных кадров видео не прошли самопроверку."
+        ),
+        "relay_self_test_timestamp_gap_decoded_audio_failed": (
+            "Интервалы декодированных кадров аудио не прошли самопроверку."
+        ),
         "relay_self_test_timestamp_av_sync_failed": (
             "Длительность и окончание аудио и видео не прошли проверку синхронизации."
         ),

@@ -132,6 +132,12 @@ SELF_TEST_STAGES = frozenset(
         "ts-v-order",
         "ts-audio-pts",
         "ts-gaps",
+        "ts-g-vdts",
+        "ts-g-adts",
+        "ts-g-vpts",
+        "ts-g-apts",
+        "ts-g-vdec",
+        "ts-g-adec",
         "ts-av-sync",
         "secrets",
         "cleanup",
@@ -2160,19 +2166,29 @@ def timestamp_failure_stage(
         and timestamps["max_pts_dts_offset_seconds"].get(1, 999)
         <= AUDIO_PTS_DTS_OFFSET_LIMIT_SECONDS
     )
-    presentation_gaps_ok = (
+    packet_video_dts_gap_ok = (
         timestamps["max_dts_gap_seconds"].get(0, 999)
         <= VIDEO_PRESENTATION_GAP_LIMIT_SECONDS
-        and timestamps["max_dts_gap_seconds"].get(1, 999)
+    )
+    packet_audio_dts_gap_ok = (
+        timestamps["max_dts_gap_seconds"].get(1, 999)
         <= AUDIO_PRESENTATION_GAP_LIMIT_SECONDS
-        and timestamps["max_sorted_pts_gap_seconds"].get(0, 999)
+    )
+    packet_video_pts_gap_ok = (
+        timestamps["max_sorted_pts_gap_seconds"].get(0, 999)
         <= VIDEO_PRESENTATION_GAP_LIMIT_SECONDS
-        and timestamps["max_sorted_pts_gap_seconds"].get(1, 999)
+    )
+    packet_audio_pts_gap_ok = (
+        timestamps["max_sorted_pts_gap_seconds"].get(1, 999)
         <= AUDIO_PRESENTATION_GAP_LIMIT_SECONDS
-        and decoded_frames["maximum_presentation_timestamp_gap_seconds"] is not None
+    )
+    decoded_video_pts_gap_ok = (
+        decoded_frames["maximum_presentation_timestamp_gap_seconds"] is not None
         and decoded_frames["maximum_presentation_timestamp_gap_seconds"]
         <= VIDEO_PRESENTATION_GAP_LIMIT_SECONDS
-        and decoded_audio["maximum_presentation_timestamp_gap_seconds"] is not None
+    )
+    decoded_audio_pts_gap_ok = (
+        decoded_audio["maximum_presentation_timestamp_gap_seconds"] is not None
         and decoded_audio["maximum_presentation_timestamp_gap_seconds"]
         <= AUDIO_PRESENTATION_GAP_LIMIT_SECONDS
     )
@@ -2192,7 +2208,12 @@ def timestamp_failure_stage(
         ("ts-v-cluster", video_pts_clusters_ok),
         ("ts-v-order", video_pts_order_ok),
         ("ts-audio-pts", audio_pts_ok),
-        ("ts-gaps", presentation_gaps_ok),
+        ("ts-g-vdts", packet_video_dts_gap_ok),
+        ("ts-g-adts", packet_audio_dts_gap_ok),
+        ("ts-g-vpts", packet_video_pts_gap_ok),
+        ("ts-g-apts", packet_audio_pts_gap_ok),
+        ("ts-g-vdec", decoded_video_pts_gap_ok),
+        ("ts-g-adec", decoded_audio_pts_gap_ok),
         ("ts-av-sync", av_end_and_duration_ok),
     ):
         if not passed:

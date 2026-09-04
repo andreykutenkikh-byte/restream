@@ -749,7 +749,12 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         "ts-v-cluster",
         "ts-v-order",
         "ts-audio-pts",
-        "ts-gaps",
+        "ts-g-vdts",
+        "ts-g-adts",
+        "ts-g-vpts",
+        "ts-g-apts",
+        "ts-g-vdec",
+        "ts-g-adec",
         "ts-av-sync",
     )
     dynamic_exclusivity_stages = (
@@ -1547,7 +1552,22 @@ def test_normalizer_reexec_discards_hook_secrets() -> None:
             1,
             "ts-audio-pts",
         ),
-        ("timestamps", "max_dts_gap_seconds", {0: 3.0, 1: 0.02}, "ts-gaps"),
+        ("timestamps", "max_dts_gap_seconds", {0: 3.0, 1: 0.02}, "ts-g-vdts"),
+        ("timestamps", "max_dts_gap_seconds", {0: 0.04, 1: 0.3}, "ts-g-adts"),
+        ("timestamps", "max_sorted_pts_gap_seconds", {0: 3.0, 1: 0.02}, "ts-g-vpts"),
+        ("timestamps", "max_sorted_pts_gap_seconds", {0: 0.04, 1: 0.3}, "ts-g-apts"),
+        (
+            "decoded_frames",
+            "maximum_presentation_timestamp_gap_seconds",
+            3.0,
+            "ts-g-vdec",
+        ),
+        (
+            "decoded_audio",
+            "maximum_presentation_timestamp_gap_seconds",
+            0.3,
+            "ts-g-adec",
+        ),
         ("timestamps", "audio_video_end_difference_seconds", 0.3, "ts-av-sync"),
     ],
 )
