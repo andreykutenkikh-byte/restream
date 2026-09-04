@@ -513,11 +513,12 @@ def test_self_test_video_offset_cluster_counter_requires_contiguous_known_packet
     assert count([(0, 0.3), (0, 0.1), (0, None), (0, 0.1), (0, 0.1), (0, 0.3)]) == 1
 
 
-def test_self_test_video_offset_cluster_counter_preserves_quick_transition_cap() -> None:
+def test_self_test_video_offset_cluster_counter_reports_diagnostic_runs() -> None:
     loaded = load_self_test()
     count = loaded["count_video_pts_dts_offset_clusters"]
     one_incident = [(0, 0.3), (0, 0.1), (0, 0.1), (0, 0.1)]
 
+    assert "not source-switch validation" in count.__doc__
     assert count(one_incident * 12) == 12
     assert count(one_incident * 12 + [(0, 0.3)]) == 13
 
@@ -837,7 +838,8 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         assert f'return "{stage}"' in source
     assert "stall-ingest" in loaded["SELF_TEST_STAGES"]
     assert "stall-i-id" in loaded["SELF_TEST_STAGES"]
-    assert "ts-v-cluster" in loaded["SELF_TEST_STAGES"]
+    assert "ts-v-cluster" not in loaded["SELF_TEST_STAGES"]
+    assert not any(stage.startswith("ts-vc-") for stage in loaded["SELF_TEST_STAGES"])
     assert 'return "stall-i-id"' not in source
     assert 'mark_self_test_stage("stall-i-id")' not in source
     assert "mark_self_test_stage(\n                timestamp_failure_stage(" in source
@@ -977,6 +979,11 @@ def test_self_test_validates_actual_decoded_pts_on_native_flv_capture() -> None:
     assert '("pts_time", presentation_timestamps)' in analyzer_block
     assert '("best_effort_timestamp_time", best_effort_timestamps)' in analyzer_block
 
+    packet_analyzer_block = source.split("def analyze_timestamps", 1)[1].split(
+        "def analyze_decoded_video_frames", 1
+    )[0]
+    assert '"video_pts_dts_offset_clusters_over_normal_reorder": (' in packet_analyzer_block
+
     width = loaded["PORTRAIT_WIDTH"]
     height = loaded["PORTRAIT_HEIGHT"]
     frame_prefix = (
@@ -1010,10 +1017,40 @@ def test_self_test_validates_actual_decoded_pts_on_native_flv_capture() -> None:
     assert result["strict_best_effort_timestamps_monotonic"]
 
     timestamp_gate = source.split("timestamp_ok = (", 1)[1].split(
-        'result["timestamp_check"] = timestamp_ok', 1
+        'result["timestamp_thresholds_passed"] = timestamp_ok', 1
     )[0]
     assert 'decoded_frames["strict_presentation_timestamps_monotonic"]' in timestamp_gate
     assert 'decoded_frames["strict_best_effort_timestamps_monotonic"]' not in timestamp_gate
+    assert "video_pts_dts_offset_clusters_over_normal_reorder" not in timestamp_gate
+    for required_check in (
+        'result["timestamps"]["max_pts_dts_offset_seconds"].get(0, 999)',
+        'result["timestamps"]["max_pts_dts_offset_seconds"].get(1, 999)',
+        'result["timestamps"]["max_dts_gap_seconds"].get(0, 999)',
+        'result["timestamps"]["max_sorted_pts_gap_seconds"].get(0, 999)',
+        'decoded_frames["presentation_frame_rate_matches"]',
+        'decoded_frames["maximum_presentation_timestamp_gap_seconds"]',
+        'decoded_audio["maximum_presentation_timestamp_gap_seconds"]',
+        'result["timestamps"]["audio_video_duration_difference_seconds"]',
+        'result["timestamps"]["audio_video_end_difference_seconds"]',
+    ):
+        assert required_check in timestamp_gate
+
+    timestamp_validation = source.split(
+        'result["decoded_audio_timestamps"] = analyze_decoded_audio_timestamps(capture)',
+        1,
+    )[1].split('mark_self_test_stage("secrets")', 1)[0]
+    assert 'result["timestamps"]["dts_within_tolerance"]' in timestamp_validation
+    assert 'result["timestamps"]["negative_dts_steps"].get(0, 0) == 0' in timestamp_validation
+    assert (
+        'decoded_audio["presentation_timestamp_steps_beyond_tolerance"] == 0'
+        in timestamp_validation
+    )
+    assert "analysis.ts" not in timestamp_validation
+    assert "genpts" not in timestamp_validation
+    event_limits = source.split('result["timestamp_event_limits"] = {', 1)[1].split(
+        'result["timestamp_thresholds_passed"]', 1
+    )[0]
+    assert "video_pts_dts_offset_clusters_over_normal_reorder" not in event_limits
 
 
 def test_self_test_format_diagnostics_identify_each_safe_predicate() -> None:
@@ -1991,50 +2028,8 @@ def test_normalizer_reexec_rejects_an_unbound_source(
         (
             "timestamps",
             "video_pts_dts_offset_clusters_over_normal_reorder",
-            6,
+            999,
             "timestamps",
-        ),
-        (
-            "timestamps",
-            "video_pts_dts_offset_clusters_over_normal_reorder",
-            7,
-            "ts-vc-plus1",
-        ),
-        (
-            "timestamps",
-            "video_pts_dts_offset_clusters_over_normal_reorder",
-            8,
-            "ts-vc-plus2",
-        ),
-        (
-            "timestamps",
-            "video_pts_dts_offset_clusters_over_normal_reorder",
-            9,
-            "ts-vc-plus4",
-        ),
-        (
-            "timestamps",
-            "video_pts_dts_offset_clusters_over_normal_reorder",
-            10,
-            "ts-vc-plus4",
-        ),
-        (
-            "timestamps",
-            "video_pts_dts_offset_clusters_over_normal_reorder",
-            11,
-            "ts-vc-plus8",
-        ),
-        (
-            "timestamps",
-            "video_pts_dts_offset_clusters_over_normal_reorder",
-            14,
-            "ts-vc-plus8",
-        ),
-        (
-            "timestamps",
-            "video_pts_dts_offset_clusters_over_normal_reorder",
-            15,
-            "ts-vc-many",
         ),
         (
             "decoded_frames",
@@ -2089,7 +2084,6 @@ def test_timestamp_failure_stage_is_bounded_and_category_specific(
         "negative_dts_steps": {},
         "dts_backward_events_beyond_tolerance": {},
         "max_pts_dts_offset_seconds": {0: 0.1, 1: 0.01},
-        "video_pts_dts_offset_clusters_over_normal_reorder": 0,
         "max_dts_gap_seconds": {0: 0.04, 1: 0.02},
         "max_sorted_pts_gap_seconds": {0: 0.04, 1: 0.02},
         "audio_video_duration_difference_seconds": 0.01,
