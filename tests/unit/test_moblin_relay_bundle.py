@@ -1469,10 +1469,10 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
     loaded = load_normalizer()
     self_test = load_self_test()
     build_argv = loaded["build_ffmpeg_argv"]
-    parse_inbound_bytes = loaded["parse_inbound_bytes"]
+    parse_ingest_sample = loaded["parse_ingest_sample"]
     parse_output_sample = loaded["parse_output_sample"]
     growth_gate = loaded["GrowthGate"]
-    output_growth_gate = loaded["OutputGrowthGate"]
+    connection_growth_gate = loaded["ConnectionGrowthGate"]
     watchdog_type = loaded["MediaWatchdog"]
     sanitized_environment = loaded["sanitized_environment"]
 
@@ -1497,10 +1497,34 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
         "rtmp://127.0.0.1:11936/relay-output",
     ]
 
-    metric = 'paths_inbound_bytes{state="ready",name="iphone-live"} 100\n'
-    assert parse_inbound_bytes(metric) == 100
-    assert parse_inbound_bytes(metric + metric) is None
-    assert parse_inbound_bytes('paths_inbound_bytes{name="other",state="ready"} 100\n') is None
+    source_id = "11111111-2222-3333-4444-555555555555"
+    assert loaded["build_ingest_metrics_path"](source_id) == (
+        "/metrics?type=srt_conns&srt_conn=" + source_id
+    )
+    with pytest.raises(ValueError):
+        loaded["build_ingest_metrics_path"]("invalid&path=other")
+    metric = (
+        'srt_conns_bytes_received_unique{remoteAddr="198.51.100.10:54321",'
+        f'id="{source_id}",state="publish",path="iphone-live"}} 100\n'
+    )
+    assert parse_ingest_sample(metric, source_id) == (source_id, 100)
+    assert parse_ingest_sample(metric + metric, source_id) is None
+    rejected_candidate = (
+        'srt_conns_bytes_received_unique{remoteAddr="198.51.100.20:54322",'
+        'id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",state="idle",path=""} 999999\n'
+    )
+    assert parse_ingest_sample(metric + rejected_candidate, source_id) == (source_id, 100)
+    assert (
+        parse_ingest_sample(metric.replace('path="iphone-live"', 'path="other"'), source_id) is None
+    )
+    assert parse_ingest_sample(metric.replace('state="publish"', 'state="idle"'), source_id) is None
+    assert (
+        parse_ingest_sample(
+            metric.replace("srt_conns_bytes_received_unique", "srt_conns_bytes_received"),
+            source_id,
+        )
+        is None
+    )
     output_metric = (
         'rtmp_conns_inbound_bytes{remoteAddr="127.0.0.1:54321",id="normalizer-a",'
         'state="publish",path="relay-output"} 500\n'
@@ -1521,7 +1545,7 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
     assert gate.observe(120) is False
     assert gate.observe(120) is False
 
-    output_gate = output_growth_gate()
+    output_gate = connection_growth_gate()
     assert output_gate.observe(("normalizer-a", 100)) is False
     assert output_gate.observe(("normalizer-a", 110)) is False
     assert output_gate.observe(("normalizer-a", 120)) is True
@@ -1530,6 +1554,7 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
     assert loaded["VERIFIED_STALL_TIMEOUT_SECONDS"] == 0.075
     assert loaded["OUTPUT_IDLE_FALLBACK_SECONDS"] == 0.5
     assert loaded["REQUIRED_IDLE_OBSERVATIONS"] == 2
+    assert loaded["REQUIRED_VERIFIED_STALL_OBSERVATIONS"] == 3
     assert loaded["METRICS_BLIND_TIMEOUT_SECONDS"] == 0.75
     assert (
         loaded["VERIFIED_STALL_TIMEOUT_SECONDS"]
@@ -1548,11 +1573,19 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
 
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
     assert watchdog.observe_output(True, ("normalizer-a", 120), 1.05) == (True, True)
-    assert watchdog.observe_ingest(True, 500, 1.05, 1.051) is True
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
     assert watchdog.observe_output(True, ("normalizer-a", 120), 1.10) == (True, True)
-    assert watchdog.observe_ingest(True, 500, 1.10, 1.101) is True
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.10, 1.101) is True
     assert watchdog.observe_output(True, ("normalizer-a", 120), 1.15) == (True, True)
-    assert watchdog.observe_ingest(True, 500, 1.15, 1.152) is False
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.15, 1.152) is False
+
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe_output(True, ("normalizer-a", 120), 1.05) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
+    assert watchdog.observe_output(True, ("normalizer-a", 120), 1.14) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.14, 1.141) is True
+    assert watchdog.observe_output(True, ("normalizer-a", 120), 1.19) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.19, 1.191) is False
 
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
     for observed_at, ingest_counter in ((1.05, 500), (1.10, 501), (1.15, 502)):
@@ -1560,7 +1593,7 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
         assert (
             watchdog.observe_ingest(
                 True,
-                ingest_counter,
+                ("ingest-a", ingest_counter),
                 observed_at,
                 observed_at + 0.001,
             )
@@ -1569,11 +1602,11 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
     assert watchdog.observe_output(True, ("normalizer-a", 121), 1.16) == (True, False)
 
     assert watchdog.observe_output(True, ("normalizer-a", 121), 1.21) == (True, True)
-    assert watchdog.observe_ingest(True, 502, 1.21, 1.211) is True
+    assert watchdog.observe_ingest(True, ("ingest-a", 502), 1.21, 1.211) is True
     assert watchdog.observe_output(True, ("normalizer-a", 121), 1.26) == (True, True)
-    assert watchdog.observe_ingest(True, 502, 1.26, 1.261) is True
+    assert watchdog.observe_ingest(True, ("ingest-a", 502), 1.26, 1.261) is True
     assert watchdog.observe_output(True, ("normalizer-a", 121), 1.31) == (True, True)
-    assert watchdog.observe_ingest(True, 502, 1.31, 1.311) is False
+    assert watchdog.observe_ingest(True, ("ingest-a", 502), 1.31, 1.311) is False
 
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
     for observed_at, ingest_counter in (
@@ -1591,7 +1624,7 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
         assert (
             watchdog.observe_ingest(
                 True,
-                ingest_counter,
+                ("ingest-a", ingest_counter),
                 observed_at,
                 observed_at + 0.001,
             )
@@ -1601,19 +1634,21 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
 
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
     assert watchdog.observe_output(True, ("normalizer-a", 120), 1.05) == (True, True)
-    assert watchdog.observe_ingest(True, 500, 1.05, 1.051) is True
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
     assert watchdog.observe_output(True, ("normalizer-a", 120), 1.10) == (True, True)
-    assert watchdog.observe_ingest(True, 500, 1.10, 1.30) is True
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.10, 1.30) is True
     assert watchdog.observe_output(True, ("normalizer-a", 120), 1.31) == (True, True)
-    assert watchdog.observe_ingest(True, 500, 1.31, 1.311) is False
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.31, 1.311) is False
 
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
     assert watchdog.observe_output(True, ("normalizer-a", 120), 1.05) == (True, True)
-    assert watchdog.observe_ingest(True, 500, 1.05, 1.051) is True
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
     assert watchdog.observe_output(True, ("normalizer-a", 120), 1.10) == (True, True)
     assert watchdog.observe_ingest(False, None, 1.10, 1.11) is True
     assert watchdog.observe_output(True, ("normalizer-a", 120), 1.15) == (True, True)
-    assert watchdog.observe_ingest(True, 500, 1.15, 1.151) is False
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.15, 1.151) is True
+    assert watchdog.observe_output(True, ("normalizer-a", 120), 1.20) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.20, 1.201) is False
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
     assert watchdog.observe_output(True, ("normalizer-a", 120), 1.05) == (True, True)
     assert watchdog.observe_ingest(True, None, 1.05, 1.051) is False
@@ -1629,11 +1664,16 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
     assert watchdog.observe_output(True, ("normalizer-a", 119), 1.01) == (False, False)
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
     assert watchdog.observe_output(True, ("normalizer-a", 120), 1.05) == (True, True)
-    assert watchdog.observe_ingest(True, 500, 1.05, 1.051) is True
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
     assert watchdog.observe_output(True, ("normalizer-a", 120), 1.10) == (True, True)
-    assert watchdog.observe_ingest(True, 499, 1.10, 1.101) is False
+    assert watchdog.observe_ingest(True, ("ingest-a", 499), 1.10, 1.101) is False
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
-    assert watchdog.observe_ingest(True, 500, 1.20, 1.19) is False
+    assert watchdog.observe_output(True, ("normalizer-a", 120), 1.05) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
+    assert watchdog.observe_output(True, ("normalizer-a", 120), 1.10) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-b", 501), 1.10, 1.101) is False
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.20, 1.19) is False
     assert "make_parent_death_setup" in loaded
 
     supervisor_source = (
@@ -1654,13 +1694,14 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
     assert "if not probe_ingest:\n                ingest_reader.close()" in supervisor_source
     assert "if not keep_child:\n                ingest_reader.close()" in supervisor_source
 
-    assert sanitized_environment(18554, 11936, 19998) == {
+    assert sanitized_environment(18554, 11936, 19998, source_id) == {
         "LANG": "C",
         "LC_ALL": "C",
         "PATH": "/usr/bin:/bin",
         "MOBLIN_RELAY_INTERNAL_RTSP_PORT": "18554",
         "MOBLIN_RELAY_INTERNAL_RTMP_PORT": "11936",
         "MOBLIN_RELAY_INTERNAL_METRICS_PORT": "19998",
+        "MOBLIN_RELAY_INTERNAL_SRT_CONNECTION_ID": source_id,
     }
 
 
@@ -1669,6 +1710,7 @@ def test_normalizer_reexec_discards_hook_secrets() -> None:
     main = loaded["main"]
     captured: dict[str, object] = {}
     marker = "must-not-survive-reexec"
+    source_id = "11111111-2222-3333-4444-555555555555"
 
     def fake_execve(path: str, argv: list[str], environment: dict[str, str]) -> None:
         captured.update(path=path, argv=argv, environment=environment)
@@ -1677,6 +1719,8 @@ def test_normalizer_reexec_discards_hook_secrets() -> None:
     hook_environment = {
         "MTX_PATH": "iphone-live",
         "MTX_QUERY": f"publisher={marker}",
+        "MTX_SOURCE_TYPE": "srtConn",
+        "MTX_SOURCE_ID": source_id,
         "RTSP_PORT": "18554",
         "MOBLIN_RELAY_OUTPUT_RTMP_PORT": "11936",
         "MOBLIN_RELAY_METRICS_PORT": "19998",
@@ -1697,7 +1741,36 @@ def test_normalizer_reexec_discards_hook_secrets() -> None:
         "MOBLIN_RELAY_INTERNAL_RTSP_PORT": "18554",
         "MOBLIN_RELAY_INTERNAL_RTMP_PORT": "11936",
         "MOBLIN_RELAY_INTERNAL_METRICS_PORT": "19998",
+        "MOBLIN_RELAY_INTERNAL_SRT_CONNECTION_ID": source_id,
     }
+
+
+@pytest.mark.parametrize(
+    ("source_type", "source_id"),
+    [
+        ("rtmpConn", "11111111-2222-3333-4444-555555555555"),
+        ("srtConn", "not-a-source-id"),
+        ("srtConn", ""),
+    ],
+)
+def test_normalizer_reexec_rejects_an_unbound_source(
+    source_type: str,
+    source_id: str,
+) -> None:
+    loaded = load_normalizer()
+    hook_environment = {
+        "MTX_PATH": "iphone-live",
+        "MTX_SOURCE_TYPE": source_type,
+        "MTX_SOURCE_ID": source_id,
+        "RTSP_PORT": "18554",
+        "MOBLIN_RELAY_OUTPUT_RTMP_PORT": "11936",
+        "MOBLIN_RELAY_METRICS_PORT": "19998",
+    }
+    with (
+        patch.dict(os.environ, hook_environment, clear=True),
+        patch.object(sys, "argv", [str(NORMALIZER)]),
+    ):
+        assert loaded["main"]() == 2
 
 
 @pytest.mark.parametrize(

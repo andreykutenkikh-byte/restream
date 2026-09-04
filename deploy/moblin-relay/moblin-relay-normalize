@@ -26,8 +26,9 @@ TEST_METRICS_PORT_ENV = "MOBLIN_RELAY_METRICS_PORT"
 SAFE_RTSP_PORT_ENV = "MOBLIN_RELAY_INTERNAL_RTSP_PORT"
 SAFE_RTMP_PORT_ENV = "MOBLIN_RELAY_INTERNAL_RTMP_PORT"
 SAFE_METRICS_PORT_ENV = "MOBLIN_RELAY_INTERNAL_METRICS_PORT"
+SAFE_SOURCE_ID_ENV = "MOBLIN_RELAY_INTERNAL_SRT_CONNECTION_ID"
 SUPERVISOR_ARGUMENT = "--sanitized-supervisor"
-INGEST_METRICS_PATH = f"/metrics?type=paths&path={INGEST_PATH}"
+INGEST_METRICS_PATH_PREFIX = "/metrics?type=srt_conns&srt_conn="
 OUTPUT_METRICS_PATH = "/metrics?type=rtmp_conns"
 METRICS_RESPONSE_LIMIT_BYTES = 65_536
 METRICS_REQUEST_TIMEOUT_SECONDS = 0.2
@@ -43,16 +44,18 @@ CHILD_STOP_GRACE_SECONDS = 0.025
 CHILD_RESTART_FLOOR_SECONDS = 0.1
 REQUIRED_GROWTH_OBSERVATIONS = 2
 REQUIRED_IDLE_OBSERVATIONS = 2
+REQUIRED_VERIFIED_STALL_OBSERVATIONS = 3
 PR_SET_PDEATHSIG = 1
 
-PATH_METRIC_PATTERN = re.compile(
-    r'^paths_inbound_bytes\{(?P<labels>[^{}]*)\}\s+(?P<value>[0-9]+)$'
+SRT_METRIC_PATTERN = re.compile(
+    r'^srt_conns_bytes_received_unique\{(?P<labels>[^{}]*)\}\s+(?P<value>[0-9]+)$'
 )
 RTMP_METRIC_PATTERN = re.compile(
     r'^rtmp_conns_inbound_bytes\{(?P<labels>[^{}]*)\}\s+(?P<value>[0-9]+)$'
 )
 LABEL_PATTERN = re.compile(r'(\w+)="([^"\\]*)"(?:,|$)')
 LOOPBACK_REMOTE_PATTERN = re.compile(r"127\.0\.0\.1:[0-9]{1,5}")
+SOURCE_ID_PATTERN = re.compile(r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}")
 CounterSample = tuple[str, int]
 T = TypeVar("T")
 
@@ -64,6 +67,16 @@ def validated_port(raw_value: str) -> int:
     if not 1 <= value <= 65535:
         raise ValueError("invalid loopback media port")
     return value
+
+
+def validated_source_id(raw_value: str) -> str:
+    if SOURCE_ID_PATTERN.fullmatch(raw_value) is None:
+        raise ValueError("invalid SRT source identity")
+    return raw_value
+
+
+def build_ingest_metrics_path(source_id: str) -> str:
+    return INGEST_METRICS_PATH_PREFIX + validated_source_id(source_id)
 
 
 def build_ffmpeg_argv(rtsp_port: int, rtmp_port: int) -> list[str]:
@@ -108,19 +121,28 @@ def build_ffmpeg_argv(rtsp_port: int, rtmp_port: int) -> list[str]:
     ]
 
 
-def parse_inbound_bytes(payload: str) -> int | None:
-    """Return the one exact ready-path byte counter from a filtered response."""
-    matches: list[int] = []
+def parse_ingest_sample(
+    payload: str,
+    expected_connection_id: str,
+) -> CounterSample | None:
+    """Return identity and unique transport bytes for the active SRT publisher."""
+    validated_source_id(expected_connection_id)
+    matches: list[CounterSample] = []
     for line in payload.splitlines():
-        match = PATH_METRIC_PATTERN.fullmatch(line)
+        match = SRT_METRIC_PATTERN.fullmatch(line)
         if match is None:
             continue
         labels = {
             item.group(1): item.group(2)
             for item in LABEL_PATTERN.finditer(match.group("labels"))
         }
-        if labels == {"name": INGEST_PATH, "state": "ready"}:
-            matches.append(int(match.group("value")))
+        connection_id = labels.get("id", "")
+        if (
+            connection_id == expected_connection_id
+            and labels.get("path") == INGEST_PATH
+            and labels.get("state") == "publish"
+        ):
+            matches.append((connection_id, int(match.group("value"))))
     return matches[0] if len(matches) == 1 else None
 
 
@@ -209,8 +231,8 @@ class GrowthGate:
         return self.growth_observations >= REQUIRED_GROWTH_OBSERVATIONS
 
 
-class OutputGrowthGate:
-    """Arm output monitoring only after one RTMP publisher repeatedly grows."""
+class ConnectionGrowthGate:
+    """Require repeated counter growth from one stable connection identity."""
 
     def __init__(self) -> None:
         self.connection_id = ""
@@ -236,6 +258,7 @@ class MediaWatchdog:
         self.output_last_growth = now
         self.last_valid_observation = now
         self.output_unchanged_observations = 0
+        self.ingest_connection_id = ""
         self.ingest_counter: int | None = None
         self.joint_idle_since: float | None = None
         self.joint_unchanged_observations = 0
@@ -261,6 +284,7 @@ class MediaWatchdog:
             self.counter = counter
             self.output_last_growth = now
             self.output_unchanged_observations = 0
+            self.ingest_connection_id = ""
             self.ingest_counter = None
             self.joint_idle_since = None
             self.joint_unchanged_observations = 0
@@ -276,7 +300,7 @@ class MediaWatchdog:
     def observe_ingest(
         self,
         successful: bool,
-        counter: int | None,
+        sample: CounterSample | None,
         started_at: float,
         finished_at: float,
     ) -> bool:
@@ -284,13 +308,17 @@ class MediaWatchdog:
             return False
         if not successful:
             return True
-        if counter is None:
+        if sample is None:
             return False
+        connection_id, counter = sample
         if self.ingest_counter is None:
+            self.ingest_connection_id = connection_id
             self.ingest_counter = counter
             self.joint_idle_since = finished_at
             self.joint_unchanged_observations = 1
             return True
+        if connection_id != self.ingest_connection_id:
+            return False
         if counter < self.ingest_counter:
             return False
         if counter > self.ingest_counter:
@@ -303,11 +331,17 @@ class MediaWatchdog:
         self.joint_unchanged_observations += 1
         return (
             started_at - self.joint_idle_since < VERIFIED_STALL_TIMEOUT_SECONDS
-            or self.joint_unchanged_observations < REQUIRED_IDLE_OBSERVATIONS
+            or self.joint_unchanged_observations
+            < REQUIRED_VERIFIED_STALL_OBSERVATIONS
         )
 
 
-def sanitized_environment(rtsp_port: int, rtmp_port: int, metrics_port: int) -> dict[str, str]:
+def sanitized_environment(
+    rtsp_port: int,
+    rtmp_port: int,
+    metrics_port: int,
+    source_id: str,
+) -> dict[str, str]:
     return {
         "LANG": "C",
         "LC_ALL": "C",
@@ -315,6 +349,7 @@ def sanitized_environment(rtsp_port: int, rtmp_port: int, metrics_port: int) -> 
         SAFE_RTSP_PORT_ENV: str(rtsp_port),
         SAFE_RTMP_PORT_ENV: str(rtmp_port),
         SAFE_METRICS_PORT_ENV: str(metrics_port),
+        SAFE_SOURCE_ID_ENV: validated_source_id(source_id),
     }
 
 
@@ -359,7 +394,12 @@ def stop_child(child: subprocess.Popen, *, force: bool = False) -> None:
         pass
 
 
-def run_supervisor(rtsp_port: int, rtmp_port: int, metrics_port: int) -> int:
+def run_supervisor(
+    rtsp_port: int,
+    rtmp_port: int,
+    metrics_port: int,
+    source_id: str,
+) -> int:
     stop_requested = False
 
     def request_stop(_signum: int, _frame) -> None:
@@ -373,16 +413,16 @@ def run_supervisor(rtsp_port: int, rtmp_port: int, metrics_port: int) -> int:
     argv = build_ffmpeg_argv(rtsp_port, rtmp_port)
     ingest_reader = MetricsReader(
         metrics_port,
-        INGEST_METRICS_PATH,
-        parse_inbound_bytes,
+        build_ingest_metrics_path(source_id),
+        lambda payload: parse_ingest_sample(payload, source_id),
     )
     output_reader = MetricsReader(
         metrics_port,
         OUTPUT_METRICS_PATH,
         parse_output_sample,
     )
-    gate = GrowthGate()
-    output_gate = OutputGrowthGate()
+    ingest_gate = ConnectionGrowthGate()
+    output_gate = ConnectionGrowthGate()
     child: subprocess.Popen | None = None
     watchdog: MediaWatchdog | None = None
     child_started = 0.0
@@ -394,16 +434,16 @@ def run_supervisor(rtsp_port: int, rtmp_port: int, metrics_port: int) -> int:
             if child is not None and child.poll() is not None:
                 child = None
                 watchdog = None
-                gate.reset()
+                ingest_gate.reset()
                 restart_not_before = now + CHILD_RESTART_FLOOR_SECONDS
 
             if child is None:
-                successful, counter = ingest_reader.sample()
+                successful, ingest_sample = ingest_reader.sample()
                 now = time.monotonic()
                 if successful:
-                    if counter is None:
-                        gate.reset()
-                    elif gate.observe(counter) and now >= restart_not_before:
+                    if ingest_sample is None:
+                        ingest_gate.reset()
+                    elif ingest_gate.observe(ingest_sample) and now >= restart_not_before:
                         supervisor_pid = os.getpid()
                         parent_death_setup = make_parent_death_setup(supervisor_pid)
                         try:
@@ -420,7 +460,7 @@ def run_supervisor(rtsp_port: int, rtmp_port: int, metrics_port: int) -> int:
                         watchdog = None
                         output_gate.reset()
                 else:
-                    gate.reset()
+                    ingest_gate.reset()
                 time.sleep(MEDIA_POLL_INTERVAL_SECONDS)
                 continue
 
@@ -433,7 +473,7 @@ def run_supervisor(rtsp_port: int, rtmp_port: int, metrics_port: int) -> int:
                 elif now - child_started >= OUTPUT_START_TIMEOUT_SECONDS:
                     stop_child(child, force=True)
                     child = None
-                    gate.reset()
+                    ingest_gate.reset()
                     restart_not_before = now + CHILD_RESTART_FLOOR_SECONDS
                 time.sleep(MEDIA_POLL_INTERVAL_SECONDS)
                 continue
@@ -443,11 +483,11 @@ def run_supervisor(rtsp_port: int, rtmp_port: int, metrics_port: int) -> int:
                 ingest_reader.close()
             if keep_child and probe_ingest:
                 ingest_started = time.monotonic()
-                ingest_successful, ingest_counter = ingest_reader.sample()
+                ingest_successful, ingest_sample = ingest_reader.sample()
                 ingest_finished = time.monotonic()
                 keep_child = watchdog.observe_ingest(
                     ingest_successful,
-                    ingest_counter,
+                    ingest_sample,
                     ingest_started,
                     ingest_finished,
                 )
@@ -456,7 +496,7 @@ def run_supervisor(rtsp_port: int, rtmp_port: int, metrics_port: int) -> int:
                 stop_child(child, force=True)
                 child = None
                 watchdog = None
-                gate.reset()
+                ingest_gate.reset()
                 restart_not_before = time.monotonic() + CHILD_RESTART_FLOOR_SECONDS
             time.sleep(MEDIA_POLL_INTERVAL_SECONDS)
         return 0
@@ -473,11 +513,16 @@ def main() -> int:
             rtsp_port = validated_port(os.environ.get(SAFE_RTSP_PORT_ENV, ""))
             rtmp_port = validated_port(os.environ.get(SAFE_RTMP_PORT_ENV, ""))
             metrics_port = validated_port(os.environ.get(SAFE_METRICS_PORT_ENV, ""))
+            source_id = validated_source_id(os.environ.get(SAFE_SOURCE_ID_ENV, ""))
         except ValueError:
             return 2
-        return run_supervisor(rtsp_port, rtmp_port, metrics_port)
+        return run_supervisor(rtsp_port, rtmp_port, metrics_port, source_id)
 
-    if len(sys.argv) != 1 or os.environ.get("MTX_PATH") != INGEST_PATH:
+    if (
+        len(sys.argv) != 1
+        or os.environ.get("MTX_PATH") != INGEST_PATH
+        or os.environ.get("MTX_SOURCE_TYPE") != "srtConn"
+    ):
         return 2
     try:
         rtsp_port = validated_port(os.environ.get("RTSP_PORT", ""))
@@ -487,12 +532,13 @@ def main() -> int:
         metrics_port = validated_port(
             os.environ.get(TEST_METRICS_PORT_ENV, str(DEFAULT_METRICS_PORT))
         )
+        source_id = validated_source_id(os.environ.get("MTX_SOURCE_ID", ""))
     except ValueError:
         return 2
 
     # Re-exec first: the long-lived supervisor must not retain publisher-controlled
     # MediaMTX hook metadata (including MTX_QUERY) anywhere in /proc.
-    environment = sanitized_environment(rtsp_port, rtmp_port, metrics_port)
+    environment = sanitized_environment(rtsp_port, rtmp_port, metrics_port, source_id)
     script = os.path.realpath(__file__)
     try:
         os.execve(PYTHON, [PYTHON, "-I", script, SUPERVISOR_ARGUMENT], environment)

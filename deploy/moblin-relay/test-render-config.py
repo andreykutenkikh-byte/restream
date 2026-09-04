@@ -73,11 +73,40 @@ def assert_normalizer_contract(normalizer) -> None:
         "rtmp://127.0.0.1:11936/relay-output",
     ]
 
-    metric = 'paths_inbound_bytes{state="ready",name="iphone-live"} 123456\n'
-    assert normalizer.parse_inbound_bytes(metric) == 123456
-    assert normalizer.parse_inbound_bytes(metric + metric) is None
+    source_id = "11111111-2222-3333-4444-555555555555"
+    assert normalizer.build_ingest_metrics_path(source_id) == (
+        "/metrics?type=srt_conns&srt_conn=" + source_id
+    )
+    metric = (
+        'srt_conns_bytes_received_unique{state="publish",path="iphone-live",'
+        f'remoteAddr="198.51.100.10:54321",id="{source_id}"}} 123456\n'
+    )
+    assert normalizer.parse_ingest_sample(metric, source_id) == (source_id, 123456)
+    assert normalizer.parse_ingest_sample(metric + metric, source_id) is None
+    rejected_candidate = (
+        'srt_conns_bytes_received_unique{state="idle",path="",'
+        'remoteAddr="198.51.100.20:54322",'
+        'id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"} 999999\n'
+    )
+    assert normalizer.parse_ingest_sample(metric + rejected_candidate, source_id) == (
+        source_id,
+        123456,
+    )
     assert (
-        normalizer.parse_inbound_bytes('paths_inbound_bytes{name="other",state="ready"} 123456\n')
+        normalizer.parse_ingest_sample(
+            metric.replace('path="iphone-live"', 'path="other"'), source_id
+        )
+        is None
+    )
+    assert (
+        normalizer.parse_ingest_sample(metric.replace('state="publish"', 'state="idle"'), source_id)
+        is None
+    )
+    assert (
+        normalizer.parse_ingest_sample(
+            metric.replace("srt_conns_bytes_received_unique", "srt_conns_bytes_received"),
+            source_id,
+        )
         is None
     )
     output_metric = (
@@ -108,7 +137,7 @@ def assert_normalizer_contract(normalizer) -> None:
     assert gate.observe(120) is False
     assert gate.observe(120) is False
 
-    output_gate = normalizer.OutputGrowthGate()
+    output_gate = normalizer.ConnectionGrowthGate()
     assert output_gate.observe(("connection-a", 100)) is False
     assert output_gate.observe(("connection-a", 110)) is False
     assert output_gate.observe(("connection-a", 120)) is True
@@ -117,6 +146,7 @@ def assert_normalizer_contract(normalizer) -> None:
     assert normalizer.VERIFIED_STALL_TIMEOUT_SECONDS == 0.075
     assert normalizer.OUTPUT_IDLE_FALLBACK_SECONDS == 0.5
     assert normalizer.REQUIRED_IDLE_OBSERVATIONS == 2
+    assert normalizer.REQUIRED_VERIFIED_STALL_OBSERVATIONS == 3
     assert normalizer.METRICS_BLIND_TIMEOUT_SECONDS == 0.75
     assert (
         normalizer.VERIFIED_STALL_TIMEOUT_SECONDS
@@ -135,11 +165,19 @@ def assert_normalizer_contract(normalizer) -> None:
 
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
-    assert watchdog.observe_ingest(True, 500, 1.05, 1.051) is True
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
     assert watchdog.observe_output(True, ("connection-a", 120), 1.10) == (True, True)
-    assert watchdog.observe_ingest(True, 500, 1.10, 1.101) is True
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.10, 1.101) is True
     assert watchdog.observe_output(True, ("connection-a", 120), 1.15) == (True, True)
-    assert watchdog.observe_ingest(True, 500, 1.15, 1.152) is False
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.15, 1.152) is False
+
+    watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.14) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.14, 1.141) is True
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.19) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.19, 1.191) is False
 
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     for observed_at, ingest_counter in ((1.05, 500), (1.10, 501), (1.15, 502)):
@@ -147,7 +185,7 @@ def assert_normalizer_contract(normalizer) -> None:
         assert (
             watchdog.observe_ingest(
                 True,
-                ingest_counter,
+                ("ingest-a", ingest_counter),
                 observed_at,
                 observed_at + 0.001,
             )
@@ -156,11 +194,11 @@ def assert_normalizer_contract(normalizer) -> None:
     assert watchdog.observe_output(True, ("connection-a", 121), 1.16) == (True, False)
 
     assert watchdog.observe_output(True, ("connection-a", 121), 1.21) == (True, True)
-    assert watchdog.observe_ingest(True, 502, 1.21, 1.211) is True
+    assert watchdog.observe_ingest(True, ("ingest-a", 502), 1.21, 1.211) is True
     assert watchdog.observe_output(True, ("connection-a", 121), 1.26) == (True, True)
-    assert watchdog.observe_ingest(True, 502, 1.26, 1.261) is True
+    assert watchdog.observe_ingest(True, ("ingest-a", 502), 1.26, 1.261) is True
     assert watchdog.observe_output(True, ("connection-a", 121), 1.31) == (True, True)
-    assert watchdog.observe_ingest(True, 502, 1.31, 1.311) is False
+    assert watchdog.observe_ingest(True, ("ingest-a", 502), 1.31, 1.311) is False
 
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     for observed_at, ingest_counter in (
@@ -178,7 +216,7 @@ def assert_normalizer_contract(normalizer) -> None:
         assert (
             watchdog.observe_ingest(
                 True,
-                ingest_counter,
+                ("ingest-a", ingest_counter),
                 observed_at,
                 observed_at + 0.001,
             )
@@ -188,19 +226,21 @@ def assert_normalizer_contract(normalizer) -> None:
 
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
-    assert watchdog.observe_ingest(True, 500, 1.05, 1.051) is True
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
     assert watchdog.observe_output(True, ("connection-a", 120), 1.10) == (True, True)
-    assert watchdog.observe_ingest(True, 500, 1.10, 1.30) is True
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.10, 1.30) is True
     assert watchdog.observe_output(True, ("connection-a", 120), 1.31) == (True, True)
-    assert watchdog.observe_ingest(True, 500, 1.31, 1.311) is False
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.31, 1.311) is False
 
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
-    assert watchdog.observe_ingest(True, 500, 1.05, 1.051) is True
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
     assert watchdog.observe_output(True, ("connection-a", 120), 1.10) == (True, True)
     assert watchdog.observe_ingest(False, None, 1.10, 1.11) is True
     assert watchdog.observe_output(True, ("connection-a", 120), 1.15) == (True, True)
-    assert watchdog.observe_ingest(True, 500, 1.15, 1.151) is False
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.15, 1.151) is True
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.20) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.20, 1.201) is False
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
     assert watchdog.observe_ingest(True, None, 1.05, 1.051) is False
@@ -217,14 +257,19 @@ def assert_normalizer_contract(normalizer) -> None:
     assert watchdog.observe_output(True, ("connection-a", 119), 1.01) == (False, False)
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
-    assert watchdog.observe_ingest(True, 500, 1.05, 1.051) is True
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
     assert watchdog.observe_output(True, ("connection-a", 120), 1.10) == (True, True)
-    assert watchdog.observe_ingest(True, 499, 1.10, 1.101) is False
+    assert watchdog.observe_ingest(True, ("ingest-a", 499), 1.10, 1.101) is False
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
-    assert watchdog.observe_ingest(True, 500, 1.20, 1.19) is False
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.10) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-b", 501), 1.10, 1.101) is False
+    watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.20, 1.19) is False
     assert hasattr(normalizer, "make_parent_death_setup")
 
-    environment = normalizer.sanitized_environment(18554, 11936, 19998)
+    environment = normalizer.sanitized_environment(18554, 11936, 19998, source_id)
     assert environment == {
         "LANG": "C",
         "LC_ALL": "C",
@@ -232,6 +277,7 @@ def assert_normalizer_contract(normalizer) -> None:
         "MOBLIN_RELAY_INTERNAL_RTSP_PORT": "18554",
         "MOBLIN_RELAY_INTERNAL_RTMP_PORT": "11936",
         "MOBLIN_RELAY_INTERNAL_METRICS_PORT": "19998",
+        "MOBLIN_RELAY_INTERNAL_SRT_CONNECTION_ID": source_id,
     }
 
 
