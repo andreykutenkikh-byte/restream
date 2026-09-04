@@ -796,7 +796,6 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         "ts-probe-pts",
         "ts-packet-dts",
         "ts-v-offset",
-        "ts-v-cluster",
         "ts-v-order",
         "ts-v-fps",
         "ts-audio-pts",
@@ -838,6 +837,7 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         assert f'return "{stage}"' in source
     assert "stall-ingest" in loaded["SELF_TEST_STAGES"]
     assert "stall-i-id" in loaded["SELF_TEST_STAGES"]
+    assert "ts-v-cluster" in loaded["SELF_TEST_STAGES"]
     assert 'return "stall-i-id"' not in source
     assert 'mark_self_test_stage("stall-i-id")' not in source
     assert "mark_self_test_stage(\n                timestamp_failure_stage(" in source
@@ -1991,8 +1991,50 @@ def test_normalizer_reexec_rejects_an_unbound_source(
         (
             "timestamps",
             "video_pts_dts_offset_clusters_over_normal_reorder",
+            6,
+            "timestamps",
+        ),
+        (
+            "timestamps",
+            "video_pts_dts_offset_clusters_over_normal_reorder",
             7,
-            "ts-v-cluster",
+            "ts-vc-plus1",
+        ),
+        (
+            "timestamps",
+            "video_pts_dts_offset_clusters_over_normal_reorder",
+            8,
+            "ts-vc-plus2",
+        ),
+        (
+            "timestamps",
+            "video_pts_dts_offset_clusters_over_normal_reorder",
+            9,
+            "ts-vc-plus4",
+        ),
+        (
+            "timestamps",
+            "video_pts_dts_offset_clusters_over_normal_reorder",
+            10,
+            "ts-vc-plus4",
+        ),
+        (
+            "timestamps",
+            "video_pts_dts_offset_clusters_over_normal_reorder",
+            11,
+            "ts-vc-plus8",
+        ),
+        (
+            "timestamps",
+            "video_pts_dts_offset_clusters_over_normal_reorder",
+            14,
+            "ts-vc-plus8",
+        ),
+        (
+            "timestamps",
+            "video_pts_dts_offset_clusters_over_normal_reorder",
+            15,
+            "ts-vc-many",
         ),
         (
             "decoded_frames",

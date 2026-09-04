@@ -402,6 +402,21 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_timestamp_video_pts_clusters_failed": (
             "Переходные смещения PTS видеопотока не прошли самопроверку."
         ),
+        "relay_self_test_timestamp_video_pts_clusters_excess_1_failed": (
+            "Число переходных смещений PTS видео превысило лимит на 1."
+        ),
+        "relay_self_test_timestamp_video_pts_clusters_excess_2_failed": (
+            "Число переходных смещений PTS видео превысило лимит на 2."
+        ),
+        "relay_self_test_timestamp_video_pts_clusters_excess_3_4_failed": (
+            "Число переходных смещений PTS видео превысило лимит на 3–4."
+        ),
+        "relay_self_test_timestamp_video_pts_clusters_excess_5_8_failed": (
+            "Число переходных смещений PTS видео превысило лимит на 5–8."
+        ),
+        "relay_self_test_timestamp_video_pts_clusters_excess_many_failed": (
+            "Число переходных смещений PTS видео превысило лимит более чем на 8."
+        ),
         "relay_self_test_timestamp_video_pts_order_failed": (
             "Порядок декодированных PTS видеопотока не прошёл самопроверку."
         ),

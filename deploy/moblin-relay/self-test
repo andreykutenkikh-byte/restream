@@ -154,6 +154,11 @@ SELF_TEST_STAGES = frozenset(
         "ts-video-pts",
         "ts-v-offset",
         "ts-v-cluster",
+        "ts-vc-plus1",
+        "ts-vc-plus2",
+        "ts-vc-plus4",
+        "ts-vc-plus8",
+        "ts-vc-many",
         "ts-v-order",
         "ts-v-fps",
         "ts-audio-pts",
@@ -2342,10 +2347,7 @@ def timestamp_failure_stage(
         timestamps["max_pts_dts_offset_seconds"].get(0, 999)
         <= VIDEO_PTS_DTS_OFFSET_LIMIT_SECONDS
     )
-    video_pts_clusters_ok = (
-        timestamps["video_pts_dts_offset_clusters_over_normal_reorder"]
-        <= max_bounded_audio_backward_steps
-    )
+    video_pts_clusters = timestamps["video_pts_dts_offset_clusters_over_normal_reorder"]
     video_pts_order_ok = decoded_frames["strict_presentation_timestamps_monotonic"]
     video_frame_rate_ok = decoded_frames["presentation_frame_rate_matches"]
     audio_pts_ok = (
@@ -2394,7 +2396,21 @@ def timestamp_failure_stage(
         ("ts-probe-pts", probe_and_pts_presence_ok),
         ("ts-packet-dts", packet_dts_ok),
         ("ts-v-offset", video_pts_offset_ok),
-        ("ts-v-cluster", video_pts_clusters_ok),
+    ):
+        if not passed:
+            return stage
+    if video_pts_clusters > max_bounded_audio_backward_steps:
+        excess = video_pts_clusters - max_bounded_audio_backward_steps
+        if excess == 1:
+            return "ts-vc-plus1"
+        if excess == 2:
+            return "ts-vc-plus2"
+        if excess <= 4:
+            return "ts-vc-plus4"
+        if excess <= 8:
+            return "ts-vc-plus8"
+        return "ts-vc-many"
+    for stage, passed in (
         ("ts-v-order", video_pts_order_ok),
         ("ts-v-fps", video_frame_rate_ok),
         ("ts-audio-pts", audio_pts_ok),
