@@ -74,6 +74,18 @@ SELF_TEST_STAGES = frozenset(
         "auth-x-live",
         "auth-x-ingest",
         "auth-x-norm",
+        "auth-n-child",
+        "auth-n-start",
+        "auth-n-blind",
+        "auth-n-out-id",
+        "auth-n-out-reg",
+        "auth-n-fallback",
+        "auth-n-in-time",
+        "auth-n-in-miss",
+        "auth-n-in-id",
+        "auth-n-in-reg",
+        "auth-n-stall",
+        "auth-n-unknown",
         "auth-x-sink",
         "auth-x-bytes",
         "auth-x-blind",
@@ -199,6 +211,20 @@ SUPERVISOR_RESTART_TIMEOUT_SECONDS = 12.0
 MAX_REJECTION_LOG_TAIL_BYTES = 1024 * 1024
 DUPLICATE_PUBLISHER_LOG_MARKER = (
     f"someone is already publishing to path '{INGEST_PATH}'".encode("ascii")
+)
+NORMALIZER_RESTART_STAGE_MARKERS = (
+    (b"moblin-relay-normalize:restart:child-exit", "auth-n-child"),
+    (b"moblin-relay-normalize:restart:output-start-timeout", "auth-n-start"),
+    (b"moblin-relay-normalize:restart:metrics-blind", "auth-n-blind"),
+    (b"moblin-relay-normalize:restart:output-identity", "auth-n-out-id"),
+    (b"moblin-relay-normalize:restart:output-regression", "auth-n-out-reg"),
+    (b"moblin-relay-normalize:restart:output-fallback", "auth-n-fallback"),
+    (b"moblin-relay-normalize:restart:ingest-timing", "auth-n-in-time"),
+    (b"moblin-relay-normalize:restart:ingest-missing", "auth-n-in-miss"),
+    (b"moblin-relay-normalize:restart:ingest-identity", "auth-n-in-id"),
+    (b"moblin-relay-normalize:restart:ingest-regression", "auth-n-in-reg"),
+    (b"moblin-relay-normalize:restart:verified-stall", "auth-n-stall"),
+    (b"moblin-relay-normalize:restart:watchdog-unknown", "auth-n-unknown"),
 )
 
 
@@ -677,6 +703,7 @@ class Observer(threading.Thread):
                 "ingest_live": False,
                 "ingest_ids": [],
                 "ingest_bytes": None,
+                "ingest_transport_bytes": None,
                 "live": False,
                 "normalized": False,
                 "normalized_ids": [],
@@ -713,6 +740,17 @@ class Observer(threading.Thread):
                 ]
                 if len(ingest_path_counters) == 1:
                     sample["ingest_bytes"] = ingest_path_counters[0]
+                ingest_transport_counters = [
+                    int(value)
+                    for labels, value in parse_metrics(
+                        dut_metrics, "srt_conns_bytes_received_unique"
+                    )
+                    if labels.get("id") in sample["ingest_ids"]
+                    and labels.get("path") == INGEST_PATH
+                    and labels.get("state") == "publish"
+                ]
+                if len(ingest_transport_counters) == 1:
+                    sample["ingest_transport_bytes"] = ingest_transport_counters[0]
                 sample["forward"] = any(
                     labels.get("path") == OUTPUT_PATH
                     and labels.get("state") in ("ready", "forwarding")
@@ -1763,14 +1801,13 @@ def open_validated_log_tail(
         raise
 
 
-def log_tail_contains_marker(
+def read_validated_log_tail(
     descriptor: int,
     offset: int,
-    marker: bytes,
     expected_uid: int,
-) -> bool:
-    if offset < 0 or not marker or len(marker) > 256:
-        raise TestFailure("invalid DUT log marker request")
+) -> bytes:
+    if offset < 0:
+        raise TestFailure("invalid DUT log tail request")
     metadata = os.fstat(descriptor)
     if (
         not stat.S_ISREG(metadata.st_mode)
@@ -1791,7 +1828,50 @@ def log_tail_contains_marker(
             raise TestFailure("DUT log tail could not be read completely")
         chunks.append(chunk)
         remaining -= len(chunk)
-    return marker in b"".join(chunks)
+    return b"".join(chunks)
+
+
+def log_tail_contains_marker(
+    descriptor: int,
+    offset: int,
+    marker: bytes,
+    expected_uid: int,
+) -> bool:
+    if not marker or len(marker) > 256:
+        raise TestFailure("invalid DUT log marker request")
+    return marker in read_validated_log_tail(descriptor, offset, expected_uid)
+
+
+def classify_normalizer_restart(
+    descriptor: int,
+    offset: int,
+    expected_uid: int,
+) -> str:
+    """Return only the fixed stage for the latest secret-free restart token."""
+    tail = read_validated_log_tail(descriptor, offset, expected_uid)
+    latest_position = -1
+    latest_stage = "auth-x-norm"
+    for marker, stage in NORMALIZER_RESTART_STAGE_MARKERS:
+        position = tail.rfind(marker)
+        if position > latest_position:
+            latest_position = position
+            latest_stage = stage
+    return latest_stage
+
+
+def wait_normalizer_restart_stage(
+    descriptor: int,
+    offset: int,
+    expected_uid: int,
+    timeout: float = 0.5,
+) -> str:
+    """Wait briefly for a fixed restart token that may trail connection teardown."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        stage = classify_normalizer_restart(descriptor, offset, expected_uid)
+        if stage != "auth-x-norm" or time.monotonic() >= deadline:
+            return stage
+        time.sleep(0.025)
 
 
 def publisher_exclusivity_sample_problem(
@@ -2928,6 +3008,13 @@ def main() -> int:
             exclusivity_ingest_bytes = exclusivity_baseline.get("ingest_bytes")
             if type(exclusivity_ingest_bytes) is not int:
                 raise TestFailure("publisher-exclusivity baseline lacks its SRT byte counter")
+            exclusivity_transport_bytes = exclusivity_baseline.get(
+                "ingest_transport_bytes"
+            )
+            if type(exclusivity_transport_bytes) is not int:
+                raise TestFailure(
+                    "publisher-exclusivity baseline lacks its bound transport counter"
+                )
             rejection_log_descriptor, rejection_log_offset = open_validated_log_tail(
                 dut_log_path,
                 dut_log.fileno(),
@@ -2983,6 +3070,13 @@ def main() -> int:
                     exclusivity_ingest_bytes,
                 )
                 if sample_problem:
+                    if sample_problem == "auth-x-norm":
+                        dut_log.flush()
+                        sample_problem = wait_normalizer_restart_stage(
+                            rejection_log_descriptor,
+                            rejection_log_offset,
+                            0,
+                        )
                     mark_self_test_stage(sample_problem)
                     raise TestFailure("second SRT publisher disrupted the primary publisher")
                 time.sleep(0.1)
@@ -3034,6 +3128,11 @@ def main() -> int:
                 and sample["ingest_bytes"] > exclusivity_ingest_bytes
                 for sample in second_interval
             )
+            result["second_publisher_primary_transport_progress"] = any(
+                type(sample.get("ingest_transport_bytes")) is int
+                and sample["ingest_transport_bytes"] > exclusivity_transport_bytes
+                for sample in second_interval
+            )
             result["second_publisher_rejected"] = publisher_exclusivity_proved(
                 second_interval,
                 exclusivity_ingest_ids,
@@ -3043,6 +3142,32 @@ def main() -> int:
                 second_outbound_bytes,
                 server_rejection_seen,
             )
+            if not result["second_publisher_rejected"]:
+                if not result["second_publisher_attempted"] or not result[
+                    "second_publisher_server_rejection_seen"
+                ]:
+                    mark_self_test_stage("auth-x-attempt")
+                else:
+                    interval_problem = None
+                    for sample in second_interval:
+                        interval_problem = publisher_exclusivity_sample_problem(
+                            sample,
+                            exclusivity_ingest_ids,
+                            exclusivity_normalized_ids,
+                            initial_sink_id,
+                            exclusivity_ingest_bytes,
+                        )
+                        if interval_problem:
+                            break
+                    if interval_problem == "auth-x-norm":
+                        dut_log.flush()
+                        interval_problem = wait_normalizer_restart_stage(
+                            rejection_log_descriptor,
+                            rejection_log_offset,
+                            0,
+                        )
+                    mark_self_test_stage(interval_problem or "auth-x-bytes")
+                raise TestFailure("second publisher rejection failed")
         finally:
             safe_stop(second, force=True)
             safe_stop(second_helper)
@@ -3052,25 +3177,6 @@ def main() -> int:
                 ("tcp", SOURCE_AUX_RTMP_PORT),
                 ("tcp", SOURCE_AUX_METRICS_PORT),
             ))
-        if not result["second_publisher_rejected"]:
-            if not result["second_publisher_attempted"] or not result[
-                "second_publisher_server_rejection_seen"
-            ]:
-                mark_self_test_stage("auth-x-attempt")
-            else:
-                interval_problem = None
-                for sample in second_interval:
-                    interval_problem = publisher_exclusivity_sample_problem(
-                        sample,
-                        exclusivity_ingest_ids,
-                        exclusivity_normalized_ids,
-                        initial_sink_id,
-                        exclusivity_ingest_bytes,
-                    )
-                    if interval_problem:
-                        break
-                mark_self_test_stage(interval_problem or "auth-x-bytes")
-            raise TestFailure("second publisher rejection failed")
 
         mark_self_test_stage("outages")
         print("  checking a recoverable same-session media stall", flush=True)

@@ -59,6 +59,47 @@ SOURCE_ID_PATTERN = re.compile(r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}")
 CounterSample = tuple[str, int]
 T = TypeVar("T")
 
+RESTART_REASON_CHILD_EXIT = "child-exit"
+RESTART_REASON_OUTPUT_START_TIMEOUT = "output-start-timeout"
+RESTART_REASON_METRICS_BLIND = "metrics-blind"
+RESTART_REASON_OUTPUT_IDENTITY = "output-identity"
+RESTART_REASON_OUTPUT_REGRESSION = "output-regression"
+RESTART_REASON_OUTPUT_FALLBACK = "output-fallback"
+RESTART_REASON_INGEST_TIMING = "ingest-timing"
+RESTART_REASON_INGEST_MISSING = "ingest-missing"
+RESTART_REASON_INGEST_IDENTITY = "ingest-identity"
+RESTART_REASON_INGEST_REGRESSION = "ingest-regression"
+RESTART_REASON_VERIFIED_STALL = "verified-stall"
+RESTART_REASON_WATCHDOG_UNKNOWN = "watchdog-unknown"
+RESTART_LOG_TOKENS = {
+    RESTART_REASON_CHILD_EXIT: "moblin-relay-normalize:restart:child-exit",
+    RESTART_REASON_OUTPUT_START_TIMEOUT: (
+        "moblin-relay-normalize:restart:output-start-timeout"
+    ),
+    RESTART_REASON_METRICS_BLIND: "moblin-relay-normalize:restart:metrics-blind",
+    RESTART_REASON_OUTPUT_IDENTITY: "moblin-relay-normalize:restart:output-identity",
+    RESTART_REASON_OUTPUT_REGRESSION: (
+        "moblin-relay-normalize:restart:output-regression"
+    ),
+    RESTART_REASON_OUTPUT_FALLBACK: "moblin-relay-normalize:restart:output-fallback",
+    RESTART_REASON_INGEST_TIMING: "moblin-relay-normalize:restart:ingest-timing",
+    RESTART_REASON_INGEST_MISSING: "moblin-relay-normalize:restart:ingest-missing",
+    RESTART_REASON_INGEST_IDENTITY: "moblin-relay-normalize:restart:ingest-identity",
+    RESTART_REASON_INGEST_REGRESSION: (
+        "moblin-relay-normalize:restart:ingest-regression"
+    ),
+    RESTART_REASON_VERIFIED_STALL: "moblin-relay-normalize:restart:verified-stall",
+    RESTART_REASON_WATCHDOG_UNKNOWN: "moblin-relay-normalize:restart:watchdog-unknown",
+}
+
+
+def emit_restart_reason(reason: str) -> None:
+    """Emit one fixed, non-sensitive restart token for local diagnostics."""
+    token = RESTART_LOG_TOKENS.get(reason)
+    if token is None:
+        raise ValueError("invalid normalizer restart reason")
+    print(token, file=sys.stderr, flush=True)
+
 
 def validated_port(raw_value: str) -> int:
     if not re.fullmatch(r"[0-9]{1,5}", raw_value):
@@ -262,6 +303,13 @@ class MediaWatchdog:
         self.ingest_counter: int | None = None
         self.joint_idle_since: float | None = None
         self.joint_unchanged_observations = 0
+        self.failure_reason = ""
+
+    def reject(self, reason: str) -> bool:
+        if reason not in RESTART_LOG_TOKENS:
+            reason = RESTART_REASON_WATCHDOG_UNKNOWN
+        self.failure_reason = reason
+        return False
 
     def observe_output(
         self,
@@ -271,15 +319,18 @@ class MediaWatchdog:
     ) -> tuple[bool, bool]:
         if not successful or sample is None:
             return (
-                now - self.last_valid_observation < METRICS_BLIND_TIMEOUT_SECONDS,
+                (
+                    now - self.last_valid_observation < METRICS_BLIND_TIMEOUT_SECONDS
+                    or self.reject(RESTART_REASON_METRICS_BLIND)
+                ),
                 False,
             )
         self.last_valid_observation = now
         connection_id, counter = sample
         if connection_id != self.connection_id:
-            return False, False
+            return self.reject(RESTART_REASON_OUTPUT_IDENTITY), False
         if counter < self.counter:
-            return False, False
+            return self.reject(RESTART_REASON_OUTPUT_REGRESSION), False
         if counter > self.counter:
             self.counter = counter
             self.output_last_growth = now
@@ -294,7 +345,7 @@ class MediaWatchdog:
             now - self.output_last_growth >= OUTPUT_IDLE_FALLBACK_SECONDS
             and self.output_unchanged_observations >= REQUIRED_IDLE_OBSERVATIONS
         ):
-            return False, False
+            return self.reject(RESTART_REASON_OUTPUT_FALLBACK), False
         return True, True
 
     def observe_ingest(
@@ -305,11 +356,11 @@ class MediaWatchdog:
         finished_at: float,
     ) -> bool:
         if finished_at < started_at:
-            return False
+            return self.reject(RESTART_REASON_INGEST_TIMING)
         if not successful:
             return True
         if sample is None:
-            return False
+            return self.reject(RESTART_REASON_INGEST_MISSING)
         connection_id, counter = sample
         if self.ingest_counter is None:
             self.ingest_connection_id = connection_id
@@ -318,9 +369,9 @@ class MediaWatchdog:
             self.joint_unchanged_observations = 1
             return True
         if connection_id != self.ingest_connection_id:
-            return False
+            return self.reject(RESTART_REASON_INGEST_IDENTITY)
         if counter < self.ingest_counter:
-            return False
+            return self.reject(RESTART_REASON_INGEST_REGRESSION)
         if counter > self.ingest_counter:
             self.ingest_counter = counter
             self.joint_idle_since = None
@@ -329,11 +380,12 @@ class MediaWatchdog:
         if self.joint_idle_since is None:
             self.joint_idle_since = finished_at
         self.joint_unchanged_observations += 1
-        return (
+        keep_child = (
             started_at - self.joint_idle_since < VERIFIED_STALL_TIMEOUT_SECONDS
             or self.joint_unchanged_observations
             < REQUIRED_VERIFIED_STALL_OBSERVATIONS
         )
+        return keep_child or self.reject(RESTART_REASON_VERIFIED_STALL)
 
 
 def sanitized_environment(
@@ -432,6 +484,7 @@ def run_supervisor(
         while not stop_requested:
             now = time.monotonic()
             if child is not None and child.poll() is not None:
+                emit_restart_reason(RESTART_REASON_CHILD_EXIT)
                 child = None
                 watchdog = None
                 ingest_gate.reset()
@@ -471,6 +524,7 @@ def run_supervisor(
                     watchdog = MediaWatchdog(counter, now)
                     ingest_reader.close()
                 elif now - child_started >= OUTPUT_START_TIMEOUT_SECONDS:
+                    emit_restart_reason(RESTART_REASON_OUTPUT_START_TIMEOUT)
                     stop_child(child, force=True)
                     child = None
                     ingest_gate.reset()
@@ -492,6 +546,9 @@ def run_supervisor(
                     ingest_finished,
                 )
             if not keep_child:
+                emit_restart_reason(
+                    watchdog.failure_reason or RESTART_REASON_WATCHDOG_UNKNOWN
+                )
                 ingest_reader.close()
                 stop_child(child, force=True)
                 child = None

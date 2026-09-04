@@ -268,6 +268,25 @@ def assert_normalizer_contract(normalizer) -> None:
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.20, 1.19) is False
     assert hasattr(normalizer, "make_parent_death_setup")
+    assert set(normalizer.RESTART_LOG_TOKENS) == {
+        "child-exit",
+        "output-start-timeout",
+        "metrics-blind",
+        "output-identity",
+        "output-regression",
+        "output-fallback",
+        "ingest-timing",
+        "ingest-missing",
+        "ingest-identity",
+        "ingest-regression",
+        "verified-stall",
+        "watchdog-unknown",
+    }
+    assert all(
+        token.startswith("moblin-relay-normalize:restart:")
+        and token.replace("moblin-relay-normalize:restart:", "").replace("-", "").isalpha()
+        for token in normalizer.RESTART_LOG_TOKENS.values()
+    )
 
     environment = normalizer.sanitized_environment(18554, 11936, 19998, source_id)
     assert environment == {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import runpy
 import socket
 import sys
@@ -1288,13 +1289,20 @@ def test_self_test_refreshes_exclusivity_baseline_immediately_before_challenge()
     assert "initial_ingest_bytes" not in challenged
     assert "exclusivity_normalized_ids" in challenged
     assert "exclusivity_ingest_bytes" in challenged
+    assert "exclusivity_transport_bytes" in challenged
     assert 'sample["ingest_bytes"] > exclusivity_ingest_bytes' in challenged
+    assert 'sample["ingest_transport_bytes"] > exclusivity_transport_bytes' in challenged
+    proof_failure = 'if not result["second_publisher_rejected"]:'
+    descriptor_cleanup = "if rejection_log_descriptor is not None:\n                os.close("
+    assert challenged.index(proof_failure) < challenged.index(descriptor_cleanup)
 
 
 def test_self_test_dut_log_marker_is_scoped_to_appended_tail(tmp_path: Path) -> None:
     loaded = load_self_test()
     open_tail = loaded["open_validated_log_tail"]
     contains_marker = loaded["log_tail_contains_marker"]
+    classify_restart = loaded["classify_normalizer_restart"]
+    wait_restart = loaded["wait_normalizer_restart_stage"]
     failure = loaded["TestFailure"]
     marker = loaded["DUPLICATE_PUBLISHER_LOG_MARKER"]
     maximum_tail = loaded["MAX_REJECTION_LOG_TAIL_BYTES"]
@@ -1318,8 +1326,23 @@ def test_self_test_dut_log_marker_is_scoped_to_appended_tail(tmp_path: Path) -> 
             writer.write(b"prefix " + marker + b" suffix\n")
             writer.flush()
             assert contains_marker(descriptor, offset, marker, expected_uid)
+            assert classify_restart(descriptor, offset, expected_uid) == "auth-x-norm"
+            writer.write(b"moblin-relay-normalize:restart:output-fallback\n")
+            writer.flush()
+            assert classify_restart(descriptor, offset, expected_uid) == "auth-n-fallback"
+            writer.write(b"moblin-relay-normalize:restart:verified-stall\n")
+            writer.flush()
+            assert classify_restart(descriptor, offset, expected_uid) == "auth-n-stall"
+            assert wait_restart(descriptor, offset, expected_uid, timeout=0) == "auth-n-stall"
         finally:
             os.close(descriptor)
+
+        stages = iter(("auth-x-norm", "auth-n-child"))
+        with patch.dict(
+            wait_restart.__globals__,
+            {"classify_normalizer_restart": lambda *_args: next(stages)},
+        ):
+            assert wait_restart(-1, 0, expected_uid, timeout=0.1) == "auth-n-child"
 
         with pytest.raises(failure):
             open_tail(log_path, other.fileno(), tmp_path, expected_uid)
@@ -1695,7 +1718,8 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
         in supervisor_source
     )
     assert "if not probe_ingest:\n                ingest_reader.close()" in supervisor_source
-    assert "if not keep_child:\n                ingest_reader.close()" in supervisor_source
+    assert "if not keep_child:\n                emit_restart_reason(" in supervisor_source
+    assert "watchdog.failure_reason or RESTART_REASON_WATCHDOG_UNKNOWN" in supervisor_source
 
     assert sanitized_environment(18554, 11936, 19998, source_id) == {
         "LANG": "C",
@@ -1706,6 +1730,75 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
         "MOBLIN_RELAY_INTERNAL_METRICS_PORT": "19998",
         "MOBLIN_RELAY_INTERNAL_SRT_CONNECTION_ID": source_id,
     }
+
+
+def test_normalizer_restart_diagnostics_are_fixed_and_secret_free(capsys) -> None:
+    loaded = load_normalizer()
+    tokens = loaded["RESTART_LOG_TOKENS"]
+    emit = loaded["emit_restart_reason"]
+
+    assert len(tokens) == 12
+    assert all(
+        re.fullmatch(r"moblin-relay-normalize:restart:[a-z-]+", token) for token in tokens.values()
+    )
+    for reason, token in tokens.items():
+        emit(reason)
+        assert capsys.readouterr().err == token + "\n"
+
+    with pytest.raises(ValueError, match="invalid normalizer restart reason"):
+        emit("untrusted-value")
+    assert capsys.readouterr().err == ""
+
+
+def test_normalizer_watchdog_records_a_fixed_failure_reason() -> None:
+    loaded = load_normalizer()
+    watchdog_type = loaded["MediaWatchdog"]
+
+    cases: list[tuple[str, object]] = []
+
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe_output(False, None, 1.751) == (False, False)
+    cases.append(("metrics-blind", watchdog))
+
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe_output(True, ("normalizer-b", 121), 1.01) == (False, False)
+    cases.append(("output-identity", watchdog))
+
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe_output(True, ("normalizer-a", 119), 1.01) == (False, False)
+    cases.append(("output-regression", watchdog))
+
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe_output(True, ("normalizer-a", 120), 1.05) == (True, True)
+    assert watchdog.observe_output(True, ("normalizer-a", 120), 1.501) == (False, False)
+    cases.append(("output-fallback", watchdog))
+
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.20, 1.19) is False
+    cases.append(("ingest-timing", watchdog))
+
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe_ingest(True, None, 1.05, 1.051) is False
+    cases.append(("ingest-missing", watchdog))
+
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
+    assert watchdog.observe_ingest(True, ("ingest-b", 501), 1.10, 1.101) is False
+    cases.append(("ingest-identity", watchdog))
+
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
+    assert watchdog.observe_ingest(True, ("ingest-a", 499), 1.10, 1.101) is False
+    cases.append(("ingest-regression", watchdog))
+
+    watchdog = watchdog_type(("normalizer-a", 120), 1.0)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.10, 1.101) is True
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.15, 1.151) is False
+    cases.append(("verified-stall", watchdog))
+
+    for expected, watchdog in cases:
+        assert watchdog.failure_reason == expected
 
 
 def test_normalizer_reexec_discards_hook_secrets() -> None:

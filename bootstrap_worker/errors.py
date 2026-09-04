@@ -179,6 +179,42 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_auth_exclusivity_normalizer_failed": (
             "Нормализатор изменился во время проверки второго SRT-издателя."
         ),
+        "relay_self_test_auth_exclusivity_normalizer_child_exit_failed": (
+            "FFmpeg нормализатора самостоятельно завершился во время проверки эксклюзивности."
+        ),
+        "relay_self_test_auth_exclusivity_normalizer_start_timeout_failed": (
+            "Нормализатор не успел восстановить выход во время проверки эксклюзивности."
+        ),
+        "relay_self_test_auth_exclusivity_normalizer_metrics_blind_failed": (
+            "Нормализатор потерял доступ к метрикам выхода во время проверки эксклюзивности."
+        ),
+        "relay_self_test_auth_exclusivity_normalizer_output_identity_failed": (
+            "Изменилась идентичность выхода нормализатора во время проверки эксклюзивности."
+        ),
+        "relay_self_test_auth_exclusivity_normalizer_output_regression_failed": (
+            "Счётчик выхода нормализатора уменьшился во время проверки эксклюзивности."
+        ),
+        "relay_self_test_auth_exclusivity_normalizer_output_fallback_failed": (
+            "Резервная проверка сочла выход нормализатора зависшим."
+        ),
+        "relay_self_test_auth_exclusivity_normalizer_ingest_timing_failed": (
+            "Нарушился порядок измерений входа нормализатора."
+        ),
+        "relay_self_test_auth_exclusivity_normalizer_ingest_missing_failed": (
+            "Метрика привязанного SRT-входа нормализатора исчезла."
+        ),
+        "relay_self_test_auth_exclusivity_normalizer_ingest_identity_failed": (
+            "Изменилась идентичность привязанного SRT-входа нормализатора."
+        ),
+        "relay_self_test_auth_exclusivity_normalizer_ingest_regression_failed": (
+            "Счётчик привязанного SRT-входа нормализатора уменьшился."
+        ),
+        "relay_self_test_auth_exclusivity_normalizer_verified_stall_failed": (
+            "Нормализатор подтвердил одновременную остановку входа и выхода."
+        ),
+        "relay_self_test_auth_exclusivity_normalizer_watchdog_unknown_failed": (
+            "Watchdog перезапустил нормализатор по неизвестной безопасной причине."
+        ),
         "relay_self_test_auth_exclusivity_downstream_failed": (
             "Выходной поток изменился во время проверки второго SRT-издателя."
         ),
