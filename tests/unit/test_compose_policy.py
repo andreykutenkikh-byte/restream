@@ -622,11 +622,16 @@ def test_ci_runtime_always_uses_test_override_and_cleans_up() -> None:
     assert "sh scripts/check_runtime_limits.sh" in workflow
     assert "node --check app/static/app.js" in workflow
     assert "node --check app/static/preview-player.js" in workflow
+    assert "node --check app/static/relay-dashboard.js" in workflow
     assert "node --check app/static/servers.js" in workflow
+    assert "node --check app/static/moblin-hud-admin.js" in workflow
+    assert "node --check app/static/moblin-hud.js" in workflow
     assert (
         "tests/frontend/preview-player.test.js tests/frontend/relay-dashboard.test.js "
         "tests/frontend/servers.test.js"
     ) in workflow
+    assert "tests/frontend/moblin-hud.test.js" in workflow
+    assert "tests/frontend/moblin-hud-admin.test.js" in workflow
     assert "Real RTMP rotation and output end-to-end smoke" in workflow
     assert "python scripts/ci_output_smoke.py" in workflow
     assert "SSH bootstrap and native Moblin Relay end-to-end smoke" in workflow
