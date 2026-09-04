@@ -809,10 +809,10 @@ class RelayQualityTracker:
     ) -> HealthAssessment:
         titles = {
             HealthLevel.UNKNOWN: "Состояние уточняется",
-            HealthLevel.GREEN: "Эфир стабилен",
-            HealthLevel.YELLOW: "Связь ухудшается",
-            HealthLevel.RED: "Рекомендуется сменить сервер",
-            HealthLevel.BLACK: "Поток потерян",
+            HealthLevel.GREEN: "ЭФИР СТАБИЛЕН",
+            HealthLevel.YELLOW: "СВЯЗЬ УХУДШАЕТСЯ",
+            HealthLevel.RED: "СМЕНИТЕ СЕРВЕР",
+            HealthLevel.BLACK: "ПОТОК ПОТЕРЯН",
         }
         messages = {
             HealthLevel.UNKNOWN: "Недостаточно свежих данных для оценки.",

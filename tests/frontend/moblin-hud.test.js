@@ -383,8 +383,10 @@ test("stop aborts and invalidates pending generations", () => {
 test("alerts require a real worsening transition and honor cooldown", () => {
   assert.equal(shouldSoundTransition(null, "red", 1000), false);
   assert.equal(shouldSoundTransition("green", "yellow", 1000), true);
+  assert.equal(shouldSoundTransition("green", "red", 1000), false);
   assert.equal(shouldSoundTransition("yellow", "yellow", 2000), false);
   assert.equal(shouldSoundTransition("red", "yellow", 3000), false);
+  assert.equal(shouldSoundTransition("red", "black", 3000), true);
   assert.equal(shouldSoundTransition("yellow", "red", 1000, 900), false);
   assert.equal(shouldSoundTransition("yellow", "red", 1000 + ALERT_COOLDOWN_MS, 1000), true);
 });
@@ -414,7 +416,8 @@ test("WebAudio is created only by an explicit user-triggered toggle", async () =
   await audio.toggle();
   assert.equal(instances, 1);
   assert.deepEqual(played, [660]);
-  assert.equal(audio.notify("green", "red"), true);
+  assert.equal(audio.notify("green", "red"), false);
+  assert.equal(audio.notify("yellow", "red"), true);
   assert.deepEqual(played, [660, 330, 330]);
 });
 
@@ -461,9 +464,9 @@ test("mute is memory-only, lasts 60 seconds, and suppresses alerts", async () =>
   await audio.toggle();
   audio.mute();
   assert.equal(audio.mutedUntil, 5000 + MUTE_DURATION_MS);
-  assert.equal(audio.notify("green", "red"), false);
+  assert.equal(audio.notify("yellow", "red"), false);
   now = audio.mutedUntil;
-  assert.equal(audio.notify("green", "red"), true);
+  assert.equal(audio.notify("yellow", "red"), true);
 });
 
 test("renderer assigns API values through textContent and exposes offline vs revoked", () => {
@@ -481,7 +484,7 @@ test("renderer assigns API values through textContent and exposes offline vs rev
   assert.equal(values.get("server"), "HK relay");
   assert.equal(values.get("bitrate"), "7.5 Мбит/с");
   renderer.offline("monitoring");
-  assert.equal(values.get("title"), "Мониторинг недоступен");
+  assert.equal(values.get("title"), "Нет связи с панелью мониторинга");
   renderer.offline("revoked");
   assert.equal(values.get("title"), "Доступ HUD отключён");
 });

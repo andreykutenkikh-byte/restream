@@ -211,10 +211,8 @@
   }
 
   function shouldSoundTransition(previousLevel, nextLevel, now, lastAlertAt = null, cooldownMs = ALERT_COOLDOWN_MS) {
-    if (!LEVELS.includes(previousLevel) || !["yellow", "red", "black"].includes(nextLevel)) return false;
-    if (previousLevel === nextLevel) return false;
-    const severity = { unknown: 0, green: 0, yellow: 1, red: 2, black: 3 };
-    if (severity[nextLevel] <= severity[previousLevel]) return false;
+    const audibleTransitions = new Set(["green:yellow", "yellow:red", "red:black"]);
+    if (!audibleTransitions.has(`${previousLevel}:${nextLevel}`)) return false;
     return lastAlertAt === null || now - lastAlertAt >= cooldownMs;
   }
 
@@ -482,7 +480,7 @@
       offline(mode = "monitoring") {
         documentObject.body.dataset.hudState = mode;
         setText(elements.server, "Сервер мониторинга");
-        setText(elements.title, mode === "revoked" ? "Доступ HUD отключён" : "Мониторинг недоступен");
+        setText(elements.title, mode === "revoked" ? "Доступ HUD отключён" : "Нет связи с панелью мониторинга");
         setText(elements.message, mode === "revoked"
           ? "Создайте новую одноразовую привязку в панели администратора."
           : "Связь с панелью потеряна. Повторяем безопасно.");
@@ -511,7 +509,10 @@
       const audio = new AlertAudio({
         audioContextClass: windowObject.AudioContext || windowObject.webkitAudioContext,
         onStateChange(instance) {
-          setText(select(documentObject, "sound"), instance.enabled ? "Звук включён" : "Включить звук");
+          setText(
+            select(documentObject, "sound"),
+            instance.enabled ? "Звуковые предупреждения включены" : "Включить звуковые предупреждения",
+          );
           const mute = select(documentObject, "mute");
           if (mute) mute.disabled = !instance.enabled;
         },
