@@ -178,7 +178,11 @@ MPEGTS_PACKET_SIZE_BYTES = 188
 # as a fatal test error.
 LIVE_FEED_FIFO_UNITS = 4096
 LIVE_FEED_SOCKET_BUFFER_BYTES = 262_144
-LIVE_FEED_CHUNK_BYTES = SRT_PAYLOAD_SIZE
+# This bridge is loopback-only. Batch several MPEG-TS/SRT payload units per UDP
+# wakeup; the source helper still packetizes the actual SRT leg at 1316 bytes.
+LIVE_FEED_BATCH_PAYLOADS = 8
+LIVE_FEED_CHUNK_BYTES = SRT_PAYLOAD_SIZE * LIVE_FEED_BATCH_PAYLOADS
+MAX_UDP_DATAGRAM_BYTES = 65_507
 LIVE_FEED_START_TIMEOUT_SECONDS = 5.0
 LIVE_FEED_CONTROL_TIMEOUT_SECONDS = 1.0
 LIVE_FEED_STOP_TIMEOUT_SECONDS = 2.0
@@ -1332,6 +1336,7 @@ class PacedMPEGTSFeeder(threading.Thread):
             not remux_command
             or bytes_per_second <= 0
             or LIVE_FEED_CHUNK_BYTES % MPEGTS_PACKET_SIZE_BYTES != 0
+            or LIVE_FEED_CHUNK_BYTES > MAX_UDP_DATAGRAM_BYTES
         ):
             raise TestFailure("synthetic LIVE transport has invalid pacing metadata")
         self._remux_command = tuple(remux_command)

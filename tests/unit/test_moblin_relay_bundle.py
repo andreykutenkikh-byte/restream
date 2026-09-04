@@ -236,8 +236,11 @@ def test_self_test_primary_live_fixture_uses_backpressured_paced_transport_bridg
     assert udp_port == 31937
     assert loaded["LIVE_FEED_FIFO_UNITS"] == 4096
     assert loaded["LIVE_FEED_SOCKET_BUFFER_BYTES"] == 262_144
-    assert loaded["LIVE_FEED_CHUNK_BYTES"] == loaded["SRT_PAYLOAD_SIZE"] == 1316
+    assert loaded["SRT_PAYLOAD_SIZE"] == 1316
+    assert loaded["LIVE_FEED_BATCH_PAYLOADS"] == 8
+    assert loaded["LIVE_FEED_CHUNK_BYTES"] == 8 * loaded["SRT_PAYLOAD_SIZE"]
     assert loaded["LIVE_FEED_CHUNK_BYTES"] % loaded["MPEGTS_PACKET_SIZE_BYTES"] == 0
+    assert loaded["LIVE_FEED_CHUNK_BYTES"] <= loaded["MAX_UDP_DATAGRAM_BYTES"]
     assert loaded["LIVE_TRANSPORT_MUX_RATE_BITS_PER_SECOND"] == 9_000_000
     assert loaded["LIVE_FEED_START_TIMEOUT_SECONDS"] == 5.0
     maximum_buffered_seconds = (
