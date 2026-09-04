@@ -159,12 +159,14 @@ SRT_LATENCY_MILLISECONDS = 2000
 SRT_PAYLOAD_SIZE = 1316
 SOURCE_HELPER_PEER_IDLE_TIMEOUT_MILLISECONDS = 10_000
 MPEGTS_PACKET_SIZE_BYTES = 188
-# These buffers absorb ordinary scheduler jitter. The paced feeder itself stops
-# producing datagrams during the same-session stall, so no paused media can
-# accumulate here and FFmpeg treats any real FIFO overrun as a fatal test error.
-LIVE_FEED_FIFO_UNITS = 512
-LIVE_FEED_SOCKET_BUFFER_BYTES = 65_536
+# These bounded buffers absorb startup probing and scheduler jitter on the
+# constrained CI target. The paced feeder itself stops producing datagrams
+# during the same-session stall, and FFmpeg still treats any real FIFO overrun
+# as a fatal test error.
+LIVE_FEED_FIFO_UNITS = 4096
+LIVE_FEED_SOCKET_BUFFER_BYTES = 262_144
 LIVE_FEED_CHUNK_BYTES = SRT_PAYLOAD_SIZE
+LIVE_FEED_START_TIMEOUT_SECONDS = 5.0
 LIVE_FEED_CONTROL_TIMEOUT_SECONDS = 1.0
 LIVE_FEED_STOP_TIMEOUT_SECONDS = 2.0
 LIVE_TRANSPORT_MUX_RATE_BITS_PER_SECOND = 9_000_000
@@ -775,11 +777,14 @@ class Observer(threading.Thread):
         timeout: float,
         *,
         not_before: float = 0.0,
+        health_check=None,
     ) -> dict:
         started = time.monotonic()
         deadline = started + timeout
         fresh_after = max(started, not_before)
         while time.monotonic() < deadline:
+            if health_check is not None:
+                health_check()
             sample = self.checked_snapshot(description)
             if sample and not all(
                 sample.get(name) for name in ("dut_alive", "sink_alive", "reader_alive")
@@ -792,6 +797,8 @@ class Observer(threading.Thread):
             ):
                 return sample
             time.sleep(0.05)
+        if health_check is not None:
+            health_check()
         raise TestFailure(f"timed out waiting for {description}")
 
     def finish(self) -> None:
@@ -1354,10 +1361,17 @@ class PacedMPEGTSFeeder(threading.Thread):
     def wait_ready(self, timeout: float) -> bool:
         with self._condition:
             observed = self._condition.wait_for(
-                lambda: self._ready or self._failure_kind is not None,
+                lambda: self._ready
+                or self._stop_requested
+                or self._failure_kind is not None,
                 timeout,
             )
-            return observed and self._ready and self._failure_kind is None
+            return (
+                observed
+                and self._ready
+                and not self._stop_requested
+                and self._failure_kind is None
+            )
 
     def pause(self, timeout: float = LIVE_FEED_CONTROL_TIMEOUT_SECONDS) -> bool:
         with self._condition:
@@ -1447,7 +1461,6 @@ class PacedMPEGTSFeeder(threading.Thread):
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
                 with self._condition:
                     self._remux = remux
-                    self._ready = True
                     self._condition.notify_all()
                 pacing_anchor = time.monotonic()
                 paced_bytes = 0
@@ -1501,6 +1514,10 @@ class PacedMPEGTSFeeder(threading.Thread):
                     if sent != len(pending):
                         self._fail("socket")
                         return
+                    with self._condition:
+                        if not self._ready and not self._stop_requested:
+                            self._ready = True
+                            self._condition.notify_all()
                     paced_bytes += len(pending)
                     pending.clear()
         except OSError:
@@ -1821,12 +1838,16 @@ def publisher_exclusivity_proved(
     )
 
 
-def wait_helper_path(metrics_port: int, timeout: float = 15.0) -> None:
+def wait_helper_path(metrics_port: int, timeout: float = 15.0, health_check=None) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if health_check is not None:
+            health_check()
         if helper_path_ready(metrics_port):
             return
         time.sleep(0.1)
+    if health_check is not None:
+        health_check()
     raise TestFailure("local source helper did not receive its non-secret RTMP input")
 
 
@@ -2521,10 +2542,21 @@ def main() -> int:
                 SOURCE_PRIMARY_FEED_PORT,
             )
             live_feeder.start()
-            if not live_feeder.wait_ready(LIVE_FEED_CONTROL_TIMEOUT_SECONDS):
+            if not live_feeder.wait_ready(LIVE_FEED_START_TIMEOUT_SECONDS):
                 live_feeder.finish()
                 raise TestFailure("local live feeder exited during startup")
             return live_feeder
+
+        def require_primary_source_liveness() -> None:
+            if primary_helper is None or primary_helper.poll() is not None:
+                mark_self_test_stage("auth-src-help")
+                raise TestFailure("primary source helper exited during startup")
+            elif publisher is None or publisher.poll() is not None:
+                mark_self_test_stage("auth-src-bind")
+                raise TestFailure("primary publisher exited during startup")
+            elif feeder is None or not feeder.healthy():
+                mark_self_test_stage("auth-src-feed")
+                raise TestFailure("primary feeder exited during startup")
 
         def stop_primary_srt_source(label: str) -> None:
             nonlocal feeder, primary_helper, publisher
@@ -2730,7 +2762,10 @@ def main() -> int:
         mark_self_test_stage("auth-src-feed")
         feeder = start_live_feeder()
         mark_self_test_stage("auth-src-path")
-        wait_helper_path(SOURCE_PRIMARY_METRICS_PORT)
+        wait_helper_path(
+            SOURCE_PRIMARY_METRICS_PORT,
+            health_check=require_primary_source_liveness,
+        )
         initial_live_started = time.monotonic()
         initial_live_deadline = initial_live_started + 20
         mark_self_test_stage("live-ingest")
@@ -2745,6 +2780,7 @@ def main() -> int:
             ),
             max(0.0, initial_live_deadline - time.monotonic()),
             not_before=initial_live_started,
+            health_check=require_primary_source_liveness,
         )
         mark_self_test_stage("live-normalize")
         try:

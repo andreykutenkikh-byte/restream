@@ -234,11 +234,17 @@ def test_self_test_primary_live_fixture_uses_backpressured_paced_transport_bridg
     auxiliary = loaded["local_rtmp_publisher_command"](live, rtmp_port)
 
     assert udp_port == 31937
-    assert loaded["LIVE_FEED_FIFO_UNITS"] == 512
-    assert loaded["LIVE_FEED_SOCKET_BUFFER_BYTES"] == 65_536
+    assert loaded["LIVE_FEED_FIFO_UNITS"] == 4096
+    assert loaded["LIVE_FEED_SOCKET_BUFFER_BYTES"] == 262_144
     assert loaded["LIVE_FEED_CHUNK_BYTES"] == loaded["SRT_PAYLOAD_SIZE"] == 1316
     assert loaded["LIVE_FEED_CHUNK_BYTES"] % loaded["MPEGTS_PACKET_SIZE_BYTES"] == 0
     assert loaded["LIVE_TRANSPORT_MUX_RATE_BITS_PER_SECOND"] == 9_000_000
+    assert loaded["LIVE_FEED_START_TIMEOUT_SECONDS"] == 5.0
+    maximum_buffered_seconds = (
+        loaded["LIVE_FEED_FIFO_UNITS"] * loaded["MPEGTS_PACKET_SIZE_BYTES"]
+        + 2 * loaded["LIVE_FEED_SOCKET_BUFFER_BYTES"]
+    ) / (loaded["LIVE_TRANSPORT_MUX_RATE_BITS_PER_SECOND"] / 8)
+    assert maximum_buffered_seconds < loaded["LIVE_TO_SLATE_DEADLINE_SECONDS"] / 2
     assert remux == [
         ffmpeg,
         "-nostdin",
@@ -274,7 +280,7 @@ def test_self_test_primary_live_fixture_uses_backpressured_paced_transport_bridg
         "-loglevel",
         "quiet",
         "-i",
-        f"udp://127.0.0.1:{udp_port}?fifo_size=512&buffer_size=65536",
+        f"udp://127.0.0.1:{udp_port}?fifo_size=4096&buffer_size=262144",
         "-map",
         "0:v:0",
         "-map",
@@ -400,6 +406,44 @@ def test_self_test_paced_feeder_fails_closed_when_remux_exits() -> None:
             assert feeder.finish()
 
 
+def test_self_test_paced_feeder_is_ready_only_after_one_complete_datagram(
+    tmp_path: Path,
+) -> None:
+    loaded = load_self_test()
+    feeder_class = loaded["PacedMPEGTSFeeder"]
+    chunk_size = loaded["LIVE_FEED_CHUNK_BYTES"]
+    packet_size = loaded["MPEGTS_PACKET_SIZE_BYTES"]
+    packets_per_chunk = chunk_size // packet_size
+    gate = tmp_path / "release-remux"
+    producer = (
+        "import os, time\n"
+        f"while not os.path.exists({str(gate)!r}):\n"
+        "    time.sleep(0.005)\n"
+        "packet = b'\\x47' + b'\\x00' * 187\n"
+        f"os.write(1, packet * {packets_per_chunk})\n"
+        "time.sleep(30)\n"
+    )
+    command = [sys.executable, "-c", producer]
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver:
+        receiver.bind(("127.0.0.1", 0))
+        receiver.settimeout(1.0)
+        feeder = feeder_class(command, receiver.getsockname()[1])
+        feeder.start()
+        try:
+            deadline = time.monotonic() + 1.0
+            while feeder.remux_pid is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert feeder.remux_pid is not None
+            assert not feeder.wait_ready(0.05)
+            gate.touch()
+            assert feeder.wait_ready(1.0)
+            assert len(receiver.recvfrom(chunk_size)[0]) == chunk_size
+            assert feeder.healthy()
+        finally:
+            assert feeder.finish()
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX SIGTERM behavior only")
 def test_self_test_paced_feeder_kills_and_reaps_term_ignoring_remux() -> None:
     loaded = load_self_test()
@@ -444,7 +488,7 @@ def test_self_test_primary_live_feeder_has_strict_lifecycle_guards() -> None:
     assert "assert_clean_process_metadata(command)" in feeder_start
     assert "PacedMPEGTSFeeder(" in feeder_start
     assert "live_feeder.start()" in feeder_start
-    assert "live_feeder.wait_ready(LIVE_FEED_CONTROL_TIMEOUT_SECONDS)" in feeder_start
+    assert "live_feeder.wait_ready(LIVE_FEED_START_TIMEOUT_SECONDS)" in feeder_start
     assert "processes.append" not in feeder_start
     assert 'raise TestFailure("local live feeder exited during startup")' in feeder_start
 
@@ -459,10 +503,23 @@ def test_self_test_primary_live_feeder_has_strict_lifecycle_guards() -> None:
         'mark_self_test_stage("auth-src-feed")',
         "feeder = start_live_feeder()",
         'mark_self_test_stage("auth-src-path")',
-        "wait_helper_path(SOURCE_PRIMARY_METRICS_PORT)",
+        "wait_helper_path(",
     )
     startup_positions = [initial_start.index(step) for step in startup_steps]
     assert startup_positions == sorted(startup_positions)
+    assert "health_check=require_primary_source_liveness" in initial_start
+    initial_ingest = source.split('mark_self_test_stage("live-ingest")', 1)[1].split(
+        'mark_self_test_stage("live-normalize")', 1
+    )[0]
+    assert "health_check=require_primary_source_liveness" in initial_ingest
+
+    liveness = source.split("def require_primary_source_liveness", 1)[1].split(
+        "def stop_primary_srt_source", 1
+    )[0]
+    helper = 'mark_self_test_stage("auth-src-help")'
+    publisher = 'mark_self_test_stage("auth-src-bind")'
+    feeder = 'mark_self_test_stage("auth-src-feed")'
+    assert liveness.index(helper) < liveness.index(publisher) < liveness.index(feeder)
 
     same_session = source.split('mark_self_test_stage("stall-pre")', 1)[1].split(
         'mark_self_test_stage("stall-ident")', 1
