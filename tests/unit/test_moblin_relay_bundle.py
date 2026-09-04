@@ -451,12 +451,18 @@ def test_self_test_primary_live_feeder_has_strict_lifecycle_guards() -> None:
     initial_start = source.split('mark_self_test_stage("auth-source")', 1)[1].split(
         'mark_self_test_stage("live-ingest")', 1
     )[0]
-    helper = "primary_helper = start_source_helper("
-    publisher = "publisher = start_primary_publisher()"
-    feeder = "feeder = start_live_feeder()"
-    assert (
-        initial_start.index(helper) < initial_start.index(publisher) < initial_start.index(feeder)
+    startup_steps = (
+        'mark_self_test_stage("auth-src-help")',
+        "primary_helper = start_source_helper(",
+        'mark_self_test_stage("auth-src-bind")',
+        "publisher = start_primary_publisher()",
+        'mark_self_test_stage("auth-src-feed")',
+        "feeder = start_live_feeder()",
+        'mark_self_test_stage("auth-src-path")',
+        "wait_helper_path(SOURCE_PRIMARY_METRICS_PORT)",
     )
+    startup_positions = [initial_start.index(step) for step in startup_steps]
+    assert startup_positions == sorted(startup_positions)
 
     same_session = source.split('mark_self_test_stage("stall-pre")', 1)[1].split(
         'mark_self_test_stage("stall-ident")', 1
@@ -625,6 +631,10 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         "topology",
         "auth",
         "auth-source",
+        "auth-src-help",
+        "auth-src-bind",
+        "auth-src-feed",
+        "auth-src-path",
         "auth-scan",
         "auth-exclusive",
         "auth-x-core",

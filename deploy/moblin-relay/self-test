@@ -62,6 +62,10 @@ SELF_TEST_STAGES = frozenset(
         "topology",
         "auth",
         "auth-source",
+        "auth-src-help",
+        "auth-src-bind",
+        "auth-src-feed",
+        "auth-src-path",
         "auth-scan",
         "auth-exclusive",
         "auth-x-core",
@@ -2719,9 +2723,13 @@ def main() -> int:
         )
         secret_configs.add(primary_config)
         authorized_configs.add(primary_config)
+        mark_self_test_stage("auth-src-help")
         primary_helper = start_source_helper(primary_config, "primary", SOURCE_PRIMARY_METRICS_PORT)
+        mark_self_test_stage("auth-src-bind")
         publisher = start_primary_publisher()
+        mark_self_test_stage("auth-src-feed")
         feeder = start_live_feeder()
+        mark_self_test_stage("auth-src-path")
         wait_helper_path(SOURCE_PRIMARY_METRICS_PORT)
         initial_live_started = time.monotonic()
         initial_live_deadline = initial_live_started + 20

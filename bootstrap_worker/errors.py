@@ -140,6 +140,18 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_auth_source_failed": (
             "Основной тестовый SRT-источник Moblin Relay не запустился."
         ),
+        "relay_self_test_auth_source_helper_failed": (
+            "Основной тестовый SRT-помощник Moblin Relay не запустился."
+        ),
+        "relay_self_test_auth_source_publisher_bind_failed": (
+            "Тестовый RTMP-издатель не привязал локальный UDP-порт."
+        ),
+        "relay_self_test_auth_source_feeder_failed": (
+            "Тестовая подача LIVE-потока не перешла в состояние готовности."
+        ),
+        "relay_self_test_auth_source_path_failed": (
+            "Основной тестовый SRT-путь не перешёл в состояние готовности."
+        ),
         "relay_self_test_auth_live_failed": (
             "Тестовый LIVE-поток не прошёл самопроверку через SRT и нормализатор."
         ),
