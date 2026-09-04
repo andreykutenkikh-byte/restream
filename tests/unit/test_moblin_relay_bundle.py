@@ -448,8 +448,13 @@ def test_self_test_paced_feeder_is_ready_only_after_one_complete_datagram(
 def test_self_test_paced_feeder_kills_and_reaps_term_ignoring_remux() -> None:
     loaded = load_self_test()
     feeder_class = loaded["PacedMPEGTSFeeder"]
+    packets_per_chunk = loaded["LIVE_FEED_CHUNK_BYTES"] // loaded["MPEGTS_PACKET_SIZE_BYTES"]
     producer = (
-        "import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(30)\n"
+        "import os, signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "packet = b'\\x47' + b'\\x00' * 187\n"
+        f"os.write(1, packet * {packets_per_chunk})\n"
+        "time.sleep(30)\n"
     )
     command = [sys.executable, "-c", producer]
 
