@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any
 
@@ -21,6 +22,20 @@ class FakeMediaMTX:
 
     async def kick_publishers(self, _: str) -> int:
         return 0
+
+
+class HeartbeatBootstrap:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.completed_node_ids: list[str] = []
+        self.fail = fail
+
+    async def notify_enrollment_completed(self, node_id: str) -> None:
+        self.completed_node_ids.append(node_id)
+        if self.fail:
+            raise RuntimeError("simulated bootstrap coordinator failure")
+
+    async def close(self) -> None:
+        return None
 
 
 def safe_state(*, active: bool = False) -> dict[str, Any]:
@@ -85,10 +100,31 @@ def test_explicit_srt_labels_override_address_classification_heuristic() -> None
     assert parsed == {"public_url": public_url, "vpn_url": vpn_url}
 
 
+def test_structured_srt_result_maps_first_fallback_for_legacy_ui() -> None:
+    public_url = "srt://relay.example:8890?streamid=publish:live:public"
+    first_fallback = "srt://backup.example:8890?streamid=publish:live:backup"
+    secret = json.dumps(
+        {
+            "public_url": public_url,
+            "fallback_urls": [first_fallback, "srt://backup-2.example:8890?x=1"],
+        }
+    )
+
+    assert _parse_srt_result(secret) == {
+        "public_url": public_url,
+        "vpn_url": first_fallback,
+    }
+
+
 def test_relay_api_returns_bounded_live_input_bitrate(
     settings: Settings, admin_password: str
 ) -> None:
-    app = create_app(settings, mediamtx=FakeMediaMTX())  # type: ignore[arg-type]
+    bootstrap = HeartbeatBootstrap()
+    app = create_app(
+        settings,
+        mediamtx=FakeMediaMTX(),  # type: ignore[arg-type]
+        bootstrap=bootstrap,
+    )
     with TestClient(app) as client:
         grant = app.state.relays.provision_node(display_name="HK relay", address="relay.example")
         payload = heartbeat_payload()
@@ -101,11 +137,36 @@ def test_relay_api_returns_bounded_live_input_bitrate(
             headers={"Authorization": f"Bearer {grant.node_token}"},
         )
         assert response.status_code == 200
+        assert bootstrap.completed_node_ids == [grant.node_id]
         admin_headers(client, settings, admin_password)
 
         status = client.get(f"/api/nodes/{grant.node_id}/relay/status")
         assert status.status_code == 200
         assert status.json()["status"]["input_bitrate_bps"] == 4_000_000
+
+
+def test_bootstrap_notification_failure_does_not_reject_valid_relay_heartbeat(
+    settings: Settings,
+) -> None:
+    bootstrap = HeartbeatBootstrap(fail=True)
+    app = create_app(
+        settings,
+        mediamtx=FakeMediaMTX(),  # type: ignore[arg-type]
+        bootstrap=bootstrap,
+    )
+    with TestClient(app) as client:
+        grant = app.state.relays.provision_node(
+            display_name="HK relay",
+            address="relay.example",
+        )
+        response = client.post(
+            "/relay-agent/v1/heartbeat",
+            json=heartbeat_payload(),
+            headers={"Authorization": f"Bearer {grant.node_token}"},
+        )
+
+    assert response.status_code == 200
+    assert bootstrap.completed_node_ids == [grant.node_id]
 
 
 @pytest.mark.parametrize(

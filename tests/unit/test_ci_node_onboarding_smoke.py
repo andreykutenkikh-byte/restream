@@ -1,10 +1,16 @@
-"""Secret-safe diagnostics for the real Node onboarding smoke."""
+"""Secret-safe diagnostics for the native relay onboarding smoke."""
 
 from typing import Any
 
 import pytest
 
-from scripts.ci_node_onboarding_smoke import complete_command, safe_bootstrap_diagnostic_code
+from bootstrap_worker.relay_installer import _SELF_TEST_STAGE_CODES
+from scripts.ci_node_onboarding_smoke import (
+    SAFE_BOOTSTRAP_DIAGNOSTIC_CODES,
+    safe_api_payload,
+    safe_bootstrap_diagnostic_code,
+    safe_relay_api_diagnostic,
+)
 from scripts.ci_output_smoke import SmokeFailure
 
 
@@ -29,33 +35,224 @@ def test_bootstrap_diagnostic_code_is_strictly_allowlisted() -> None:
     assert safe_bootstrap_diagnostic_code({"safe_error": "invalid"}) == "unknown"
 
 
-class _CompletedSelfTestClient:
-    def request(self, method: str, path: str, *args: object, **kwargs: object) -> dict[str, Any]:
-        if method == "POST":
-            return {"id": "command-id"}
-        return {
-            "state": "completed",
-            "safe_result": {
-                "status": "failed",
-                "checks": {
-                    "control_https": False,
-                    "dns": True,
-                    "ffmpeg": True,
-                    "ffprobe": True,
-                    "memory": True,
-                    "disk": True,
-                    "data_writable": True,
-                    "no_inbound_ports": True,
-                },
-            },
-        }
+def test_bootstrap_timeout_diagnostics_are_fixed_and_bounded() -> None:
+    for code in _SELF_TEST_STAGE_CODES.values():
+        timeout_code = code + "_timeout"
+        assert len(timeout_code) <= 96
+        assert (
+            safe_bootstrap_diagnostic_code({"safe_error": {"code": timeout_code}}) == timeout_code
+        )
+    for code in (
+        "relay_dependency_install_failed_timeout",
+        "mediamtx_download_failed_timeout",
+        "mediamtx_archive_invalid_timeout",
+        "mediamtx_binary_invalid_timeout",
+        "mediamtx_license_missing_timeout",
+        "relay_slate_generation_failed_timeout",
+        "relay_agent_copy_failed_timeout",
+        "remote_command_timeout",
+    ):
+        assert safe_bootstrap_diagnostic_code({"safe_error": {"code": code}}) == code
+    assert (
+        safe_bootstrap_diagnostic_code({"safe_error": {"code": "private-secret-failed_timeout"}})
+        == "unknown"
+    )
 
 
-def test_self_test_diagnostic_prints_only_fixed_check_name(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
+def test_native_safe_failure_code_is_allowlisted() -> None:
+    for code in (
+        "relay_self_test_failed",
+        "relay_self_test_decode_streams_failed",
+        "relay_self_test_decode_format_failed",
+        "relay_self_test_decode_format_video_codec_failed",
+        "relay_self_test_decode_format_video_profile_failed",
+        "relay_self_test_decode_format_video_level_failed",
+        "relay_self_test_decode_format_video_b_frames_failed",
+        "relay_self_test_decode_format_video_dimensions_failed",
+        "relay_self_test_decode_format_video_pixel_format_failed",
+        "relay_self_test_decode_format_video_r_frame_rate_failed",
+        "relay_self_test_decode_format_audio_codec_failed",
+        "relay_self_test_decode_format_audio_profile_failed",
+        "relay_self_test_decode_format_audio_sample_rate_failed",
+        "relay_self_test_decode_format_audio_channels_failed",
+        "relay_self_test_decode_format_audio_layout_failed",
+        "relay_self_test_decode_gop_failed",
+        "relay_self_test_decode_decoder_failed",
+        "relay_self_test_decode_frames_failed",
+        "relay_self_test_decode_timestamps_failed",
+        "relay_self_test_timestamp_probe_pts_failed",
+        "relay_self_test_timestamp_packet_dts_failed",
+        "relay_self_test_timestamp_video_pts_failed",
+        "relay_self_test_timestamp_video_pts_offset_failed",
+        "relay_self_test_timestamp_video_pts_order_failed",
+        "relay_self_test_timestamp_video_frame_rate_failed",
+        "relay_self_test_timestamp_audio_pts_failed",
+        "relay_self_test_timestamp_gaps_failed",
+        "relay_self_test_timestamp_gap_video_dts_failed",
+        "relay_self_test_timestamp_gap_audio_dts_failed",
+        "relay_self_test_timestamp_gap_video_pts_failed",
+        "relay_self_test_timestamp_gap_audio_pts_failed",
+        "relay_self_test_timestamp_gap_decoded_video_failed",
+        "relay_self_test_timestamp_gap_decoded_audio_failed",
+        "relay_self_test_timestamp_av_sync_failed",
+        "relay_self_test_auth_source_helper_failed",
+        "relay_self_test_auth_source_publisher_bind_failed",
+        "relay_self_test_auth_source_feeder_failed",
+        "relay_self_test_auth_source_path_failed",
+        "relay_self_test_auth_exclusivity_core_failed",
+        "relay_self_test_auth_exclusivity_candidate_failed",
+        "relay_self_test_auth_exclusivity_primary_failed",
+        "relay_self_test_auth_exclusivity_live_failed",
+        "relay_self_test_auth_exclusivity_ingest_failed",
+        "relay_self_test_auth_exclusivity_normalizer_failed",
+        "relay_self_test_auth_exclusivity_normalizer_child_exit_failed",
+        "relay_self_test_auth_exclusivity_normalizer_start_timeout_failed",
+        "relay_self_test_auth_exclusivity_normalizer_metrics_blind_failed",
+        "relay_self_test_auth_exclusivity_normalizer_output_identity_failed",
+        "relay_self_test_auth_exclusivity_normalizer_output_regression_failed",
+        "relay_self_test_auth_exclusivity_normalizer_output_fallback_failed",
+        "relay_self_test_auth_exclusivity_normalizer_ingest_timing_failed",
+        "relay_self_test_auth_exclusivity_normalizer_ingest_missing_failed",
+        "relay_self_test_auth_exclusivity_normalizer_ingest_identity_failed",
+        "relay_self_test_auth_exclusivity_normalizer_ingest_regression_failed",
+        "relay_self_test_auth_exclusivity_normalizer_verified_stall_failed",
+        "relay_self_test_auth_exclusivity_normalizer_confirmed_input_stall_failed",
+        "relay_self_test_auth_exclusivity_normalizer_watchdog_unknown_failed",
+        "relay_self_test_auth_exclusivity_downstream_failed",
+        "relay_self_test_auth_exclusivity_progress_failed",
+        "relay_self_test_auth_exclusivity_observability_failed",
+        "relay_self_test_auth_exclusivity_proof_failed",
+        "relay_self_test_stall_resume_failed",
+        "relay_self_test_stall_core_failed",
+        "relay_self_test_stall_source_failed",
+        "relay_self_test_stall_ingest_failed",
+        "relay_self_test_stall_ingest_offline_failed",
+        "relay_self_test_stall_ingest_identity_failed",
+        "relay_self_test_stall_ingest_identity_pre_resume_failed",
+        "relay_self_test_stall_ingest_identity_recovery_failed",
+        "relay_self_test_stall_ingest_progress_failed",
+        "relay_self_test_stall_helper_observability_failed",
+        "relay_self_test_stall_helper_path_failed",
+        "relay_self_test_stall_helper_forward_failed",
+        "relay_self_test_stall_helper_state_failed",
+        "relay_self_test_stall_normalizer_failed",
+        "relay_self_test_stall_downstream_failed",
+        "relay_self_test_stall_observability_failed",
+        "relay_self_test_stall_identity_failed",
+        "relay_self_test_persistent_stall_precondition_failed",
+        "relay_self_test_persistent_stall_slate_failed",
+        "relay_self_test_persistent_stall_confirmation_failed",
+        "relay_self_test_persistent_stall_reset_failed",
+        "relay_self_test_persistent_stall_reconnect_failed",
+        "relay_self_test_persistent_stall_source_failed",
+        "relay_self_test_persistent_stall_continuity_failed",
+        "relay_self_test_reset_precondition_failed",
+        "relay_self_test_reset_injection_failed",
+        "relay_self_test_reset_slate_failed",
+        "relay_self_test_reset_circuit_failed",
+        "relay_self_test_reset_kick_failed",
+        "relay_self_test_reset_reconnect_failed",
+        "relay_self_test_reset_source_failed",
+        "relay_self_test_reset_continuity_failed",
+    ):
+        assert safe_bootstrap_diagnostic_code({"safe_error": {"code": code}}) == code
+
+
+def test_every_installer_self_test_diagnostic_is_safe_for_ci_output() -> None:
+    assert set(_SELF_TEST_STAGE_CODES.values()) <= SAFE_BOOTSTRAP_DIAGNOSTIC_CODES
+
+
+def test_api_payload_password_marker_fails_closed() -> None:
     with pytest.raises(SmokeFailure):
-        complete_command(_CompletedSelfTestClient(), "node-id", "SELF_TEST")  # type: ignore[arg-type]
+        safe_api_payload(
+            {"unexpected": "CI_SSH_PASSWORD_MUST_NEVER_PERSIST_9F3A"},
+            "unit test payload",
+        )
 
-    output = capsys.readouterr().out
-    assert output == "SELF_TEST failed safe checks: control_https\n"
+    clean: dict[str, Any] = {"install_profile": "moblin_relay"}
+    assert safe_api_payload(clean, "unit test payload") is clean
+
+
+def test_relay_api_diagnostic_reports_only_allowlisted_readiness_facts() -> None:
+    marker = "CI_SSH_PASSWORD_MUST_NEVER_PERSIST_9F3A"
+    diagnostic = safe_relay_api_diagnostic(
+        {
+            "items": [
+                {
+                    "id": marker,
+                    "status": "connecting",
+                    "node_kind": "moblin_relay",
+                    "agent_version": "wrong-and-sensitive-" + marker,
+                    "protocol_version": 9,
+                    "capabilities": ["other", marker],
+                    "hostname": marker,
+                }
+            ]
+        },
+        {
+            "items": [
+                {
+                    "node_id": "different-" + marker,
+                    "available": False,
+                    "status": {
+                        "service": "active",
+                        "enabled": False,
+                        "main_process": "stopped",
+                        "srt_listener": "closed",
+                        "source": "NONE",
+                        "input_bitrate_bps": None,
+                        "youtube_forward": "inactive",
+                        "overall": "ok",
+                        "youtube_url_configured": False,
+                        "youtube_key_configured": False,
+                        "portrait_profile": True,
+                        "error_code": None,
+                        marker: marker,
+                    },
+                }
+            ]
+        },
+        expected_node_id="different-expected-" + marker,
+        expected_host_fingerprint="different-fingerprint-" + marker,
+    )
+
+    assert diagnostic == {
+        "node_count": "one",
+        "relay_count": "one",
+        "node_status": "connecting",
+        "node_kind": "moblin_relay",
+        "agent_version_match": False,
+        "protocol_version_match": False,
+        "relay_capability_present": False,
+        "hostname_match": False,
+        "completed_node_identity_match": False,
+        "host_key_fingerprint_match": False,
+        "host_key_trust_mode_match": False,
+        "resolved_ip_present": False,
+        "relay_identity_match": False,
+        "relay_available": False,
+        "relay_status_shape": "mapping",
+        "relay_status_mismatches": ["service"],
+        "relay_status_unexpected_fields": True,
+    }
+    assert marker not in repr(diagnostic)
+
+
+def test_relay_api_diagnostic_distinguishes_missing_and_invalid_state() -> None:
+    assert safe_relay_api_diagnostic({"items": []}, {"items": [{"status": "bad"}]}) == {
+        "node_count": "none",
+        "relay_count": "one",
+        "relay_identity_match": False,
+        "relay_available": "invalid",
+        "relay_status_shape": "invalid",
+    }
+    assert safe_relay_api_diagnostic(None, None) == {
+        "node_count": "invalid",
+        "relay_count": "invalid",
+    }
+    unhashable = safe_relay_api_diagnostic(
+        {"items": [{"status": [], "node_kind": {}}]},
+        {"items": []},
+    )
+    assert unhashable["node_status"] == "unexpected"
+    assert unhashable["node_kind"] == "unexpected"

@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from app.core.config import Settings
 from app.main import create_app
+from app.services.bootstrap import BootstrapCoordinator
 from app.services.mediamtx import IngestState, IngestStatus
 
 
@@ -41,6 +43,7 @@ class FakeBootstrap:
             "port": 22,
             "username": "root",
             "expected_host_fingerprint": None,
+            "install_profile": "moblin_relay",
         }
         self.active_job_id = "11111111-1111-4111-8111-111111111111"
         return {"job_id": self.active_job_id, "state": "queued"}
@@ -190,4 +193,60 @@ def test_bootstrap_request_rejects_url_and_invalid_port(
             headers=headers,
         )
         assert invalid_port.status_code == 422
+        client_selected_profile = client.post(
+            "/api/nodes/bootstrap",
+            json={
+                "address": "example.test",
+                "port": 22,
+                "username": "root",
+                "password": "temporary",
+                "install_profile": "generic_node",
+            },
+            headers=headers,
+        )
+        assert client_selected_profile.status_code == 422
         assert bootstrap.password_seen is False
+
+
+@pytest.mark.parametrize("suffix", ["", "_timeout"])
+def test_admin_api_preserves_long_native_recovery_diagnostics(
+    settings: Settings,
+    admin_password: str,
+    suffix: str,
+) -> None:
+    worker = FakeBootstrap()
+    app = create_app(settings, mediamtx=OfflineMediaMTX(), bootstrap=worker)  # type: ignore[arg-type]
+    code = "relay_self_test_auth_exclusivity_normalizer_confirmed_input_stall_failed" + suffix
+    job_id = "11111111-1111-4111-8111-111111111111"
+    with TestClient(app) as client:
+        coordinator = BootstrapCoordinator(
+            app.state.database,
+            app.state.nodes,
+            worker,  # type: ignore[arg-type]
+            control_url="https://restream.example.test",
+            node_agent_image="ghcr.io/example/node@sha256:" + "1" * 64,
+        )
+        app.state.bootstrap = coordinator
+        app.state.nodes.create_pending_bootstrap_node(
+            job_id=job_id,
+            install_profile="moblin_relay",
+            display_name="CI relay",
+            address="relay.example.test",
+            resolved_ip="",
+            ssh_port=22,
+            ssh_username="root",
+            node_id="22222222-2222-4222-8222-222222222222",
+        )
+        with app.state.database.connect() as connection:
+            connection.execute(
+                "UPDATE node_install_jobs SET state = 'failed', current_step = 'failed', "
+                "safe_error_code = ?, safe_error_message = ? WHERE id = ?",
+                (code, "Safe native test diagnostic", job_id),
+            )
+        endpoint = f"/api/nodes/bootstrap/{job_id}"
+        assert client.get(endpoint).status_code == 401
+        login(client, settings, admin_password)
+        response = client.get(endpoint)
+        assert response.status_code == 200
+        assert response.json()["safe_error"]["code"] == code
+        assert response.json()["state"] == "failed"

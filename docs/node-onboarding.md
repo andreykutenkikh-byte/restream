@@ -1,9 +1,15 @@
-# Node onboarding (Stage 4A)
+# Legacy generic Node Agent onboarding (Stage 4A)
+
+> **Current public workflow:** **Servers → Connect server** provisions a complete native Moblin
+> Relay, not the generic Docker Node Agent described below. Supported systems, installed files,
+> operator steps, credential handling, and the clean-host release gate for that workflow are in
+> [Moblin Relay onboarding](moblin-relay-onboarding.md). The generic profile remains an internal
+> compatibility path and cannot be selected by the browser.
 
 Stage 4A lets the single authenticated administrator attach one or more supported Linux servers
-from the **Servers** page. The control plane performs a bounded SSH bootstrap, installs an
-outbound-only Node Agent, waits for one-time enrollment, and runs a fixed installation check. The
-remote node is not yet part of the media path.
+through the legacy generic profile. The control plane performs a bounded SSH bootstrap, installs
+an outbound-only Node Agent, waits for one-time enrollment, and runs a fixed installation check.
+The remote node is not part of the media path.
 
 This document describes the implemented workflow. It is not authorization to run it against a
 production server.

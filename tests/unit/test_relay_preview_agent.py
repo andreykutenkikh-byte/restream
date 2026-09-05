@@ -232,12 +232,8 @@ def test_local_hls_reader_rebootstraps_after_session_expires(
     calls: list[str] = []
     root_responses = iter(
         (
-            (f"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n{first_resource}\n").encode(
-                "ascii"
-            ),
-            (f"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n{second_resource}\n").encode(
-                "ascii"
-            ),
+            (f"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n{first_resource}\n").encode("ascii"),
+            (f"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n{second_resource}\n").encode("ascii"),
         )
     )
     first_media_calls = 0
@@ -447,7 +443,7 @@ def test_control_client_accepts_optional_preview_demand_and_uses_separate_media_
     assert method == "GET"
     assert path == "/relay-agent/v1/commands/next?wait=0"
     assert sent is None
-    assert headers["X-Relay-Agent-Version"] == "1.2.5"
+    assert headers["X-Relay-Agent-Version"] == "1.2.6"
 
     payload = ts_segment()
     client.upload_preview_segment(generation, 22, payload)

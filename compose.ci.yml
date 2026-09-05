@@ -5,7 +5,9 @@ services:
       ENVIRONMENT: test
       COOKIE_SECURE: "false"
       NODE_AGENT_IMAGE: ghcr.io/adojapan/ci-node-agent@sha256:1111111111111111111111111111111111111111111111111111111111111111
-      PUBLIC_CONTROL_URL: http://backend:8000
+      # Native relay artifacts intentionally pin this production origin. The
+      # CI-only heartbeat peer below still targets the local backend directly.
+      PUBLIC_CONTROL_URL: https://restream.adojapan.ru
       TEST_DESTINATION_ALLOWLIST: rtmp://ci-rtmp-receiver:1935/ci-output
     depends_on:
       ci-rtmp-receiver:
@@ -25,17 +27,24 @@ services:
       context: .
       dockerfile: ci/ssh-target/Dockerfile
     networks:
-      - bootstrap-egress
+      internal: {}
+      # The target also needs the isolated control-plane network for its CI
+      # heartbeat, so make the only egress-capable network the explicit
+      # default gateway instead of relying on attachment order.
+      bootstrap-egress:
+        gw_priority: 1
     volumes:
       - ci_node_data:/opt/adojapan-restream-node
     init: true
-    read_only: true
+    # A native install must write the disposable target's /etc, /opt, /usr and
+    # /var. This is an isolated CI-only container with no host bind mounts.
+    read_only: false
     tmpfs:
       - /run:size=16m,mode=0755
-      - /tmp:size=32m,mode=1777
-    cpus: "0.10"
-    mem_limit: 256m
-    pids_limit: 64
+      - /tmp:size=256m,mode=1777
+    cpus: "1.50"
+    mem_limit: 1536m
+    pids_limit: 512
     stop_grace_period: 10s
     restart: "no"
     healthcheck:

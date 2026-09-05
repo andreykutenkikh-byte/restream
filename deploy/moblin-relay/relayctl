@@ -1,0 +1,1254 @@
+#!/usr/bin/python3
+"""Safe operator interface for the Moblin -> MediaMTX -> YouTube relay."""
+
+from __future__ import annotations
+
+import contextlib
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urlsplit
+
+SERVICE = "moblin-relay.service"
+SECRET_FILE = Path("/etc/moblin-relay/secrets.json")
+NODE_CONFIG_FILE = Path("/etc/moblin-relay/node.json")
+LOCK_DIR = Path("/run/lock/moblin-relay")
+LOCK_FILE = LOCK_DIR / "control.lock"
+TEST_PROGRAM = Path("/opt/moblin-relay/libexec/self-test")
+SRT_PORT = 8890
+SRT_PATH = "iphone-live"
+MAX_FALLBACK_SRT_HOSTS = 4
+OUTPUT_PATH = "relay-output"
+RTSP_PORT = 8554
+RTMP_PORT = 1935
+CONTROL_API_PORT = 9997
+INCIDENT_JOURNAL_LINES = 4_000
+INCIDENT_JOURNAL_SINCE = "-6h"
+INCIDENT_REPEAT_WINDOW_MICROSECONDS = 5 * 60 * 1_000_000
+INCIDENT_REPEAT_MAX_COUNT = 1_000_000
+UTC_TIMEZONE = timezone.utc  # noqa: UP017 -- the portable bundle still supports Python 3.10
+
+NORMALIZER_RESTART_INCIDENTS = {
+    "child-exit": (
+        "NORMALIZER_CHILD_EXIT",
+        "FFmpeg exited; the normalizer is restarting it",
+    ),
+    "output-start-timeout": (
+        "NORMALIZER_OUTPUT_START_TIMEOUT",
+        "FFmpeg did not establish relay-output in time",
+    ),
+    "metrics-blind": (
+        "NORMALIZER_METRICS_UNAVAILABLE",
+        "The watchdog could not verify media progress",
+    ),
+    "output-identity": (
+        "NORMALIZER_OUTPUT_REPLACED",
+        "The relay-output publisher identity changed unexpectedly",
+    ),
+    "output-regression": (
+        "NORMALIZER_OUTPUT_COUNTER_RESET",
+        "The relay-output media counter moved backwards",
+    ),
+    "output-fallback": (
+        "NORMALIZER_OUTPUT_STALLED",
+        "relay-output stopped advancing",
+    ),
+    "ingest-timing": (
+        "SRT_INPUT_CHECK_TIMEOUT",
+        "The watchdog could not verify SRT input in time",
+    ),
+    "ingest-missing": (
+        "SRT_INPUT_DISAPPEARED",
+        "The active SRT input disappeared during recovery",
+    ),
+    "ingest-identity": (
+        "SRT_INPUT_REPLACED",
+        "The active SRT publisher identity changed",
+    ),
+    "ingest-regression": (
+        "SRT_INPUT_COUNTER_RESET",
+        "The SRT input media counter moved backwards",
+    ),
+    "verified-stall": (
+        "NORMALIZER_VERIFIED_STALL",
+        "SRT input and relay-output both stopped advancing",
+    ),
+    "ingest-confirmed-stall": (
+        "SRT_INPUT_MEDIA_STILL_STALLED",
+        "The same Moblin input remained connected but media did not resume after the grace period",
+    ),
+    "watchdog-unknown": (
+        "NORMALIZER_WATCHDOG_FAILURE",
+        "The media watchdog requested a fail-safe restart",
+    ),
+}
+NORMALIZER_RECOVERY_INCIDENTS = {
+    "reset-requested": (
+        "SRT_RECOVERY_RESET_REQUESTED",
+        "Automatic local recovery did not restore media; "
+        "the server requested a fresh SRT handshake",
+    ),
+    "reset-succeeded": (
+        "SRT_RECOVERY_RESET_SUCCEEDED",
+        "The server closed the old SRT transport so Moblin can reconnect automatically",
+    ),
+    "source-already-gone": (
+        "SRT_RECOVERY_SOURCE_GONE",
+        "The previous SRT transport had already disconnected",
+    ),
+    "reset-failed-credential": (
+        "SRT_RECOVERY_CREDENTIAL_ERROR",
+        "The local recovery credential was unavailable",
+    ),
+    "reset-failed-transport": (
+        "SRT_RECOVERY_CONTROL_UNAVAILABLE",
+        "The local recovery control API was unavailable",
+    ),
+    "reset-failed-rejected": (
+        "SRT_RECOVERY_RESET_REJECTED",
+        "The local recovery control API rejected the reset",
+    ),
+    "reset-failed-response": (
+        "SRT_RECOVERY_INVALID_RESPONSE",
+        "The local recovery control API returned an invalid response",
+    ),
+    "attempts-exhausted": (
+        "SRT_RECOVERY_ATTEMPTS_EXHAUSTED",
+        "Automatic SRT recovery exhausted its bounded attempts",
+    ),
+    "source-resumed-before-reset": (
+        "SRT_INPUT_RESUMED",
+        "Moblin media resumed after the network interruption; "
+        "the pending transport reset was cancelled",
+    ),
+}
+NORMALIZER_STATE_INCIDENTS = {
+    "source-attached": (
+        "SRT_INPUT_ATTACHED",
+        "The server accepted a Moblin input connection",
+    ),
+    "source-detached": (
+        "SRT_INPUT_DETACHED",
+        "The Moblin input connection ended or the relay was stopped",
+    ),
+    "bridge-active": (
+        "NORMALIZER_BRIDGE_ACTIVE",
+        "LIVE media is advancing through the normalizer",
+    ),
+}
+INCIDENT_EPISODE_BOUNDARY_CODES = frozenset(
+    {
+        "NORMALIZER_BRIDGE_ACTIVE",
+        "RELAY_OUTPUT_ACTIVE",
+        "SRT_INPUT_ACTIVE",
+        "YOUTUBE_FORWARD_ACTIVE",
+    }
+)
+
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        raise SystemExit("Run this command as root: sudo relayctl ...")
+
+
+class RelayLock:
+    def __enter__(self):
+        try:
+            LOCK_DIR.mkdir(mode=0o700, parents=False, exist_ok=True)
+        except FileNotFoundError:
+            raise SystemExit("System lock directory is unavailable.") from None
+        directory_stat = LOCK_DIR.lstat()
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or directory_stat.st_uid != 0
+            or directory_stat.st_mode & 0o077
+        ):
+            raise SystemExit("Relay lock directory is unsafe.")
+        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(LOCK_FILE, flags, 0o600)
+        except OSError:
+            raise SystemExit("Unable to open the relay lock safely.") from None
+        file_stat = os.fstat(fd)
+        if (
+            not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_uid != 0
+            or file_stat.st_mode & 0o077
+        ):
+            os.close(fd)
+            raise SystemExit("Relay lock file is unsafe.")
+        self.fp = os.fdopen(fd, "r+", encoding="utf-8")
+        fcntl.flock(self.fp.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        fcntl.flock(self.fp.fileno(), fcntl.LOCK_UN)
+        self.fp.close()
+
+
+def run_quiet(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # noqa: S603 -- callers use fixed binaries and validated values
+        args,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def service_is_active() -> bool:
+    return run_quiet(["systemctl", "is-active", "--quiet", SERVICE]).returncode == 0
+
+
+def service_allows_reconfiguration() -> bool:
+    result = run_quiet(
+        [
+            "systemctl",
+            "show",
+            SERVICE,
+            "--property=ActiveState",
+            "--property=MainPID",
+            "--no-pager",
+        ]
+    )
+    if result.returncode != 0:
+        return False
+    values = {}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            values[key] = value
+    try:
+        main_pid = int(values.get("MainPID", "-1"))
+    except ValueError:
+        return False
+    return values.get("ActiveState") in ("inactive", "failed") and main_pid == 0
+
+
+def service_is_enabled() -> bool:
+    return run_quiet(["systemctl", "is-enabled", "--quiet", SERVICE]).returncode == 0
+
+
+def load_secrets(optional: bool = False) -> dict:
+    try:
+        parent_stat = SECRET_FILE.parent.lstat()
+        st = SECRET_FILE.lstat()
+        if (
+            not stat.S_ISDIR(parent_stat.st_mode)
+            or parent_stat.st_uid != 0
+            or parent_stat.st_mode & 0o077
+            or not stat.S_ISREG(st.st_mode)
+            or st.st_uid != 0
+            or st.st_mode & 0o077
+        ):
+            raise SystemExit("Secret file permissions are unsafe; refusing to continue.")
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(SECRET_FILE, flags)
+        opened_stat = os.fstat(fd)
+        if (opened_stat.st_dev, opened_stat.st_ino) != (st.st_dev, st.st_ino):
+            os.close(fd)
+            raise SystemExit("Secret file changed while opening; refusing to continue.")
+        with os.fdopen(fd, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+    except FileNotFoundError:
+        if optional:
+            return {"youtube": {"url": "", "key": ""}}
+        raise SystemExit("Relay secret file is missing.") from None
+    except (OSError, json.JSONDecodeError, TypeError, KeyError) as exc:
+        raise SystemExit(f"Relay secret file is invalid: {type(exc).__name__}") from None
+    return data
+
+
+def atomic_save_secrets(data: dict) -> None:
+    SECRET_FILE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".secrets.", dir=SECRET_FILE.parent)
+    temporary_path = Path(temporary)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fp:
+            json.dump(data, fp, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+            fp.write("\n")
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(temporary_path, SECRET_FILE)
+        directory_fd = os.open(SECRET_FILE.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary_path.unlink()
+
+
+def validate_srt_host(value: object) -> str:
+    """Return one canonical host safe for interpolation into an SRT URL."""
+
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= 253
+        or not value.isascii()
+        or any(ord(character) < 0x20 or character.isspace() for character in value)
+        or any(character in value for character in "/?#@")
+    ):
+        raise ValueError("invalid SRT host")
+    if value.startswith("[") or value.endswith("]"):
+        if not (value.startswith("[") and value.endswith("]")):
+            raise ValueError("invalid bracketed IPv6 SRT host")
+        try:
+            address = ipaddress.IPv6Address(value[1:-1])
+        except ipaddress.AddressValueError as exc:
+            raise ValueError("invalid bracketed IPv6 SRT host") from exc
+        return f"[{address.compressed}]"
+    if ":" in value:
+        raise ValueError("IPv6 SRT hosts must be bracketed")
+    try:
+        return str(ipaddress.IPv4Address(value))
+    except ipaddress.AddressValueError:
+        pass
+    if value.endswith(".") or all(character.isdigit() or character == "." for character in value):
+        raise ValueError("invalid DNS SRT host")
+    labels = value.split(".")
+    if any(
+        not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+        for label in labels
+    ):
+        raise ValueError("invalid DNS SRT host")
+    return value.lower()
+
+
+def validate_node_config(data: object) -> dict[str, object]:
+    """Validate the non-secret, per-node SRT address contract."""
+
+    required = {"schema", "public_srt_host", "srt_port", "srt_path"}
+    allowed = required | {"fallback_srt_hosts"}
+    if not isinstance(data, dict) or not required.issubset(data) or not set(data).issubset(allowed):
+        raise ValueError("invalid relay node configuration")
+    if (
+        not isinstance(data["schema"], int)
+        or isinstance(data["schema"], bool)
+        or data["schema"] != 1
+    ):
+        raise ValueError("unsupported relay node configuration schema")
+    port = data["srt_port"]
+    path = data["srt_path"]
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise ValueError("invalid SRT port")
+    if port != SRT_PORT:
+        raise ValueError("SRT port does not match the installed runtime")
+    if not isinstance(path, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", path):
+        raise ValueError("invalid SRT path")
+    if path != SRT_PATH:
+        raise ValueError("SRT path does not match the installed runtime")
+    primary = validate_srt_host(data["public_srt_host"])
+    raw_fallbacks = data.get("fallback_srt_hosts", [])
+    if not isinstance(raw_fallbacks, list) or len(raw_fallbacks) > MAX_FALLBACK_SRT_HOSTS:
+        raise ValueError("invalid fallback SRT hosts")
+    fallbacks = [validate_srt_host(value) for value in raw_fallbacks]
+    if len({primary, *fallbacks}) != 1 + len(fallbacks):
+        raise ValueError("duplicate SRT host")
+    return {
+        "public_srt_host": primary,
+        "fallback_srt_hosts": fallbacks,
+        "srt_port": port,
+        "srt_path": path,
+    }
+
+
+def load_node_config() -> dict[str, object]:
+    try:
+        parent_stat = NODE_CONFIG_FILE.parent.lstat()
+        before = NODE_CONFIG_FILE.lstat()
+        if (
+            not stat.S_ISDIR(parent_stat.st_mode)
+            or parent_stat.st_uid != 0
+            or parent_stat.st_mode & 0o022
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_uid != 0
+            or before.st_mode & 0o022
+            or not 1 <= before.st_size <= 16 * 1024
+        ):
+            raise ValueError("unsafe relay node configuration")
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(NODE_CONFIG_FILE, flags)
+        try:
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise ValueError("relay node configuration changed while opening")
+            with os.fdopen(fd, "r", encoding="utf-8", closefd=False) as stream:
+                decoded = json.load(stream)
+        finally:
+            os.close(fd)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise SystemExit("Relay node configuration is invalid.") from exc
+    try:
+        return validate_node_config(decoded)
+    except ValueError as exc:
+        raise SystemExit("Relay node configuration is invalid.") from exc
+
+
+def validate_youtube(url: str, key: str) -> tuple[str, str]:
+    url = url.strip()
+    key = key.strip()
+    if not url:
+        raise ValueError("YouTube RTMPS URL must not be empty.")
+    if not key:
+        raise ValueError("YouTube stream key must not be empty.")
+    if "#" in url:
+        raise ValueError("YouTube RTMPS URL must not contain '#'.")
+    if any(ord(ch) < 0x20 or ch.isspace() for ch in url):
+        raise ValueError("YouTube RTMPS URL contains whitespace or control characters.")
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() != "rtmps":
+        raise ValueError("Only rtmps:// URLs are accepted.")
+    if not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        raise ValueError("YouTube RTMPS URL is invalid.")
+    if parsed.fragment:
+        raise ValueError("YouTube RTMPS URL must not contain a fragment.")
+    if any(ord(ch) < 0x20 or ch.isspace() for ch in key):
+        raise ValueError("YouTube stream key contains whitespace or control characters.")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", key):
+        raise ValueError("YouTube stream key contains unsupported characters.")
+    return url, key
+
+
+def read_youtube_from_tty() -> tuple[str, str]:
+    flags = os.O_RDWR | os.O_CLOEXEC
+    if hasattr(os, "O_NOCTTY"):
+        flags |= os.O_NOCTTY
+    fd = os.open("/dev/tty", flags)
+    tty_in = os.fdopen(os.dup(fd), "r", encoding="utf-8", buffering=1)
+    tty_out = os.fdopen(os.dup(fd), "w", encoding="utf-8", buffering=1)
+    try:
+        tty_out.write("YouTube RTMPS URL:\n> ")
+        tty_out.flush()
+        url = tty_in.readline()
+        if url == "":
+            raise EOFError
+        original = termios.tcgetattr(fd)
+        hidden = termios.tcgetattr(fd)
+        hidden[3] &= ~(termios.ECHO | getattr(termios, "ECHONL", 0))
+        termios.tcsetattr(fd, termios.TCSANOW, hidden)
+        try:
+            tty_out.write("YouTube stream key:\n> ")
+            tty_out.flush()
+            key = tty_in.readline()
+            if key == "":
+                raise EOFError
+        finally:
+            termios.tcsetattr(fd, termios.TCSANOW, original)
+            tty_out.write("\n")
+        return url, key
+    finally:
+        tty_in.close()
+        tty_out.close()
+        os.close(fd)
+
+
+def cmd_configure_youtube() -> int:
+    with RelayLock():
+        if not service_allows_reconfiguration():
+            print("Relay is active. Finish the YouTube broadcast first.")
+            print("Run: sudo relayctl stop")
+            return 1
+
+        try:
+            url, key = read_youtube_from_tty()
+            url, key = validate_youtube(url, key)
+        except (EOFError, KeyboardInterrupt, OSError):
+            print("\nYouTube configuration was not changed.", file=sys.stderr)
+            return 1
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
+        data = load_secrets()
+        data["youtube"] = {"url": url, "key": key}
+        atomic_save_secrets(data)
+        print("YouTube configuration saved successfully")
+        return 0
+
+
+def youtube_state(data: dict) -> tuple[bool, bool]:
+    youtube = data.get("youtube") or {}
+    return bool((youtube.get("url") or "").strip()), bool((youtube.get("key") or "").strip())
+
+
+def cmd_status() -> int:
+    data = load_secrets(optional=True)
+    has_url, has_key = youtube_state(data)
+    print(f"YouTube RTMPS URL: {'configured' if has_url else 'not configured'}")
+    print(f"YouTube stream key: {'configured' if has_key else 'not configured'}")
+    return 0
+
+
+def cmd_start() -> int:
+    with RelayLock():
+        data = load_secrets()
+        has_url, has_key = youtube_state(data)
+        if not (has_url and has_key):
+            print("YouTube is not configured.")
+            print("Run: sudo relayctl configure-youtube")
+            return 1
+        try:
+            validate_youtube(data["youtube"]["url"], data["youtube"]["key"])
+        except (KeyError, ValueError):
+            print("YouTube is not configured.")
+            print("Run: sudo relayctl configure-youtube")
+            return 1
+
+        result = run_quiet(["systemctl", "enable", "--now", SERVICE])
+        if result.returncode != 0:
+            print("Relay failed to start. Run: sudo relayctl health", file=sys.stderr)
+            return 1
+        for _ in range(30):
+            if service_is_active():
+                print("Relay started")
+                return 0
+            time.sleep(0.25)
+        print("Relay failed to become active. Run: sudo relayctl health", file=sys.stderr)
+        return 1
+
+
+def cmd_stop() -> int:
+    with RelayLock():
+        result = run_quiet(["systemctl", "disable", "--now", SERVICE])
+        if result.returncode != 0:
+            print("Relay failed to stop.", file=sys.stderr)
+            return 1
+        print("Relay stopped")
+        return 0
+
+
+def get_main_pid() -> int:
+    result = run_quiet(["systemctl", "show", SERVICE, "--property=MainPID", "--value"])
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        return 0
+
+
+def read_metrics() -> str:
+    request = urllib.request.Request("http://127.0.0.1:9998/metrics", method="GET")
+    with urllib.request.urlopen(request, timeout=2) as response:  # noqa: S310 -- fixed loopback
+        return response.read(2_000_000).decode("utf-8", errors="replace")
+
+
+def loopback_tcp_listener(port: int) -> bool:
+    result = run_quiet(["ss", "-H", "-ltn", "sport", "=", f":{port}"])
+    if result.returncode != 0:
+        return False
+    lines = [line for line in result.stdout.splitlines() if f":{port}" in line]
+    return bool(lines) and all(
+        f"127.0.0.1:{port}" in line or f"[::1]:{port}" in line for line in lines
+    )
+
+
+def parse_metric_samples(metrics: str, name: str) -> list[tuple[dict[str, str], float]]:
+    samples: list[tuple[dict[str, str], float]] = []
+    pattern = re.compile(rf"^{re.escape(name)}(?:\{{([^}}]*)\}})?\s+([-+0-9.eE]+)$")
+    label_pattern = re.compile(r'(\w+)="((?:\\.|[^"\\])*)"(?:,|$)')
+    for line in metrics.splitlines():
+        match = pattern.match(line)
+        if not match:
+            continue
+        labels: dict[str, str] = {}
+        for label_match in label_pattern.finditer(match.group(1) or ""):
+            labels[label_match.group(1)] = bytes(label_match.group(2), "utf-8").decode(
+                "unicode_escape"
+            )
+        try:
+            value = float(match.group(2))
+        except ValueError:
+            continue
+        samples.append((labels, value))
+    return samples
+
+
+def cmd_health() -> int:
+    active = service_is_active()
+    enabled = service_is_enabled()
+    pid = get_main_pid() if active else 0
+    pid_ok = pid > 1 and Path(f"/proc/{pid}/exe").exists()
+    listener = False
+    rtsp_loopback = False
+    rtmp_loopback = False
+    recovery_api_loopback = False
+    if active:
+        result = run_quiet(["ss", "-H", "-lunp", "sport", "=", f":{SRT_PORT}"])
+        listener = result.returncode == 0 and f":{SRT_PORT}" in result.stdout
+        rtsp_loopback = loopback_tcp_listener(RTSP_PORT)
+        rtmp_loopback = loopback_tcp_listener(RTMP_PORT)
+        recovery_api_loopback = loopback_tcp_listener(CONTROL_API_PORT)
+
+    source = "unknown"
+    forward = "unknown"
+    metrics_ok = False
+    path_ready = False
+    forward_ok = False
+    bridge_live = False
+    live = False
+    if active:
+        try:
+            metrics = read_metrics()
+            metrics_ok = True
+            path_ready = any(
+                labels.get("name") == OUTPUT_PATH and labels.get("state") == "ready" and value == 1
+                for labels, value in parse_metric_samples(metrics, "paths")
+            )
+            live = any(
+                labels.get("path") == SRT_PATH and labels.get("state") == "publish" and value == 1
+                for labels, value in parse_metric_samples(metrics, "srt_conns")
+            )
+            bridge_live = any(
+                labels.get("path") == OUTPUT_PATH
+                and labels.get("state") == "publish"
+                and value == 1
+                for labels, value in parse_metric_samples(metrics, "rtmp_conns")
+            )
+            source = "LIVE" if live and bridge_live else ("SLATE" if path_ready else "unknown")
+            forward_samples = parse_metric_samples(metrics, "forward_dests")
+            forward_ok = any(
+                labels.get("path") == OUTPUT_PATH
+                and labels.get("protocol") == "rtmps"
+                and labels.get("state") in ("forwarding", "ready")
+                and value == 1
+                for labels, value in forward_samples
+            )
+            forward = "active" if forward_ok else "not active"
+        except (OSError, ValueError):
+            pass
+
+    bridge_ok = bridge_live if live else not bridge_live
+    overall = (
+        active
+        and enabled
+        and pid_ok
+        and listener
+        and rtsp_loopback
+        and rtmp_loopback
+        and recovery_api_loopback
+        and metrics_ok
+        and path_ready
+        and forward_ok
+        and bridge_ok
+    )
+    print(f"Service: {'active' if active else 'inactive'}")
+    print(f"Enabled at boot: {'yes' if enabled else 'no'}")
+    print(f"Main process: {'running' if pid_ok else 'not running'}")
+    print(f"SRT listener UDP/{SRT_PORT}: {'listening' if listener else 'not listening'}")
+    print(f"Internal RTSP TCP/{RTSP_PORT}: {'loopback-only' if rtsp_loopback else 'not ready'}")
+    print(f"Internal RTMP TCP/{RTMP_PORT}: {'loopback-only' if rtmp_loopback else 'not ready'}")
+    print(
+        f"Recovery API TCP/{CONTROL_API_PORT}: "
+        f"{'loopback-only' if recovery_api_loopback else 'not ready'}"
+    )
+    print(f"Source: {source}")
+    print(
+        "Audio normalizer: " + ("active" if bridge_live else ("not active" if live else "waiting"))
+    )
+    print(f"YouTube forward: {forward}")
+    print(f"Overall: {'PASS' if overall else 'FAIL'}")
+    return 0 if overall else 1
+
+
+def log_redaction_values() -> list[str]:
+    """Return configured secret values without ever printing a load failure."""
+
+    try:
+        data = load_secrets(optional=True)
+    except SystemExit:
+        return []
+    if not isinstance(data, dict):
+        return []
+    youtube = data.get("youtube") or {}
+    srt = data.get("srt") or {}
+    if not isinstance(youtube, dict) or not isinstance(srt, dict):
+        return []
+    values = [
+        youtube.get("url"),
+        youtube.get("key"),
+        srt.get("password"),
+        srt.get("passphrase"),
+    ]
+    return sorted(
+        {value for value in values if isinstance(value, str) and value},
+        key=len,
+        reverse=True,
+    )
+
+
+def redact_log(text: str, secret_values: list[str] | None = None) -> str:
+    """Redact relay credentials and remote locators from diagnostic journal text."""
+
+    for value in secret_values or []:
+        text = text.replace(value, "[REDACTED]")
+    text = re.sub(
+        r"\b(?:rtmps?|srt)://[^\s\"'<>]+",
+        "[REDACTED_URL]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(streamid=publish:)[^&\s\"']+",
+        r"\1[REDACTED]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"((?:passphrase|password|stream_?key|key)=)[^&\s\"']+",
+        r"\1[REDACTED]",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    def redact_ipv4(match: re.Match[str]) -> str:
+        raw_address = match.group("address")
+        try:
+            address = ipaddress.IPv4Address(raw_address)
+        except ipaddress.AddressValueError:
+            return match.group(0)
+        if address.is_loopback or address.is_unspecified:
+            return match.group(0)
+        return "[REMOTE_ADDRESS]"
+
+    text = re.sub(
+        r"(?<![0-9.])(?P<address>(?:[0-9]{1,3}\.){3}[0-9]{1,3})(?::[0-9]{1,5})?",
+        redact_ipv4,
+        text,
+    )
+
+    def redact_bracketed_ipv6(match: re.Match[str]) -> str:
+        raw_address = match.group("address")
+        try:
+            address = ipaddress.IPv6Address(raw_address)
+        except ipaddress.AddressValueError:
+            return "[REMOTE_ADDRESS]"
+        if address.is_loopback or address.is_unspecified:
+            return match.group(0)
+        return "[REMOTE_ADDRESS]"
+
+    text = re.sub(
+        r"\[(?P<address>[0-9A-Fa-f:]+)\](?::[0-9]{1,5})?",
+        redact_bracketed_ipv6,
+        text,
+    )
+
+    def redact_unbracketed_ipv6(match: re.Match[str]) -> str:
+        try:
+            address = ipaddress.IPv6Address(match.group(0))
+        except ipaddress.AddressValueError:
+            return match.group(0)
+        if address.is_loopback or address.is_unspecified:
+            return match.group(0)
+        return "[REMOTE_ADDRESS]"
+
+    text = re.sub(
+        r"(?<![A-Za-z0-9:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![A-Za-z0-9:])",
+        redact_unbracketed_ipv6,
+        text,
+    )
+    text = re.sub(
+        r"(?<![A-Za-z0-9_.-])(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}(?::[0-9]{1,5})?",
+        "[REMOTE_ADDRESS]",
+        text,
+    )
+    return text
+
+
+def cmd_logs() -> int:
+    result = run_quiet(
+        ["journalctl", "--unit", SERVICE, "--no-pager", "--lines", "200", "--output", "short-iso"]
+    )
+    sys.stdout.write(redact_log(result.stdout, log_redaction_values()))
+    if result.returncode != 0:
+        print("Unable to read relay journal.", file=sys.stderr)
+        return 1
+    return 0
+
+
+def classify_incident(message: str) -> tuple[str, str, str] | None:
+    """Map an untrusted journal message to fixed, non-sensitive operator text."""
+
+    lowered = message.casefold()
+    restart_prefix = "moblin-relay-normalize:restart:"
+    restart_at = lowered.find(restart_prefix)
+    if restart_at >= 0:
+        reason_match = re.match(r"[a-z-]+", lowered[restart_at + len(restart_prefix) :])
+        if reason_match is not None:
+            reason = reason_match.group(0)
+            incident = NORMALIZER_RESTART_INCIDENTS.get(reason)
+            if incident is not None:
+                stage = "SRT input" if reason.startswith("ingest-") else "normalizer"
+                return stage, incident[0], incident[1]
+
+    recovery_prefix = "moblin-relay-normalize:recovery:"
+    recovery_at = lowered.find(recovery_prefix)
+    if recovery_at >= 0:
+        event_match = re.match(r"[a-z-]+", lowered[recovery_at + len(recovery_prefix) :])
+        if event_match is not None:
+            incident = NORMALIZER_RECOVERY_INCIDENTS.get(event_match.group(0))
+            if incident is not None:
+                return "SRT input", incident[0], incident[1]
+
+    state_prefix = "moblin-relay-normalize:state:"
+    state_at = lowered.find(state_prefix)
+    if state_at >= 0:
+        event_match = re.match(r"[a-z-]+", lowered[state_at + len(state_prefix) :])
+        if event_match is not None:
+            incident = NORMALIZER_STATE_INCIDENTS.get(event_match.group(0))
+            if incident is not None:
+                stage = "SRT input" if event_match.group(0).startswith("source-") else "normalizer"
+                return stage, incident[0], incident[1]
+
+    service_markers = ("moblin srt audio-normalizing relay", "moblin-relay.service")
+    if any(marker in lowered for marker in service_markers):
+        if "scheduled restart job" in lowered or "restart counter" in lowered:
+            return "service", "SERVICE_RESTART_SCHEDULED", "systemd scheduled a relay restart"
+        if "failed with result" in lowered or "failed to start" in lowered:
+            return "service", "SERVICE_FAILED", "The relay service entered a failed state"
+        if "main process exited" in lowered:
+            return "service", "SERVICE_PROCESS_EXITED", "The relay process exited unexpectedly"
+        if "stopping" in lowered:
+            return "service", "SERVICE_STOPPING", "The relay service is stopping"
+        if "stopped" in lowered:
+            return "service", "SERVICE_STOPPED", "The relay service stopped"
+        if "started" in lowered:
+            return "service", "SERVICE_STARTED", "The relay service started"
+
+    if OUTPUT_PATH in lowered and "dts is not monotonically increasing" in lowered:
+        return (
+            "YouTube-forward",
+            "DELIVERY_TIMESTAMP_REGRESSION",
+            "The server detected a video timestamp discontinuity; "
+            "forwarding retries automatically",
+        )
+
+    youtube_marker = "rtmps" in lowered or "forward" in lowered
+    if youtube_marker:
+        if any(word in lowered for word in ("retry", "reconnect", "backoff")):
+            return (
+                "YouTube-forward",
+                "YOUTUBE_FORWARD_RETRY",
+                "The YouTube forward is retrying",
+            )
+        if any(
+            phrase in lowered
+            for phrase in (
+                "broken pipe",
+                "closed",
+                "connection reset",
+                "connection refused",
+                "context deadline exceeded",
+                "eof",
+                "failed",
+                "handshake failure",
+                "i/o timeout",
+                "network is unreachable",
+                "no route to host",
+                "no such host",
+                "temporary failure in name resolution",
+                "timed out",
+                "tls handshake",
+                "unable to",
+            )
+        ):
+            return (
+                "YouTube-forward",
+                "YOUTUBE_FORWARD_INTERRUPTED",
+                "The YouTube forward was interrupted; MediaMTX retries automatically",
+            )
+        if any(word in lowered for word in ("connected", "forwarding", "ready", "started")):
+            return (
+                "YouTube-forward",
+                "YOUTUBE_FORWARD_ACTIVE",
+                "The YouTube forward became active",
+            )
+
+    corrupt_input_markers = (
+        "corrupt input packet",
+        "decode_slice_header error",
+        "error while decoding mb",
+        "invalid mpeg",
+        "invalid pes",
+        "invalid data found when processing input",
+        "no frame!",
+        "non-existing pps",
+        "packet corrupt",
+        "pes packet size mismatch",
+        "pps id out of range",
+    )
+    if any(phrase in lowered for phrase in corrupt_input_markers):
+        return (
+            "SRT input",
+            "SRT_INPUT_CORRUPT_MEDIA",
+            "The SRT input contained damaged media packets",
+        )
+
+    srt_marker = "iphone-live" in lowered or "[srt" in lowered or "srt " in lowered
+    if srt_marker:
+        if any(
+            phrase in lowered
+            for phrase in (
+                "closed",
+                "connection reset",
+                "disconnected",
+                "no packets",
+                "i/o timeout",
+                "timed out",
+            )
+        ):
+            return "SRT input", "SRT_INPUT_LOST", "The Moblin SRT input was lost"
+        if "is publishing" in lowered or "publisher connected" in lowered:
+            return "SRT input", "SRT_INPUT_ACTIVE", "Moblin began publishing SRT input"
+
+    if "broken pipe" in lowered:
+        return (
+            "normalizer",
+            "NORMALIZER_OUTPUT_BROKEN_PIPE",
+            "FFmpeg lost its local relay-output connection",
+        )
+    if "too many packets buffered" in lowered:
+        return (
+            "normalizer",
+            "NORMALIZER_MUX_QUEUE_FULL",
+            "FFmpeg output buffering overflowed",
+        )
+    if any(phrase in lowered for phrase in ("packet is missing pts", "timestamps are unset")):
+        return (
+            "normalizer",
+            "NORMALIZER_TIMESTAMP_MISSING",
+            "FFmpeg received media without required presentation timestamps",
+        )
+    if "non-monoton" in lowered and ("dts" in lowered or "timestamp" in lowered):
+        return (
+            "normalizer",
+            "NORMALIZER_TIMESTAMP_DISCONTINUITY",
+            "FFmpeg detected a media timestamp discontinuity",
+        )
+    if any(phrase in lowered for phrase in ("error while decoding", "decode error", "concealing ")):
+        return (
+            "normalizer",
+            "NORMALIZER_DECODE_ERROR",
+            "FFmpeg received undecodable media",
+        )
+
+    if OUTPUT_PATH in lowered:
+        if any(
+            phrase in lowered
+            for phrase in ("closed", "not ready", "failed", "stopped", "terminated")
+        ):
+            return (
+                "relay-output",
+                "RELAY_OUTPUT_LOST",
+                "The normalized relay output became unavailable",
+            )
+        if "is publishing" in lowered or "publisher connected" in lowered or "ready" in lowered:
+            return (
+                "relay-output",
+                "RELAY_OUTPUT_ACTIVE",
+                "The normalized relay output became available",
+            )
+    return None
+
+
+def parse_incident_journal(payload: str) -> list[tuple[int, str, str, str, int]]:
+    """Parse journal JSON into safe events without retaining original messages."""
+
+    records: list[tuple[int, str]] = []
+    for raw_line in payload.splitlines():
+        try:
+            record = json.loads(raw_line)
+            timestamp = int(record["__REALTIME_TIMESTAMP"])
+            message = record["MESSAGE"]
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            continue
+        if timestamp < 0 or not isinstance(message, str):
+            continue
+        records.append((timestamp, message))
+
+    events: list[tuple[int, str, str, str, int]] = []
+    previous_incident: tuple[str, str, str] | None = None
+    repeat_pattern = re.compile(
+        r"\b(?:last message|message) repeated (?P<count>[0-9]{1,9}) times\b"
+    )
+    for timestamp, message in sorted(records, key=lambda record: record[0]):
+        lowered = message.casefold()
+        repeat_match = repeat_pattern.search(lowered)
+        if repeat_match is not None:
+            repeated_incident = previous_incident
+            _, separator, repeated_message = message.partition(":")
+            if separator:
+                repeated_incident = classify_incident(repeated_message)
+            count = min(int(repeat_match.group("count")), INCIDENT_REPEAT_MAX_COUNT)
+            if repeated_incident is not None and count > 0:
+                events.append((timestamp, *repeated_incident, count))
+                previous_incident = repeated_incident
+            else:
+                previous_incident = None
+            continue
+        incident = classify_incident(message)
+        if incident is not None:
+            events.append((timestamp, *incident, 1))
+        previous_incident = incident
+    return events
+
+
+def collapse_incidents(
+    events: list[tuple[int, str, str, str, int]],
+) -> list[tuple[int, int, str, str, str, int]]:
+    """Collapse interleaved repeats within one bounded incident episode."""
+
+    collapsed: list[tuple[int, int, str, str, str, int]] = []
+    open_groups: dict[tuple[str, str, str], int] = {}
+    for timestamp, stage, code, detail, occurrences in events:
+        boundary = (
+            code in INCIDENT_EPISODE_BOUNDARY_CODES
+            or code.startswith("SRT_RECOVERY_")
+            or code.startswith("SERVICE_")
+        )
+        if boundary:
+            # Lifecycle and recovery markers define chronology.  Never merge
+            # them with an earlier marker, and never merge failures across one.
+            open_groups.clear()
+            collapsed.append((timestamp, timestamp, stage, code, detail, occurrences))
+            continue
+        key = (stage, code, detail)
+        group_index = open_groups.get(key)
+        if group_index is not None:
+            first, last, previous_stage, previous_code, previous_detail, count = collapsed[
+                group_index
+            ]
+            if timestamp - last <= INCIDENT_REPEAT_WINDOW_MICROSECONDS:
+                collapsed[group_index] = (
+                    first,
+                    timestamp,
+                    previous_stage,
+                    previous_code,
+                    previous_detail,
+                    min(count + occurrences, INCIDENT_REPEAT_MAX_COUNT),
+                )
+                continue
+        open_groups[key] = len(collapsed)
+        collapsed.append((timestamp, timestamp, stage, code, detail, occurrences))
+    return collapsed
+
+
+def format_incident_timestamp(timestamp: int) -> str:
+    return datetime.fromtimestamp(timestamp / 1_000_000, tz=UTC_TIMEZONE).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def cmd_incidents() -> int:
+    result = run_quiet(
+        [
+            "journalctl",
+            "--unit",
+            SERVICE,
+            "--since",
+            INCIDENT_JOURNAL_SINCE,
+            "--lines",
+            str(INCIDENT_JOURNAL_LINES),
+            "--no-pager",
+            "--output",
+            "json",
+            "--utc",
+            "--quiet",
+        ]
+    )
+    if result.returncode != 0:
+        print("Unable to read relay incidents.", file=sys.stderr)
+        return 1
+
+    print(f"Relay incidents (UTC; last 6 hours; up to {INCIDENT_JOURNAL_LINES} journal records)")
+    events = collapse_incidents(parse_incident_journal(result.stdout))
+    if not events:
+        print("No classified relay incidents found in this window.")
+        return 0
+    for first, last, stage, code, detail, count in events:
+        repetition = ""
+        if count > 1:
+            repetition = f" [{count} occurrences; last {format_incident_timestamp(last)}]"
+        print(f"{format_incident_timestamp(first)}  {stage:<15} {code}: {detail}{repetition}")
+    return 0
+
+
+def build_moblin_urls() -> dict[str, object]:
+    data = load_secrets()
+    try:
+        srt = data["srt"]
+        user = srt["user"]
+        password = srt["password"]
+        passphrase = srt["passphrase"]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", user):
+            raise ValueError
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", password):
+            raise ValueError
+        if not re.fullmatch(r"[A-Za-z0-9_-]{10,79}", passphrase):
+            raise ValueError
+        node = load_node_config()
+        port = node["srt_port"]
+        path = node["srt_path"]
+        query = (
+            f"streamid=publish:{path}:{user}:{password}"
+            f"&passphrase={passphrase}&pbkeylen=32&latency=2000&payloadsize=1316"
+        )
+        primary = f"srt://{node['public_srt_host']}:{port}?{query}"
+        raw_fallbacks = node["fallback_srt_hosts"]
+        if not isinstance(raw_fallbacks, list):
+            raise ValueError
+        fallbacks = [f"srt://{host}:{port}?{query}" for host in raw_fallbacks]
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("SRT configuration is unavailable.") from None
+    return {"public_url": primary, "fallback_urls": fallbacks}
+
+
+def cmd_show_moblin_url() -> int:
+    try:
+        urls = build_moblin_urls()
+        primary = urls["public_url"]
+        fallbacks = urls["fallback_urls"]
+        if not isinstance(primary, str) or not isinstance(fallbacks, list):
+            raise ValueError
+    except (KeyError, TypeError, ValueError, SystemExit):
+        print("SRT credentials are unavailable.", file=sys.stderr)
+        return 1
+    print("Public SRT URL:")
+    print(primary)
+    for index, fallback in enumerate(fallbacks, start=1):
+        if not isinstance(fallback, str):
+            print("SRT credentials are unavailable.", file=sys.stderr)
+            return 1
+        print(f"Fallback SRT URL {index}:")
+        print(fallback)
+    return 0
+
+
+def cmd_self_test() -> int:
+    with RelayLock():
+        if service_is_active():
+            print("Stop the production relay before running self-test.", file=sys.stderr)
+            print("Run: sudo relayctl stop", file=sys.stderr)
+            return 1
+        if not TEST_PROGRAM.exists():
+            print("Self-test program is missing.", file=sys.stderr)
+            return 1
+        return subprocess.run(  # noqa: S603 -- root-owned fixed program path
+            [str(TEST_PROGRAM)], check=False
+        ).returncode
+
+
+ROLLBACK_FILES = (
+    "/etc/systemd/system/moblin-relay.service",
+    "/usr/local/sbin/relayctl",
+    "/usr/local/libexec/moblin-relay-render-config",
+    "/opt/moblin-relay/bin/mediamtx",
+    "/opt/moblin-relay/libexec/self-test",
+    "/opt/moblin-relay/libexec/moblin-relay-normalize",
+    "/opt/moblin-relay/LICENSE",
+    "/etc/moblin-relay/secrets.json",
+    "/etc/moblin-relay/node.json",
+    "/etc/moblin-relay/install-manifest.json",
+    "/etc/moblin-relay/slate.txt",
+    "/var/lib/moblin-relay/slate.mp4",
+)
+
+ROLLBACK_GENERATED_TREES = (
+    "/var/lib/moblin-relay/tests",
+    "/run/moblin-relay",
+    "/run/lock/moblin-relay",
+)
+
+ROLLBACK_EMPTY_DIRS = (
+    "/opt/moblin-relay/bin",
+    "/opt/moblin-relay/libexec",
+    "/opt/moblin-relay",
+    "/etc/moblin-relay",
+)
+
+
+def cmd_rollback(args: list[str]) -> int:
+    if args != ["--dry-run"]:
+        print("Safety gate: only 'relayctl rollback --dry-run' is implemented.", file=sys.stderr)
+        print("Ask the owner to authorize an actual rollback.", file=sys.stderr)
+        return 2
+    print("DRY RUN - no changes will be made")
+    print("1. systemctl disable --now moblin-relay.service; abort if it remains active")
+    print("2. remove only these relay-owned files:")
+    for path in ROLLBACK_FILES:
+        print(f"   {path}")
+    print("3. remove only these relay-owned generated subtrees after the service is inactive:")
+    for path in ROLLBACK_GENERATED_TREES:
+        print(f"   {path}")
+    print("4. remove these relay-owned directories with rmdir, deepest first, only when empty:")
+    for path in ROLLBACK_EMPTY_DIRS:
+        print(f"   {path}")
+    print("5. systemctl daemon-reload")
+    print(
+        "6. after verifying no processes or files use it: "
+        "userdel moblin-relay; groupdel moblin-relay"
+    )
+    print("7. retain every baseline backup under /var/lib/moblin-relay/backups/")
+    print("8. pre-existing files to restore: none")
+    print("9. ffmpeg and shared package dependencies are not removed automatically")
+    print("10. no firewall deletion: no moblin-relay firewall rule was added")
+    print("11. Amnezia, Docker, routes, NAT and existing firewall rules remain untouched")
+    return 0
+
+
+def usage() -> None:
+    print("Usage: sudo relayctl <command>")
+    print("Commands: configure-youtube, start, stop, status, health, incidents, logs,")
+    print("          self-test, show-moblin-url, rollback --dry-run")
+
+
+def main() -> int:
+    require_root()
+    if len(sys.argv) < 2:
+        usage()
+        return 2
+    command, args = sys.argv[1], sys.argv[2:]
+    if command in ("configure-youtube", "set-youtube-key") and not args:
+        return cmd_configure_youtube()
+    if command == "start" and not args:
+        return cmd_start()
+    if command == "stop" and not args:
+        return cmd_stop()
+    if command == "status" and not args:
+        return cmd_status()
+    if command == "health" and not args:
+        return cmd_health()
+    if command == "logs" and not args:
+        return cmd_logs()
+    if command == "incidents" and not args:
+        return cmd_incidents()
+    if command == "show-moblin-url" and not args:
+        return cmd_show_moblin_url()
+    if command == "self-test" and not args:
+        return cmd_self_test()
+    if command == "rollback":
+        return cmd_rollback(args)
+    usage()
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -22,6 +22,7 @@ from bootstrap_worker.models import (
     PrivilegeMode,
     SELinuxMode,
     SystemFacts,
+    TargetIdentity,
     TimeoutPolicy,
 )
 from bootstrap_worker.ssh import RemoteResult, RemoteSession
@@ -869,7 +870,9 @@ class RemoteNodeInstaller:
         job_id: UUID,
         docker_installed: bool,
         timeouts: TimeoutPolicy,
+        target: TargetIdentity | None = None,
     ) -> InstallReceipt:
+        del target
         ownership = await self.inspect_ownership(session, timeout=timeouts.command_seconds)
         adopted_empty_mountpoint = False
         if ownership is InstallOwnership.CONFLICT:

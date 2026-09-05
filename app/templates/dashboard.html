@@ -48,6 +48,10 @@
         </p>
       </div>
       <div class="relay-console__hero-state">
+        <label class="relay-node-picker">
+          <span>Relay-сервер</span>
+          <select data-relay-node-select disabled aria-label="Relay-сервер"></select>
+        </label>
         <span class="relay-badge relay-badge--neutral" data-relay-dashboard-badge role="status" aria-live="polite">
           Проверяем связь…
         </span>
@@ -136,7 +140,7 @@
             <span class="status-dot status-dot--large status-dot--neutral" data-relay-signal-dot></span>
             <div>
               <strong data-relay-signal-label>Проверяем входящий поток…</strong>
-              <span data-relay-signal-description>Получаем состояние HK-сервера.</span>
+              <span data-relay-signal-description>Получаем состояние relay-сервера.</span>
             </div>
           </div>
           <dl class="relay-live-metrics">
@@ -174,7 +178,7 @@
             <div><dt>Серверная заставка</dt><dd data-relay-profile>1080×1920 · 30 FPS</dd></div>
             <div><dt>YouTube RTMPS URL</dt><dd data-relay-field="youtube-url">—</dd></div>
             <div><dt>YouTube stream key</dt><dd data-relay-field="youtube-key">—</dd></div>
-            <div><dt>Связь с HK-сервером</dt><dd data-relay-field="last-seen">—</dd></div>
+            <div><dt>Связь с relay-сервером</dt><dd data-relay-field="last-seen">—</dd></div>
           </dl>
         </section>
         <a class="button button--quiet button--small relay-advanced__servers-link" href="/servers">Управление серверами</a>
@@ -189,7 +193,7 @@
         <button class="icon-button icon-button--plain" type="button" data-close-dialog aria-label="Закрыть">×</button>
       </header>
       <div class="modal__body relay-secret-form">
-        <p class="form-help" data-youtube-dialog-help>Скопируйте stream key из YouTube Live Control Room. Он сохраняется только на HK relay.</p>
+        <p class="form-help" data-youtube-dialog-help>Скопируйте stream key из YouTube Live Control Room. Он сохраняется только на выбранном relay-сервере.</p>
         <label class="form-field">
           <span>YouTube stream key</span>
           <input name="stream_key" type="password" maxlength="1024" autocomplete="new-password" autocapitalize="none" spellcheck="false" required data-dashboard-youtube-stream-key>
@@ -235,7 +239,7 @@
           <details class="setup-guide relay-url-advanced">
             <summary>Дополнительно</summary>
             <div class="form-field relay-url-field" data-dashboard-vpn-url-row hidden>
-              <label for="dashboard-moblin-vpn-url">SRT URL через VPN</label>
+              <label for="dashboard-moblin-vpn-url">Резервный SRT URL</label>
               <span class="relay-url-field__control">
                 <input id="dashboard-moblin-vpn-url" type="text" readonly autocomplete="off" spellcheck="false" data-dashboard-moblin-vpn-url data-sensitive-output>
                 <button class="button button--secondary button--small" type="button" data-dashboard-copy-moblin="vpn">Копировать</button>
@@ -273,5 +277,5 @@
 {% endblock %}
 
 {% block scripts %}
-  <script src="/static/relay-dashboard.js?v=20260903.1" defer></script>
+  <script src="/static/relay-dashboard.js?v=20260904.1" defer></script>
 {% endblock %}

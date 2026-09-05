@@ -75,7 +75,7 @@
       badgeTone = "warning";
     }
 
-    let actionReason = "Состояние HK-сервера недоступно.";
+    let actionReason = "Состояние relay-сервера недоступно.";
     if (failed) actionReason = "Команды заблокированы до устранения ошибки.";
     else if (!fullyConfigured) actionReason = "Сначала настройте YouTube.";
     else if (safelyStopped) actionReason = "Relay готов к безопасному запуску.";
@@ -138,6 +138,23 @@
     } catch (_error) {
       return "";
     }
+  }
+
+  function normalizeRelayNodeOptions(payload) {
+    if (!Array.isArray(payload?.items)) return [];
+    const seen = new Set();
+    const options = [];
+    for (const item of payload.items) {
+      const nodeId = typeof item?.node_id === "string" ? item.node_id.trim() : "";
+      if (!nodeId || nodeId.length > 128 || seen.has(nodeId)) continue;
+      seen.add(nodeId);
+      const rawName = typeof item?.display_name === "string" ? item.display_name : "";
+      const rawAddress = typeof item?.address === "string" ? item.address : "";
+      const displayName = rawName.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 80) || "Relay-сервер";
+      const address = rawAddress.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 253);
+      options.push({ nodeId, label: address ? `${displayName} · ${address}` : displayName });
+    }
+    return options;
   }
 
   function buildYouTubePayload(values) {
@@ -225,6 +242,7 @@
       formatBitrate,
       formatResolution,
       isCurrentDialogRequest,
+      normalizeRelayNodeOptions,
       normalizeRelayStatus,
       previewUpdateIsCurrent,
       relayCommandOutcome,
@@ -243,6 +261,7 @@
   const badge = page.querySelector("[data-relay-dashboard-badge]");
   const primaryAction = page.querySelector("[data-relay-primary-action]");
   const retryButton = page.querySelector("[data-relay-dashboard-retry]");
+  const relayNodeSelect = page.querySelector("[data-relay-node-select]");
   const pageError = page.querySelector("[data-relay-dashboard-error]");
   const youtubeDialog = document.querySelector("[data-relay-dashboard-youtube-dialog]");
   const youtubeForm = document.querySelector("[data-relay-dashboard-youtube-form]");
@@ -272,6 +291,20 @@
   let moblinRequestGeneration = 0;
   let clearRequestGeneration = 0;
 
+  function renderRelayNodeOptions(payload) {
+    const options = normalizeRelayNodeOptions(payload);
+    if (!relayNodeSelect) return options;
+    const elements = options.map(({ nodeId, label }) => {
+      const option = document.createElement("option");
+      option.value = nodeId;
+      option.textContent = label;
+      return option;
+    });
+    relayNodeSelect.replaceChildren(...elements);
+    relayNodeSelect.disabled = commandBusy || options.length < 2;
+    return options;
+  }
+
   class ApiError extends Error {
     constructor(message, status = 0, payload = null) {
       super(message);
@@ -292,7 +325,8 @@
     if (error.status === 401) return "Сессия завершена. Войдите снова.";
     if (error.status === 403) return "Сессия устарела. Обновите страницу и повторите действие.";
     if (error.status === 409 && code === "relay_active") return "Сначала завершите broadcast в YouTube и остановите relay.";
-    if (error.status === 409 && code === "relay_unavailable") return "HK relay сейчас не на связи.";
+    if (error.status === 409 && code === "relay_bootstrap_active") return "Установка relay ещё выполняется. Дождитесь её завершения.";
+    if (error.status === 409 && code === "relay_unavailable") return "Relay-сервер сейчас не на связи.";
     if (error.status === 409 && code === "relay_command_pending") return "Предыдущая команда ещё выполняется.";
     if (error.status === 429) return "Слишком много попыток. Подождите и повторите.";
     return fallback;
@@ -388,7 +422,7 @@
     let description = "Запустите relay, чтобы сервер начал ожидать видеопоток.";
     let hint = "После запуска приложения здесь появятся статус, битрейт и превью.";
     if (!relay.available) {
-      label = "Нет связи с HK-сервером";
+      label = "Нет связи с relay-сервером";
       description = "Последнее состояние входящего потока неизвестно.";
       hint = "Обновите состояние или проверьте сервер в разделе «Дополнительно».";
     } else if (relay.source === "LIVE") {
@@ -484,6 +518,7 @@
     for (const button of page.querySelectorAll("[data-open-youtube-clear]")) button.disabled = commandBusy || view.clearDisabled;
     const refresh = page.querySelector("[data-relay-refresh]");
     if (refresh) refresh.disabled = commandBusy || !relay.available;
+    if (relayNodeSelect) relayNodeSelect.disabled = commandBusy || relayNodeSelect.options.length < 2;
     if (primaryAction) {
       primaryAction.disabled = commandBusy || (view.active ? view.stopDisabled : view.startDisabled);
       primaryAction.textContent = view.active ? "Остановить ретрансляцию" : "Включить ретрансляцию";
@@ -507,7 +542,7 @@
       youtubeStatus.textContent = currentView.fullyConfigured ? "Настроен" : "Не настроен";
     }
     setText("[data-youtube-setup-copy]", currentView.fullyConfigured
-      ? "Ключ сохранён на HK relay. При выдаче нового ключа замените только его."
+      ? "Ключ сохранён на relay-сервере. При выдаче нового ключа замените только его."
       : currentRelay.youtubeUrlConfigured
         ? "RTMPS-адрес уже сохранён. Введите только новый stream key из YouTube Studio."
         : "Для первой настройки нужны stream key и точный RTMPS-адрес из YouTube Studio.");
@@ -542,9 +577,11 @@
     try {
       if (!relayNodeId) {
         const nodes = await apiRequest("/api/relay-nodes");
-        const item = Array.isArray(nodes?.items) ? nodes.items[0] : null;
-        if (!item?.node_id) throw new ApiError("Relay not found", 404);
-        relayNodeId = String(item.node_id);
+        const options = renderRelayNodeOptions(nodes);
+        const selected = options.find((item) => item.nodeId === relayNodeSelect?.value) || options[0];
+        if (!selected?.nodeId) throw new ApiError("Relay not found", 404);
+        relayNodeId = selected.nodeId;
+        if (relayNodeSelect) relayNodeSelect.value = relayNodeId;
       }
       const payload = await apiRequest(`/api/nodes/${encodeURIComponent(relayNodeId)}/relay`);
       if (generation !== loadGeneration) return;
@@ -631,7 +668,7 @@
     const submit = youtubeDialog?.querySelector("[data-youtube-submit-label]");
     if (title) title.textContent = urlAlreadyConfigured ? "Ключ потока YouTube" : "Первичная настройка YouTube";
     if (help) help.textContent = urlAlreadyConfigured
-      ? "Введите только новый stream key. Сохранённый на HK relay RTMPS-адрес останется без изменений."
+      ? "Введите только новый stream key. Сохранённый на relay-сервере RTMPS-адрес останется без изменений."
       : "Для первого запуска скопируйте stream key и точный RTMPS-адрес из YouTube Live Control Room.";
     if (summary) summary.textContent = urlAlreadyConfigured
       ? "Дополнительно: заменить RTMPS-адрес"
@@ -858,6 +895,22 @@
     previewLeaseRenewedAt = 0;
     previewController?.retry();
     void updatePreview(currentRelay);
+  });
+  relayNodeSelect?.addEventListener("change", () => {
+    const nextNodeId = String(relayNodeSelect.value || "");
+    if (!nextNodeId || nextNodeId === relayNodeId || commandBusy) return;
+    relayNodeId = nextNodeId;
+    loadGeneration += 1;
+    previewUpdateGeneration += 1;
+    youtubeRequestGeneration += 1;
+    moblinRequestGeneration += 1;
+    clearRequestGeneration += 1;
+    previewLeaseRenewedAt = 0;
+    previewNodeId = "";
+    previewController?.suspend("offline");
+    previewController = null;
+    updatePage({ available: false });
+    void loadStatus();
   });
   moblinDialog?.querySelectorAll("[data-dashboard-copy-moblin]").forEach((button) => {
     button.addEventListener("click", async () => {

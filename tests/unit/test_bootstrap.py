@@ -13,7 +13,7 @@ import pytest
 from pydantic import SecretStr
 
 from app.bootstrap_api import BootstrapRateLimiter, BootstrapRequest, SudoPasswordRequest
-from app.core.security import digest_opaque_token
+from app.core.security import digest_opaque_token, generate_master_key
 from app.core.ssh_target import canonicalize_ssh_address
 from app.db import Database
 from app.services.bootstrap import (
@@ -28,7 +28,8 @@ from app.services.bootstrap import (
     BootstrapUnavailable,
     BootstrapWorkerRestarted,
 )
-from app.services.nodes import EnrollmentTokenError, NodeService
+from app.services.nodes import EnrollmentTokenError, NodeAuthenticationError, NodeService
+from app.services.relays import RelayAuthenticationError, RelayService
 from bootstrap_worker.jobs import MIN_TERMINAL_RESULT_TTL_SECONDS
 
 
@@ -185,6 +186,161 @@ def bootstrap_components(
     return database, client, coordinator
 
 
+def test_worker_hostname_populates_before_agent_heartbeat(
+    bootstrap_components: tuple[Database, FakeBootstrapClient, BootstrapCoordinator],
+) -> None:
+    database, client, coordinator = bootstrap_components
+    job_id = str(uuid4())
+    node_id = str(uuid4())
+    coordinator.nodes.create_pending_bootstrap_node(
+        job_id=job_id,
+        install_profile="generic_node",
+        display_name="server-01",
+        address="example.test",
+        resolved_ip="",
+        ssh_port=22,
+        ssh_username="root",
+        node_id=node_id,
+    )
+    job = coordinator._job(job_id)
+    assert job is not None
+
+    coordinator._persist_worker_facts(job, client.view)
+
+    with database.connect() as connection:
+        node = connection.execute(
+            "SELECT hostname, status FROM restream_nodes WHERE id = ?", (node_id,)
+        ).fetchone()
+    assert dict(node) == {"hostname": "edge-01", "status": "installing"}
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize(
+    "code,expected",
+    [
+        (
+            "relay_self_test_auth_exclusivity_normalizer_confirmed_input_stall_failed",
+            "relay_self_test_auth_exclusivity_normalizer_confirmed_input_stall_failed",
+        ),
+        (
+            "relay_self_test_auth_exclusivity_normalizer_confirmed_input_stall_failed_timeout",
+            "relay_self_test_auth_exclusivity_normalizer_confirmed_input_stall_failed_timeout",
+        ),
+        ("x" * 96, "x" * 96),
+        ("x" * 97, "bootstrap_failed"),
+        ("rtmps://example.invalid/not-an-error-code", "bootstrap_failed"),
+    ],
+)
+async def test_native_failure_codes_survive_worker_persistence_and_panel_rendering(
+    bootstrap_components: tuple[Database, FakeBootstrapClient, BootstrapCoordinator],
+    code: str,
+    expected: str,
+) -> None:
+    database, client, coordinator = bootstrap_components
+    accepted = await coordinator.create_job(
+        address="example.test",
+        port=22,
+        username="root",
+        password=SecretStr("temporary"),
+        expected_host_fingerprint=None,
+    )
+    client.view = {
+        **client.view,
+        "state": "failed",
+        "current_step": "failed",
+        "safe_error": {"code": code, "message": "Safe native test failure"},
+        # Enlarging the error-code bound must not enlarge the separate step-name bound.
+        "steps": [
+            {"name": "x" * 64, "state": "failed"},
+            {"name": "x" * 65, "state": "failed"},
+        ],
+    }
+    rendered = await coordinator.get_job(accepted["job_id"])
+    assert rendered["safe_error"]["code"] == expected
+    assert rendered["steps"] == [{"name": "x" * 64, "state": "failed"}]
+    with database.connect() as connection:
+        persisted = connection.execute(
+            "SELECT safe_error_code FROM node_install_jobs WHERE id = ?",
+            (accepted["job_id"],),
+        ).fetchone()[0]
+    assert persisted == expected
+    # A subsequent terminal read no longer depends on the worker response.
+    assert (await coordinator.get_job(accepted["job_id"]))["safe_error"]["code"] == expected
+
+
+def test_completed_worker_poll_preserves_heartbeat_owned_hostname(
+    bootstrap_components: tuple[Database, FakeBootstrapClient, BootstrapCoordinator],
+) -> None:
+    database, client, coordinator = bootstrap_components
+    job_id = str(uuid4())
+    node_id = str(uuid4())
+    coordinator.nodes.create_pending_bootstrap_node(
+        job_id=job_id,
+        install_profile="moblin_relay",
+        display_name="HK relay",
+        address="relay.example.test",
+        resolved_ip="",
+        ssh_port=22,
+        ssh_username="root",
+        node_id=node_id,
+    )
+    job = coordinator._job(job_id)
+    assert job is not None
+    node_token = coordinator.nodes.issue_relay_bootstrap_credential(node_id, job_id)
+    RelayService(database, generate_master_key()).record_heartbeat(
+        node_token,
+        {
+            "agent_version": "1.2.6",
+            "protocol_version": 1,
+            "hostname": "ci-native-moblin-relay",
+            "relay": {
+                "service_state": "inactive",
+                "enabled": False,
+                "main_process": "stopped",
+                "srt_listener": "closed",
+                "source": "NONE",
+                "youtube_forward": "inactive",
+                "overall": "ok",
+                "youtube_url_configured": False,
+                "youtube_key_configured": False,
+                "healthy": True,
+                "portrait_profile": True,
+                "error_code": None,
+            },
+            "host": {
+                "uptime_seconds": 100.0,
+                "load_1m": 0.1,
+                "cpu_percent": 2.5,
+                "memory_total_bytes": 2_147_483_648,
+                "memory_available_bytes": 1_073_741_824,
+                "disk_total_bytes": 21_474_836_480,
+                "disk_free_bytes": 10_737_418_240,
+            },
+            "current_command_id": None,
+        },
+    )
+
+    coordinator._persist_worker_view(
+        job,
+        {
+            **client.view,
+            "state": "completed",
+            "current_step": "completed",
+            "progress_percent": 100,
+        },
+    )
+
+    with database.connect() as connection:
+        node = connection.execute(
+            "SELECT hostname, status FROM restream_nodes WHERE id = ?", (node_id,)
+        ).fetchone()
+        persisted_job = connection.execute(
+            "SELECT state FROM node_install_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+    assert dict(node) == {"hostname": "ci-native-moblin-relay", "status": "ready"}
+    assert persisted_job["state"] == "completed"
+
+
 def test_secret_models_never_reveal_passwords_in_repr() -> None:
     marker = "CI_SSH_PASSWORD_MUST_NEVER_PERSIST_9F3A"
     request = BootstrapRequest(
@@ -333,6 +489,88 @@ async def test_jit_enrollment_is_issued_after_slow_preflight_and_replaces_expire
 
     await coordinator.sync_active_jobs_once()
     assert client.enrollment_token_calls == 1
+
+
+@pytest.mark.asyncio()
+async def test_native_relay_bootstrap_issues_only_a_scoped_permanent_credential(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "relay-bootstrap.db")
+    database.migrate()
+    relay_service = RelayService(database, generate_master_key())
+    nodes = NodeService(database, relay_payload_tombstone=relay_service.encrypted_empty_payload())
+    client = FakeBootstrapClient()
+    coordinator = BootstrapCoordinator(
+        database,
+        nodes,
+        client,  # type: ignore[arg-type]
+        control_url="https://restream.example.test",
+        node_agent_image="ghcr.io/example/node@sha256:" + "1" * 64,
+    )
+    accepted = await coordinator.create_job(
+        address="relay.example.test",
+        port=22,
+        username="root",
+        password=SecretStr("temporary"),
+        expected_host_fingerprint=None,
+        install_profile="moblin_relay",
+    )
+    with database.connect() as connection:
+        reserved = connection.execute(
+            """
+            SELECT node.node_kind, job.install_profile, relay.node_id AS relay_node_id
+            FROM node_install_jobs AS job
+            JOIN restream_nodes AS node ON node.id = job.node_id
+            JOIN relay_nodes AS relay ON relay.node_id = node.id
+            WHERE job.id = ?
+            """,
+            (accepted["job_id"],),
+        ).fetchone()
+    assert reserved["node_kind"] == "moblin_relay"
+    assert reserved["install_profile"] == "moblin_relay"
+    assert reserved["relay_node_id"] is not None
+    client.view = {
+        **client.view,
+        "state": "needs_enrollment_token",
+        "current_step": "agent_install",
+        "enrollment_token_received": False,
+    }
+
+    await coordinator.sync_active_jobs_once()
+
+    raw_token = client.last_enrollment_token
+    assert raw_token.startswith("node_")
+    assert raw_token.encode() not in database.path.read_bytes()
+    authenticated = relay_service.authenticate(raw_token)
+    assert authenticated["node_kind"] == "moblin_relay"
+    with pytest.raises(NodeAuthenticationError):
+        nodes.authenticate(raw_token)
+    with database.connect() as connection:
+        job = connection.execute(
+            "SELECT node_id, install_profile FROM node_install_jobs WHERE id = ?",
+            (accepted["job_id"],),
+        ).fetchone()
+        node = connection.execute(
+            "SELECT node_kind FROM restream_nodes WHERE id = ?",
+            (job["node_id"],),
+        ).fetchone()
+        enrollment_count = connection.execute(
+            "SELECT COUNT(*) FROM node_enrollment_tokens WHERE node_id = ?",
+            (job["node_id"],),
+        ).fetchone()[0]
+        relay_count = connection.execute(
+            "SELECT COUNT(*) FROM relay_nodes WHERE node_id = ?",
+            (job["node_id"],),
+        ).fetchone()[0]
+    assert job["install_profile"] == "moblin_relay"
+    assert node["node_kind"] == "moblin_relay"
+    assert enrollment_count == 0
+    assert relay_count == 1
+
+    cancelled = await coordinator.cancel_job(accepted["job_id"])
+    assert cancelled["state"] == "cancelled"
+    with pytest.raises(RelayAuthenticationError):
+        relay_service.authenticate(raw_token)
 
 
 @pytest.mark.parametrize("action", ["get", "cancel"])
@@ -901,17 +1139,17 @@ async def test_backend_restart_recovers_installing_node_without_a_job(
 
 
 @pytest.mark.asyncio()
-async def test_job_staging_failure_is_recovered_without_backend_restart(
+async def test_atomic_bootstrap_reservation_failure_is_recovered_without_backend_restart(
     bootstrap_components: tuple[Database, FakeBootstrapClient, BootstrapCoordinator],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     database, client, coordinator = bootstrap_components
-    insert_job = coordinator._insert_job
+    reserve = coordinator.nodes.create_pending_bootstrap_node
 
     def fail_insert(*_: object, **__: object) -> None:
         raise sqlite3.OperationalError("simulated insert failure")
 
-    monkeypatch.setattr(coordinator, "_insert_job", fail_insert)
+    monkeypatch.setattr(coordinator.nodes, "create_pending_bootstrap_node", fail_insert)
     with pytest.raises(BootstrapUnavailable):
         await coordinator.create_job(
             address="example.test",
@@ -922,14 +1160,14 @@ async def test_job_staging_failure_is_recovered_without_backend_restart(
         )
 
     with database.connect() as connection:
-        node = connection.execute("SELECT status FROM restream_nodes").fetchone()
-        token = connection.execute("SELECT used_at FROM node_enrollment_tokens").fetchone()
+        nodes = connection.execute("SELECT COUNT(*) AS count FROM restream_nodes").fetchone()
+        relays = connection.execute("SELECT COUNT(*) AS count FROM relay_nodes").fetchone()
         jobs = connection.execute("SELECT COUNT(*) AS count FROM node_install_jobs").fetchone()
-    assert node["status"] == "failed"
-    assert token is None
+    assert nodes["count"] == 0
+    assert relays["count"] == 0
     assert jobs["count"] == 0
 
-    monkeypatch.setattr(coordinator, "_insert_job", insert_job)
+    monkeypatch.setattr(coordinator.nodes, "create_pending_bootstrap_node", reserve)
     retry = await coordinator.create_job(
         address="example.test",
         port=22,
@@ -939,7 +1177,7 @@ async def test_job_staging_failure_is_recovered_without_backend_restart(
     )
     assert retry["state"] == "queued"
     assert client.submission is not None
-    assert client.submission.recover_failed_install is True
+    assert client.submission.recover_failed_install is False
 
 
 @pytest.mark.asyncio()

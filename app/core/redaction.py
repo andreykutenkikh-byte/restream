@@ -28,6 +28,7 @@ _NORMALIZED_SENSITIVE_KEYS = frozenset(
         "masterkey",
         "masterencryptionkey",
         "password",
+        "passphrase",
         "passwd",
         "privatekey",
         "pwd",
@@ -42,14 +43,17 @@ _NORMALIZED_SENSITIVE_KEYS = frozenset(
         "nodetoken",
         "bootstrapsecret",
         "streamkey",
+        "streamid",
         "key",
         "token",
     }
 )
 _SENSITIVE_SUFFIXES = (
     "password",
+    "passphrase",
     "secret",
     "streamkey",
+    "streamid",
     "token",
     "apikey",
     "sessioncookie",
@@ -59,7 +63,8 @@ _URL_IN_TEXT = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\"']+")
 _BEARER_TOKEN = re.compile(r"(?i)(\b(?:authorization\s*[:=]\s*)?bearer\s+)[^\s,;]+")
 _SENSITIVE_TEXT_KEY_PATTERN = (
     r"password|passwd|pwd|secret|token|access[_-]?token|api[_-]?key|"
-    r"stream[_-]?key|session(?:[_-]?id)?|csrf(?:[_-]?token)?|signature|"
+    r"stream[_-]?(?:key|id)|passphrase|session(?:[_-]?id)?|"
+    r"csrf(?:[_-]?token)?|signature|"
     r"ssh[_-]?password|sudo[_-]?password|enrollment[_-]?token|"
     r"node[_-]?token|bootstrap[_-]?secret"
 )

@@ -84,8 +84,8 @@
       <div class="server-empty__art" aria-hidden="true"><span></span></div>
       <h2>Серверов пока нет</h2>
       <p>
-        Подключите дополнительный сервер, чтобы подготовить резервный маршрут.
-        На этом этапе реальный видеопоток на него ещё не передаётся.
+        Подключите сервер — панель автоматически установит Moblin Relay, создаст
+        защищённый SRT-вход и подготовит управление трансляцией.
       </p>
       <button class="button button--primary" type="button" data-open-server-dialog>
         Подключить сервер
@@ -103,8 +103,8 @@
     <form class="modal__form" data-server-form>
       <header class="modal__header">
         <div>
-          <p class="eyebrow">Новый узел</p>
-          <h2>Подключение сервера</h2>
+          <p class="eyebrow">Новый relay-сервер</p>
+          <h2>Установка Moblin Relay</h2>
         </div>
         <button class="icon-button icon-button--plain" type="button" data-close-dialog aria-label="Закрыть">×</button>
       </header>
@@ -140,13 +140,15 @@
         <p class="form-help">
           Пароль используется только для текущего подключения и не сохраняется.
           Без указанного fingerprint применяется TOFU: первый ключ сервера будет закреплён.
+          Поддерживаются Ubuntu 22.04/24.04 и Debian 12/13 (amd64). UDP-порт 8890 должен
+          быть разрешён у хостинг-провайдера; установщик не меняет firewall и сетевые настройки.
         </p>
         <p class="field-error" data-server-form-error hidden role="alert"></p>
       </div>
 
       <footer class="modal__footer">
         <button class="button button--quiet" type="button" data-close-dialog>Отмена</button>
-        <button class="button button--primary" type="submit">Проверить и подключить</button>
+        <button class="button button--primary" type="submit">Установить Moblin Relay</button>
       </footer>
     </form>
   </dialog>
@@ -156,7 +158,7 @@
       <header class="modal__header">
         <div>
           <p class="eyebrow">Безопасная установка</p>
-          <h2>Подключение сервера</h2>
+          <h2>Установка Moblin Relay</h2>
         </div>
       </header>
       <div class="modal__body">
@@ -322,7 +324,7 @@
             </span>
           </div>
           <div class="form-field relay-url-field" data-vpn-url-row hidden>
-            <label for="moblin-vpn-url">SRT URL через VPN</label>
+            <label for="moblin-vpn-url">Резервный SRT URL</label>
             <span class="relay-url-field__control">
               <input id="moblin-vpn-url" type="text" readonly autocomplete="off" spellcheck="false" data-moblin-vpn-url data-sensitive-output>
               <button class="button button--secondary button--small" type="button" data-copy-moblin-url="vpn">
@@ -347,5 +349,5 @@
 {% endblock %}
 
 {% block scripts %}
-  <script src="/static/servers.js?v=20260903.1" defer></script>
+  <script src="/static/servers.js?v=20260904.1" defer></script>
 {% endblock %}
