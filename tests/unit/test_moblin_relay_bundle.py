@@ -249,6 +249,37 @@ def test_self_test_classifies_first_absence_before_natural_idle_window() -> None
     assert "final_reset_log_offset = os.fstat(transition_log_descriptor).st_size" in source
 
 
+def test_self_test_aggregate_decoder_uses_full_process_deadline() -> None:
+    namespace = load_self_test()
+    tree = ast.parse(SELF_TEST.read_text(encoding="utf-8"))
+    assignments = {
+        target.id: statement
+        for statement in ast.walk(tree)
+        if isinstance(statement, ast.Assign)
+        for target in statement.targets
+        if isinstance(target, ast.Name) and target.id in {"decode", "decode_text"}
+    }
+    block = compile(
+        ast.Module(body=[assignments["decode"], assignments["decode_text"]], type_ignores=[]),
+        str(SELF_TEST),
+        "exec",
+    )
+    namespace["capture"] = Path("isolated-aggregate.flv")
+    with patch("subprocess.run", return_value=SimpleNamespace(stderr="decode warning")) as run:
+        exec(block, namespace)  # noqa: S102 - fixed, repository-owned decoder AST
+    assert run.call_args.kwargs["timeout"] == 60
+    assert run.call_args.kwargs["stdout"] == subprocess.PIPE
+    assert run.call_args.kwargs["stderr"] == subprocess.PIPE
+    assert run.call_args.kwargs["text"] is True
+    assert namespace["decode_text"] == "decode warning"
+    assert "explode" in run.call_args.args[0]
+    with (
+        patch("subprocess.run", side_effect=subprocess.TimeoutExpired(["private-fixture"], 60)),
+        pytest.raises(namespace["TestFailure"], match="^local media probe timed out$"),
+    ):
+        exec(block, namespace)  # noqa: S102 - fixed, repository-owned decoder AST
+
+
 def node_config(
     public_host: str,
     *,
@@ -2001,11 +2032,11 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         'normalized_signature["video_gop"] = video_gop_signature(capture)'
     )
     assert decode_block.index('mark_self_test_stage("decoder")') < decode_block.index(
-        "decode = run("
+        "decode = run_probe("
     )
-    aggregate_decode_command = decode_block.split("decode = run(", 1)[1].split("decode_text =", 1)[
-        0
-    ]
+    aggregate_decode_command = decode_block.split("decode = run_probe(", 1)[1].split(
+        "decode_text =", 1
+    )[0]
     assert '"-err_detect"' in aggregate_decode_command
     assert '"explode"' in aggregate_decode_command
     assert '"-xerror"' not in aggregate_decode_command

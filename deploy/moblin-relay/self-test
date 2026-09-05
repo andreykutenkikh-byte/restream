@@ -6002,7 +6002,7 @@ def main() -> int:
         result["normalized_output_streams"] = normalized_streams
         result["mono_to_stereo_normalization_passed"] = True
         mark_self_test_stage("decoder")
-        decode = run(
+        decode = run_probe(
             [
                 str(FFMPEG),
                 "-nostdin",
@@ -6021,11 +6021,9 @@ def main() -> int:
                 "null",
                 "-",
             ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            timeout=60,
         )
-        decode_text = decode.stderr.decode(errors="replace")
+        decode_text = decode.stderr
         # A single long-lived RTSP-to-FLV recorder observes several independent
         # publisher epochs. Its muxer can clamp DTS at intentional SLATE/LIVE
         # boundaries and, if the diagnostic reader falls behind, its own queue

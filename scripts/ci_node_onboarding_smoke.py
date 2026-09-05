@@ -1006,6 +1006,7 @@ def main() -> None:
 
     set_smoke_stage("bootstrap_job")
     completed = poll_job(client, job_id)
+    print_self_test_progress(job_id)
     set_smoke_stage("relay_ready")
     try:
         node, _relay = ready_relay(client)

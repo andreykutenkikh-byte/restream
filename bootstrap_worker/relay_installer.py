@@ -54,6 +54,11 @@ MEDIA_MTX_URL = (
     f"{MEDIA_MTX_VERSION}/{MEDIA_MTX_ARCHIVE}"
 )
 MEDIA_MTX_ARCHIVE_SHA256 = "81b143f55a5d23d4a8c028d52869c14ea4a59919900528698fcc97a747fd69c6"
+# CI reached aggregate GOP analysis at 296.168s after recovery and thirteen
+# strict sink samples. Remaining probes have 60+60+60+60+30s whole-process
+# deadlines; reserve 90s for cleanup/variation. This media-test-only envelope
+# does not change package timeouts or the job manager's overall deadline.
+RELAY_SELF_TEST_TIMEOUT_SECONDS = 660.0
 
 _CORE_PAYLOADS = (
     "initialize-secrets",
@@ -960,7 +965,7 @@ class RemoteRelayInstaller:
             'if test "$self_test_status" -eq 0; then '
             f"rm -f -- {self_test_stage}; fi; "
             'exit "$self_test_status"',
-            timeout=timeouts.package_seconds,
+            timeout=min(RELAY_SELF_TEST_TIMEOUT_SECONDS, timeouts.overall_seconds),
         )
         if self_test is None or self_test.exit_status != 0:
             diagnostic, _diagnostic_failure = await self._run_diagnosable(

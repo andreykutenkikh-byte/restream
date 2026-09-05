@@ -27,6 +27,7 @@ from bootstrap_worker.relay_installer import (
     MEDIA_MTX_ARCHIVE_SHA256,
     MEDIA_MTX_URL,
     RELAY_CONTROL_ORIGIN,
+    RELAY_SELF_TEST_TIMEOUT_SECONDS,
     RelayInstallReceipt,
     RemoteRelayInstaller,
     load_relay_bundle,
@@ -330,6 +331,29 @@ async def test_managed_retry_rejects_symlink_or_special_file_in_owned_paths() ->
         )
     assert captured.value.code == "remote_relay_conflict"
     assert not session.uploads
+
+
+@pytest.mark.parametrize(("overall", "expected"), [(450, 450), (900, 660), (3600, 660)])
+async def test_media_test_has_its_own_bounded_budget_without_extending_other_operations(
+    overall: int,
+    expected: int,
+) -> None:
+    session = FakeSession()
+    timeouts = TimeoutPolicy(overall_seconds=overall)
+    await RemoteRelayInstaller().install(
+        session,
+        PrivilegeContext(PrivilegeMode.ROOT),
+        receipt(),
+        timeouts=timeouts,
+    )
+    media = [limit for command, _, limit in session.commands if "self-test --quick" in command]
+    assert media == [expected]
+    assert RELAY_SELF_TEST_TIMEOUT_SECONDS == 300 + 60 + 60 + 60 + 60 + 30 + 90
+    assert timeouts.package_seconds == 300
+    packages = [limit for command, _, limit in session.commands if "apt-get" in command]
+    assert packages and all(limit == 300 for limit in packages)
+    assert all(limit <= overall for _, _, limit in session.commands)
+    assert TimeoutPolicy().overall_seconds == 900
 
 
 async def test_install_uses_pinned_mediamtx_and_never_mutates_host_networking() -> None:
