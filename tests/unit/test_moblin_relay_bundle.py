@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -51,6 +51,71 @@ def load_self_test() -> dict[str, object]:
 
 def load_normalizer() -> dict[str, object]:
     return runpy.run_path(str(NORMALIZER), run_name="_moblin_normalizer_test")
+
+
+def invoke_self_test_stage_marker(stage: str, **kwargs):
+    namespace = load_self_test()
+    mark = namespace["mark_self_test_stage"]
+    stage_file = "/run/moblin-relay-self-test.11111111-2222-3333-4444-555555555555.stage"
+    with (
+        patch.dict(
+            mark.__globals__,
+            {"SELF_TEST_STAGE_FILE": stage_file, "SELF_TEST_STARTED_MONOTONIC": 100.0},
+        ),
+        patch("time.monotonic", return_value=112.345),
+        patch("os.lstat", return_value=SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)),
+        patch("os.O_CLOEXEC", 0, create=True),
+        patch("os.O_NONBLOCK", 0, create=True),
+        patch("os.open", return_value=99),
+        patch(
+            "os.fstat",
+            return_value=SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=0, st_nlink=1),
+        ),
+        patch("os.fchmod", create=True),
+        patch("os.ftruncate"),
+        patch("os.write", side_effect=lambda _fd, value: len(value)) as write,
+        patch("os.fsync"),
+        patch("os.close"),
+        patch.dict(mark.__globals__, {"atomic_json": lambda *args: saved.append(args)}),
+    ):
+        saved = []
+        mark(stage, **kwargs)
+        stage_payload = bytes(write.call_args.args[1])
+    return saved, stage_payload
+
+
+@pytest.mark.parametrize("segment_index", [None, 1, 13, 32])
+def test_self_test_progress_is_bounded_fixed_schema_without_media_values(segment_index) -> None:
+    saved, stage_payload = invoke_self_test_stage_marker(
+        "sink-video", strict_segment_index=segment_index
+    )
+    expected = {
+        "job_id": "11111111-2222-3333-4444-555555555555",
+        "stage": "sink-video",
+        "elapsed_seconds": 12.345,
+    }
+    if segment_index is not None:
+        expected["strict_segment_index"] = segment_index
+    assert saved == [(Path("/run/moblin-relay-self-test.progress.json"), expected)]
+    assert stage_payload == b"sink-video\n"
+    assert len(json.dumps(expected).encode("ascii")) < 512
+
+
+@pytest.mark.parametrize(
+    "stage,segment_index",
+    [
+        ("private-fixture", None),
+        ("sink-video", 0),
+        ("sink-video", 33),
+        ("sink-video", True),
+        ("sink-video", 1.5),
+        ("sink-video", "1"),
+        ("cont-kick", 1),
+    ],
+)
+def test_self_test_progress_rejects_untrusted_stage_or_segment(stage, segment_index) -> None:
+    with pytest.raises(RuntimeError, match="^invalid internal self-test stage$"):
+        invoke_self_test_stage_marker(stage, strict_segment_index=segment_index)
 
 
 def node_config(
@@ -1879,7 +1944,8 @@ def test_self_test_validates_actual_decoded_pts_on_native_flv_capture() -> None:
 
     class FakeProbe:
         returncode = 0
-        stdout = iter(
+        stderr = ""
+        stdout = "".join(
             [
                 frame_prefix + "pts_time=0.000000|best_effort_timestamp_time=0.000000\n",
                 frame_prefix + "pkt_pts_time=0.033333|best_effort_timestamp_time=0.033333\n",
@@ -1887,14 +1953,11 @@ def test_self_test_validates_actual_decoded_pts_on_native_flv_capture() -> None:
             ]
         )
 
-        def communicate(self, *, timeout: int) -> tuple[str, str]:
-            assert timeout == 60
-            return "", ""
-
-    with patch("subprocess.Popen", return_value=FakeProbe()) as popen:
+    with patch("subprocess.run", return_value=FakeProbe()) as run:
         result = analyze(Path("native-downstream.flv"))
 
-    command = popen.call_args.args[0]
+    command = run.call_args.args[0]
+    assert run.call_args.kwargs["timeout"] == 60
     assert any("pts_time,pkt_pts_time,best_effort_timestamp_time" in item for item in command)
     assert result["presentation_timestamp_count"] == result["frame_count"] == 3
     assert not result["strict_presentation_timestamps_monotonic"]
@@ -1958,9 +2021,10 @@ def test_self_test_rejects_observed_resolution_changes_despite_recorder_decode_a
 
     class FakeProbe:
         returncode = 1
+        stderr = "diagnostic reader decode artifact"
 
         def __init__(self) -> None:
-            self.stdout = iter(
+            self.stdout = "".join(
                 [
                     "width=1080|height=1920|pix_fmt=yuv420p|decode_error_flags=0\n",
                     f"width={width}|height={height}|pix_fmt=yuv420p|decode_error_flags=1\n",
@@ -1968,11 +2032,7 @@ def test_self_test_rejects_observed_resolution_changes_despite_recorder_decode_a
                 ]
             )
 
-        def communicate(self, *, timeout: int) -> tuple[str, str]:
-            assert timeout == 60
-            return "", "diagnostic reader decode artifact"
-
-    with patch("subprocess.Popen", return_value=FakeProbe()):
+    with patch("subprocess.run", return_value=FakeProbe()):
         decoded = analyze(Path("aggregate-downstream.flv"))
     assert decoded["frame_count"] == 3
     assert decoded["ffprobe_exit"] == 1

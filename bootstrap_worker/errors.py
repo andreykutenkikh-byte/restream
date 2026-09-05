@@ -387,6 +387,39 @@ def safe_failure(code: str) -> BootstrapError:
             "Возврат LIVE после восстановления источника не прошёл самопроверку."
         ),
         "relay_self_test_continuity_failed": "Непрерывность выходного потока не подтверждена.",
+        "relay_self_test_continuity_disconnect_failed": (
+            "Принудительное переподключение тестового RTMP-приёмника не подтверждено."
+        ),
+        "relay_self_test_continuity_final_slate_failed": (
+            "Финальный переход на заставку не подтверждён."
+        ),
+        "relay_self_test_continuity_capture_failed": (
+            "Финальная запись тестового выходного потока не подтверждена."
+        ),
+        "relay_self_test_continuity_ledger_failed": (
+            "Учёт восстановления передачи данных не прошёл проверку."
+        ),
+        "relay_self_test_continuity_reader_failed": (
+            "Завершение тестового RTSP-приёмника не подтверждено."
+        ),
+        "relay_self_test_sink_format_failed": (
+            "Формат сохранённого фрагмента RTMP-выхода не прошёл проверку."
+        ),
+        "relay_self_test_sink_gop_failed": (
+            "Интервал ключевых кадров фрагмента RTMP-выхода не прошёл проверку."
+        ),
+        "relay_self_test_sink_decode_failed": (
+            "Декодирование фрагмента RTMP-выхода не прошло проверку."
+        ),
+        "relay_self_test_sink_video_failed": (
+            "Видеокадры фрагмента RTMP-выхода не прошли проверку."
+        ),
+        "relay_self_test_sink_audio_failed": (
+            "Аудиокадры фрагмента RTMP-выхода не прошли проверку."
+        ),
+        "relay_self_test_sink_timestamps_failed": (
+            "Временные метки фрагмента RTMP-выхода не прошли проверку."
+        ),
         "relay_self_test_decode_failed": "Декодирование и временные метки не прошли проверку.",
         "relay_self_test_decode_streams_failed": (
             "Состав выходных медиапотоков не прошёл самопроверку."

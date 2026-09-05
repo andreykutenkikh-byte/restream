@@ -57,6 +57,8 @@ INGEST_PATH = "iphone-live"
 OUTPUT_PATH = "relay-output"
 SELF_TEST_LOCK = Path("/run/lock/moblin-relay-self-test.lock")
 SELF_TEST_STAGE_FILE = os.environ.pop("MOBLIN_RELAY_SELF_TEST_STAGE_FILE", "")
+SELF_TEST_STARTED_MONOTONIC = time.monotonic()
+SELF_TEST_PROGRESS_FILE = Path("/run/moblin-relay-self-test.progress.json")
 SELF_TEST_STAGES = frozenset(
     {
         "startup",
@@ -148,6 +150,17 @@ SELF_TEST_STAGES = frozenset(
         "outage-hold",
         "outage-live",
         "continuity",
+        "cont-kick",
+        "cont-final",
+        "cont-capture",
+        "cont-ledger",
+        "cont-reader",
+        "sink-format",
+        "sink-gop",
+        "sink-decode",
+        "sink-video",
+        "sink-audio",
+        "sink-timestamps",
         "decode",
         "streams",
         "format",
@@ -187,7 +200,8 @@ SELF_TEST_STAGES = frozenset(
     }
 )
 SELF_TEST_STAGE_PATH = re.compile(
-    r"/run/moblin-relay-self-test\.[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\.stage"
+    r"/run/moblin-relay-self-test\."
+    r"(?P<job_id>[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})\.stage"
 )
 
 PORTRAIT_WIDTH = 1080
@@ -304,12 +318,21 @@ class TestFailure(RuntimeError):
     pass
 
 
-def mark_self_test_stage(stage: str) -> None:
+def mark_self_test_stage(stage: str, *, strict_segment_index: int | None = None) -> None:
     if not SELF_TEST_STAGE_FILE:
         return
+    stage_path_match = SELF_TEST_STAGE_PATH.fullmatch(SELF_TEST_STAGE_FILE)
     if (
         stage not in SELF_TEST_STAGES
-        or SELF_TEST_STAGE_PATH.fullmatch(SELF_TEST_STAGE_FILE) is None
+        or stage_path_match is None
+        or (
+            strict_segment_index is not None
+            and (
+                type(strict_segment_index) is not int
+                or not 1 <= strict_segment_index <= 32
+                or not stage.startswith("sink-")
+            )
+        )
     ):
         raise TestFailure("invalid internal self-test stage")
     parent_metadata = os.lstat(Path(SELF_TEST_STAGE_FILE).parent)
@@ -340,6 +363,21 @@ def mark_self_test_stage(stage: str) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+    # One root-only sidecar survives installer rollback so the disposable CI
+    # fixture can distinguish slow progress from a hung probe. The self-test
+    # lock serializes writers; every attempt replaces the previous metadata.
+    # It contains only its validated job ID, a fixed stage and numeric timing.
+    elapsed = time.monotonic() - SELF_TEST_STARTED_MONOTONIC
+    if not math.isfinite(elapsed) or not 0 <= elapsed <= 3600:
+        raise TestFailure("invalid internal self-test timing")
+    progress = {
+        "job_id": stage_path_match.group("job_id"),
+        "stage": stage,
+        "elapsed_seconds": round(elapsed, 3),
+    }
+    if strict_segment_index is not None:
+        progress["strict_segment_index"] = strict_segment_index
+    atomic_json(SELF_TEST_PROGRESS_FILE, progress)
 
 
 def validate_preview_renderer_contract() -> dict:
@@ -679,6 +717,23 @@ def cleanup_test_workdir_after_supervisors(
 
 def run(args: list[str], **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(args, check=False, **kwargs)
+
+
+def run_probe(command: list[str], *, timeout: float) -> subprocess.CompletedProcess:
+    """Drain both probe pipes concurrently under one full-process deadline."""
+    try:
+        return run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        # subprocess.run kills and reaps the child before raising. Never expose
+        # its command, partial stdout/stderr, or a potentially sensitive path.
+        raise TestFailure("local media probe timed out") from None
 
 
 def service_is_active() -> bool:
@@ -1803,7 +1858,7 @@ def generate_live(work: Path) -> Path:
 
 
 def video_gop_signature(path: Path) -> dict:
-    completed = run(
+    completed = run_probe(
         [
             str(FFPROBE),
             "-v",
@@ -1817,10 +1872,7 @@ def video_gop_signature(path: Path) -> dict:
             "json",
             str(path),
         ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+        timeout=60,
     )
     if completed.returncode != 0:
         raise TestFailure(f"ffprobe frame scan failed for {path.name}")
@@ -1839,12 +1891,9 @@ def video_gop_signature(path: Path) -> dict:
 
 
 def stream_signature(path: Path, *, include_gop: bool = True) -> dict:
-    completed = run(
+    completed = run_probe(
         [str(FFPROBE), "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+        timeout=60,
     )
     if completed.returncode != 0:
         raise TestFailure(f"ffprobe failed for {path.name}")
@@ -2907,9 +2956,7 @@ def analyze_timestamps(capture: Path) -> dict:
         "compact=p=0:nk=0",
         str(capture),
     ]
-    process = subprocess.Popen(
-        command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-    )
+    completed = run_probe(command, timeout=30)
     previous_dts: dict[int, float] = {}
     max_dts_gap: dict[int, float] = {}
     packets: dict[int, int] = {}
@@ -2924,8 +2971,7 @@ def analyze_timestamps(capture: Path) -> dict:
     dts_backward_events_beyond_tolerance: dict[int, int] = {}
     strict_dts_monotonic = True
     dts_within_tolerance = True
-    assert process.stdout is not None
-    for line in process.stdout:
+    for line in completed.stdout.splitlines():
         fields = {}
         for item in line.strip().split("|"):
             if "=" in item:
@@ -2982,7 +3028,6 @@ def analyze_timestamps(capture: Path) -> dict:
             if dts is not None:
                 offset = abs(pts - dts)
                 max_pts_dts_offset[index] = max(max_pts_dts_offset.get(index, 0.0), offset)
-    stderr = process.communicate(timeout=30)[1]
     durations = {
         index: previous_dts[index] - first_dts[index]
         for index in first_dts
@@ -3010,7 +3055,7 @@ def analyze_timestamps(capture: Path) -> dict:
         else None
     )
     return {
-        "ffprobe_exit": process.returncode,
+        "ffprobe_exit": completed.returncode,
         "strict_dts_monotonic": strict_dts_monotonic,
         "dts_within_tolerance": dts_within_tolerance,
         "dts_backward_tolerance_seconds": TIMESTAMP_BACKWARD_TOLERANCE_SECONDS,
@@ -3037,7 +3082,7 @@ def analyze_timestamps(capture: Path) -> dict:
         "stream_durations_seconds": durations,
         "audio_video_duration_difference_seconds": av_difference,
         "audio_video_end_difference_seconds": av_end_difference,
-        "stderr_empty": not bool(stderr.strip()),
+        "stderr_empty": not bool(completed.stderr.strip()),
     }
 
 
@@ -3056,17 +3101,14 @@ def analyze_decoded_video_frames(capture: Path) -> dict:
         "compact=p=0:nk=0",
         str(capture),
     ]
-    process = subprocess.Popen(
-        command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-    )
+    completed = run_probe(command, timeout=60)
     frame_count = 0
     dimensions: dict[str, int] = {}
     pixel_formats: dict[str, int] = {}
     decode_error_flags: dict[str, int] = {}
     presentation_timestamps: list[float] = []
     best_effort_timestamps: list[float] = []
-    assert process.stdout is not None
-    for line in process.stdout:
+    for line in completed.stdout.splitlines():
         fields = {}
         for item in line.strip().split("|"):
             if "=" in item:
@@ -3103,7 +3145,6 @@ def analyze_decoded_video_frames(capture: Path) -> dict:
                         target.append(float(match.group(0)))
                     except ValueError:
                         pass
-    stderr = process.communicate(timeout=60)[1]
     required_size = f"{PORTRAIT_WIDTH}x{PORTRAIT_HEIGHT}"
     presentation_steps = [
         right - left for left, right in zip(presentation_timestamps, presentation_timestamps[1:])
@@ -3117,7 +3158,7 @@ def analyze_decoded_video_frames(capture: Path) -> dict:
         right - left for left, right in zip(best_effort_timestamps, best_effort_timestamps[1:])
     ]
     return {
-        "ffprobe_exit": process.returncode,
+        "ffprobe_exit": completed.returncode,
         "frame_count": frame_count,
         "dimensions": dimensions,
         "pixel_formats": pixel_formats,
@@ -3153,7 +3194,7 @@ def analyze_decoded_video_frames(capture: Path) -> dict:
         "maximum_best_effort_timestamp_backward_step_seconds": max(
             (-step for step in best_effort_steps if step < 0), default=0.0
         ),
-        "stderr_empty": not bool(stderr.strip()),
+        "stderr_empty": not bool(completed.stderr.strip()),
     }
 
 
@@ -3181,13 +3222,10 @@ def analyze_decoded_audio_timestamps(capture: Path) -> dict:
         "compact=p=0:nk=0",
         str(capture),
     ]
-    process = subprocess.Popen(
-        command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-    )
+    completed = run_probe(command, timeout=60)
     timestamps: list[float] = []
     frame_count = 0
-    assert process.stdout is not None
-    for line in process.stdout:
+    for line in completed.stdout.splitlines():
         frame_count += 1
         fields = {}
         for item in line.strip().split("|"):
@@ -3203,12 +3241,11 @@ def analyze_decoded_audio_timestamps(capture: Path) -> dict:
                 timestamps.append(float(match.group(0)))
             except ValueError:
                 pass
-    stderr = process.communicate(timeout=60)[1]
     steps = [right - left for left, right in zip(timestamps, timestamps[1:])]
     negative_steps = [step for step in steps if step < 0]
     beyond_tolerance = [step for step in steps if step < -TIMESTAMP_BACKWARD_TOLERANCE_SECONDS]
     return {
-        "ffprobe_exit": process.returncode,
+        "ffprobe_exit": completed.returncode,
         "frame_count": frame_count,
         "presentation_timestamp_count": len(timestamps),
         "strict_presentation_timestamps_monotonic": not any(step < -0.000001 for step in steps),
@@ -3219,7 +3256,7 @@ def analyze_decoded_audio_timestamps(capture: Path) -> dict:
         ),
         "minimum_presentation_timestamp_step_seconds": min(steps, default=None),
         "maximum_presentation_timestamp_gap_seconds": max(steps, default=None),
-        "stderr_empty": not bool(stderr.strip()),
+        "stderr_empty": not bool(completed.stderr.strip()),
     }
 
 
@@ -3326,9 +3363,12 @@ def validate_final_sink_media_segment(
     capture_bytes: int,
     expected_video: dict,
     process_metadata_guard,
+    *,
+    segment_index: int | None = None,
 ) -> dict[str, int]:
     """Strictly probe and decode a retained final-RTMP-sink stream-copy sample."""
     try:
+        mark_self_test_stage("sink-format", strict_segment_index=segment_index)
         if not sink_capture.is_file() or capture_bytes < SLATE_CAPTURE_GROWTH_BYTES:
             raise TestFailure("strict RTMP sink media capture is unavailable")
         signature = stream_signature(sink_capture, include_gop=False)
@@ -3341,6 +3381,7 @@ def validate_final_sink_media_segment(
         if output_format_failure_stage(streams[0], streams[1], expected_video) is not None:
             raise TestFailure("strict RTMP sink media format is invalid")
 
+        mark_self_test_stage("sink-gop", strict_segment_index=segment_index)
         gop = video_gop_signature(sink_capture)
         keyframe_indexes = gop.get("keyframe_indexes", [])
         intervals = gop.get("interval_frames", [])
@@ -3352,6 +3393,7 @@ def validate_final_sink_media_segment(
         ):
             raise TestFailure("strict RTMP sink media GOP is invalid")
 
+        mark_self_test_stage("sink-decode", strict_segment_index=segment_index)
         decode_command = [
             str(FFMPEG),
             "-nostdin",
@@ -3382,6 +3424,7 @@ def validate_final_sink_media_segment(
         if decoded.returncode != 0:
             raise TestFailure("strict RTMP sink media decode failed")
 
+        mark_self_test_stage("sink-video", strict_segment_index=segment_index)
         decoded_frames = analyze_decoded_video_frames(sink_capture)
         if (
             decoded_frames["ffprobe_exit"] != 0
@@ -3393,7 +3436,9 @@ def validate_final_sink_media_segment(
         ):
             raise TestFailure("strict RTMP sink video frame validation failed")
 
+        mark_self_test_stage("sink-audio", strict_segment_index=segment_index)
         decoded_audio = analyze_decoded_audio_timestamps(sink_capture)
+        mark_self_test_stage("sink-timestamps", strict_segment_index=segment_index)
         timestamps = analyze_timestamps(sink_capture)
         timestamp_stage = timestamp_failure_stage(
             timestamps,
@@ -5519,6 +5564,7 @@ def main() -> int:
         # Force one exact, loopback-only downstream disconnect so recovery is
         # proven deterministically even when all content transitions happened
         # to preserve their RTMP publisher connection.
+        mark_self_test_stage("cont-kick")
         before_forced_reconnect = wait_healthy_live(
             "healthy LIVE before forced RTMP sink reconnect",
             5,
@@ -5552,6 +5598,7 @@ def main() -> int:
         if forced_reconnect_no_growth > CAPTURE_NO_GROWTH_LIMIT_SECONDS:
             raise TestFailure("RTSP capture stalled during forced RTMP sink reconnect")
 
+        mark_self_test_stage("cont-final")
         before_final = wait_healthy_live("healthy LIVE before final transition", 5)
         final_ingest_ids = list(before_final["ingest_ids"])
         if len(final_ingest_ids) != 1:
@@ -5578,6 +5625,7 @@ def main() -> int:
             not_before=float(final_slate["t"]),
         )
         current_sink_id = final_stable["sink_ids"][0]
+        mark_self_test_stage("cont-capture")
         record_strict_sink_segment(
             "stable final SLATE",
             lambda sample: (
@@ -5607,6 +5655,7 @@ def main() -> int:
             network_capture_window_started,
             "network-outage matrix",
         )
+        mark_self_test_stage("cont-ledger")
         capture_observer.finish()
         observer.finish()
         samples = observer.samples
@@ -5722,6 +5771,7 @@ def main() -> int:
             "mux_invalid_argument_absent": True,
         }
 
+        mark_self_test_stage("cont-reader")
         safe_stop(reader)
         reader = None
         strict_sink_segment_counts: list[dict[str, int]] = []
@@ -5740,6 +5790,7 @@ def main() -> int:
                     int(pending_segment["capture_bytes"]),
                     slate_sig["streams"][0],
                     assert_clean_process_metadata,
+                    segment_index=segment_number,
                 )
                 strict_sink_segment_counts.append(strict_counts)
                 result_key = pending_segment.get("result_key")

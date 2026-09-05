@@ -9,12 +9,15 @@ code intentionally refuses non-HTTPS/non-production control origins.
 from __future__ import annotations
 
 import json
+import math
 import re
 import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
+from uuid import UUID
 
+from bootstrap_worker.relay_installer import _SELF_TEST_STAGE_CODES
 from scripts.ci_output_smoke import COMPOSE, APIClient, SmokeFailure
 
 PASSWORD_MARKER = "CI_SSH_PASSWORD_MUST_NEVER_PERSIST_9F3A"  # noqa: S105
@@ -155,6 +158,17 @@ SAFE_BOOTSTRAP_DIAGNOSTIC_CODES = frozenset(
         "relay_self_test_outage_hold_failed",
         "relay_self_test_outage_live_failed",
         "relay_self_test_continuity_failed",
+        "relay_self_test_continuity_disconnect_failed",
+        "relay_self_test_continuity_final_slate_failed",
+        "relay_self_test_continuity_capture_failed",
+        "relay_self_test_continuity_ledger_failed",
+        "relay_self_test_continuity_reader_failed",
+        "relay_self_test_sink_format_failed",
+        "relay_self_test_sink_gop_failed",
+        "relay_self_test_sink_decode_failed",
+        "relay_self_test_sink_video_failed",
+        "relay_self_test_sink_audio_failed",
+        "relay_self_test_sink_timestamps_failed",
         "relay_self_test_decode_failed",
         "relay_self_test_decode_streams_failed",
         "relay_self_test_decode_format_failed",
@@ -291,6 +305,81 @@ def safe_bootstrap_diagnostic_code(payload: Mapping[str, Any]) -> str:
     if isinstance(code, str) and code in SAFE_BOOTSTRAP_DIAGNOSTIC_CODES:
         return code
     return "unknown"
+
+
+def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
+    """Only fixed stage names and bounded numbers may reach the CI log."""
+    unavailable = {"progress": "unavailable"}
+    if not isinstance(payload, dict) or payload.get("job_id") != job_id:
+        return unavailable
+    stage = payload.get("stage")
+    elapsed = payload.get("elapsed_seconds")
+    segment = payload.get("strict_segment_index")
+    if (
+        not isinstance(stage, str)
+        or stage not in _SELF_TEST_STAGE_CODES
+        or not isinstance(elapsed, (int, float))
+        or isinstance(elapsed, bool)
+        or not 0 <= elapsed <= JOB_TIMEOUT_SECONDS
+        or not math.isfinite(elapsed)
+        or (segment is not None and (type(segment) is not int or not 1 <= segment <= 32))
+    ):
+        return unavailable
+    result: dict[str, Any] = {"stage": stage, "elapsed_seconds": round(elapsed, 3)}
+    if segment is not None:
+        result["strict_segment_index"] = segment
+    return result
+
+
+def print_self_test_progress(job_id: str) -> None:
+    """Inspect the one non-secret progress checkpoint on the disposable CI target."""
+    diagnostic: dict[str, Any] = {"progress": "unavailable"}
+    try:
+        if str(UUID(job_id)) != job_id:
+            raise ValueError("invalid job identity")
+        result = compose(
+            "exec",
+            "-T",
+            "ci-ssh-target",
+            "python3",
+            "-c",
+            """
+import json
+import os
+import stat
+import time
+from pathlib import Path
+
+path = Path('/run/moblin-relay-self-test.progress.json')
+try:
+    before = path.lstat()
+    if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0
+            or stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != 1
+            or not 0 < before.st_size <= 512
+            or not -5 <= time.time() - before.st_mtime <= 960):
+        raise ValueError('unavailable')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as handle:
+        after = os.fstat(handle.fileno())
+        if before != after:
+            raise ValueError('unavailable')
+        raw = handle.read(513)
+    if len(raw) > 512:
+        raise ValueError('unavailable')
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError('unavailable')
+    print(json.dumps({key: value.get(key) for key in
+        ('job_id', 'stage', 'elapsed_seconds', 'strict_segment_index')}))
+except (OSError, ValueError):
+    print('{}')
+""",
+            max_capture_bytes=2048,
+        )
+        diagnostic = safe_self_test_progress(json.loads(result.stdout), job_id=job_id)
+    except (ValueError, SmokeFailure):
+        pass
+    print("Self-test progress diagnostic: " + json.dumps(diagnostic, sort_keys=True))
 
 
 def _safe_item_count(value: Any) -> str:
@@ -585,6 +674,7 @@ def poll_job(client: APIClient, job_id: str) -> Mapping[str, Any]:
         state = str(raw.get("state", ""))
         if state in {"failed", "cancelled"}:
             print(f"Bootstrap terminal safe code: {safe_bootstrap_diagnostic_code(raw)}")
+            print_self_test_progress(job_id)
             raise SmokeFailure("bootstrap job reached a non-success terminal state")
         return raw if state == "completed" else None
 
