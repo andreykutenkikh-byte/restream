@@ -59,6 +59,7 @@ SELF_TEST_LOCK = Path("/run/lock/moblin-relay-self-test.lock")
 SELF_TEST_STAGE_FILE = os.environ.pop("MOBLIN_RELAY_SELF_TEST_STAGE_FILE", "")
 SELF_TEST_STARTED_MONOTONIC = time.monotonic()
 SELF_TEST_PROGRESS_FILE = Path("/run/moblin-relay-self-test.progress.json")
+SELF_TEST_LAST_PROGRESS: dict = {}
 SELF_TEST_STAGES = frozenset(
     {
         "startup",
@@ -319,6 +320,7 @@ class TestFailure(RuntimeError):
 
 
 def mark_self_test_stage(stage: str, *, strict_segment_index: int | None = None) -> None:
+    global SELF_TEST_LAST_PROGRESS
     if not SELF_TEST_STAGE_FILE:
         return
     stage_path_match = SELF_TEST_STAGE_PATH.fullmatch(SELF_TEST_STAGE_FILE)
@@ -377,6 +379,25 @@ def mark_self_test_stage(stage: str, *, strict_segment_index: int | None = None)
     }
     if strict_segment_index is not None:
         progress["strict_segment_index"] = strict_segment_index
+    atomic_json(SELF_TEST_PROGRESS_FILE, progress)
+    SELF_TEST_LAST_PROGRESS = progress
+
+
+def persist_self_test_failure_progress(exc: BaseException) -> None:
+    """Retain only exact self-test source line integers, never traceback text."""
+    if not SELF_TEST_STAGE_FILE or not SELF_TEST_LAST_PROGRESS:
+        return
+    mark_self_test_stage(
+        SELF_TEST_LAST_PROGRESS["stage"],
+        strict_segment_index=SELF_TEST_LAST_PROGRESS.get("strict_segment_index"),
+    )
+    lines = []
+    trace = exc.__traceback__
+    while trace is not None:
+        if trace.tb_frame.f_code.co_filename == __file__ and 1 <= trace.tb_lineno <= 20000:
+            lines.append(trace.tb_lineno)
+        trace = trace.tb_next
+    progress = {**SELF_TEST_LAST_PROGRESS, "failure_lines": lines[-8:]}
     atomic_json(SELF_TEST_PROGRESS_FILE, progress)
 
 
@@ -1599,6 +1620,93 @@ def require_metrics_coverage(
     if blind_seconds > METRICS_BLIND_LIMIT_SECONDS:
         raise TestFailure(f"metrics observability was lost during {description}")
     return blind_seconds
+
+
+def confirmed_input_reset_disconnect_proved(
+    samples: list[dict],
+    expected_ingest_ids: list[str],
+    outage_started: float,
+    detached_sample: dict,
+    reset_log_tail: bytes,
+) -> bool:
+    """Account for an early disconnect only with fresh, exact-source reset proof."""
+    if (
+        len(expected_ingest_ids) != 1
+        or not isinstance(expected_ingest_ids[0], str)
+        or re.fullmatch(
+            r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}", expected_ingest_ids[0]
+        ) is None
+        or len(samples) < 3
+    ):
+        return False
+    markers = (
+        NORMALIZER_CONFIRMED_INPUT_STALL_MARKER,
+        NORMALIZER_RESET_REQUESTED_MARKER,
+        NORMALIZER_RESET_SUCCEEDED_MARKER,
+    )
+    if any(reset_log_tail.count(marker) != 1 for marker in markers):
+        return False
+    positions = [reset_log_tail.index(marker) for marker in markers]
+    if positions != sorted(positions):
+        return False
+    previous_finished = outage_started
+    previous_observed = outage_started
+    previous_counter = None
+    possible_flat_since = None
+    try:
+        detached_at = float(detached_sample["t"])
+        detached_finished = float(detached_sample["finished"])
+        elapsed = detached_at - outage_started
+        if (
+            not math.isfinite(elapsed)
+            or not math.isfinite(detached_finished)
+            or not 0 <= detached_finished - detached_at <= 0.5
+            or not CONFIRMED_INPUT_STALL_GRACE_SECONDS <= elapsed < SRT_IDLE_LOWER_BOUND_SECONDS
+            or not complete_metrics_sample(detached_sample)
+            or detached_sample.get("ingest_live")
+            or detached_sample.get("ingest_ids") != []
+            or not detached_sample.get("path_ready")
+        ):
+            return False
+        for sample in samples:
+            observed = float(sample["t"])
+            finished = float(sample["finished"])
+            if (
+                not math.isfinite(observed)
+                or not math.isfinite(finished)
+                or not outage_started <= observed < detached_at
+                or not observed <= finished <= detached_at
+                or not 0 <= observed - previous_finished <= 0.5
+                or finished - observed > 0.5
+                or not complete_metrics_sample(sample)
+                or not sample.get("ingest_live")
+                or sample.get("ingest_ids") != expected_ingest_ids
+            ):
+                return False
+            counter = sample.get("ingest_transport_bytes")
+            if type(counter) is not int or counter < 0:
+                return False
+            if previous_counter is not None and counter < previous_counter:
+                return False
+            if counter != previous_counter:
+                # The last growth occurred between adjacent counter reads.
+                # Their actual read intervals bracket the plateau start; do
+                # not invent a tolerance to synchronize 0.2s observer polls
+                # with the normalizer's independent 0.05s confirmation polls.
+                possible_flat_since = previous_observed
+            previous_counter = counter
+            previous_finished = finished
+            previous_observed = observed
+        return bool(
+            possible_flat_since is not None
+            and 0 <= detached_at - previous_finished <= 0.5
+            # Fresh ordered runtime markers attest its continuous 6s gate.
+            # Independent counter evidence must be compatible with that
+            # claim; if even its upper duration bound is short, reject it.
+            and detached_finished - possible_flat_since >= CONFIRMED_INPUT_STALL_GRACE_SECONDS
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
 
 
 def maximum_capture_no_growth_seconds(samples: list[dict]) -> float:
@@ -4331,6 +4439,8 @@ def main() -> int:
         def wait_srt_idle_expiry(
             description: str,
             outage_started: float,
+            expected_ingest_ids: list[str],
+            reset_log_offset: int,
         ) -> tuple[dict, float]:
             remaining = SRT_IDLE_UPPER_BOUND_SECONDS - (time.monotonic() - outage_started)
             if remaining <= 0:
@@ -4346,9 +4456,38 @@ def main() -> int:
                 remaining,
                 not_before=outage_started,
             )
-            elapsed = float(sample["t"]) - outage_started
+            observed = observer.samples_between(outage_started, float(sample["t"]))
+            first_absent = next(
+                (
+                    item for item in observed
+                    if complete_metrics_sample(item)
+                    and not item.get("ingest_live")
+                    and item.get("ingest_ids") == []
+                ),
+                sample,
+            )
+            # A later waiter sample must not relabel an earlier active reset
+            # as natural transport expiry merely because it arrived after 8s.
+            elapsed = float(first_absent["t"]) - outage_started
             if not SRT_IDLE_LOWER_BOUND_SECONDS <= elapsed <= SRT_IDLE_UPPER_BOUND_SECONDS:
-                raise TestFailure(f"{description} violated the configured SRT idle tolerance")
+                if transition_log_descriptor is None:
+                    raise TestFailure("transition log gate was not initialized")
+                confirmed_reset = confirmed_input_reset_disconnect_proved(
+                    [item for item in observed if item["t"] < first_absent["t"]],
+                    expected_ingest_ids,
+                    outage_started,
+                    first_absent,
+                    read_validated_log_tail(
+                        transition_log_descriptor,
+                        reset_log_offset,
+                        os.geteuid(),
+                    ),
+                )
+                if elapsed > SRT_IDLE_UPPER_BOUND_SECONDS or not confirmed_reset:
+                    raise TestFailure(f"{description} violated the configured SRT idle tolerance")
+                result.setdefault("confirmed_reset_outage_disconnects", []).append(
+                    {"event": description, "elapsed_seconds": round(elapsed, 3)}
+                )
             return sample, elapsed
 
         def wait_normalizer_child(
@@ -5430,6 +5569,10 @@ def main() -> int:
             if len(outage_ingest_ids) != 1:
                 raise TestFailure(f"outage {index} precondition lacks one SRT connection")
             stopped_feeder = feeder
+            if transition_log_descriptor is None:
+                raise TestFailure("transition log gate was not initialized")
+            dut_log.flush()
+            outage_reset_log_offset = os.fstat(transition_log_descriptor).st_size
             outage_started = time.monotonic()
             mark_self_test_stage("outage-slate")
             stop_primary_srt_source(f"outage {index}")
@@ -5456,6 +5599,8 @@ def main() -> int:
             _srt_expired, srt_idle_elapsed = wait_srt_idle_expiry(
                 f"outage {index} SRT idle expiry",
                 outage_started,
+                outage_ingest_ids,
+                outage_reset_log_offset,
             )
             wait_slate_downstream_recovery(
                 f"outage {index} SLATE transition",
@@ -5603,6 +5748,10 @@ def main() -> int:
         final_ingest_ids = list(before_final["ingest_ids"])
         if len(final_ingest_ids) != 1:
             raise TestFailure("final transition precondition lacks one SRT connection")
+        if transition_log_descriptor is None:
+            raise TestFailure("transition log gate was not initialized")
+        dut_log.flush()
+        final_reset_log_offset = os.fstat(transition_log_descriptor).st_size
         final_started = time.monotonic()
         stop_primary_srt_source("final continuity transition")
         final_slate = wait_slate_with_live_srt(
@@ -5614,6 +5763,8 @@ def main() -> int:
         _final_expired, final_srt_idle = wait_srt_idle_expiry(
             "final SRT idle expiry",
             final_started,
+            final_ingest_ids,
+            final_reset_log_offset,
         )
         wait_slate_downstream_recovery("final SLATE transition", final_started)
         final_stable = wait_sink_delivery_growth(
@@ -6026,6 +6177,8 @@ def main() -> int:
             raise TestFailure("one or more isolated test ports remained open")
         result["status"] = "PASS"
     except Exception as exc:
+        with contextlib.suppress(OSError, TestFailure):
+            persist_self_test_failure_progress(exc)
         result["status"] = "FAIL"
         result["failure"] = redact_markers(str(exc), markers)
         for handle in log_handles:

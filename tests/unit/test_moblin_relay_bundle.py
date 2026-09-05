@@ -118,6 +118,137 @@ def test_self_test_progress_rejects_untrusted_stage_or_segment(stage, segment_in
         invoke_self_test_stage_marker(stage, strict_segment_index=segment_index)
 
 
+def confirmed_reset_fixture(namespace):
+    identity = ["11111111-2222-3333-4444-555555555555"]
+    samples = [
+        {
+            "t": 100.2 + index * 0.2,
+            "finished": 100.21 + index * 0.2,
+            "dut_metrics_ok": True,
+            "sink_metrics_ok": True,
+            "ingest_live": True,
+            "ingest_ids": identity,
+            "ingest_transport_bytes": 12345,
+        }
+        for index in range(30)
+    ]
+    detached = {
+        "t": 106.2,
+        "finished": 106.21,
+        "dut_metrics_ok": True,
+        "sink_metrics_ok": True,
+        "ingest_live": False,
+        "ingest_ids": [],
+        "path_ready": True,
+    }
+    markers = b"\n".join(
+        namespace[name]
+        for name in (
+            "NORMALIZER_CONFIRMED_INPUT_STALL_MARKER",
+            "NORMALIZER_RESET_REQUESTED_MARKER",
+            "NORMALIZER_RESET_SUCCEEDED_MARKER",
+        )
+    )
+    return samples, identity, detached, markers
+
+
+def test_self_test_accounts_only_corroborated_early_confirmed_input_reset() -> None:
+    namespace = load_self_test()
+    samples, identity, detached, markers = confirmed_reset_fixture(namespace)
+    prove = namespace["confirmed_input_reset_disconnect_proved"]
+    # Independent sampling phases do not provide a six-second *lower* bound,
+    # but their real intervals corroborate the fresh runtime-confirmed gate.
+    assert detached["t"] - samples[0]["finished"] < 6
+    assert prove(samples, identity, 100.0, detached, markers)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "wrong_uuid",
+        "ambiguous_uuid",
+        "bad_expected_uuid",
+        "blind",
+        "missing_counter",
+        "counter_regression",
+        "recent_growth",
+        "poll_hole",
+        "slow_read",
+        "reordered_samples",
+        "early_absence",
+        "late_absence",
+        "wrong_absent_identity",
+        "nonfinite_time",
+        "stale_markers",
+        "missing_request",
+        "reordered_markers",
+        "duplicate_success",
+    ],
+)
+def test_self_test_rejects_unproven_early_srt_disconnect(invalid: str) -> None:
+    namespace = load_self_test()
+    samples, identity, detached, markers = confirmed_reset_fixture(namespace)
+    if invalid == "wrong_uuid":
+        samples[10]["ingest_ids"] = ["aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"]
+    elif invalid == "ambiguous_uuid":
+        samples[10]["ingest_ids"] = identity * 2
+    elif invalid == "bad_expected_uuid":
+        identity = ["not-a-uuid"]
+    elif invalid == "blind":
+        samples[10]["dut_metrics_ok"] = False
+    elif invalid == "missing_counter":
+        samples[10]["ingest_transport_bytes"] = None
+    elif invalid == "counter_regression":
+        samples[10]["ingest_transport_bytes"] = 12344
+    elif invalid == "recent_growth":
+        for sample in samples[20:]:
+            sample["ingest_transport_bytes"] = 12346
+    elif invalid == "poll_hole":
+        del samples[5:10]
+    elif invalid == "slow_read":
+        samples[10]["finished"] = samples[10]["t"] + 0.6
+    elif invalid == "reordered_samples":
+        samples[10], samples[11] = samples[11], samples[10]
+    elif invalid == "early_absence":
+        detached["t"], detached["finished"] = 105.9, 105.91
+    elif invalid == "late_absence":
+        detached["t"], detached["finished"] = 114.0, 114.01
+    elif invalid == "wrong_absent_identity":
+        detached["ingest_ids"] = identity
+    elif invalid == "nonfinite_time":
+        samples[10]["finished"] = float("nan")
+    elif invalid == "stale_markers":
+        markers = b""
+    elif invalid == "missing_request":
+        markers = markers.replace(namespace["NORMALIZER_RESET_REQUESTED_MARKER"], b"")
+    elif invalid == "reordered_markers":
+        markers = b"\n".join(reversed(markers.splitlines()))
+    elif invalid == "duplicate_success":
+        markers += b"\n" + namespace["NORMALIZER_RESET_SUCCEEDED_MARKER"]
+    assert not namespace["confirmed_input_reset_disconnect_proved"](
+        samples, identity, 100.0, detached, markers
+    )
+
+
+def test_self_test_classifies_first_absence_before_natural_idle_window() -> None:
+    source = SELF_TEST.read_text(encoding="utf-8")
+    helper = source.split("def wait_srt_idle_expiry(", 1)[1].split("def wait_normalizer_child(", 1)[
+        0
+    ]
+    assert (
+        helper.index("first_absent = next(")
+        < helper.index('elapsed = float(first_absent["t"]) - outage_started')
+        < helper.index(
+            "if not SRT_IDLE_LOWER_BOUND_SECONDS <= elapsed <= SRT_IDLE_UPPER_BOUND_SECONDS:"
+        )
+    )
+    assert "confirmed_input_reset_disconnect_proved(" in helper
+    assert "elapsed > SRT_IDLE_UPPER_BOUND_SECONDS or not confirmed_reset" in helper
+    assert "reset_log_offset" in helper
+    assert "outage_reset_log_offset = os.fstat(transition_log_descriptor).st_size" in source
+    assert "final_reset_log_offset = os.fstat(transition_log_descriptor).st_size" in source
+
+
 def node_config(
     public_host: str,
     *,

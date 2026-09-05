@@ -119,11 +119,17 @@ def test_progress_diagnostic_retains_only_fixed_stage_and_bounded_numbers() -> N
             "stage": "sink-video",
             "elapsed_seconds": 287.12345,
             "strict_segment_index": 12,
+            "failure_lines": [5678, 1234],
             "stdout": "PRIVATE_FIXTURE_MARKER",
             "url": "rtmps://example.test/live#private-fixture",
         },
         job_id="test-job",
-    ) == {"stage": "sink-video", "elapsed_seconds": 287.123, "strict_segment_index": 12}
+    ) == {
+        "stage": "sink-video",
+        "elapsed_seconds": 287.123,
+        "strict_segment_index": 12,
+        "failure_lines": [5678, 1234],
+    }
 
 
 @pytest.mark.parametrize(
@@ -143,9 +149,40 @@ def test_progress_diagnostic_retains_only_fixed_stage_and_bounded_numbers() -> N
         {"strict_segment_index": 0},
         {"strict_segment_index": 33},
         {"strict_segment_index": "12"},
+        {"failure_lines": []},
+        {"failure_lines": [False]},
+        {"failure_lines": [1] * 9},
+        {"failure_lines": [20001]},
+        {"failure_lines": [0]},
+        {"failure_lines": ["PRIVATE_FIXTURE"]},
+        {"failure_lines": "PRIVATE_FIXTURE"},
     ],
 )
 def test_progress_diagnostic_rejects_untrusted_or_stale_fields(change: dict) -> None:
     payload = {"job_id": "test-job", "stage": "sink-video", "elapsed_seconds": 287}
     payload.update(change)
     assert safe_self_test_progress(payload, job_id="test-job") == {"progress": "unavailable"}
+
+
+def test_failure_checkpoint_contains_source_line_numbers_not_exception_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = load_probe()
+    persist = namespace["persist_self_test_failure_progress"]
+    state = persist.__globals__
+    checkpoint = {"job_id": "test-job", "stage": "sink-video", "elapsed_seconds": 12.0}
+    writes = []
+    monkeypatch.setitem(state, "SELF_TEST_STAGE_FILE", "configured")
+    monkeypatch.setitem(state, "SELF_TEST_LAST_PROGRESS", checkpoint)
+    monkeypatch.setitem(state, "mark_self_test_stage", lambda *args, **kwargs: None)
+    monkeypatch.setitem(state, "atomic_json", lambda path, value: writes.append(value))
+    # Give only the inner test-generated frame the exact self-test filename.
+    # The outer pytest frame and exception text must not be serialized.
+    code = compile("raise RuntimeError('PRIVATE_TRACEBACK_FIXTURE')", str(SELF_TEST), "exec")
+    try:
+        exec(code, {})  # noqa: S102 - fixed synthetic exception, no user input
+    except RuntimeError as error:
+        persist(error)
+    assert writes == [{**checkpoint, "failure_lines": [1]}]
+    assert "PRIVATE_TRACEBACK_FIXTURE" not in repr(writes)
+    assert str(SELF_TEST) not in repr(writes)

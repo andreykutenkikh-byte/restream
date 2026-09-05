@@ -315,6 +315,7 @@ def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
     stage = payload.get("stage")
     elapsed = payload.get("elapsed_seconds")
     segment = payload.get("strict_segment_index")
+    failure_lines = payload.get("failure_lines")
     if (
         not isinstance(stage, str)
         or stage not in _SELF_TEST_STAGE_CODES
@@ -323,11 +324,21 @@ def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
         or not 0 <= elapsed <= JOB_TIMEOUT_SECONDS
         or not math.isfinite(elapsed)
         or (segment is not None and (type(segment) is not int or not 1 <= segment <= 32))
+        or (
+            failure_lines is not None
+            and (
+                not isinstance(failure_lines, list)
+                or not 1 <= len(failure_lines) <= 8
+                or any(type(line) is not int or not 1 <= line <= 20_000 for line in failure_lines)
+            )
+        )
     ):
         return unavailable
     result: dict[str, Any] = {"stage": stage, "elapsed_seconds": round(elapsed, 3)}
     if segment is not None:
         result["strict_segment_index"] = segment
+    if failure_lines is not None:
+        result["failure_lines"] = failure_lines
     return result
 
 
@@ -370,7 +381,7 @@ try:
     if not isinstance(value, dict):
         raise ValueError('unavailable')
     print(json.dumps({key: value.get(key) for key in
-        ('job_id', 'stage', 'elapsed_seconds', 'strict_segment_index')}))
+        ('job_id', 'stage', 'elapsed_seconds', 'strict_segment_index', 'failure_lines')}))
 except (OSError, ValueError):
     print('{}')
 """,
