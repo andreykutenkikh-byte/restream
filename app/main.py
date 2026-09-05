@@ -173,9 +173,7 @@ def create_app(
     app.state.moblin_hud_status_lock = asyncio.Lock()
     app.state.moblin_hud_status_cached_at = None
     app.state.moblin_hud_status_cache = None
-    app.state.moblin_hud_status_observation = None
-    app.state.moblin_hud_active_route_id = None
-    app.state.moblin_hud_stream_session_sequence = 0
+    app.state.moblin_hud_status_observations = {}
     app.state.nodes = nodes
     app.state.relays = relays
     app.state.relay_preview = relay_preview

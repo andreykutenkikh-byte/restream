@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -119,47 +120,313 @@ def test_schema_v7_adds_scoped_hud_tables_idempotently(database: Database) -> No
     assert foreign_key_errors == []
 
 
-def test_schema_v6_upgrade_preserves_existing_data_and_adds_hud_tables(
+def seed_existing_schema_v6_data(connection: sqlite3.Connection) -> None:
+    """Representative durable pre-HUD state; every credential here is synthetic."""
+    created = "2026-09-03T00:00:00+00:00"
+    updated = "2026-09-03T00:01:00+00:00"
+    expires = "2030-09-03T00:00:00+00:00"
+
+    def insert(table: str, values: dict[str, Any]) -> None:
+        columns = ", ".join(values)
+        placeholders = ", ".join("?" for _ in values)
+        connection.execute(
+            f"INSERT INTO {table} ({columns}) VALUES ({placeholders})",  # noqa: S608 - fixed fixture identifiers
+            tuple(values.values()),
+        )
+
+    insert(
+        "ingest_config",
+        {
+            "id": 1,
+            "stream_key_encrypted": "synthetic-ingest-ciphertext",
+            "updated_at": updated,
+        },
+    )
+    insert(
+        "sessions",
+        {
+            "id_hash": "a" * 64,
+            "csrf_hash": "b" * 64,
+            "created_at": created,
+            "expires_at": expires,
+        },
+    )
+    insert(
+        "destinations",
+        {
+            "id": 41,
+            "name": "Existing synthetic YouTube",
+            "server_url": "rtmps://sink.example/live2",
+            "stream_key_encrypted": "synthetic-destination-ciphertext",
+            "enabled": 1,
+            "state": "streaming",
+            "last_error": None,
+            "started_at": created,
+            "worker_pid": 4321,
+            "created_at": created,
+            "updated_at": updated,
+        },
+    )
+    for index, kind in enumerate(("generic_node", "moblin_relay"), start=1):
+        node_id = f"existing-{kind}"
+        insert(
+            "restream_nodes",
+            {
+                "id": node_id,
+                "node_kind": kind,
+                "display_name": f"Synthetic node {index}",
+                "address": f"node{index}.example",
+                "resolved_ip": f"192.0.2.{index}",
+                "ssh_port": 2220 + index,
+                "ssh_username": "operator",
+                "host_key_algorithm": "ssh-ed25519",
+                "host_key_fingerprint": f"SHA256:synthetic-{index}",
+                "host_key_trust_mode": "tofu",
+                "status": "ready",
+                "public_ip": f"192.0.2.{index}",
+                "hostname": f"relay-{index}",
+                "os_name": "Ubuntu",
+                "os_version": "24.04",
+                "architecture": "x86_64",
+                "cpu_count": 2,
+                "uptime_seconds": 12345.5,
+                "load_1m": 0.25,
+                "cpu_percent": 12.5,
+                "memory_total_bytes": 4294967296,
+                "memory_available_bytes": 3221225472,
+                "disk_total_bytes": 42949672960,
+                "disk_free_bytes": 32212254720,
+                "ffmpeg_version": "6.1.1",
+                "ffprobe_version": "6.1.1",
+                "agent_version": "1.2.6",
+                "protocol_version": 1,
+                "capabilities_json": '["moblin_relay"]' if index == 2 else '["ping"]',
+                "current_command_id": "relay-queued" if index == 2 else "node-queued",
+                "control_latency_ms": 123.5,
+                "last_seen_at": updated,
+                "created_at": created,
+                "updated_at": updated,
+                "revoked_at": None,
+            },
+        )
+        insert(
+            "node_install_jobs",
+            {
+                "id": f"job-{index}",
+                "node_id": node_id,
+                "install_profile": kind,
+                "state": "completed" if index == 2 else "failed",
+                "current_step": "finalize",
+                "progress_percent": 100 if index == 2 else 60,
+                "safe_error_code": None if index == 2 else "remote_command_timeout",
+                "safe_error_message": None if index == 2 else "Bounded synthetic failure",
+                "worker_job_id": f"worker-{index}",
+                "docker_install_started": int(index == 1),
+                "created_at": created,
+                "updated_at": updated,
+                "finished_at": updated,
+            },
+        )
+        insert(
+            "node_enrollment_tokens",
+            {
+                "id": f"enrollment-{index}",
+                "node_id": node_id,
+                "token_digest": str(index) * 64,
+                "expires_at": expires,
+                "used_at": updated if index == 2 else None,
+                "created_at": created,
+            },
+        )
+        insert(
+            "node_credentials",
+            {
+                "node_id": node_id,
+                "token_digest": str(index + 2) * 64,
+                "issued_at": created,
+                "last_rotated_at": updated,
+                "revoked_at": None,
+            },
+        )
+        insert(
+            "node_events",
+            {
+                "id": index + 50,
+                "node_id": node_id,
+                "event_type": "node.heartbeat",
+                "safe_detail": '{"status":"ready"}',
+                "created_at": updated,
+            },
+        )
+    insert(
+        "node_commands",
+        {
+            "id": "node-queued",
+            "node_id": "existing-generic_node",
+            "command_type": "PING",
+            "payload_json": '{"synthetic":true}',
+            "state": "queued",
+            "lease_until": None,
+            "attempt_count": 0,
+            "created_at": created,
+            "acknowledged_at": None,
+            "completed_at": None,
+            "safe_result_json": None,
+        },
+    )
+    insert(
+        "relay_nodes",
+        {
+            "node_id": "existing-moblin_relay",
+            "service_state": "active",
+            "service_enabled": 0,
+            "main_process": "running",
+            "srt_listener": "listening",
+            "source": "LIVE",
+            "input_bitrate_bps": 4000123,
+            "youtube_forward": "active",
+            "overall": "healthy",
+            "youtube_url_configured": 1,
+            "youtube_key_configured": 1,
+            "healthy": 1,
+            "portrait_profile": 1,
+            "last_error_code": None,
+            "current_command_id": "relay-queued",
+            "last_seen_at": updated,
+            "created_at": created,
+            "updated_at": updated,
+        },
+    )
+    for completed in (False, True):
+        identity = "completed" if completed else "queued"
+        insert(
+            "relay_commands",
+            {
+                "id": f"relay-{identity}",
+                "node_id": "existing-moblin_relay",
+                "command_type": "REVEAL_MOBLIN_URL" if completed else "CONFIGURE_YOUTUBE_KEY",
+                "payload_encrypted": f"synthetic-{identity}-payload-ciphertext",
+                "state": identity,
+                "lease_until": None,
+                "expires_at": expires,
+                "attempt_count": int(completed),
+                "idempotency_key": f"idem-{identity}",
+                "request_fingerprint": f"fingerprint-{identity}",
+                "created_at": created,
+                "acknowledged_at": updated if completed else None,
+                "completed_at": updated if completed else None,
+                "completion_status": "ok" if completed else None,
+                "safe_result_json": '{"overall":"healthy"}' if completed else None,
+                "secret_result_encrypted": "synthetic-unconsumed-secret-ciphertext"
+                if completed
+                else None,
+                "secret_consumed_at": None,
+            },
+        )
+    insert(
+        "audit_events",
+        {
+            "id": 61,
+            "event_type": "relay.command_queued",
+            "detail": "relay-queued",
+            "created_at": created,
+        },
+    )
+    insert(
+        "audit_events",
+        {
+            "id": 62,
+            "event_type": "node.installed",
+            "detail": "existing-moblin_relay",
+            "created_at": updated,
+        },
+    )
+
+
+def test_schema_v6_upgrade_preserves_all_existing_rows_schema_and_foreign_keys(
     tmp_path: Path,
 ) -> None:
     database = Database(tmp_path / "schema-v6.sqlite")
     database.migrate()
-    with database.connect() as connection:
-        connection.execute(
-            """
-            INSERT INTO audit_events(event_type, detail, created_at)
-            VALUES ('existing.event', 'preserve-me', '2026-09-03T00:00:00+00:00')
-            """
+
+    def schema(connection: sqlite3.Connection) -> list[tuple[Any, ...]]:
+        return [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+            )
+        ]
+
+    def existing_rows(connection: sqlite3.Connection) -> dict[str, list[tuple[Any, ...]]]:
+        # These are all pre-v7 tables, including sequence and migration metadata.
+        tables = (
+            "ingest_config",
+            "sessions",
+            "destinations",
+            "audit_events",
+            "restream_nodes",
+            "node_install_jobs",
+            "node_enrollment_tokens",
+            "node_credentials",
+            "node_commands",
+            "node_events",
+            "relay_nodes",
+            "relay_commands",
+            "sqlite_sequence",
+            "schema_migrations",
         )
+        result = {}
+        for table in tables:
+            suffix = " WHERE version <= 6" if table == "schema_migrations" else ""
+            result[table] = [
+                tuple(row)
+                for row in connection.execute(
+                    f"SELECT * FROM {table}{suffix} ORDER BY rowid"  # noqa: S608 - fixed fixture table names
+                )
+            ]
+        return result
+
+    with database.connect() as connection:
+        seed_existing_schema_v6_data(connection)
+        expected_schema_v7 = schema(connection)
+        # Verified against the PR15 base schema: v7 adds only these two HUD
+        # tables (and their indexes), plus marker7. No legacy column differs.
         connection.execute("DROP TABLE moblin_hud_pairings")
         connection.execute("DROP TABLE moblin_hud_devices")
         connection.execute("DELETE FROM schema_migrations WHERE version = 7")
+        legacy_schema = schema(connection)
+        assert legacy_schema == [
+            row
+            for row in expected_schema_v7
+            if row[2] not in {"moblin_hud_devices", "moblin_hud_pairings"}
+        ]
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 6
+        before = existing_rows(connection)
+        assert all(before.values()), "Every legacy table must contain real synthetic fixture rows"
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     assert database.ready() is False
 
-    database.migrate()
-    database.migrate()
-
-    with database.connect() as connection:
-        version = connection.execute(
-            "SELECT MAX(version) AS version FROM schema_migrations"
-        ).fetchone()["version"]
-        preserved = connection.execute(
-            "SELECT detail FROM audit_events WHERE event_type = 'existing.event'"
-        ).fetchone()["detail"]
-        tables = {
-            row["name"]
-            for row in connection.execute(
-                """
-                SELECT name FROM sqlite_master
-                WHERE type = 'table' AND name LIKE 'moblin_hud_%'
-                """
+    for _ in range(2):
+        database.migrate()
+        assert database.ready() is True
+        with database.connect() as connection:
+            assert schema(connection) == expected_schema_v7
+            assert existing_rows(connection) == before
+            assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+            assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            assert connection.execute("SELECT COUNT(*) FROM moblin_hud_devices").fetchone()[0] == 0
+            assert connection.execute("SELECT COUNT(*) FROM moblin_hud_pairings").fetchone()[0] == 0
+            assert (
+                connection.execute(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = 7"
+                ).fetchone()[0]
+                == 1
             )
-        }
-        foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
-    assert version == SCHEMA_VERSION == 7
-    assert preserved == "preserve-me"
-    assert tables == {"moblin_hud_devices", "moblin_hud_pairings"}
-    assert foreign_key_errors == []
+            assert (
+                connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+                == SCHEMA_VERSION
+                == 7
+            )
 
 
 def test_pairing_has_256_bit_entropy_and_persists_only_digest(
