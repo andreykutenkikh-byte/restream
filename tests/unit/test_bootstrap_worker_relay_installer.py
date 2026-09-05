@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -22,6 +23,7 @@ from bootstrap_worker.models import (
     TimeoutPolicy,
 )
 from bootstrap_worker.relay_installer import (
+    _SELF_TEST_STAGE_CODES,
     MEDIA_MTX_ARCHIVE_SHA256,
     MEDIA_MTX_URL,
     RELAY_CONTROL_ORIGIN,
@@ -176,6 +178,8 @@ def test_bundle_loader_has_a_fixed_reviewed_allowlist() -> None:
     names = {str(path) for path in bundle}
     assert "deploy/moblin-relay/relayctl" in names
     assert "deploy/moblin-relay/self-test" in names
+    assert "deploy/moblin-relay/moblin-relay-normalize" in names
+    assert "deploy/moblin-relay/moblin-relay-render-config" in names
     assert "deploy/hk-relay-agent/install.sh" in names
     assert "relay_agent/__init__.py" in names
     assert "relay_agent/broker.py" in names
@@ -222,7 +226,28 @@ async def test_prepare_stages_token_only_as_a_mode_0600_sftp_payload() -> None:
     assert TOKEN_VALUE not in repr(session.commands)
     assert "docker" not in commands.lower()
     assert "/proc/net/tcp" in commands
-    assert "22BA 216A 078F 22B8 270E" in commands
+    assert "22BA 216A 078F 22B8 270D 270E" in commands
+
+
+async def test_control_api_port_collision_fails_closed_before_upload() -> None:
+    observed: list[str] = []
+
+    def responder(command: str, stdin: SecretStr | None) -> RemoteResult:
+        del stdin
+        observed.append(command)
+        return RemoteResult(1)
+
+    with pytest.raises(BootstrapError) as captured:
+        await RemoteRelayInstaller._assert_ports_free(
+            FakeSession(responder),
+            PrivilegeContext(PrivilegeMode.ROOT),
+            timeout=1,
+        )
+
+    assert captured.value.code == "relay_port_conflict"
+    assert len(observed) == 1
+    assert "270D" in observed[0]
+    assert "270E" in observed[0]
 
 
 @pytest.mark.parametrize(
@@ -328,15 +353,20 @@ async def test_install_uses_pinned_mediamtx_and_never_mutates_host_networking() 
     assert "-pix_fmt yuv420p" in commands
     assert "-g 60" in commands
     assert "-b:v 8M -minrate 8M -maxrate 8M -bufsize 16M" in commands
-    assert "-x264-params nal-hrd=cbr:force-cfr=1:filler=1:bframes=3:b-pyramid=normal" in commands
+    assert "-x264-params nal-hrd=cbr:force-cfr=1:filler=1:bframes=0" in commands
     assert "-c:a aac" in commands and "-ar 48000 -ac 2" in commands
     assert "'drawtext=" in commands and "x=(w-text_w)/2" in commands
+    assert "install -o root -g moblin-relay -m 0640" in commands
+    assert "/slate.mp4" in commands
     assert "systemctl disable --now moblin-relay.service" in commands
     assert "systemctl enable --now adojapan-relay-agent.service" in commands
     assert "/opt/moblin-relay/libexec/self-test --quick" in commands
     assert "MOBLIN_RELAY_SELF_TEST_STAGE_FILE=/run/moblin-relay-self-test." in commands
     assert "self_test_status" in commands
     assert "account_shell" in commands and "group_members" in commands
+    assert "if test -e /etc/moblin-relay/secrets.json" in commands
+    assert "stat -c" in commands and "%u:%a" in commands and "0:600" in commands
+    assert "else /opt/moblin-relay/libexec/initialize-secrets; fi" in commands
     assert TOKEN_VALUE not in commands
     for forbidden in (
         "docker",
@@ -453,6 +483,26 @@ async def test_agent_install_failure_rejects_an_unknown_diagnostic_stage() -> No
     assert captured.value.code == "relay_agent_install_failed"
 
 
+def test_installer_maps_every_declared_self_test_stage_exactly() -> None:
+    source = (
+        Path(__file__).resolve().parents[2] / "deploy" / "moblin-relay" / "self-test"
+    ).read_text(encoding="utf-8")
+    module = ast.parse(source)
+    assignment = next(
+        statement
+        for statement in module.body
+        if isinstance(statement, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "SELF_TEST_STAGES"
+            for target in statement.targets
+        )
+    )
+    assert isinstance(assignment.value, ast.Call)
+    declared = set(ast.literal_eval(assignment.value.args[0]))
+
+    assert set(_SELF_TEST_STAGE_CODES) == declared
+
+
 @pytest.mark.parametrize(
     ("diagnostic", "expected_code"),
     [
@@ -465,7 +515,6 @@ async def test_agent_install_failure_rejects_an_unknown_diagnostic_stage() -> No
         ("auth-src-bind", "relay_self_test_auth_source_publisher_bind_failed"),
         ("auth-src-feed", "relay_self_test_auth_source_feeder_failed"),
         ("auth-src-path", "relay_self_test_auth_source_path_failed"),
-        ("auth-live", "relay_self_test_auth_live_failed"),
         ("auth-scan", "relay_self_test_auth_scan_failed"),
         ("auth-exclusive", "relay_self_test_auth_exclusivity_failed"),
         ("auth-x-core", "relay_self_test_auth_exclusivity_core_failed"),
@@ -519,6 +568,10 @@ async def test_agent_install_failure_rejects_an_unknown_diagnostic_stage() -> No
             "relay_self_test_auth_exclusivity_normalizer_verified_stall_failed",
         ),
         (
+            "auth-n-confirm",
+            "relay_self_test_auth_exclusivity_normalizer_confirmed_input_stall_failed",
+        ),
+        (
             "auth-n-unknown",
             "relay_self_test_auth_exclusivity_normalizer_watchdog_unknown_failed",
         ),
@@ -532,6 +585,7 @@ async def test_agent_install_failure_rejects_an_unknown_diagnostic_stage() -> No
         ("norm-child", "relay_self_test_normalizer_child_failed"),
         ("norm-publish", "relay_self_test_normalizer_publish_failed"),
         ("norm-flap", "relay_self_test_normalizer_flap_failed"),
+        ("dts-regression", "relay_self_test_dts_regression_failed"),
         ("stall-slate", "relay_self_test_stall_slate_failed"),
         ("stall-pre", "relay_self_test_stall_precondition_failed"),
         ("stall-pause", "relay_self_test_stall_pause_failed"),
@@ -556,9 +610,24 @@ async def test_agent_install_failure_rejects_an_unknown_diagnostic_stage() -> No
         ("stall-blind", "relay_self_test_stall_observability_failed"),
         ("stall-ident", "relay_self_test_stall_identity_failed"),
         ("stall-cont", "relay_self_test_stall_continuity_failed"),
+        ("stuck-start", "relay_self_test_persistent_stall_precondition_failed"),
+        ("stuck-slate", "relay_self_test_persistent_stall_slate_failed"),
+        ("stuck-open", "relay_self_test_persistent_stall_confirmation_failed"),
+        ("stuck-kicked", "relay_self_test_persistent_stall_reset_failed"),
+        ("stuck-live", "relay_self_test_persistent_stall_reconnect_failed"),
+        ("stuck-source", "relay_self_test_persistent_stall_source_failed"),
+        ("stuck-cont", "relay_self_test_persistent_stall_continuity_failed"),
         ("crash-death", "relay_self_test_crash_death_failed"),
         ("crash-live", "relay_self_test_crash_live_failed"),
         ("crash-cont", "relay_self_test_crash_continuity_failed"),
+        ("reset-start", "relay_self_test_reset_precondition_failed"),
+        ("reset-kill", "relay_self_test_reset_injection_failed"),
+        ("reset-slate", "relay_self_test_reset_slate_failed"),
+        ("reset-open", "relay_self_test_reset_circuit_failed"),
+        ("reset-kicked", "relay_self_test_reset_kick_failed"),
+        ("reset-session", "relay_self_test_reset_reconnect_failed"),
+        ("reset-source", "relay_self_test_reset_source_failed"),
+        ("reset-cont", "relay_self_test_reset_continuity_failed"),
         ("outages", "relay_self_test_outages_failed"),
         ("outage-slate", "relay_self_test_outage_slate_failed"),
         ("outage-normal", "relay_self_test_outage_normal_failed"),

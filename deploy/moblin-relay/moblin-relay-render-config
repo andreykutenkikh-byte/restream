@@ -10,21 +10,24 @@ import json
 import os
 import pwd
 import re
+import secrets
 import stat
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
-
 SECRET_FILE = Path("/etc/moblin-relay/secrets.json")
 PREVIEW_TOKEN_FILE = Path("/etc/adojapan-relay-agent/preview-reader.token")
 RUNTIME_DIR = Path("/run/moblin-relay")
 RUNTIME_FILE = RUNTIME_DIR / "mediamtx.json"
+CONTROL_TOKEN_FILE = RUNTIME_DIR / "control-api.token"
 SLATE_FILE = "/var/lib/moblin-relay/slate.mp4"
 NORMALIZER = "/opt/moblin-relay/libexec/moblin-relay-normalize"
 INGEST_PATH = "iphone-live"
 OUTPUT_PATH = "relay-output"
 PREVIEW_USER = "relay-preview"
+CONTROL_API_USER = "relay-recovery"
+CONTROL_TOKEN_PATTERN = re.compile(rb"[A-Za-z0-9_-]{43}\Z")
 PREVIEW_TOKEN_PATTERN = re.compile(rb"[A-Za-z0-9._~+/=-]{32,512}\Z")
 PREVIEW_TOKEN_MAX_FILE_BYTES = 513
 
@@ -112,8 +115,7 @@ def read_preview_token() -> bytes | None:
         opened_parent = os.fstat(parent_fd)
         if (
             not stat.S_ISDIR(opened_parent.st_mode)
-            or (opened_parent.st_dev, opened_parent.st_ino)
-            != (parent.st_dev, parent.st_ino)
+            or (opened_parent.st_dev, opened_parent.st_ino) != (parent.st_dev, parent.st_ino)
             or opened_parent.st_uid != 0
             or opened_parent.st_gid != account.pw_gid
             or stat.S_IMODE(opened_parent.st_mode) != 0o750
@@ -215,6 +217,38 @@ def preview_config(token: bytes | None) -> tuple[dict, dict | None]:
     )
 
 
+def generate_control_token() -> bytearray:
+    """Generate a 256-bit, URL-safe credential for the loopback control API."""
+    token = bytearray(base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"="))
+    if CONTROL_TOKEN_PATTERN.fullmatch(token) is None:
+        die("unable to generate control API credential")
+    return token
+
+
+def atomic_write_runtime_file(path: Path, payload: bytes, relay_gid: int) -> None:
+    """Atomically install one root/relay runtime file into the tmpfs directory."""
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=RUNTIME_DIR)
+    temporary_path = Path(temporary)
+    try:
+        os.fchmod(fd, 0o640)
+        os.fchown(fd, 0, relay_gid)
+        with os.fdopen(fd, "wb") as fp:
+            fp.write(payload)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(temporary_path, path)
+        directory_fd = os.open(RUNTIME_DIR, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def build_runtime_config(
     user: str,
     password: str,
@@ -222,11 +256,15 @@ def build_runtime_config(
     url: str,
     key: str,
     preview_token: bytes | None,
+    control_token: bytes | bytearray,
 ) -> dict:
-    password_hash = base64.b64encode(
-        hashlib.sha256(password.encode("utf-8")).digest()
-    ).decode("ascii")
+    password_hash = base64.b64encode(hashlib.sha256(password.encode("utf-8")).digest()).decode(
+        "ascii"
+    )
     preview_settings, preview_user = preview_config(preview_token)
+    if CONTROL_TOKEN_PATTERN.fullmatch(control_token) is None:
+        die("invalid control API credential")
+    control_password_hash = base64.b64encode(hashlib.sha256(control_token).digest()).decode("ascii")
     auth_users = [
         {
             "user": user,
@@ -244,6 +282,12 @@ def build_runtime_config(
                 {"action": "publish", "path": OUTPUT_PATH},
             ],
         },
+        {
+            "user": CONTROL_API_USER,
+            "pass": f"sha256:{control_password_hash}",
+            "ips": ["127.0.0.1", "::1"],
+            "permissions": [{"action": "api"}],
+        },
     ]
     if preview_user is not None:
         auth_users.append(preview_user)
@@ -257,7 +301,11 @@ def build_runtime_config(
         "writeQueueSize": 1024,
         "authMethod": "internal",
         "authInternalUsers": auth_users,
-        "api": False,
+        "api": True,
+        "apiAddress": "127.0.0.1:9997",
+        "apiEncryption": False,
+        "apiAllowOrigins": [],
+        "apiTrustedProxies": [],
         "metrics": True,
         "metricsAddress": "127.0.0.1:9998",
         "pprof": False,
@@ -289,7 +337,7 @@ def build_runtime_config(
                 "alwaysAvailable": True,
                 "alwaysAvailableFile": SLATE_FILE,
                 "forward": [{"dest": f"{url}#{key}"}],
-            }
+            },
         },
         **preview_settings,
     }
@@ -318,35 +366,40 @@ def main() -> None:
     validate_youtube(url, key)
 
     preview_token = read_preview_token()
-    config = build_runtime_config(user, password, passphrase, url, key, preview_token)
-
     relay_gid = grp.getgrnam("moblin-relay").gr_gid
     RUNTIME_DIR.mkdir(mode=0o750, parents=True, exist_ok=True)
     os.chown(RUNTIME_DIR, 0, relay_gid)
     os.chmod(RUNTIME_DIR, 0o750)
-    fd, temporary = tempfile.mkstemp(prefix=".mediamtx.", dir=RUNTIME_DIR)
-    temporary_path = Path(temporary)
+
+    control_token = generate_control_token()
     try:
-        os.fchmod(fd, 0o640)
-        os.fchown(fd, 0, relay_gid)
-        with os.fdopen(fd, "w", encoding="utf-8") as fp:
-            json.dump(config, fp, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-            fp.write("\n")
-            fp.flush()
-            os.fsync(fp.fileno())
-        os.replace(temporary_path, RUNTIME_FILE)
-        os.chown(RUNTIME_FILE, 0, relay_gid)
-        os.chmod(RUNTIME_FILE, 0o640)
-        directory_fd = os.open(RUNTIME_DIR, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        config = build_runtime_config(
+            user,
+            password,
+            passphrase,
+            url,
+            key,
+            preview_token,
+            control_token,
+        )
+        serialized = (
+            json.dumps(
+                config,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+        atomic_write_runtime_file(
+            CONTROL_TOKEN_FILE,
+            bytes(control_token) + b"\n",
+            relay_gid,
+        )
+        atomic_write_runtime_file(RUNTIME_FILE, serialized, relay_gid)
     finally:
-        try:
-            temporary_path.unlink()
-        except FileNotFoundError:
-            pass
+        for index in range(len(control_token)):
+            control_token[index] = 0
 
 
 if __name__ == "__main__":

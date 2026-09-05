@@ -33,7 +33,7 @@ from bootstrap_worker.models import (
 )
 from bootstrap_worker.ssh import RemoteSession
 
-RELAY_RELEASE = "2026.09.04.1"
+RELAY_RELEASE = "2026.09.05.1"
 RELAY_CONTROL_ORIGIN = "https://restream.adojapan.ru"
 RELAY_MARKER_CONTENT = "adojapan-moblin-relay:v1"
 RELAY_ETC_ROOT = "/etc/moblin-relay"
@@ -115,7 +115,6 @@ _SELF_TEST_STAGE_CODES = {
     "auth-src-bind": "relay_self_test_auth_source_publisher_bind_failed",
     "auth-src-feed": "relay_self_test_auth_source_feeder_failed",
     "auth-src-path": "relay_self_test_auth_source_path_failed",
-    "auth-live": "relay_self_test_auth_live_failed",
     "auth-scan": "relay_self_test_auth_scan_failed",
     "auth-exclusive": "relay_self_test_auth_exclusivity_failed",
     "auth-x-core": "relay_self_test_auth_exclusivity_core_failed",
@@ -135,6 +134,7 @@ _SELF_TEST_STAGE_CODES = {
     "auth-n-in-id": "relay_self_test_auth_exclusivity_normalizer_ingest_identity_failed",
     "auth-n-in-reg": "relay_self_test_auth_exclusivity_normalizer_ingest_regression_failed",
     "auth-n-stall": "relay_self_test_auth_exclusivity_normalizer_verified_stall_failed",
+    "auth-n-confirm": ("relay_self_test_auth_exclusivity_normalizer_confirmed_input_stall_failed"),
     "auth-n-unknown": "relay_self_test_auth_exclusivity_normalizer_watchdog_unknown_failed",
     "auth-x-sink": "relay_self_test_auth_exclusivity_downstream_failed",
     "auth-x-bytes": "relay_self_test_auth_exclusivity_progress_failed",
@@ -146,6 +146,7 @@ _SELF_TEST_STAGE_CODES = {
     "norm-child": "relay_self_test_normalizer_child_failed",
     "norm-publish": "relay_self_test_normalizer_publish_failed",
     "norm-flap": "relay_self_test_normalizer_flap_failed",
+    "dts-regression": "relay_self_test_dts_regression_failed",
     "stall-slate": "relay_self_test_stall_slate_failed",
     "stall-pre": "relay_self_test_stall_precondition_failed",
     "stall-pause": "relay_self_test_stall_pause_failed",
@@ -170,9 +171,24 @@ _SELF_TEST_STAGE_CODES = {
     "stall-blind": "relay_self_test_stall_observability_failed",
     "stall-ident": "relay_self_test_stall_identity_failed",
     "stall-cont": "relay_self_test_stall_continuity_failed",
+    "stuck-start": "relay_self_test_persistent_stall_precondition_failed",
+    "stuck-slate": "relay_self_test_persistent_stall_slate_failed",
+    "stuck-open": "relay_self_test_persistent_stall_confirmation_failed",
+    "stuck-kicked": "relay_self_test_persistent_stall_reset_failed",
+    "stuck-live": "relay_self_test_persistent_stall_reconnect_failed",
+    "stuck-source": "relay_self_test_persistent_stall_source_failed",
+    "stuck-cont": "relay_self_test_persistent_stall_continuity_failed",
     "crash-death": "relay_self_test_crash_death_failed",
     "crash-live": "relay_self_test_crash_live_failed",
     "crash-cont": "relay_self_test_crash_continuity_failed",
+    "reset-start": "relay_self_test_reset_precondition_failed",
+    "reset-kill": "relay_self_test_reset_injection_failed",
+    "reset-slate": "relay_self_test_reset_slate_failed",
+    "reset-open": "relay_self_test_reset_circuit_failed",
+    "reset-kicked": "relay_self_test_reset_kick_failed",
+    "reset-session": "relay_self_test_reset_reconnect_failed",
+    "reset-source": "relay_self_test_reset_source_failed",
+    "reset-cont": "relay_self_test_reset_continuity_failed",
     "outages": "relay_self_test_outages_failed",
     "outage-slate": "relay_self_test_outage_slate_failed",
     "outage-normal": "relay_self_test_outage_normal_failed",
@@ -476,12 +492,12 @@ class RemoteRelayInstaller:
         timeout: float,
     ) -> None:
         # No firewall commands are used here.  This is only a local collision
-        # check for the one public UDP listener and four loopback listeners.
+        # check for the one public UDP listener and five loopback listeners.
         # Read the kernel socket tables directly so this check also works on a
         # minimal image before iproute2/ss has been installed.  Any socket bound
         # to one of the fixed relay ports is treated conservatively as a clash.
         command = (
-            "for port in 22BA 216A 078F 22B8 270E; do "
+            "for port in 22BA 216A 078F 22B8 270D 270E; do "
             'if awk -v wanted="$port" \'NR > 1 { split($2, local, ":"); '
             "if (toupper(local[2]) == wanted) { found=1; exit } } "
             "END { exit(found ? 0 : 1) }' "
@@ -743,7 +759,7 @@ class RemoteRelayInstaller:
             "-map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -profile:v main "
             "-level:v 4.0 -pix_fmt yuv420p -r 30 -g 60 -keyint_min 60 -sc_threshold 0 "
             "-b:v 8M -minrate 8M -maxrate 8M -bufsize 16M "
-            "-x264-params nal-hrd=cbr:force-cfr=1:filler=1:bframes=3:b-pyramid=normal "
+            "-x264-params nal-hrd=cbr:force-cfr=1:filler=1:bframes=0 "
             "-c:a aac -profile:a aac_low "
             "-ar 48000 -ac 2 -b:a 128k -t 12 -shortest -movflags +faststart "
             f"{temp}/slate.mp4",
@@ -819,7 +835,7 @@ class RemoteRelayInstaller:
             f"install -o root -g root -m 0644 {repo}/deploy/moblin-relay/slate.txt "
             f"{shlex.quote(RELAY_ETC_ROOT + '/slate.txt')} && "
             f"install -o root -g root -m 0600 {temp}/node.json {shlex.quote(RELAY_NODE_CONFIG)} && "
-            f"install -o root -g root -m 0644 {temp}/slate.mp4 "
+            f"install -o root -g moblin-relay -m 0640 {temp}/slate.mp4 "
             f"{shlex.quote(RELAY_STATE_ROOT + '/slate.mp4')} && "
             f"install -o root -g root -m 0644 {repo}/deploy/moblin-relay/moblin-relay.service "
             "/etc/systemd/system/moblin-relay.service && "

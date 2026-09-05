@@ -152,9 +152,6 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_auth_source_path_failed": (
             "Основной тестовый SRT-путь не перешёл в состояние готовности."
         ),
-        "relay_self_test_auth_live_failed": (
-            "Тестовый LIVE-поток не прошёл самопроверку через SRT и нормализатор."
-        ),
         "relay_self_test_auth_scan_failed": (
             "Граница секретов активного тестового потока не прошла самопроверку."
         ),
@@ -212,6 +209,10 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_auth_exclusivity_normalizer_verified_stall_failed": (
             "Нормализатор подтвердил одновременную остановку входа и выхода."
         ),
+        "relay_self_test_auth_exclusivity_normalizer_confirmed_input_stall_failed": (
+            "Watchdog подтвердил длительную остановку входных медиаданных во время "
+            "проверки эксклюзивности."
+        ),
         "relay_self_test_auth_exclusivity_normalizer_watchdog_unknown_failed": (
             "Watchdog перезапустил нормализатор по неизвестной безопасной причине."
         ),
@@ -240,6 +241,9 @@ def safe_failure(code: str) -> BootstrapError:
         ),
         "relay_self_test_normalizer_flap_failed": (
             "Тестовый LIVE-поток нормализатора оказался нестабильным."
+        ),
+        "relay_self_test_dts_regression_failed": (
+            "При переключении источника обнаружен обратный скачок видеометки DTS."
         ),
         "relay_self_test_stall_slate_failed": (
             "Переход на заставку при зависании LIVE не прошёл самопроверку."
@@ -313,6 +317,28 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_stall_continuity_failed": (
             "Непрерывность выхода при зависании LIVE не подтверждена."
         ),
+        "relay_self_test_persistent_stall_precondition_failed": (
+            "LIVE перед проверкой длительной остановки медиаданных не прошёл самопроверку."
+        ),
+        "relay_self_test_persistent_stall_slate_failed": (
+            "Заставка не сохранила выход при длительной остановке медиаданных."
+        ),
+        "relay_self_test_persistent_stall_confirmation_failed": (
+            "Watchdog не подтвердил длительную остановку входных медиаданных."
+        ),
+        "relay_self_test_persistent_stall_reset_failed": (
+            "Сервер не смог запросить новый SRT-handshake после остановки медиаданных."
+        ),
+        "relay_self_test_persistent_stall_reconnect_failed": (
+            "LIVE не восстановился после автоматического нового SRT-handshake."
+        ),
+        "relay_self_test_persistent_stall_source_failed": (
+            "Автоматическое восстановление длительного обрыва остановило тестовый источник."
+        ),
+        "relay_self_test_persistent_stall_continuity_failed": (
+            "Непрерывность выхода при автоматическом восстановлении длительного обрыва "
+            "не подтверждена."
+        ),
         "relay_self_test_crash_death_failed": (
             "Изоляция падения supervisor нормализатора не прошла самопроверку."
         ),
@@ -321,6 +347,30 @@ def safe_failure(code: str) -> BootstrapError:
         ),
         "relay_self_test_crash_continuity_failed": (
             "Непрерывность выхода после падения supervisor не подтверждена."
+        ),
+        "relay_self_test_reset_precondition_failed": (
+            "LIVE-состояние перед проверкой автоматического восстановления не подтверждено."
+        ),
+        "relay_self_test_reset_injection_failed": (
+            "Не удалось безопасно воспроизвести повторный отказ внутреннего медиамоста."
+        ),
+        "relay_self_test_reset_slate_failed": (
+            "Заставка не сохранила выход во время автоматического восстановления."
+        ),
+        "relay_self_test_reset_circuit_failed": (
+            "Автоматическое восстановление не распознало повторные отказы медиамоста."
+        ),
+        "relay_self_test_reset_kick_failed": (
+            "Сервер не смог безопасно завершить зависшее SRT-соединение."
+        ),
+        "relay_self_test_reset_reconnect_failed": (
+            "LIVE не восстановился через новое SRT-соединение."
+        ),
+        "relay_self_test_reset_source_failed": (
+            "Автоматическое восстановление неожиданно остановило тестовый источник."
+        ),
+        "relay_self_test_reset_continuity_failed": (
+            "Непрерывность выхода во время автоматического восстановления не подтверждена."
         ),
         "relay_self_test_outages_failed": "Переключение LIVE и заставки не прошло самопроверку.",
         "relay_self_test_outage_slate_failed": (

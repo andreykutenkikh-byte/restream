@@ -3,55 +3,97 @@
 
 from __future__ import annotations
 
+import base64
 import ctypes
 import http.client
+import math
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import time
+from collections import deque
 from collections.abc import Callable
+from pathlib import Path
 from typing import Generic, TypeVar
-
 
 PYTHON = "/usr/bin/python3"
 FFMPEG = "/usr/bin/ffmpeg"
 INGEST_PATH = "iphone-live"
 OUTPUT_PATH = "relay-output"
 DEFAULT_RTMP_PORT = 1935
+DEFAULT_CONTROL_API_PORT = 9997
 DEFAULT_METRICS_PORT = 9998
+CONTROL_API_USER = "relay-recovery"
+CONTROL_TOKEN_FILE = Path("/run/moblin-relay/control-api.token")
+CONTROL_TOKEN_PATTERN = re.compile(rb"[A-Za-z0-9_-]{43}\Z")
+CONTROL_TOKEN_TEST_PATH_PATTERN = re.compile(
+    r"/var/lib/moblin-relay/tests/\.run-[A-Za-z0-9._-]{1,96}/control-api\.token\Z"
+)
+CONTROL_TOKEN_MAX_FILE_BYTES = 44
 TEST_RTMP_PORT_ENV = "MOBLIN_RELAY_OUTPUT_RTMP_PORT"
+TEST_CONTROL_API_PORT_ENV = "MOBLIN_RELAY_CONTROL_API_PORT"
+TEST_CONTROL_TOKEN_FILE_ENV = "MOBLIN_RELAY_CONTROL_TOKEN_FILE"  # noqa: S105
 TEST_METRICS_PORT_ENV = "MOBLIN_RELAY_METRICS_PORT"
 SAFE_RTSP_PORT_ENV = "MOBLIN_RELAY_INTERNAL_RTSP_PORT"
 SAFE_RTMP_PORT_ENV = "MOBLIN_RELAY_INTERNAL_RTMP_PORT"
+SAFE_CONTROL_API_PORT_ENV = "MOBLIN_RELAY_INTERNAL_CONTROL_API_PORT"
+SAFE_CONTROL_TOKEN_FILE_ENV = "MOBLIN_RELAY_INTERNAL_CONTROL_TOKEN_FILE"  # noqa: S105
 SAFE_METRICS_PORT_ENV = "MOBLIN_RELAY_INTERNAL_METRICS_PORT"
 SAFE_SOURCE_ID_ENV = "MOBLIN_RELAY_INTERNAL_SRT_CONNECTION_ID"
 SUPERVISOR_ARGUMENT = "--sanitized-supervisor"
+CONTROL_API_KICK_PATH_PREFIX = "/v3/srtconns/kick/"
 INGEST_METRICS_PATH_PREFIX = "/metrics?type=srt_conns&srt_conn="
 OUTPUT_METRICS_PATH = "/metrics?type=rtmp_conns"
 METRICS_RESPONSE_LIMIT_BYTES = 65_536
 METRICS_REQUEST_TIMEOUT_SECONDS = 0.2
+CONTROL_API_RESPONSE_LIMIT_BYTES = 4096
+CONTROL_API_REQUEST_TIMEOUT_SECONDS = 0.5
 MEDIA_POLL_INTERVAL_SECONDS = 0.05
 # Corroborate a fast output stall with the ingest counter.  RTMP transport bytes
 # can briefly plateau while healthy; the longer output-only fallback still
 # catches a wedged normalizer without treating that batching as a source outage.
-VERIFIED_STALL_TIMEOUT_SECONDS = 0.075
-OUTPUT_IDLE_FALLBACK_SECONDS = 0.5
+# A brief userspace pause or one delayed metrics scrape is not a dead media
+# path.  This stays comfortably below the 2 s SRT latency and 1 s downstream
+# continuity budget while avoiding false restarts on constrained relay nodes.
+VERIFIED_STALL_TIMEOUT_SECONDS = 0.50
+# Leave enough room for the corroborating ingest scrape to complete before an
+# output-only timeout is classified.  Otherwise scheduler jitter can turn the
+# same network stall into a breaker-eligible output failure.
+OUTPUT_IDLE_FALLBACK_SECONDS = 0.90
 METRICS_BLIND_TIMEOUT_SECONDS = 0.75
 OUTPUT_START_TIMEOUT_SECONDS = 6.0
+# A verified short stall first falls back to SLATE.  Only the same hook-bound
+# SRT publisher remaining present without a single additional media byte for
+# three times the configured 2 s latency is strong enough evidence to request a
+# fresh handshake.  This acts before MediaMTX's 10 s idle teardown can collapse
+# the upstream chain. Failed metrics reads never contribute to this proof.
+CONFIRMED_INPUT_STALL_GRACE_SECONDS = 6.0
+CONFIRMED_INPUT_STALL_REQUIRED_OBSERVATIONS = 3
 CHILD_STOP_GRACE_SECONDS = 0.025
 CHILD_RESTART_FLOOR_SECONDS = 0.1
 REQUIRED_GROWTH_OBSERVATIONS = 2
 REQUIRED_IDLE_OBSERVATIONS = 2
 REQUIRED_VERIFIED_STALL_OBSERVATIONS = 3
+RECOVERY_FAILURE_THRESHOLD = 3
+RECOVERY_FAILURE_WINDOW_SECONDS = 30.0
+RECOVERY_RETRY_COOLDOWN_SECONDS = 30.0
+RECOVERY_MAX_API_ATTEMPTS = 3
+RECOVERY_WAIT_POLL_SECONDS = 1.0
+# After the six-second stall proof, take two additional fresh samples before
+# touching the connection.  This small delay closes the boundary race in which
+# media resumes between the last stall observation and the API request.
+RECOVERY_PRE_RESET_CONFIRMATION_SECONDS = 0.10
+RECOVERY_PRE_RESET_REQUIRED_OBSERVATIONS = 2
 PR_SET_PDEATHSIG = 1
 
 SRT_METRIC_PATTERN = re.compile(
-    r'^srt_conns_bytes_received_unique\{(?P<labels>[^{}]*)\}\s+(?P<value>[0-9]+)$'
+    r"^srt_conns_bytes_received_unique\{(?P<labels>[^{}]*)\}\s+(?P<value>[0-9]+)$"
 )
 RTMP_METRIC_PATTERN = re.compile(
-    r'^rtmp_conns_inbound_bytes\{(?P<labels>[^{}]*)\}\s+(?P<value>[0-9]+)$'
+    r"^rtmp_conns_inbound_bytes\{(?P<labels>[^{}]*)\}\s+(?P<value>[0-9]+)$"
 )
 LABEL_PATTERN = re.compile(r'(\w+)="([^"\\]*)"(?:,|$)')
 LOOPBACK_REMOTE_PATTERN = re.compile(r"127\.0\.0\.1:[0-9]{1,5}")
@@ -70,27 +112,74 @@ RESTART_REASON_INGEST_MISSING = "ingest-missing"
 RESTART_REASON_INGEST_IDENTITY = "ingest-identity"
 RESTART_REASON_INGEST_REGRESSION = "ingest-regression"
 RESTART_REASON_VERIFIED_STALL = "verified-stall"
+RESTART_REASON_INGEST_CONFIRMED_STALL = "ingest-confirmed-stall"
 RESTART_REASON_WATCHDOG_UNKNOWN = "watchdog-unknown"
 RESTART_LOG_TOKENS = {
     RESTART_REASON_CHILD_EXIT: "moblin-relay-normalize:restart:child-exit",
-    RESTART_REASON_OUTPUT_START_TIMEOUT: (
-        "moblin-relay-normalize:restart:output-start-timeout"
-    ),
+    RESTART_REASON_OUTPUT_START_TIMEOUT: ("moblin-relay-normalize:restart:output-start-timeout"),
     RESTART_REASON_METRICS_BLIND: "moblin-relay-normalize:restart:metrics-blind",
     RESTART_REASON_OUTPUT_IDENTITY: "moblin-relay-normalize:restart:output-identity",
-    RESTART_REASON_OUTPUT_REGRESSION: (
-        "moblin-relay-normalize:restart:output-regression"
-    ),
+    RESTART_REASON_OUTPUT_REGRESSION: ("moblin-relay-normalize:restart:output-regression"),
     RESTART_REASON_OUTPUT_FALLBACK: "moblin-relay-normalize:restart:output-fallback",
     RESTART_REASON_INGEST_TIMING: "moblin-relay-normalize:restart:ingest-timing",
     RESTART_REASON_INGEST_MISSING: "moblin-relay-normalize:restart:ingest-missing",
     RESTART_REASON_INGEST_IDENTITY: "moblin-relay-normalize:restart:ingest-identity",
-    RESTART_REASON_INGEST_REGRESSION: (
-        "moblin-relay-normalize:restart:ingest-regression"
-    ),
+    RESTART_REASON_INGEST_REGRESSION: ("moblin-relay-normalize:restart:ingest-regression"),
     RESTART_REASON_VERIFIED_STALL: "moblin-relay-normalize:restart:verified-stall",
+    RESTART_REASON_INGEST_CONFIRMED_STALL: (
+        "moblin-relay-normalize:restart:ingest-confirmed-stall"
+    ),
     RESTART_REASON_WATCHDOG_UNKNOWN: "moblin-relay-normalize:restart:watchdog-unknown",
 }
+STATE_EVENT_SOURCE_ATTACHED = "source-attached"
+STATE_EVENT_SOURCE_DETACHED = "source-detached"
+STATE_EVENT_BRIDGE_ACTIVE = "bridge-active"
+STATE_EVENT_TOKENS = {
+    STATE_EVENT_SOURCE_ATTACHED: "moblin-relay-normalize:state:source-attached",
+    STATE_EVENT_SOURCE_DETACHED: "moblin-relay-normalize:state:source-detached",
+    STATE_EVENT_BRIDGE_ACTIVE: "moblin-relay-normalize:state:bridge-active",
+}
+
+RECOVERY_RESULT_KICKED = "source-kicked"
+RECOVERY_RESULT_GONE = "source-gone"
+RECOVERY_RESULT_CREDENTIAL = "credential-unavailable"
+RECOVERY_RESULT_TRANSPORT = "api-unreachable"
+RECOVERY_RESULT_REJECTED = "api-rejected"
+RECOVERY_RESULT_RESPONSE = "api-invalid-response"
+RECOVERY_EVENT_THRESHOLD = "threshold-reached"
+RECOVERY_EVENT_EXHAUSTED = "attempts-exhausted"
+RECOVERY_EVENT_SOURCE_RESUMED = "source-resumed-before-reset"
+RECOVERY_EVENT_TOKENS = {
+    RECOVERY_EVENT_THRESHOLD: "moblin-relay-normalize:recovery:reset-requested",
+    RECOVERY_RESULT_KICKED: "moblin-relay-normalize:recovery:reset-succeeded",
+    RECOVERY_RESULT_GONE: "moblin-relay-normalize:recovery:source-already-gone",
+    RECOVERY_RESULT_CREDENTIAL: ("moblin-relay-normalize:recovery:reset-failed-credential"),
+    RECOVERY_RESULT_TRANSPORT: ("moblin-relay-normalize:recovery:reset-failed-transport"),
+    RECOVERY_RESULT_REJECTED: "moblin-relay-normalize:recovery:reset-failed-rejected",
+    RECOVERY_RESULT_RESPONSE: "moblin-relay-normalize:recovery:reset-failed-response",
+    RECOVERY_EVENT_EXHAUSTED: ("moblin-relay-normalize:recovery:attempts-exhausted"),
+    RECOVERY_EVENT_SOURCE_RESUMED: (
+        "moblin-relay-normalize:recovery:source-resumed-before-reset"
+    ),
+}
+RECOVERY_SUCCESS_RESULTS = frozenset({RECOVERY_RESULT_KICKED, RECOVERY_RESULT_GONE})
+RECOVERY_FAILURE_RESULTS = frozenset(
+    {
+        RECOVERY_RESULT_CREDENTIAL,
+        RECOVERY_RESULT_TRANSPORT,
+        RECOVERY_RESULT_REJECTED,
+        RECOVERY_RESULT_RESPONSE,
+    }
+)
+# Bridge failures are diagnostic and may restart FFmpeg, but are never proof
+# that the SRT transport itself is stale.  Only ConfirmedInputStallGate is
+# allowed to open transport recovery.
+SOURCE_RESET_ELIGIBLE_REASONS: frozenset[str] = frozenset()
+
+RECOVERY_PREFLIGHT_WAIT = "wait"
+RECOVERY_PREFLIGHT_READY = "ready"
+RECOVERY_PREFLIGHT_RESUMED = "resumed"
+RECOVERY_PREFLIGHT_INVALID = "invalid"
 
 
 def emit_restart_reason(reason: str) -> None:
@@ -98,6 +187,22 @@ def emit_restart_reason(reason: str) -> None:
     token = RESTART_LOG_TOKENS.get(reason)
     if token is None:
         raise ValueError("invalid normalizer restart reason")
+    print(token, file=sys.stderr, flush=True)
+
+
+def emit_recovery_event(event: str) -> None:
+    """Emit one fixed recovery event without connection or credential details."""
+    token = RECOVERY_EVENT_TOKENS.get(event)
+    if token is None:
+        raise ValueError("invalid source recovery event")
+    print(token, file=sys.stderr, flush=True)
+
+
+def emit_state_event(event: str) -> None:
+    """Emit one fixed proof that a media lifecycle transition completed."""
+    token = STATE_EVENT_TOKENS.get(event)
+    if token is None:
+        raise ValueError("invalid normalizer state event")
     print(token, file=sys.stderr, flush=True)
 
 
@@ -116,6 +221,298 @@ def validated_source_id(raw_value: str) -> str:
     return raw_value
 
 
+def validated_control_token_path(raw_value: str) -> Path:
+    """Accept the production credential or a root-owned self-test work path."""
+    if not raw_value:
+        return CONTROL_TOKEN_FILE
+    if CONTROL_TOKEN_TEST_PATH_PATTERN.fullmatch(raw_value) is None:
+        raise ValueError("invalid control credential path")
+    return Path(raw_value)
+
+
+def read_control_token(token_file: Path) -> bytearray:
+    """Read a bounded root-owned API credential without following links."""
+    try:
+        parent = token_file.parent.lstat()
+        before = token_file.lstat()
+    except OSError as exc:
+        raise ValueError("control credential unavailable") from exc
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != 0
+        or stat.S_IMODE(parent.st_mode) & 0o022
+        or stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_uid != 0
+        or before.st_gid != os.getegid()
+        or stat.S_IMODE(before.st_mode) not in {0o600, 0o640}
+        or before.st_nlink != 1
+        or not 43 <= before.st_size <= CONTROL_TOKEN_MAX_FILE_BYTES
+    ):
+        raise ValueError("control credential unavailable")
+
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(token_file, flags)
+    except OSError as exc:
+        raise ValueError("control credential unavailable") from exc
+    payload = bytearray()
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or opened.st_uid != before.st_uid
+            or opened.st_gid != before.st_gid
+            or stat.S_IMODE(opened.st_mode) != stat.S_IMODE(before.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_size != before.st_size
+            or opened.st_mtime_ns != before.st_mtime_ns
+            or opened.st_ctime_ns != before.st_ctime_ns
+        ):
+            raise ValueError("control credential unavailable")
+        payload = bytearray(os.read(descriptor, CONTROL_TOKEN_MAX_FILE_BYTES + 1))
+        if os.read(descriptor, 1):
+            raise ValueError("control credential unavailable")
+        after = os.fstat(descriptor)
+        if (
+            (after.st_dev, after.st_ino, after.st_size)
+            != (opened.st_dev, opened.st_ino, opened.st_size)
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or after.st_ctime_ns != opened.st_ctime_ns
+        ):
+            raise ValueError("control credential unavailable")
+    except (OSError, ValueError) as exc:
+        for index in range(len(payload)):
+            payload[index] = 0
+        raise ValueError("control credential unavailable") from exc
+    finally:
+        os.close(descriptor)
+
+    if payload.endswith(b"\n"):
+        payload.pop()
+    if CONTROL_TOKEN_PATTERN.fullmatch(payload) is None:
+        for index in range(len(payload)):
+            payload[index] = 0
+        raise ValueError("control credential unavailable")
+    return payload
+
+
+def kick_srt_source(api_port: int, source_id: str, token_file: Path) -> str:
+    """Kick only the hook-bound SRT UUID through the authenticated local API."""
+    validated_port(str(api_port))
+    validated_source_id(source_id)
+    try:
+        token = read_control_token(token_file)
+    except ValueError:
+        return RECOVERY_RESULT_CREDENTIAL
+
+    credentials = bytearray(CONTROL_API_USER.encode("ascii"))
+    credentials.extend(b":")
+    credentials.extend(token)
+    authorization = ""
+    connection: http.client.HTTPConnection | None = None
+    try:
+        authorization = "Basic " + base64.b64encode(credentials).decode("ascii")
+        connection = http.client.HTTPConnection(
+            "127.0.0.1",
+            api_port,
+            timeout=CONTROL_API_REQUEST_TIMEOUT_SECONDS,
+        )
+        connection.request(
+            "POST",
+            CONTROL_API_KICK_PATH_PREFIX + source_id,
+            body=b"",
+            headers={
+                "Accept": "application/json",
+                "Authorization": authorization,
+                "Connection": "close",
+                "Content-Length": "0",
+            },
+        )
+        response = connection.getresponse()
+        payload = response.read(CONTROL_API_RESPONSE_LIMIT_BYTES + 1)
+        if len(payload) > CONTROL_API_RESPONSE_LIMIT_BYTES:
+            return RECOVERY_RESULT_RESPONSE
+        if response.status == 200:
+            return RECOVERY_RESULT_KICKED
+        if response.status == 404:
+            return RECOVERY_RESULT_GONE
+        return RECOVERY_RESULT_REJECTED
+    except (OSError, TimeoutError, http.client.HTTPException):
+        return RECOVERY_RESULT_TRANSPORT
+    finally:
+        authorization = ""
+        for buffer in (credentials, token):
+            for index in range(len(buffer)):
+                buffer[index] = 0
+        if connection is not None:
+            connection.close()
+
+
+class RecoveryCircuitBreaker:
+    """Bound recovery attempts for one hook-bound SRT publisher."""
+
+    def __init__(self, source_id: str) -> None:
+        self.source_id = validated_source_id(source_id)
+        self.failures: deque[tuple[float, str]] = deque(maxlen=RECOVERY_FAILURE_THRESHOLD)
+        self.opened = False
+        self.completed = False
+        self.exhausted = False
+        self.attempts = 0
+        self.next_attempt_at = 0.0
+        self.reason = ""
+        self.confirmed_counter: int | None = None
+        self.pre_reset_observations = 0
+
+    def record_failure(self, reason: str, now: float) -> bool:
+        """Return true only when this observation opens the breaker."""
+        if reason not in RESTART_LOG_TOKENS or not math.isfinite(now):
+            raise ValueError("invalid source recovery observation")
+        if self.opened or reason not in SOURCE_RESET_ELIGIBLE_REASONS:
+            return False
+        while self.failures and now - self.failures[0][0] > RECOVERY_FAILURE_WINDOW_SECONDS:
+            self.failures.popleft()
+        if self.failures and now < self.failures[-1][0]:
+            self.failures.clear()
+        self.failures.append((now, reason))
+        if len(self.failures) < RECOVERY_FAILURE_THRESHOLD:
+            return False
+        self.opened = True
+        self.reason = reason
+        self.next_attempt_at = now
+        return True
+
+    def should_attempt(self, now: float) -> bool:
+        if not math.isfinite(now):
+            raise ValueError("invalid source recovery observation")
+        return (
+            self.opened
+            and not self.completed
+            and not self.exhausted
+            and self.attempts < RECOVERY_MAX_API_ATTEMPTS
+            and self.reason == RESTART_REASON_INGEST_CONFIRMED_STALL
+            and self.confirmed_counter is not None
+            and self.pre_reset_observations >= RECOVERY_PRE_RESET_REQUIRED_OBSERVATIONS
+            and now >= self.next_attempt_at
+        )
+
+    def open_after_confirmed_input_stall(self, counter: int, now: float) -> bool:
+        """Open immediately after one continuously verified, prolonged stall."""
+        if isinstance(counter, bool) or not isinstance(counter, int) or counter < 0:
+            raise ValueError("invalid source recovery counter")
+        if not math.isfinite(now):
+            raise ValueError("invalid source recovery observation")
+        if self.opened or self.completed or self.exhausted:
+            return False
+        self.failures.clear()
+        self.opened = True
+        self.reason = RESTART_REASON_INGEST_CONFIRMED_STALL
+        self.confirmed_counter = counter
+        self.pre_reset_observations = 0
+        self.next_attempt_at = max(
+            self.next_attempt_at,
+            now + RECOVERY_PRE_RESET_CONFIRMATION_SECONDS,
+        )
+        return True
+
+    def observe_before_reset(
+        self,
+        successful: bool,
+        sample: CounterSample | None,
+        now: float,
+    ) -> str:
+        """Require consecutive fresh exact-source samples immediately before POST."""
+        if not math.isfinite(now):
+            raise ValueError("invalid source recovery observation")
+        if not self.opened or self.completed or self.confirmed_counter is None:
+            raise ValueError("unexpected source recovery proof")
+        if not successful or sample is None:
+            self.pre_reset_observations = 0
+            return RECOVERY_PREFLIGHT_INVALID
+
+        connection_id, counter = sample
+        if (
+            connection_id != self.source_id
+            or isinstance(counter, bool)
+            or not isinstance(counter, int)
+            or counter < self.confirmed_counter
+        ):
+            self.pre_reset_observations = 0
+            return RECOVERY_PREFLIGHT_INVALID
+        if counter > self.confirmed_counter:
+            self.pre_reset_observations = 0
+            return RECOVERY_PREFLIGHT_RESUMED
+
+        self.pre_reset_observations = min(
+            RECOVERY_PRE_RESET_REQUIRED_OBSERVATIONS,
+            self.pre_reset_observations + 1,
+        )
+        if self.pre_reset_observations >= RECOVERY_PRE_RESET_REQUIRED_OBSERVATIONS:
+            return RECOVERY_PREFLIGHT_READY
+        return RECOVERY_PREFLIGHT_WAIT
+
+    def record_result(self, result: str, now: float) -> None:
+        if result not in RECOVERY_SUCCESS_RESULTS | RECOVERY_FAILURE_RESULTS:
+            raise ValueError("invalid source recovery result")
+        if not self.should_attempt(now):
+            raise ValueError("unexpected source recovery result")
+        self.attempts += 1
+        if result in RECOVERY_SUCCESS_RESULTS:
+            self.completed = True
+            return
+        self.pre_reset_observations = 0
+        if self.attempts >= RECOVERY_MAX_API_ATTEMPTS:
+            self.exhausted = True
+            return
+        self.next_attempt_at = now + RECOVERY_RETRY_COOLDOWN_SECONDS
+
+    def cancel_after_source_resumed(self) -> bool:
+        """Cancel pending recovery as soon as exact-source media grows."""
+        if self.completed or not (
+            self.opened
+            or self.exhausted
+            or self.attempts > 0
+            or self.confirmed_counter is not None
+        ):
+            return False
+        self.failures.clear()
+        self.opened = False
+        self.exhausted = False
+        self.attempts = 0
+        self.next_attempt_at = 0.0
+        self.reason = ""
+        self.confirmed_counter = None
+        self.pre_reset_observations = 0
+        return True
+
+    def source_has_resumed(self, sample: CounterSample) -> bool:
+        """Compare a fresh exact-source sample with the last proven stall."""
+        connection_id, counter = sample
+        if (
+            connection_id != self.source_id
+            or isinstance(counter, bool)
+            or not isinstance(counter, int)
+            or counter < 0
+        ):
+            return False
+        return self.confirmed_counter is not None and counter > self.confirmed_counter
+
+    def invalidate_unverified_source(self) -> bool:
+        """Close this proof without restoring API budget or retrying blindly."""
+        if not self.opened or self.completed:
+            return False
+        self.opened = False
+        self.reason = ""
+        # Retain the last stalled counter only as a recovery baseline. A later
+        # exact-source increase can still restore LIVE immediately, but another
+        # POST requires a brand-new six-second ConfirmedInputStallGate proof.
+        self.pre_reset_observations = 0
+        return True
+
+
 def build_ingest_metrics_path(source_id: str) -> str:
     return INGEST_METRICS_PATH_PREFIX + validated_source_id(source_id)
 
@@ -130,6 +527,12 @@ def build_ffmpeg_argv(rtsp_port: int, rtmp_port: int) -> list[str]:
         "-nostats",
         "-loglevel",
         "error",
+        # The FLV muxer hard-fails an H.264 stream-copy packet without PTS.
+        # Repair only missing input PTS from an available DTS, preserving the
+        # encoded video and its native timeline instead of using wall-clock
+        # timestamps or transcoding.
+        "-fflags",
+        "+genpts",
         "-rtsp_transport",
         "tcp",
         "-i",
@@ -174,8 +577,7 @@ def parse_ingest_sample(
         if match is None:
             continue
         labels = {
-            item.group(1): item.group(2)
-            for item in LABEL_PATTERN.finditer(match.group("labels"))
+            item.group(1): item.group(2) for item in LABEL_PATTERN.finditer(match.group("labels"))
         }
         connection_id = labels.get("id", "")
         if (
@@ -195,8 +597,7 @@ def parse_output_sample(payload: str) -> CounterSample | None:
         if match is None:
             continue
         labels = {
-            item.group(1): item.group(2)
-            for item in LABEL_PATTERN.finditer(match.group("labels"))
+            item.group(1): item.group(2) for item in LABEL_PATTERN.finditer(match.group("labels"))
         }
         connection_id = labels.get("id", "")
         if (
@@ -264,9 +665,9 @@ class GrowthGate:
         self.growth_observations = 0
 
     def observe(self, counter: int) -> bool:
-        if self.previous is None or counter <= self.previous:
+        if self.previous is None or counter < self.previous:
             self.growth_observations = 0
-        else:
+        elif counter > self.previous:
             self.growth_observations += 1
         self.previous = counter
         return self.growth_observations >= REQUIRED_GROWTH_OBSERVATIONS
@@ -284,11 +685,88 @@ class ConnectionGrowthGate:
         self.gate.reset()
 
     def observe(self, sample: CounterSample) -> bool:
+        _, confirmed = self.observe_with_progress(sample)
+        return confirmed
+
+    def observe_with_progress(self, sample: CounterSample) -> tuple[bool, bool]:
         connection_id, counter = sample
+        progressed = (
+            connection_id == self.connection_id
+            and self.gate.previous is not None
+            and counter > self.gate.previous
+        )
         if connection_id != self.connection_id:
             self.connection_id = connection_id
             self.gate.reset()
-        return self.gate.observe(counter)
+        return progressed, self.gate.observe(counter)
+
+
+class ConfirmedInputStallGate:
+    """Confirm that one exact SRT publisher stayed present without media growth."""
+
+    def __init__(self, source_id: str, counter: int, now: float) -> None:
+        self.source_id = validated_source_id(source_id)
+        if isinstance(counter, bool) or not isinstance(counter, int) or counter < 0:
+            raise ValueError("invalid confirmed input stall counter")
+        if not math.isfinite(now):
+            raise ValueError("invalid confirmed input stall observation")
+        self.counter = counter
+        self.idle_since: float | None = now
+        self.unchanged_observations = 1
+
+    def reset_confirmation(self) -> None:
+        """Discard elapsed proof while retaining the exact source and counter."""
+        self.idle_since = None
+        self.unchanged_observations = 0
+
+    def observe(
+        self,
+        successful: bool,
+        sample: CounterSample | None,
+        now: float,
+    ) -> bool:
+        """Return true only after continuous valid no-growth proof through the grace."""
+        if not math.isfinite(now):
+            raise ValueError("invalid confirmed input stall observation")
+        if not successful or sample is None:
+            self.reset_confirmation()
+            return False
+
+        connection_id, counter = sample
+        if (
+            connection_id != self.source_id
+            or isinstance(counter, bool)
+            or not isinstance(counter, int)
+            or counter < 0
+        ):
+            self.reset_confirmation()
+            return False
+
+        if counter > self.counter:
+            # One real media-byte increase is recovery evidence.  Start a new
+            # grace from that byte, while the ordinary growth gate remains free
+            # to relaunch FFmpeg after its second growth observation.
+            self.counter = counter
+            self.idle_since = now
+            self.unchanged_observations = 0
+            return False
+        if counter < self.counter:
+            # A counter reset is not proof of an idle connection.  Adopt the new
+            # baseline and require a complete fresh grace before acting.
+            self.counter = counter
+            self.idle_since = now
+            self.unchanged_observations = 1
+            return False
+
+        if self.idle_since is None:
+            self.idle_since = now
+            self.unchanged_observations = 1
+            return False
+        self.unchanged_observations += 1
+        return (
+            now - self.idle_since >= CONFIRMED_INPUT_STALL_GRACE_SECONDS
+            and self.unchanged_observations >= CONFIRMED_INPUT_STALL_REQUIRED_OBSERVATIONS
+        )
 
 
 class MediaWatchdog:
@@ -311,6 +789,13 @@ class MediaWatchdog:
         self.failure_reason = reason
         return False
 
+    def reset_joint_idle(self) -> None:
+        """Discard non-consecutive proof that both media counters are idle."""
+        self.ingest_connection_id = ""
+        self.ingest_counter = None
+        self.joint_idle_since = None
+        self.joint_unchanged_observations = 0
+
     def observe_output(
         self,
         successful: bool,
@@ -318,6 +803,7 @@ class MediaWatchdog:
         now: float,
     ) -> tuple[bool, bool]:
         if not successful or sample is None:
+            self.reset_joint_idle()
             return (
                 (
                     now - self.last_valid_observation < METRICS_BLIND_TIMEOUT_SECONDS
@@ -335,10 +821,7 @@ class MediaWatchdog:
             self.counter = counter
             self.output_last_growth = now
             self.output_unchanged_observations = 0
-            self.ingest_connection_id = ""
-            self.ingest_counter = None
-            self.joint_idle_since = None
-            self.joint_unchanged_observations = 0
+            self.reset_joint_idle()
             return True, False
         self.output_unchanged_observations += 1
         if (
@@ -358,6 +841,7 @@ class MediaWatchdog:
         if finished_at < started_at:
             return self.reject(RESTART_REASON_INGEST_TIMING)
         if not successful:
+            self.reset_joint_idle()
             return True
         if sample is None:
             return self.reject(RESTART_REASON_INGEST_MISSING)
@@ -382,8 +866,7 @@ class MediaWatchdog:
         self.joint_unchanged_observations += 1
         keep_child = (
             started_at - self.joint_idle_since < VERIFIED_STALL_TIMEOUT_SECONDS
-            or self.joint_unchanged_observations
-            < REQUIRED_VERIFIED_STALL_OBSERVATIONS
+            or self.joint_unchanged_observations < REQUIRED_VERIFIED_STALL_OBSERVATIONS
         )
         return keep_child or self.reject(RESTART_REASON_VERIFIED_STALL)
 
@@ -393,8 +876,10 @@ def sanitized_environment(
     rtmp_port: int,
     metrics_port: int,
     source_id: str,
+    control_api_port: int = DEFAULT_CONTROL_API_PORT,
+    control_token_file: Path = CONTROL_TOKEN_FILE,
 ) -> dict[str, str]:
-    return {
+    environment = {
         "LANG": "C",
         "LC_ALL": "C",
         "PATH": "/usr/bin:/bin",
@@ -403,6 +888,13 @@ def sanitized_environment(
         SAFE_METRICS_PORT_ENV: str(metrics_port),
         SAFE_SOURCE_ID_ENV: validated_source_id(source_id),
     }
+    if control_api_port != DEFAULT_CONTROL_API_PORT:
+        environment[SAFE_CONTROL_API_PORT_ENV] = str(validated_port(str(control_api_port)))
+    if control_token_file != CONTROL_TOKEN_FILE:
+        control_token_path = str(control_token_file)
+        validated_control_token_path(control_token_path)
+        environment[SAFE_CONTROL_TOKEN_FILE_ENV] = control_token_path
+    return environment
 
 
 def make_parent_death_setup(expected_parent_pid: int) -> Callable[[], None]:
@@ -451,6 +943,8 @@ def run_supervisor(
     rtmp_port: int,
     metrics_port: int,
     source_id: str,
+    control_api_port: int = DEFAULT_CONTROL_API_PORT,
+    control_token_file: Path = CONTROL_TOKEN_FILE,
 ) -> int:
     stop_requested = False
 
@@ -479,24 +973,146 @@ def run_supervisor(
     watchdog: MediaWatchdog | None = None
     child_started = 0.0
     restart_not_before = 0.0
+    recovery = RecoveryCircuitBreaker(source_id)
+    confirmed_input_stall: ConfirmedInputStallGate | None = None
+    source_attached_emitted = False
 
     try:
         while not stop_requested:
             now = time.monotonic()
             if child is not None and child.poll() is not None:
                 emit_restart_reason(RESTART_REASON_CHILD_EXIT)
+                recovery.record_failure(RESTART_REASON_CHILD_EXIT, now)
                 child = None
                 watchdog = None
                 ingest_gate.reset()
                 restart_not_before = now + CHILD_RESTART_FLOOR_SECONDS
 
+            if recovery.opened:
+                if child is not None:
+                    stop_child(child, force=True)
+                    child = None
+                watchdog = None
+                ingest_gate.reset()
+                output_gate.reset()
+                output_reader.close()
+                if recovery.completed:
+                    # Keep the hook alive and fail closed.  Exiting would make
+                    # runOnAvailableRestart construct a fresh breaker and turn
+                    # this terminal state into an unnecessary restart race or
+                    # turn bounded API failures into an unbounded retry storm.
+                    ingest_reader.close()
+                    time.sleep(RECOVERY_WAIT_POLL_SECONDS)
+                    continue
+                # Re-check the exact hook-bound source immediately before every
+                # POST. Two fresh, unchanged observations authorize the request;
+                # any growth cancels it, while missing/untrusted metrics discard
+                # the entire six-second proof.
+                ingest_successful, ingest_sample = ingest_reader.sample()
+                proof = recovery.observe_before_reset(
+                    ingest_successful,
+                    ingest_sample,
+                    time.monotonic(),
+                )
+                if proof == RECOVERY_PREFLIGHT_INVALID:
+                    recovery.invalidate_unverified_source()
+                    confirmed_input_stall = None
+                    ingest_gate.reset()
+                    time.sleep(MEDIA_POLL_INTERVAL_SECONDS)
+                    continue
+                if proof == RECOVERY_PREFLIGHT_RESUMED:
+                    if recovery.cancel_after_source_resumed():
+                        emit_recovery_event(RECOVERY_EVENT_SOURCE_RESUMED)
+                    confirmed_input_stall = None
+                    ingest_gate.reset()
+                    if ingest_sample is not None:
+                        ingest_gate.observe(ingest_sample)
+                    restart_not_before = time.monotonic()
+                    continue
+                now = time.monotonic()
+                if proof == RECOVERY_PREFLIGHT_READY and recovery.should_attempt(now):
+                    result = kick_srt_source(
+                        control_api_port,
+                        source_id,
+                        control_token_file,
+                    )
+                    emit_recovery_event(result)
+                    recovery.record_result(result, now)
+                    if recovery.exhausted:
+                        emit_recovery_event(RECOVERY_EVENT_EXHAUSTED)
+                    if recovery.completed:
+                        continue
+                if recovery.exhausted:
+                    # Attempts remain bounded, but a later proven recovery of
+                    # this exact source is still allowed to reopen the bridge.
+                    time.sleep(RECOVERY_WAIT_POLL_SECONDS)
+                    continue
+                wait_seconds = max(
+                    MEDIA_POLL_INTERVAL_SECONDS,
+                    min(
+                        RECOVERY_WAIT_POLL_SECONDS,
+                        recovery.next_attempt_at - time.monotonic(),
+                    ),
+                )
+                time.sleep(wait_seconds)
+                continue
+
             if child is None:
                 successful, ingest_sample = ingest_reader.sample()
                 now = time.monotonic()
+                progressed = False
+                growth_confirmed = False
+                if successful and ingest_sample is not None:
+                    progressed, growth_confirmed = ingest_gate.observe_with_progress(
+                        ingest_sample
+                    )
+                    if (
+                        recovery.source_has_resumed(ingest_sample) or progressed
+                    ) and recovery.cancel_after_source_resumed():
+                        emit_recovery_event(RECOVERY_EVENT_SOURCE_RESUMED)
+                        confirmed_input_stall = None
+                else:
+                    ingest_gate.reset()
+                confirmed_stall_detected = False
+                if recovery.exhausted:
+                    confirmed_input_stall = None
+                elif confirmed_input_stall is None:
+                    if successful and ingest_sample is not None:
+                        confirmed_input_stall = ConfirmedInputStallGate(
+                            source_id,
+                            ingest_sample[1],
+                            now,
+                        )
+                else:
+                    confirmed_stall_detected = confirmed_input_stall.observe(
+                        successful,
+                        ingest_sample,
+                        now,
+                    )
+                if confirmed_stall_detected:
+                    confirmed_counter = confirmed_input_stall.counter
+                    if recovery.open_after_confirmed_input_stall(
+                        confirmed_counter,
+                        now,
+                    ):
+                        emit_restart_reason(RESTART_REASON_INGEST_CONFIRMED_STALL)
+                        emit_recovery_event(RECOVERY_EVENT_THRESHOLD)
+                    confirmed_input_stall = None
+                    ingest_gate.reset()
+                    time.sleep(MEDIA_POLL_INTERVAL_SECONDS)
+                    continue
                 if successful:
                     if ingest_sample is None:
                         ingest_gate.reset()
-                    elif ingest_gate.observe(ingest_sample) and now >= restart_not_before:
+                    else:
+                        if not source_attached_emitted:
+                            emit_state_event(STATE_EVENT_SOURCE_ATTACHED)
+                            source_attached_emitted = True
+                    if (
+                        ingest_sample is not None
+                        and growth_confirmed
+                        and now >= restart_not_before
+                    ):
                         supervisor_pid = os.getpid()
                         parent_death_setup = make_parent_death_setup(supervisor_pid)
                         try:
@@ -511,6 +1127,7 @@ def run_supervisor(
                             return 1
                         child_started = now
                         watchdog = None
+                        confirmed_input_stall = None
                         output_gate.reset()
                 else:
                     ingest_gate.reset()
@@ -522,9 +1139,11 @@ def run_supervisor(
             if watchdog is None:
                 if successful and counter is not None and output_gate.observe(counter):
                     watchdog = MediaWatchdog(counter, now)
+                    emit_state_event(STATE_EVENT_BRIDGE_ACTIVE)
                     ingest_reader.close()
                 elif now - child_started >= OUTPUT_START_TIMEOUT_SECONDS:
                     emit_restart_reason(RESTART_REASON_OUTPUT_START_TIMEOUT)
+                    recovery.record_failure(RESTART_REASON_OUTPUT_START_TIMEOUT, now)
                     stop_child(child, force=True)
                     child = None
                     ingest_gate.reset()
@@ -546,9 +1165,21 @@ def run_supervisor(
                     ingest_finished,
                 )
             if not keep_child:
-                emit_restart_reason(
-                    watchdog.failure_reason or RESTART_REASON_WATCHDOG_UNKNOWN
-                )
+                failure_reason = watchdog.failure_reason or RESTART_REASON_WATCHDOG_UNKNOWN
+                emit_restart_reason(failure_reason)
+                recovery.record_failure(failure_reason, now)
+                if (
+                    failure_reason == RESTART_REASON_VERIFIED_STALL
+                    and watchdog.ingest_connection_id == source_id
+                    and watchdog.ingest_counter is not None
+                ):
+                    confirmed_input_stall = ConfirmedInputStallGate(
+                        source_id,
+                        watchdog.ingest_counter,
+                        time.monotonic(),
+                    )
+                else:
+                    confirmed_input_stall = None
                 ingest_reader.close()
                 stop_child(child, force=True)
                 child = None
@@ -562,6 +1193,8 @@ def run_supervisor(
         output_reader.close()
         if child is not None:
             stop_child(child)
+        if stop_requested and source_attached_emitted:
+            emit_state_event(STATE_EVENT_SOURCE_DETACHED)
 
 
 def main() -> int:
@@ -571,9 +1204,25 @@ def main() -> int:
             rtmp_port = validated_port(os.environ.get(SAFE_RTMP_PORT_ENV, ""))
             metrics_port = validated_port(os.environ.get(SAFE_METRICS_PORT_ENV, ""))
             source_id = validated_source_id(os.environ.get(SAFE_SOURCE_ID_ENV, ""))
+            control_api_port = validated_port(
+                os.environ.get(
+                    SAFE_CONTROL_API_PORT_ENV,
+                    str(DEFAULT_CONTROL_API_PORT),
+                )
+            )
+            control_token_file = validated_control_token_path(
+                os.environ.get(SAFE_CONTROL_TOKEN_FILE_ENV, "")
+            )
         except ValueError:
             return 2
-        return run_supervisor(rtsp_port, rtmp_port, metrics_port, source_id)
+        return run_supervisor(
+            rtsp_port,
+            rtmp_port,
+            metrics_port,
+            source_id,
+            control_api_port,
+            control_token_file,
+        )
 
     if (
         len(sys.argv) != 1
@@ -583,19 +1232,33 @@ def main() -> int:
         return 2
     try:
         rtsp_port = validated_port(os.environ.get("RTSP_PORT", ""))
-        rtmp_port = validated_port(
-            os.environ.get(TEST_RTMP_PORT_ENV, str(DEFAULT_RTMP_PORT))
-        )
+        rtmp_port = validated_port(os.environ.get(TEST_RTMP_PORT_ENV, str(DEFAULT_RTMP_PORT)))
         metrics_port = validated_port(
             os.environ.get(TEST_METRICS_PORT_ENV, str(DEFAULT_METRICS_PORT))
         )
         source_id = validated_source_id(os.environ.get("MTX_SOURCE_ID", ""))
+        control_api_port = validated_port(
+            os.environ.get(
+                TEST_CONTROL_API_PORT_ENV,
+                str(DEFAULT_CONTROL_API_PORT),
+            )
+        )
+        control_token_file = validated_control_token_path(
+            os.environ.get(TEST_CONTROL_TOKEN_FILE_ENV, "")
+        )
     except ValueError:
         return 2
 
     # Re-exec first: the long-lived supervisor must not retain publisher-controlled
     # MediaMTX hook metadata (including MTX_QUERY) anywhere in /proc.
-    environment = sanitized_environment(rtsp_port, rtmp_port, metrics_port, source_id)
+    environment = sanitized_environment(
+        rtsp_port,
+        rtmp_port,
+        metrics_port,
+        source_id,
+        control_api_port,
+        control_token_file,
+    )
     script = os.path.realpath(__file__)
     try:
         os.execve(PYTHON, [PYTHON, "-I", script, SUPERVISOR_ARGUMENT], environment)

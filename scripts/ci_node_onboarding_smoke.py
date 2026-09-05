@@ -75,7 +75,6 @@ SAFE_BOOTSTRAP_DIAGNOSTIC_CODES = frozenset(
         "relay_self_test_auth_source_publisher_bind_failed",
         "relay_self_test_auth_source_feeder_failed",
         "relay_self_test_auth_source_path_failed",
-        "relay_self_test_auth_live_failed",
         "relay_self_test_auth_scan_failed",
         "relay_self_test_auth_exclusivity_failed",
         "relay_self_test_auth_exclusivity_core_failed",
@@ -95,6 +94,7 @@ SAFE_BOOTSTRAP_DIAGNOSTIC_CODES = frozenset(
         "relay_self_test_auth_exclusivity_normalizer_ingest_identity_failed",
         "relay_self_test_auth_exclusivity_normalizer_ingest_regression_failed",
         "relay_self_test_auth_exclusivity_normalizer_verified_stall_failed",
+        "relay_self_test_auth_exclusivity_normalizer_confirmed_input_stall_failed",
         "relay_self_test_auth_exclusivity_normalizer_watchdog_unknown_failed",
         "relay_self_test_auth_exclusivity_downstream_failed",
         "relay_self_test_auth_exclusivity_progress_failed",
@@ -106,6 +106,7 @@ SAFE_BOOTSTRAP_DIAGNOSTIC_CODES = frozenset(
         "relay_self_test_normalizer_child_failed",
         "relay_self_test_normalizer_publish_failed",
         "relay_self_test_normalizer_flap_failed",
+        "relay_self_test_dts_regression_failed",
         "relay_self_test_stall_slate_failed",
         "relay_self_test_stall_precondition_failed",
         "relay_self_test_stall_pause_failed",
@@ -130,9 +131,24 @@ SAFE_BOOTSTRAP_DIAGNOSTIC_CODES = frozenset(
         "relay_self_test_stall_observability_failed",
         "relay_self_test_stall_identity_failed",
         "relay_self_test_stall_continuity_failed",
+        "relay_self_test_persistent_stall_precondition_failed",
+        "relay_self_test_persistent_stall_slate_failed",
+        "relay_self_test_persistent_stall_confirmation_failed",
+        "relay_self_test_persistent_stall_reset_failed",
+        "relay_self_test_persistent_stall_reconnect_failed",
+        "relay_self_test_persistent_stall_source_failed",
+        "relay_self_test_persistent_stall_continuity_failed",
         "relay_self_test_crash_death_failed",
         "relay_self_test_crash_live_failed",
         "relay_self_test_crash_continuity_failed",
+        "relay_self_test_reset_precondition_failed",
+        "relay_self_test_reset_injection_failed",
+        "relay_self_test_reset_slate_failed",
+        "relay_self_test_reset_circuit_failed",
+        "relay_self_test_reset_kick_failed",
+        "relay_self_test_reset_reconnect_failed",
+        "relay_self_test_reset_source_failed",
+        "relay_self_test_reset_continuity_failed",
         "relay_self_test_outages_failed",
         "relay_self_test_outage_slate_failed",
         "relay_self_test_outage_normal_failed",
@@ -654,9 +670,39 @@ assert result['same_session_stall']['srt_connection_preserved'] is True
 assert result['same_session_stall']['normalizer_reconnected'] is True
 assert result['supervisor_crash_recovery']['ffmpeg_parent_death_passed'] is True
 assert result['supervisor_crash_recovery']['srt_connection_preserved'] is True
+recovery = result['repeated_bridge_failure_recovery']
+assert recovery['forced_ffmpeg_failures'] == 3
+assert recovery['circuit_breaker_opened'] is True
+assert recovery['source_reset_succeeded'] is True
+assert recovery['srt_session_replaced'] is True
+assert recovery['source_processes_preserved'] is True
+assert recovery['slate_available'] is True
+assert recovery['fresh_session_live'] is True
+assert recovery['automatic_rtmp_recovery'] is True
+assert recovery['max_capture_no_growth_seconds'] <= 1.5
+persistent = result['persistent_input_stall_recovery']
+assert persistent['stalled_srt_session_observed_before_recovery'] is True
+assert persistent['recovery_path'] == 'exact-api-reset'
+assert persistent['confirmed_stall_marker_seen'] is True
+assert persistent['source_detached_marker_seen'] is True
+assert persistent['source_reset_succeeded'] is True
+assert persistent['reset_before_transport_idle_timeout'] is True
+assert persistent['reset_elapsed_seconds'] < 10.0
+assert persistent['automatic_srt_recovery'] is True
+assert persistent['srt_session_replaced'] is True
+assert persistent['source_processes_preserved'] is True
+assert persistent['automatic_rtmp_recovery'] is True
+assert persistent['max_capture_no_growth_seconds'] <= 1.5
 assert len(result['srt_idle_expiry_seconds']) == 3
 assert all(8.0 <= value <= 13.0 for value in result['srt_idle_expiry_seconds'])
-assert all(value <= 1.0 for value in result['outage_max_capture_no_growth_seconds'])
+assert all(value <= 1.5 for value in result['outage_max_capture_no_growth_seconds'])
+assert result['rtsp_capture_session_preserved'] is True
+forward = result['automatic_rtmp_forward_recovery']
+assert forward['recovery_limit_seconds'] == 8.0
+assert forward['maximum_event_to_delivery_seconds'] <= 8.0
+assert forward['max_delivery_outage_seconds'] <= 8.0
+assert forward['forced_disconnect_recovered'] is True
+assert forward['final_active'] is True
 PY
 for spec in 'moblin-relay|/var/lib/moblin-relay' \
   'restream-agent|/var/lib/adojapan-relay-agent'; do

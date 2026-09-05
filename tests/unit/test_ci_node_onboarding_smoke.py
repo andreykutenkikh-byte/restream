@@ -4,7 +4,9 @@ from typing import Any
 
 import pytest
 
+from bootstrap_worker.relay_installer import _SELF_TEST_STAGE_CODES
 from scripts.ci_node_onboarding_smoke import (
+    SAFE_BOOTSTRAP_DIAGNOSTIC_CODES,
     safe_api_payload,
     safe_bootstrap_diagnostic_code,
     safe_relay_api_diagnostic,
@@ -90,6 +92,7 @@ def test_native_safe_failure_code_is_allowlisted() -> None:
         "relay_self_test_auth_exclusivity_normalizer_ingest_identity_failed",
         "relay_self_test_auth_exclusivity_normalizer_ingest_regression_failed",
         "relay_self_test_auth_exclusivity_normalizer_verified_stall_failed",
+        "relay_self_test_auth_exclusivity_normalizer_confirmed_input_stall_failed",
         "relay_self_test_auth_exclusivity_normalizer_watchdog_unknown_failed",
         "relay_self_test_auth_exclusivity_downstream_failed",
         "relay_self_test_auth_exclusivity_progress_failed",
@@ -112,8 +115,27 @@ def test_native_safe_failure_code_is_allowlisted() -> None:
         "relay_self_test_stall_downstream_failed",
         "relay_self_test_stall_observability_failed",
         "relay_self_test_stall_identity_failed",
+        "relay_self_test_persistent_stall_precondition_failed",
+        "relay_self_test_persistent_stall_slate_failed",
+        "relay_self_test_persistent_stall_confirmation_failed",
+        "relay_self_test_persistent_stall_reset_failed",
+        "relay_self_test_persistent_stall_reconnect_failed",
+        "relay_self_test_persistent_stall_source_failed",
+        "relay_self_test_persistent_stall_continuity_failed",
+        "relay_self_test_reset_precondition_failed",
+        "relay_self_test_reset_injection_failed",
+        "relay_self_test_reset_slate_failed",
+        "relay_self_test_reset_circuit_failed",
+        "relay_self_test_reset_kick_failed",
+        "relay_self_test_reset_reconnect_failed",
+        "relay_self_test_reset_source_failed",
+        "relay_self_test_reset_continuity_failed",
     ):
         assert safe_bootstrap_diagnostic_code({"safe_error": {"code": code}}) == code
+
+
+def test_every_installer_self_test_diagnostic_is_safe_for_ci_output() -> None:
+    assert set(_SELF_TEST_STAGE_CODES.values()) <= SAFE_BOOTSTRAP_DIAGNOSTIC_CODES
 
 
 def test_api_payload_password_marker_fails_closed() -> None:

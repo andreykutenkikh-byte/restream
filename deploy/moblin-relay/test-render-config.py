@@ -9,10 +9,12 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import types
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 
@@ -52,6 +54,11 @@ def assert_normalizer_contract(normalizer) -> None:
     assert "rtmp://127.0.0.1:11936/relay-output" in argv
     assert "-rw_timeout" not in argv
     assert "-timeout" not in argv
+    assert argv.count("-fflags") == 1
+    assert argv[argv.index("-fflags") + 1] == "+genpts"
+    assert argv.index("-fflags") < argv.index("-i")
+    assert "-use_wallclock_as_timestamps" not in argv
+    assert "-copyts" not in argv
     assert argv[argv.index("-c:v") + 1] == "copy"
     assert "-copyinkf" not in argv
     assert argv[argv.index("-c:a") + 1] == "aac"
@@ -60,14 +67,14 @@ def assert_normalizer_contract(normalizer) -> None:
     assert argv[argv.index("-ar") + 1] == "48000"
     assert argv[argv.index("-ac") + 1] == "2"
     assert argv[argv.index("-max_muxing_queue_size") + 1] == "2048"
+    assert "-bsf:v" not in argv
+    assert "-output_ts_offset" not in argv
     assert "-nostats" in argv
     assert "rtmps://" not in joined
     assert "passphrase=" not in joined
     assert argv.count("-flush_packets") == 1
     assert "-tcp_nodelay" not in argv
-    assert argv[-5:] == [
-        "-flush_packets",
-        "1",
+    assert argv[-3:] == [
         "-f",
         "flv",
         "rtmp://127.0.0.1:11936/relay-output",
@@ -132,6 +139,7 @@ def assert_normalizer_contract(normalizer) -> None:
     gate = normalizer.GrowthGate()
     assert gate.observe(100) is False
     assert gate.observe(110) is False
+    assert gate.observe(110) is False
     assert gate.observe(120) is True
     gate.reset()
     assert gate.observe(120) is False
@@ -143,8 +151,8 @@ def assert_normalizer_contract(normalizer) -> None:
     assert output_gate.observe(("connection-a", 120)) is True
     assert output_gate.observe(("connection-b", 130)) is False
 
-    assert normalizer.VERIFIED_STALL_TIMEOUT_SECONDS == 0.075
-    assert normalizer.OUTPUT_IDLE_FALLBACK_SECONDS == 0.5
+    assert normalizer.VERIFIED_STALL_TIMEOUT_SECONDS == 0.50
+    assert normalizer.OUTPUT_IDLE_FALLBACK_SECONDS == 0.90
     assert normalizer.REQUIRED_IDLE_OBSERVATIONS == 2
     assert normalizer.REQUIRED_VERIFIED_STALL_OBSERVATIONS == 3
     assert normalizer.METRICS_BLIND_TIMEOUT_SECONDS == 0.75
@@ -153,7 +161,7 @@ def assert_normalizer_contract(normalizer) -> None:
         + (2 * normalizer.MEDIA_POLL_INTERVAL_SECONDS)
         + normalizer.CHILD_STOP_GRACE_SECONDS
         + (1024 / 48000)
-        < 0.25
+        < 1.1
     )
     assert (
         normalizer.OUTPUT_IDLE_FALLBACK_SECONDS
@@ -166,18 +174,18 @@ def assert_normalizer_contract(normalizer) -> None:
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
     assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
-    assert watchdog.observe_output(True, ("connection-a", 120), 1.10) == (True, True)
-    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.10, 1.101) is True
-    assert watchdog.observe_output(True, ("connection-a", 120), 1.15) == (True, True)
-    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.15, 1.152) is False
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.49) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.49, 1.491) is True
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.552) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.552, 1.553) is False
 
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
     assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
-    assert watchdog.observe_output(True, ("connection-a", 120), 1.14) == (True, True)
-    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.14, 1.141) is True
-    assert watchdog.observe_output(True, ("connection-a", 120), 1.19) == (True, True)
-    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.19, 1.191) is False
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.60) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.60, 1.601) is True
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.61) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.61, 1.611) is False
 
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     for observed_at, ingest_counter in ((1.05, 500), (1.10, 501), (1.15, 502)):
@@ -195,10 +203,10 @@ def assert_normalizer_contract(normalizer) -> None:
 
     assert watchdog.observe_output(True, ("connection-a", 121), 1.21) == (True, True)
     assert watchdog.observe_ingest(True, ("ingest-a", 502), 1.21, 1.211) is True
-    assert watchdog.observe_output(True, ("connection-a", 121), 1.26) == (True, True)
-    assert watchdog.observe_ingest(True, ("ingest-a", 502), 1.26, 1.261) is True
-    assert watchdog.observe_output(True, ("connection-a", 121), 1.31) == (True, True)
-    assert watchdog.observe_ingest(True, ("ingest-a", 502), 1.31, 1.311) is False
+    assert watchdog.observe_output(True, ("connection-a", 121), 1.60) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 502), 1.60, 1.601) is True
+    assert watchdog.observe_output(True, ("connection-a", 121), 1.72) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 502), 1.72, 1.721) is False
 
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     for observed_at, ingest_counter in (
@@ -207,7 +215,8 @@ def assert_normalizer_contract(normalizer) -> None:
         (1.25, 502),
         (1.35, 503),
         (1.45, 504),
-        (1.499, 505),
+        (1.55, 505),
+        (1.899, 506),
     ):
         assert watchdog.observe_output(True, ("connection-a", 120), observed_at) == (
             True,
@@ -222,25 +231,43 @@ def assert_normalizer_contract(normalizer) -> None:
             )
             is True
         )
-    assert watchdog.observe_output(True, ("connection-a", 120), 1.501) == (False, False)
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.901) == (False, False)
 
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
     assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
     assert watchdog.observe_output(True, ("connection-a", 120), 1.10) == (True, True)
     assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.10, 1.30) is True
-    assert watchdog.observe_output(True, ("connection-a", 120), 1.31) == (True, True)
-    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.31, 1.311) is False
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.56) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.56, 1.561) is False
 
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
     assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
     assert watchdog.observe_output(True, ("connection-a", 120), 1.10) == (True, True)
     assert watchdog.observe_ingest(False, None, 1.10, 1.11) is True
-    assert watchdog.observe_output(True, ("connection-a", 120), 1.15) == (True, True)
-    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.15, 1.151) is True
-    assert watchdog.observe_output(True, ("connection-a", 120), 1.20) == (True, True)
-    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.20, 1.201) is False
+    assert watchdog.ingest_counter is None
+    assert watchdog.joint_idle_since is None
+    assert watchdog.joint_unchanged_observations == 0
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.11) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.11, 1.111) is True
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.55) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.55, 1.551) is True
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.62) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.62, 1.621) is False
+    watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
+    assert watchdog.observe_output(False, None, 1.10) == (True, False)
+    assert watchdog.ingest_counter is None
+    assert watchdog.joint_idle_since is None
+    assert watchdog.joint_unchanged_observations == 0
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.11) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.11, 1.111) is True
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.55) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.55, 1.551) is True
+    assert watchdog.observe_output(True, ("connection-a", 120), 1.62) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.62, 1.621) is False
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
     assert watchdog.observe_ingest(True, None, 1.05, 1.051) is False
@@ -280,6 +307,7 @@ def assert_normalizer_contract(normalizer) -> None:
         "ingest-identity",
         "ingest-regression",
         "verified-stall",
+        "ingest-confirmed-stall",
         "watchdog-unknown",
     }
     assert all(
@@ -287,6 +315,81 @@ def assert_normalizer_contract(normalizer) -> None:
         and token.replace("moblin-relay-normalize:restart:", "").replace("-", "").isalpha()
         for token in normalizer.RESTART_LOG_TOKENS.values()
     )
+    assert set(normalizer.RECOVERY_EVENT_TOKENS) == {
+        "threshold-reached",
+        "source-kicked",
+        "source-gone",
+        "credential-unavailable",
+        "api-unreachable",
+        "api-rejected",
+        "api-invalid-response",
+        "attempts-exhausted",
+        "source-resumed-before-reset",
+    }
+    assert all(
+        re.fullmatch(r"moblin-relay-normalize:recovery:[a-z-]+", token)
+        for token in normalizer.RECOVERY_EVENT_TOKENS.values()
+    )
+    assert normalizer.STATE_EVENT_TOKENS == {
+        "source-attached": "moblin-relay-normalize:state:source-attached",
+        "source-detached": "moblin-relay-normalize:state:source-detached",
+        "bridge-active": "moblin-relay-normalize:state:bridge-active",
+    }
+
+    confirmed_stall_grace = normalizer.CONFIRMED_INPUT_STALL_GRACE_SECONDS
+    assert confirmed_stall_grace == 6.0
+    confirmed_stall = normalizer.ConfirmedInputStallGate(source_id, 500, 1.0)
+    assert (
+        confirmed_stall.observe(
+            True,
+            (source_id, 500),
+            1.0 + confirmed_stall_grace - 0.001,
+        )
+        is False
+    )
+    assert confirmed_stall.observe(True, (source_id, 500), 1.0 + confirmed_stall_grace) is True
+    confirmed_stall = normalizer.ConfirmedInputStallGate(source_id, 500, 1.0)
+    assert confirmed_stall.observe(False, None, 6.9) is False
+    assert confirmed_stall.observe(True, (source_id, 500), 7.0) is False
+    assert confirmed_stall.observe(True, (source_id, 501), 8.0) is False
+    assert confirmed_stall.observe(True, (source_id, 501), 13.999) is False
+    assert confirmed_stall.observe(True, (source_id, 501), 14.0) is False
+    assert confirmed_stall.observe(True, (source_id, 501), 14.001) is True
+
+    circuit = normalizer.RecoveryCircuitBreaker(source_id)
+    for observed_at in (1.0, 2.0, 3.0):
+        assert circuit.record_failure("verified-stall", observed_at) is False
+    assert len(circuit.failures) == 0
+    assert circuit.record_failure("output-fallback", 3.5) is False
+    assert circuit.record_failure("child-exit", 4.0) is False
+    assert circuit.record_failure("output-start-timeout", 5.0) is False
+    assert circuit.record_failure("output-regression", 6.0) is False
+    assert circuit.opened is False
+    assert len(circuit.failures) == 0
+    assert not normalizer.SOURCE_RESET_ELIGIBLE_REASONS
+
+    circuit = normalizer.RecoveryCircuitBreaker(source_id)
+    assert circuit.open_after_confirmed_input_stall(500, 10.0) is True
+    assert circuit.reason == "ingest-confirmed-stall"
+    assert circuit.should_attempt(10.0) is False
+    assert circuit.observe_before_reset(True, (source_id, 500), 10.05) == "wait"
+    assert circuit.observe_before_reset(True, (source_id, 500), 10.10) == "ready"
+    assert circuit.should_attempt(10.10) is True
+    assert circuit.open_after_confirmed_input_stall(500, 11.0) is False
+    assert circuit.observe_before_reset(True, (source_id, 501), 10.11) == "resumed"
+    assert circuit.cancel_after_source_resumed() is True
+
+    circuit = normalizer.RecoveryCircuitBreaker(source_id)
+    for observed_at in (1.0, 2.0, 3.0):
+        assert circuit.record_failure("metrics-blind", observed_at) is False
+    assert circuit.opened is False
+    assert len(circuit.failures) == 0
+    assert circuit.record_failure("child-exit", 4.0) is False
+    assert circuit.record_failure("child-exit", 35.0) is False
+    assert circuit.record_failure("child-exit", 36.0) is False
+    assert circuit.record_failure("child-exit", 37.0) is False
+
+    assert_control_api_contract(normalizer, source_id)
 
     environment = normalizer.sanitized_environment(18554, 11936, 19998, source_id)
     assert environment == {
@@ -298,10 +401,148 @@ def assert_normalizer_contract(normalizer) -> None:
         "MOBLIN_RELAY_INTERNAL_METRICS_PORT": "19998",
         "MOBLIN_RELAY_INTERNAL_SRT_CONNECTION_ID": source_id,
     }
+    test_token_path = PurePosixPath("/var/lib/moblin-relay/tests/.run-contract/control-api.token")
+    test_environment = normalizer.sanitized_environment(
+        18554,
+        11936,
+        19998,
+        source_id,
+        29997,
+        test_token_path,
+    )
+    assert test_environment["MOBLIN_RELAY_INTERNAL_CONTROL_API_PORT"] == "29997"
+    assert test_environment["MOBLIN_RELAY_INTERNAL_CONTROL_TOKEN_FILE"] == str(test_token_path)
+    for rejected in (
+        "/tmp/control-api.token",  # noqa: S108 - deliberately rejected fixture
+        "/var/lib/moblin-relay/tests/control-api.token",
+        "/var/lib/moblin-relay/tests/.run-a/../control-api.token",
+    ):
+        try:
+            normalizer.validated_control_token_path(rejected)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unsafe control credential path was accepted")
+
+
+def assert_control_api_contract(normalizer, source_id: str) -> None:
+    token_value = b"A" * 43
+    issued_tokens: list[bytearray] = []
+    requests: list[tuple[str, str, str, int, float]] = []
+
+    class FakeResponse:
+        def __init__(self, status: int, payload: bytes = b'{"status":"ok"}') -> None:
+            self.status = status
+            self.payload = payload
+
+        def read(self, limit: int) -> bytes:
+            assert limit == normalizer.CONTROL_API_RESPONSE_LIMIT_BYTES + 1
+            return self.payload[:limit]
+
+    class FakeConnection:
+        response = FakeResponse(200)
+
+        def __init__(self, host: str, port: int, timeout: float) -> None:
+            self.host = host
+            self.port = port
+            self.timeout = timeout
+
+        def request(
+            self,
+            method: str,
+            path: str,
+            *,
+            body: bytes,
+            headers: dict[str, str],
+        ) -> None:
+            assert body == b""
+            assert headers["Connection"] == "close"
+            assert headers["Content-Length"] == "0"
+            scheme, encoded = headers["Authorization"].split(" ", 1)
+            assert scheme == "Basic"
+            assert base64.b64decode(encoded) == b"relay-recovery:" + token_value
+            requests.append((method, path, self.host, self.port, self.timeout))
+
+        def getresponse(self) -> FakeResponse:
+            return self.response
+
+        def close(self) -> None:
+            pass
+
+    def issue_token(_path: Path) -> bytearray:
+        token = bytearray(token_value)
+        issued_tokens.append(token)
+        return token
+
+    with (
+        patch.object(normalizer, "read_control_token", issue_token),
+        patch.object(normalizer.http.client, "HTTPConnection", FakeConnection),
+    ):
+        result = normalizer.kick_srt_source(
+            29997,
+            source_id,
+            Path("/unused-by-fixture"),
+        )
+        assert result == "source-kicked"
+        assert requests == [
+            (
+                "POST",
+                "/v3/srtconns/kick/" + source_id,
+                "127.0.0.1",
+                29997,
+                normalizer.CONTROL_API_REQUEST_TIMEOUT_SECONDS,
+            )
+        ]
+        assert issued_tokens and not any(issued_tokens[0])
+
+        FakeConnection.response = FakeResponse(404)
+        assert normalizer.kick_srt_source(29997, source_id, Path("/unused")) == "source-gone"
+        FakeConnection.response = FakeResponse(401)
+        assert normalizer.kick_srt_source(29997, source_id, Path("/unused")) == "api-rejected"
+        FakeConnection.response = FakeResponse(
+            200,
+            b"x" * (normalizer.CONTROL_API_RESPONSE_LIMIT_BYTES + 1),
+        )
+        assert (
+            normalizer.kick_srt_source(29997, source_id, Path("/unused")) == "api-invalid-response"
+        )
+
+    class FailedConnection:
+        def __init__(self, *_args, **_kwargs) -> None:
+            raise OSError("fixture endpoint unavailable")
+
+    with (
+        patch.object(normalizer, "read_control_token", issue_token),
+        patch.object(normalizer.http.client, "HTTPConnection", FailedConnection),
+    ):
+        assert normalizer.kick_srt_source(29997, source_id, Path("/unused")) == "api-unreachable"
+    assert not any(issued_tokens[-1])
+    assert token_value.decode("ascii") not in repr(requests)
+
+    with patch.object(
+        normalizer,
+        "read_control_token",
+        side_effect=ValueError("fixture credential unavailable"),
+    ):
+        assert (
+            normalizer.kick_srt_source(29997, source_id, Path("/unused"))
+            == "credential-unavailable"
+        )
+    try:
+        normalizer.kick_srt_source(
+            29997,
+            "invalid/path?query=secret",
+            Path("/unused"),
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unbound SRT source identity was accepted")
 
 
 def assert_preview_contract(renderer) -> None:
     token = b"renderer-preview-test-token-0123456789AB"
+    control_token = b"C" * 43
     config = renderer.build_runtime_config(
         "test_publisher",
         "publisher-password-0123456789",
@@ -309,6 +550,7 @@ def assert_preview_contract(renderer) -> None:
         "rtmps://example.invalid/live2",
         "test-youtube-key",
         token,
+        control_token,
     )
     assert config["hls"] is True
     assert config["hlsAddress"] == "127.0.0.1:8888"
@@ -326,8 +568,13 @@ def assert_preview_contract(renderer) -> None:
     assert config["rtspTransports"] == ["tcp"]
     assert config["rtmp"] is True
     assert config["rtmpAddress"] == "127.0.0.1:1935"
-    for feature in ("api", "playback", "webrtc"):
+    for feature in ("playback", "webrtc"):
         assert config[feature] is False
+    assert config["api"] is True
+    assert config["apiAddress"] == "127.0.0.1:9997"
+    assert config["apiEncryption"] is False
+    assert config["apiAllowOrigins"] == []
+    assert config["apiTrustedProxies"] == []
 
     ingest = config["paths"]["iphone-live"]
     output = config["paths"]["relay-output"]
@@ -337,7 +584,11 @@ def assert_preview_contract(renderer) -> None:
     assert "forward" not in ingest
     assert output["alwaysAvailable"] is True
     assert output["alwaysAvailableFile"] == renderer.SLATE_FILE
-    assert output["forward"] == [{"dest": "rtmps://example.invalid/live2#test-youtube-key"}]
+    assert output["forward"] == [
+        {"dest": "rtmps://example.invalid/live2#test-youtube-key"}
+    ]
+    assert "runOnAvailable" not in output
+    assert set(config["paths"]) == {"iphone-live", "relay-output"}
 
     users = [item for item in config["authInternalUsers"] if item["user"] == "relay-preview"]
     assert len(users) == 1
@@ -350,6 +601,34 @@ def assert_preview_contract(renderer) -> None:
     }
     assert token.decode("ascii") not in json.dumps(config, sort_keys=True)
 
+    recovery_users = [
+        item for item in config["authInternalUsers"] if item["user"] == "relay-recovery"
+    ]
+    assert len(recovery_users) == 1
+    control_hash = base64.b64encode(hashlib.sha256(control_token).digest()).decode("ascii")
+    assert recovery_users[0] == {
+        "user": "relay-recovery",
+        "pass": f"sha256:{control_hash}",
+        "ips": ["127.0.0.1", "::1"],
+        "permissions": [{"action": "api"}],
+    }
+    assert control_token.decode("ascii") not in json.dumps(config, sort_keys=True)
+    anonymous = [item for item in config["authInternalUsers"] if item["user"] == "any"]
+    assert len(anonymous) == 1
+    assert not any(permission["action"] == "api" for permission in anonymous[0]["permissions"])
+    assert {tuple(permission.items()) for permission in anonymous[0]["permissions"]} == {
+        (("action", "metrics"),),
+        (("action", "read"), ("path", "iphone-live")),
+        (("action", "publish"), ("path", "relay-output")),
+    }
+
+    generated = renderer.generate_control_token()
+    assert isinstance(generated, bytearray)
+    assert len(generated) == 43
+    assert renderer.CONTROL_TOKEN_PATTERN.fullmatch(generated)
+    for index in range(len(generated)):
+        generated[index] = 0
+
     disabled = renderer.build_runtime_config(
         "test_publisher",
         "publisher-password-0123456789",
@@ -357,6 +636,7 @@ def assert_preview_contract(renderer) -> None:
         "rtmps://example.invalid/live2",
         "test-youtube-key",
         None,
+        control_token,
     )
     assert disabled["hls"] is False
     assert "hlsAddress" not in disabled
@@ -422,7 +702,7 @@ def main() -> int:
     assert_preview_contract(renderer)
     assert_token_reader_contract(renderer)
     assert_normalizer_contract(load_normalizer())
-    print("Renderer and audio normalizer contract: PASS")
+    print("Renderer and normalizer contract: PASS")
     return 0
 
 
