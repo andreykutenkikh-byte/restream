@@ -52,6 +52,11 @@ instead of attempting to consume the one-time token again. The HTML exposes only
 paired/not-paired boolean, never the cookie value. With no valid session, a consumed or
 expired link still requires a new administrator-issued pairing link.
 
+Saved-link reopening is supported both as a new page and as a same-document fragment
+navigation. The latter erases the fragment and reuses only an already confirmed session;
+it cannot revive a revoked session. For a genuinely new pairing after revocation, open
+the administrator-issued link as a fresh page, not just a fragment change in the old one.
+
 ## What the HUD shows
 
 The compact view shows the current server, LIVE/SLATE/NONE source, input bitrate and

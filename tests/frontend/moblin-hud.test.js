@@ -546,6 +546,9 @@ test("pagehide/pageshow resumes the same initialized page and logout stays termi
   harness.window.dispatch("pagehide");
   assert.equal(harness.timers.size, 0);
   harness.window.document.dispatch("visibilitychange");
+  harness.window.location.hash = `#pair=${validToken}`;
+  harness.window.dispatch("hashchange");
+  assert.equal(harness.window.location.hash, "");
   assert.equal(harness.timers.size, 0);
   harness.window.dispatch("pageshow");
   await runImmediatePoll(harness);
@@ -557,6 +560,36 @@ test("pagehide/pageshow resumes the same initialized page and logout stays termi
   harness.window.document.dispatch("visibilitychange");
   assert.equal(harness.timers.size, 0);
   assert.equal(harness.window.document.body.dataset.hudState, "revoked");
+});
+
+test("same-document pairing-link reopen clears its fragment and reuses the confirmed session", async () => {
+  const harness = ordinaryScriptWindow({ hash: `#pair=${validToken}` });
+  vm.runInNewContext(javascript, { window: harness.window });
+  await runImmediatePoll(harness);
+  const instance = initializeHud(harness.window);
+  harness.window.location.hash = `#pair=${validToken}`;
+  harness.window.dispatch("hashchange");
+  assert.equal(harness.window.location.hash, "");
+  await runImmediatePoll(harness);
+  assert.equal(initializeHud(harness.window), instance);
+  assert.deepEqual(harness.requests, [
+    "/moblin-hud/api/pair", "/moblin-hud/api/status", "/moblin-hud/api/status",
+  ]);
+  harness.window.dispatch("pagehide");
+});
+
+test("a new fragment alone cannot pair or revive an unconfirmed HUD document", async () => {
+  const harness = ordinaryScriptWindow();
+  vm.runInNewContext(javascript, { window: harness.window });
+  await flushMicrotasks();
+  const pendingTimers = [...harness.timers.keys()];
+  harness.window.location.hash = `#pair=${validToken}`;
+  harness.window.dispatch("hashchange");
+  await flushMicrotasks();
+  assert.equal(harness.window.location.hash, "");
+  assert.deepEqual(harness.requests, []);
+  assert.deepEqual([...harness.timers.keys()], pendingTimers);
+  harness.window.dispatch("pagehide");
 });
 
 test("alert patterns use one, two, and three tones", async () => {
