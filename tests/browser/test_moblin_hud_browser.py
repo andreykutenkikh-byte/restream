@@ -312,7 +312,8 @@ def test_ordinary_hud_browser_contract(
         initial = first.value.json()
         assert initial["stream_state"] == "idle"
         assert page.locator('script[src*="moblin-hud.js"]').count() == 1
-        assert page.url == fixture.origin + "/moblin-hud"
+        clean_url = page.url == fixture.origin + "/moblin-hud"
+        assert clean_url, "HUD did not remove its pairing fragment"
         cookies = [cookie for cookie in context.cookies() if cookie["name"] == HUD_SESSION_COOKIE]
         assert len(cookies) == 1
         cookie = cookies[0]
@@ -382,20 +383,39 @@ def test_ordinary_hud_browser_contract(
         assert _poll(page)["recommendation"]["action"] in {"watch", "stay"}
         assert page.evaluate("window.__hudSmoke.maximum") == 1
 
-        # The same consumed link now carries a valid cookie; no replay POST/401.
+        # A saved link can reopen in the same document, without loading the script again.
         before_pair_requests = sum(urlsplit(url).path.endswith("/api/pair") for url in request_urls)
         page.wait_for_function("() => window.__hudSmoke.active === 0")
         with page.expect_response(
             lambda response: urlsplit(response.url).path == "/moblin-hud/api/status"
         ) as reopened:
-            page.goto(pairing["pairing_url"], wait_until="load")
+            page.evaluate("fragment => { location.hash = fragment; }", arg=f"pair={pair_token}")
         assert reopened.value.status == 200
+        assert page.evaluate(
+            "window.__hudSmoke.instance === document[Symbol.for('adojapan.moblinHud.instance')]"
+        )
         assert (
             sum(urlsplit(url).path.endswith("/api/pair") for url in request_urls)
             == before_pair_requests
         )
-        assert page.url == fixture.origin + "/moblin-hud"
+        clean_url = page.url == fixture.origin + "/moblin-hud"
+        assert clean_url, "Same-document pairing reopen left its fragment visible"
         assert not page_errors and not console_errors
+
+        # A separate full-document load must reuse the cookie too, without a pair POST.
+        page.wait_for_function("() => window.__hudSmoke.active === 0")
+        page.goto("about:blank")
+        with page.expect_response(
+            lambda response: urlsplit(response.url).path == "/moblin-hud/api/status"
+        ) as full_reopen:
+            page.goto(pairing["pairing_url"], wait_until="load")
+        assert full_reopen.value.status == 200
+        assert (
+            sum(urlsplit(url).path.endswith("/api/pair") for url in request_urls)
+            == before_pair_requests
+        )
+        clean_url = page.url == fixture.origin + "/moblin-hud"
+        assert clean_url, "Full-document pairing reopen left its fragment visible"
 
         # Exercise persisted-page lifecycle in the real engine, plus a real navigation return.
         page.wait_for_function("() => window.__hudSmoke.active === 0")

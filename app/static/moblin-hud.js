@@ -539,10 +539,12 @@
       let terminalSession = false;
       let pageSuspended = false;
       let pairingFinished = false;
+      let sessionConfirmed = false;
       const poller = new HudPoller({
         fetchFn: windowObject.fetch.bind(windowObject),
         isHidden: () => documentObject.hidden,
         onStatus(status) {
+          sessionConfirmed = true;
           renderer.render(status);
           audio.notify(previousLevel, status.health.level);
           previousLevel = status.health.level;
@@ -553,6 +555,7 @@
         },
         onRevoked() {
           terminalSession = true;
+          sessionConfirmed = false;
           previousLevel = null;
           renderer.offline("revoked");
         },
@@ -577,6 +580,7 @@
       });
       select(documentObject, "logout")?.addEventListener("click", async () => {
         terminalSession = true;
+        sessionConfirmed = false;
         poller.stop();
         audio.destroy();
         try {
@@ -608,6 +612,17 @@
       windowObject.addEventListener("pageshow", () => {
         pageSuspended = false;
         if (!terminalSession && pairingFinished) poller.start();
+      });
+      windowObject.addEventListener("hashchange", () => {
+        if (!windowObject.location.hash) return;
+        windowObject.history.replaceState(
+          null, "", `${windowObject.location.pathname}${windowObject.location.search || ""}`,
+        );
+        // Reopening a saved link may be a same-document navigation. Reuse only
+        // an already confirmed session; a new pairing requires a fresh page.
+        if (sessionConfirmed && pairingFinished && !terminalSession && !pageSuspended) {
+          poller.restart(0);
+        }
       });
 
       const pairController = new windowObject.AbortController();
