@@ -227,6 +227,14 @@ uses explicit function predicates throughout. CSP was neither bypassed nor weake
 all browser assertions and both required engines remain. A regression checks this
 test contract. That original failed run is not accepted as final browser success.
 
+The next browser run reached source-loss/recovery and the held-request checks, then
+found that reopening the saved pairing link could be a same-document fragment navigation.
+No script reinitialization occurs on that path. A hashchange handler now erases the
+fragment and reuses the confirmed session without token replay or another controller.
+The real fixture separately checks same-document and full-page cookie reuse. Revoked
+or unconfirmed documents cannot gain a session from a fragment event alone. URL-failure
+assertions expose only booleans, not temporary fixture token values.
+
 The PR descriptions record the final exact HEADs, CI run URLs and results. A final-review
 declaration requires both complete exact-head runs to succeed, including native media
 and both browser engines. Both PRs stay Draft, and even full code CI does not remove the
