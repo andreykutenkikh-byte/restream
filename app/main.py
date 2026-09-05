@@ -25,6 +25,8 @@ from app.core.validation import destination_validator
 from app.db import Database
 from app.logging_config import configure_logging
 from app.login_limiter import LoginRateLimiter
+from app.moblin_hud_api import HudBodyLimitMiddleware, HudRateLimiter
+from app.moblin_hud_api import router as moblin_hud_router
 from app.node_api import NodeBodyLimitMiddleware, NodeCommandPollGate, NodeEnrollmentGate
 from app.node_api import router as node_router
 from app.relay_api import router as relay_router
@@ -36,9 +38,11 @@ from app.services.bootstrap import (
     UnavailableBootstrapCoordinator,
 )
 from app.services.mediamtx import MediaMTXClient
+from app.services.moblin_hud import MoblinHudService
 from app.services.nodes import NodeService
 from app.services.preview import PreviewService
 from app.services.relay_preview import RelayPreviewStore
+from app.services.relay_quality import RelayQualityTracker
 from app.services.relays import RelayService
 from app.session import SessionManager
 from app.step_up_limiter import StepUpRateLimiter
@@ -74,6 +78,7 @@ def create_app(
         password=settings.worker_auth_password,
     )
     relays = RelayService(database, settings.master_encryption_key)
+    moblin_hud = MoblinHudService(database)
     relay_preview = RelayPreviewStore()
     nodes = NodeService(
         database,
@@ -105,6 +110,7 @@ def create_app(
                 try:
                     nodes.prune_retention()
                     relays.prune_retention()
+                    moblin_hud.prune_expired_pairings()
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -160,6 +166,14 @@ def create_app(
     app.state.login_limiter = LoginRateLimiter()
     app.state.relay_step_up_limiter = StepUpRateLimiter()
     app.state.bootstrap_limiter = BootstrapRateLimiter()
+    app.state.moblin_hud = moblin_hud
+    app.state.relay_quality = RelayQualityTracker()
+    app.state.moblin_hud_pair_limiter = HudRateLimiter(attempts=8, window_seconds=60)
+    app.state.moblin_hud_admin_limiter = HudRateLimiter(attempts=6, window_seconds=60)
+    app.state.moblin_hud_status_lock = asyncio.Lock()
+    app.state.moblin_hud_status_cached_at = None
+    app.state.moblin_hud_status_cache = None
+    app.state.moblin_hud_status_observations = {}
     app.state.nodes = nodes
     app.state.relays = relays
     app.state.relay_preview = relay_preview
@@ -179,12 +193,14 @@ def create_app(
     )
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
     app.add_middleware(NodeBodyLimitMiddleware)
+    app.add_middleware(HudBodyLimitMiddleware)
     app.mount("/static", StaticFiles(directory=PACKAGE_DIR / "static"), name="static")
     app.include_router(router)
     app.include_router(node_router)
     app.include_router(relay_router)
     app.include_router(relay_preview_router)
     app.include_router(bootstrap_router)
+    app.include_router(moblin_hud_router)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Callable[..., Any]) -> Any:
@@ -196,7 +212,8 @@ def create_app(
         ):
             relay_preview.clear()
         response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["Referrer-Policy"] = "same-origin"
+        hud_path = request.url.path.startswith(("/moblin-hud", "/api/moblin-hud"))
+        response.headers["Referrer-Policy"] = "no-referrer" if hud_path else "same-origin"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
         response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
@@ -208,7 +225,7 @@ def create_app(
             "base-uri 'none'; form-action 'self'"
         )
         if request.url.path.startswith(
-            ("/api/", "/node-api/", "/relay-agent/", "/relay-media/")
+            ("/api/", "/node-api/", "/relay-agent/", "/relay-media/", "/moblin-hud")
         ) or request.url.path in {
             "/",
             "/login",
