@@ -77,6 +77,50 @@ cause of the network or video failures.
 
 ## Operations
 
+### HK installation result
+
+The checked update was applied on HK. Read-only preflight verified the audited
+before-hashes; the transaction created
+`/var/backups/adojapan-relay-observability-20260905T164627447789Z` before replacing
+these eight files atomically:
+
+| Installed file | Repository source |
+| --- | --- |
+| `/usr/local/sbin/relayctl` | `deploy/moblin-relay/relayctl` |
+| `/opt/moblin-relay/libexec/moblin-relay-normalize` | `deploy/moblin-relay/moblin-relay-normalize` |
+| `/usr/local/libexec/moblin-relay-render-config` | `deploy/moblin-relay/moblin-relay-render-config` |
+| `/etc/systemd/system/moblin-relay.service` | `deploy/moblin-relay/moblin-relay.service` |
+| `/usr/local/lib/adojapan-relay-agent/relay_agent/broker.py` | `relay_agent/broker.py` |
+| `/usr/local/lib/adojapan-relay-agent/relay_agent/history.py` | `relay_agent/history.py` |
+| `/etc/systemd/system/adojapan-relay-broker.service` | `deploy/hk-relay-agent/adojapan-relay-broker.service` |
+| `/etc/tmpfiles.d/adojapan-relay-agent.conf` | `deploy/hk-relay-agent/adojapan-relay-agent.tmpfiles` |
+
+The installed broker had an older fixed-host URL interface than the existing
+portable relayctl. Pairing it with the repository version also preserves the
+current `node.json`-based URL builder and its validation; no key was regenerated.
+
+Post-update checks:
+
+- Real Unix-socket `status` request as `restream-agent`: `ok`, no error code,
+  no secret result, relay `inactive`, `enabled=false`.
+- Twelve persisted samples over 55 seconds, five-second spacing, state `NONE` /
+  `service_inactive`; bitrate/RTT remained unavailable, correctly not zero, with
+  no running stream. Root-only directory/database modes were `0700` / `0600`.
+- `relayctl history` read-only text export succeeded. A repeated deployment
+  preflight reported `NOOP-ALREADY-CURRENT`.
+- Protected fingerprints matched: relay secrets, node/preview credentials,
+  node configuration, install manifest, slate text/video, MediaMTX binary,
+  baseline backups and the existing command-journal rollback file.
+- Existing agent, broker and socket were restored to their prior active states.
+  The actual relay remained inactive and disabled throughout the update.
+
+The root-private transaction backup contains each old file plus `metadata.json`
+with its original target, owner/mode and checksum. A manual rollback must stop
+the control agent and idle broker, restore only those exact files, remove the
+new `history.py` only after matching its recorded checksum, reload systemd, and
+restore the previous control-service states. Preserve the history database and
+all relay secrets/baselines; do not start the relay as part of rollback.
+
 Pair the renderer, normalizer, relay unit and relayctl with the matching broker
 package, broker unit and tmpfiles definition. Create the root-only history
 directory before restarting the existing broker. Preserve source backups and
