@@ -328,6 +328,86 @@ def safe_bootstrap_diagnostic_code(payload: Mapping[str, Any]) -> str:
     return "unknown"
 
 
+_MEDIA_DIAGNOSTIC_MARKERS = frozenset(
+    {
+        "attached",
+        "active",
+        "detached",
+        "child-exit",
+        "start-timeout",
+        "metrics-blind",
+        "output-identity",
+        "output-regression",
+        "output-fallback",
+        "ingest-timing",
+        "ingest-missing",
+        "ingest-identity",
+        "ingest-regression",
+        "verified-stall",
+        "ingest-confirmed-stall",
+        "watchdog-unknown",
+        "reset-requested",
+        "reset-succeeded",
+    }
+)
+_MEDIA_FIRST_SEEN_MARKERS = frozenset({"attached", "active", "start-timeout", "child-exit"})
+
+
+def _diagnostic_seconds(value: Any, maximum: float = 660) -> bool:
+    # Compare the bound before isfinite so enormous JSON integers cannot overflow.
+    return type(value) in {int, float} and 0 <= value <= maximum and math.isfinite(value)
+
+
+def _safe_failure_media(value: Any) -> dict[str, Any] | None:
+    """Reject the entire nested diagnostic on any non-schema value; never reflect text."""
+    required = {"scope", "elapsed_seconds", "log_ok", "markers", "first_seen"}
+    optional = {"supervisor_count", "child_count", "supervisor_seen_seconds", "child_seen_seconds"}
+    reader = {"reader_input", "reader_output", "reader_frames"}
+    if not isinstance(value, dict) or not required <= value.keys():
+        return None
+    scope = value.get("scope")
+    if not isinstance(scope, str) or scope not in {"crash", "capture"}:
+        return None
+    if scope == "capture":
+        required |= reader
+    if not required <= value.keys() or not value.keys() <= required | optional:
+        return None
+    elapsed = value["elapsed_seconds"]
+    if not _diagnostic_seconds(elapsed) or type(value["log_ok"]) is not bool:
+        return None
+    markers, first_seen = value["markers"], value["first_seen"]
+    if (
+        not isinstance(markers, dict)
+        or not markers.keys() <= _MEDIA_DIAGNOSTIC_MARKERS
+        or any(type(count) is not int or not 1 <= count <= 255 for count in markers.values())
+        or not isinstance(first_seen, dict)
+        or not first_seen.keys() <= _MEDIA_FIRST_SEEN_MARKERS & markers.keys()
+        or any(not _diagnostic_seconds(seconds, elapsed) for seconds in first_seen.values())
+    ):
+        return None
+    for name in ("supervisor_count", "child_count"):
+        if name in value and (type(value[name]) is not int or not 0 <= value[name] <= 32):
+            return None
+    for name in ("supervisor_seen_seconds", "child_seen_seconds"):
+        if name in value and not _diagnostic_seconds(value[name], elapsed):
+            return None
+    if scope == "capture" and (
+        type(value["reader_input"]) is not bool
+        or type(value["reader_output"]) is not bool
+        or type(value["reader_frames"]) is not int
+        or not 0 <= value["reader_frames"] <= 10000
+    ):
+        return None
+    result = dict(value)
+    result["elapsed_seconds"] = round(elapsed, 3)
+    result["markers"] = dict(markers)
+    result["first_seen"] = {name: round(seconds, 3) for name, seconds in first_seen.items()}
+    for name in ("supervisor_seen_seconds", "child_seen_seconds"):
+        if name in result:
+            result[name] = round(result[name], 3)
+    return result
+
+
 def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
     """Only fixed stage names and bounded numbers may reach the CI log."""
     unavailable = {"progress": "unavailable"}
@@ -339,6 +419,8 @@ def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
     failure_lines = payload.get("failure_lines")
     failure_flags = payload.get("failure_flags")
     failure_wait = payload.get("failure_wait_seconds")
+    failure_media = payload.get("failure_media")
+    safe_media = _safe_failure_media(failure_media) if failure_media is not None else None
     allowed_flags = {
         "live",
         "normalized",
@@ -386,6 +468,7 @@ def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
                 or not math.isfinite(failure_wait)
             )
         )
+        or (failure_media is not None and safe_media is None)
     ):
         return unavailable
     result: dict[str, Any] = {"stage": stage, "elapsed_seconds": round(elapsed, 3)}
@@ -397,6 +480,8 @@ def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
         result["failure_flags"] = failure_flags
     if failure_wait is not None:
         result["failure_wait_seconds"] = round(failure_wait, 3)
+    if safe_media is not None:
+        result["failure_media"] = safe_media
     return result
 
 
@@ -424,7 +509,7 @@ try:
     before = path.lstat()
     if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0
             or stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != 1
-            or not 0 < before.st_size <= 1024
+            or not 0 < before.st_size <= 2048
             or not -5 <= time.time() - before.st_mtime <= 960):
         raise ValueError('unavailable')
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -432,19 +517,19 @@ try:
         after = os.fstat(handle.fileno())
         if before != after:
             raise ValueError('unavailable')
-        raw = handle.read(1025)
-    if len(raw) > 1024:
+        raw = handle.read(2049)
+    if len(raw) > 2048:
         raise ValueError('unavailable')
     value = json.loads(raw)
     if not isinstance(value, dict):
         raise ValueError('unavailable')
     print(json.dumps({key: value.get(key) for key in
         ('job_id', 'stage', 'elapsed_seconds', 'strict_segment_index', 'failure_lines',
-         'failure_flags', 'failure_wait_seconds')}))
+         'failure_flags', 'failure_wait_seconds', 'failure_media')}))
 except (OSError, ValueError):
     print('{}')
 """,
-            max_capture_bytes=2048,
+            max_capture_bytes=4096,
         )
         diagnostic = safe_self_test_progress(json.loads(result.stdout), job_id=job_id)
     except (ValueError, SmokeFailure):

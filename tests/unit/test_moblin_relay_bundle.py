@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import io
 import json
 import os
 import re
@@ -51,6 +52,328 @@ def load_self_test() -> dict[str, object]:
 
 def load_normalizer() -> dict[str, object]:
     return runpy.run_path(str(NORMALIZER), run_name="_moblin_normalizer_test")
+
+
+def test_capture_reader_diagnostic_discards_secret_text_and_bounds_lines() -> None:
+    namespace = load_self_test()
+    reader = namespace["CaptureReaderProgress"]()
+    reader.drain(
+        io.BytesIO(
+            b"PRIVATE_READER_FIXTURE rtmps://private.invalid/live#private\n"
+            b"Input #0, flv, from 'PRIVATE_INPUT':\n"
+            b"Output #0, flv, to 'PRIVATE_OUTPUT':\n" + b"e" * 5000 + b"\n"
+        ),
+        progress=False,
+    )
+    reader.drain(io.BytesIO(b"frame=3\nframe=90\nframe=12\nframe=PRIVATE\n"), progress=True)
+    assert reader.snapshot() == {"reader_input": True, "reader_output": True, "reader_frames": 90}
+    assert "PRIVATE" not in repr(vars(reader))
+    assert "rtmps" not in repr(vars(reader))
+
+
+def test_capture_reader_diagnostic_inspection_budget_keeps_draining() -> None:
+    namespace = load_self_test()
+    reader = namespace["CaptureReaderProgress"]()
+    pipe = io.BytesIO(b"x" * (1024 * 1024 + 4096) + b"\nInput #0, flv, from 'secret':\n")
+    reader.drain(pipe, progress=False)
+    assert pipe.tell() == len(pipe.getvalue())
+    assert reader.snapshot()["reader_input"] is False
+
+
+def test_capture_reader_real_dual_pipe_flood_cannot_deadlock_or_return_text() -> None:
+    namespace = load_self_test()
+    reader = namespace["CaptureReaderProgress"]()
+    result = namespace["run_capture_reader"](
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stderr.write('x'*200000+'\\nInput #0, flv, from secret:\\n'); "
+            "sys.stderr.flush(); sys.stdout.write('y'*200000+'\\nframe=90\\n'); sys.stdout.flush()",
+        ],
+        reader,
+        timeout=10,
+    )
+    assert result.returncode == 0
+    assert result.stdout is None and result.stderr is None
+    assert reader.snapshot() == {"reader_input": True, "reader_output": False, "reader_frames": 90}
+
+
+def test_capture_reader_timeout_reaps_child_and_retains_only_safe_progress(monkeypatch) -> None:
+    namespace = load_self_test()
+    reader = namespace["CaptureReaderProgress"]()
+    created = []
+    original = subprocess.Popen
+
+    def record_process(*args, **kwargs):
+        child = original(*args, **kwargs)
+        created.append(child)
+        return child
+
+    monkeypatch.setattr(subprocess, "Popen", record_process)
+    with pytest.raises(subprocess.TimeoutExpired):
+        namespace["run_capture_reader"](
+            [
+                sys.executable,
+                "-c",
+                "import sys,time; "
+                "print('Input #0, flv, from PRIVATE:', file=sys.stderr, flush=True); "
+                "print('frame=5', flush=True); time.sleep(10)",
+            ],
+            reader,
+            timeout=0.3,
+        )
+    assert created and all(child.poll() is not None for child in created)
+    assert reader.snapshot() == {"reader_input": True, "reader_output": False, "reader_frames": 5}
+    assert "PRIVATE" not in repr(vars(reader))
+
+
+def test_capture_reader_nonzero_exit_is_not_promoted_to_success() -> None:
+    namespace = load_self_test()
+    result = namespace["run_capture_reader"](
+        [sys.executable, "-c", "import sys; sys.exit(7)"],
+        namespace["CaptureReaderProgress"](),
+        timeout=10,
+    )
+    assert result.returncode == 7
+
+
+@pytest.mark.parametrize("failure", ["timeout", "nonzero", "incomplete"])
+def test_strict_capture_diagnostics_preserve_deadline_assertions_and_partial_cleanup(
+    monkeypatch, tmp_path, failure
+):
+    namespace = load_self_test()
+    capture = namespace["capture_final_sink_media_segment"]
+    guarded = []
+
+    def failed_reader(command, diagnostic, *, timeout):
+        assert timeout == 15
+        assert command[command.index("-frames:v") + 1] == "90"
+        assert command[command.index("-c") + 1] == "copy"
+        assert "-xerror" in command
+        assert command[command.index("-progress") + 1] == "pipe:1"
+        assert guarded == [command]
+        Path(command[-1]).write_bytes(b"partial fixture")
+        diagnostic.observe_line(b"frame=2", progress=True)
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(command, timeout, stderr=b"PRIVATE_STDERR")
+        return subprocess.CompletedProcess(command, 7 if failure == "nonzero" else 0)
+
+    monkeypatch.setitem(capture.__globals__, "run_capture_reader", failed_reader)
+    reader = namespace["CaptureReaderProgress"]()
+    reason = {
+        "timeout": "strict RTMP sink media read timed out",
+        "nonzero": "strict RTMP sink media read failed",
+        "incomplete": "strict RTMP sink media capture is incomplete",
+    }[failure]
+    with pytest.raises(namespace["TestFailure"], match=f"^{reason}$") as error:
+        capture(tmp_path, 1, guarded.append, reader_diagnostic=reader)
+    assert "PRIVATE" not in str(error.value)
+    assert not (tmp_path / "sink-proof-001.flv").exists()
+    assert reader.snapshot()["reader_frames"] == 2
+
+
+def make_media_diagnostic(monkeypatch, *, scope="crash"):
+    namespace = load_self_test()
+    cls = namespace["MediaFailureDiagnostics"]
+    state = cls.__init__.__globals__
+    monkeypatch.setattr(os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr(time, "monotonic", lambda: 100.0)
+    monkeypatch.setitem(state, "open_validated_log_tail", lambda *_args: (99, 123))
+    monkeypatch.setitem(state, "matching_test_normalizer_supervisor_ids", lambda _work: [11, 22])
+    monkeypatch.setitem(state, "direct_child_process_ids", lambda _pid: [33])
+    diagnostic = cls(scope, Path("PRIVATE_WORKDIR"), Path("PRIVATE_LOG"), 77, ignored_supervisor=11)
+    return namespace, diagnostic
+
+
+def test_media_diagnostic_is_event_scoped_exact_marker_only_and_has_no_identities(monkeypatch):
+    namespace, diagnostic = make_media_diagnostic(monkeypatch)
+    calls = []
+
+    def read_tail(*args):
+        calls.append(args)
+        return (
+            b"PRIVATE_LOG rtmps://private.invalid/live#secret\n"
+            b"moblin-relay-normalize:state:source-attached\n"
+            b"moblin-relay-normalize:restart:output-start-timeout\n"
+            b"prefix moblin-relay-normalize:restart:child-exit\n"
+            b"moblin-relay-normalize:restart:child-exit suffix\n"
+            b"moblin-relay-normalize:restart:child-exit"
+        )
+
+    monkeypatch.setitem(diagnostic.sample.__globals__, "read_validated_log_tail", read_tail)
+    monkeypatch.setattr(time, "monotonic", lambda: 105.25)
+    diagnostic.sample()
+    assert calls == [(99, 123, 0)]
+    assert diagnostic.values == {
+        "scope": "crash",
+        "log_ok": True,
+        "markers": {"attached": 1, "start-timeout": 1},
+        "first_seen": {"attached": 5.25, "start-timeout": 5.25},
+        "supervisor_count": 1,
+        "child_count": 1,
+        "supervisor_seen_seconds": 5.25,
+        "child_seen_seconds": 5.25,
+    }
+    assert "PRIVATE" not in repr(diagnostic.values)
+    assert "rtmps" not in repr(diagnostic.values)
+    assert namespace["SELF_TEST_MEDIA_FAILURE"] is None
+
+
+@pytest.mark.parametrize("failure", ["truncated", "regressed"])
+def test_media_diagnostic_invalid_log_window_discards_all_old_marker_evidence(monkeypatch, failure):
+    namespace, diagnostic = make_media_diagnostic(monkeypatch)
+    state = diagnostic.sample.__globals__
+    monkeypatch.setitem(
+        state,
+        "read_validated_log_tail",
+        lambda *_args: b"moblin-relay-normalize:state:bridge-active\n",
+    )
+    diagnostic.sample()
+    assert diagnostic.values["markers"] == {"active": 1}
+
+    def failed_read(*_args):
+        if failure == "truncated":
+            raise namespace["TestFailure"]("PRIVATE_LOG_IO_FAILURE")
+        return b""
+
+    monkeypatch.setitem(state, "read_validated_log_tail", failed_read)
+    diagnostic.sample()
+    assert diagnostic.values["log_ok"] is False
+    assert diagnostic.values["markers"] == diagnostic.values["first_seen"] == {}
+    # A later readable window must not rehabilitate the invalid event evidence.
+    monkeypatch.setitem(
+        state,
+        "read_validated_log_tail",
+        lambda *_args: b"moblin-relay-normalize:state:bridge-active\n",
+    )
+    diagnostic.sample()
+    assert diagnostic.values["log_ok"] is False
+    assert diagnostic.values["markers"] == {}
+
+
+def test_media_diagnostic_checkpoint_is_exact_exception_scoped_and_nested_capture_wins(monkeypatch):
+    namespace, diagnostic = make_media_diagnostic(monkeypatch, scope="capture")
+    state = diagnostic.__exit__.__globals__
+    monkeypatch.setitem(state, "read_validated_log_tail", lambda *_args: b"")
+    monkeypatch.setattr(os, "close", lambda _fd: None)
+    diagnostic.thread = SimpleNamespace(
+        join=lambda **_kwargs: diagnostic.observe(), is_alive=lambda: False
+    )
+    error = namespace["TestFailure"]("PRIVATE_EXCEPTION")
+    assert diagnostic.__exit__(type(error), error, None) is False
+    captured_exception, value = state["SELF_TEST_MEDIA_FAILURE"]
+    assert captured_exception is error
+    assert value["scope"] == "capture"
+    assert value["reader_frames"] == 0
+    assert "PRIVATE" not in repr(value)
+    diagnostic.values["scope"] = "crash"
+    diagnostic.__exit__(type(error), error, None)
+    assert state["SELF_TEST_MEDIA_FAILURE"][1] == value
+    # A later, unrelated exception must not reuse this capture's evidence.
+    next_error = namespace["TestFailure"]("PRIVATE_NEXT_EXCEPTION")
+    diagnostic.__exit__(type(next_error), next_error, None)
+    assert state["SELF_TEST_MEDIA_FAILURE"][0] is next_error
+    assert state["SELF_TEST_MEDIA_FAILURE"][1]["scope"] == "crash"
+
+
+def test_media_diagnostic_maximum_fixed_checkpoint_fits_reader_and_exposes_no_media(monkeypatch):
+    from scripts.ci_node_onboarding_smoke import safe_self_test_progress
+
+    namespace, diagnostic = make_media_diagnostic(monkeypatch, scope="capture")
+    state = diagnostic.__exit__.__globals__
+    monkeypatch.setitem(
+        state,
+        "read_validated_log_tail",
+        lambda *_args: (
+            b"\n".join(
+                marker
+                for marker in namespace["MEDIA_DIAGNOSTIC_MARKERS"].values()
+                for _ in range(300)
+            )
+            + b"\n"
+        ),
+    )
+    monkeypatch.setattr(os, "close", lambda _fd: None)
+    monkeypatch.setattr(time, "monotonic", lambda: 759.999)
+    diagnostic.thread = SimpleNamespace(
+        join=lambda **_kwargs: diagnostic.observe(), is_alive=lambda: False
+    )
+    diagnostic.reader.observe_line(b"frame=99999", progress=True)
+    error = namespace["TestFailure"]("PRIVATE_EXCEPTION")
+    diagnostic.__exit__(type(error), error, None)
+    checkpoint = {
+        "job_id": "11111111-2222-3333-4444-555555555555",
+        "stage": "crash-live",
+        "elapsed_seconds": 659.999,
+        "failure_lines": [20000] * 8,
+        "strict_segment_index": 32,
+        "failure_flags": {
+            key: False
+            for key in (
+                "live",
+                "normalized",
+                "path_ready",
+                "ingest_live",
+                "metrics_ok",
+                "core_alive",
+                "ingest_one",
+                "sink_one",
+                "sink_growth",
+                "state_ok",
+                "ingest_match",
+            )
+        },
+        "failure_wait_seconds": 659.999,
+        "failure_media": state["SELF_TEST_MEDIA_FAILURE"][1],
+    }
+    assert max(checkpoint["failure_media"]["markers"].values()) == 255
+    assert (
+        len(json.dumps(checkpoint, ensure_ascii=True, sort_keys=True, indent=2).encode()) + 1
+        <= 2048
+    )
+    assert (
+        safe_self_test_progress(checkpoint, job_id=checkpoint["job_id"])["failure_media"]
+        == checkpoint["failure_media"]
+    )
+
+
+def test_media_diagnostic_process_scan_failure_drops_current_counts_not_history(monkeypatch):
+    namespace, diagnostic = make_media_diagnostic(monkeypatch)
+    state = diagnostic.sample.__globals__
+    monkeypatch.setitem(state, "read_validated_log_tail", lambda *_args: b"")
+    monkeypatch.setattr(time, "monotonic", lambda: 105.0)
+    diagnostic.sample()
+    assert diagnostic.values["supervisor_count"] == diagnostic.values["child_count"] == 1
+
+    def failed_scan(_work):
+        raise namespace["TestFailure"]("PRIVATE_PROCESS_FAILURE")
+
+    monkeypatch.setitem(state, "matching_test_normalizer_supervisor_ids", failed_scan)
+    monkeypatch.setattr(time, "monotonic", lambda: 106.0)
+    diagnostic.sample()
+    assert "supervisor_count" not in diagnostic.values
+    assert "child_count" not in diagnostic.values
+    assert diagnostic.values["supervisor_seen_seconds"] == 5.0
+    assert diagnostic.values["child_seen_seconds"] == 5.0
+    assert "PRIVATE" not in repr(diagnostic.values)
+
+
+def test_media_diagnostic_lagging_sampler_closes_its_own_fd_after_join_timeout(monkeypatch):
+    namespace, diagnostic = make_media_diagnostic(monkeypatch)
+    monkeypatch.setitem(
+        diagnostic.sample.__globals__, "read_validated_log_tail", lambda *_args: b""
+    )
+    closed = []
+    monkeypatch.setattr(os, "close", closed.append)
+    diagnostic.thread = SimpleNamespace(join=lambda **_kwargs: None, is_alive=lambda: True)
+    error = namespace["TestFailure"]("PRIVATE_EXCEPTION")
+    assert diagnostic.__exit__(type(error), error, None) is False
+    assert closed == []  # The caller must not close an FD still owned by a read.
+    assert diagnostic.descriptor == 99
+    diagnostic.observe()  # Simulate the lagging sampler resuming after stop.
+    assert closed == [99]
+    assert diagnostic.descriptor is None
+    assert diagnostic.__exit__.__globals__["SELF_TEST_MEDIA_FAILURE"] is None
 
 
 def invoke_self_test_stage_marker(stage: str, **kwargs):

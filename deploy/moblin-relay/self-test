@@ -61,6 +61,7 @@ SELF_TEST_STARTED_MONOTONIC = time.monotonic()
 SELF_TEST_PROGRESS_FILE = Path("/run/moblin-relay-self-test.progress.json")
 SELF_TEST_LAST_PROGRESS: dict = {}
 SELF_TEST_WAIT_FAILURE: tuple[BaseException, dict, float] | None = None
+SELF_TEST_MEDIA_FAILURE: tuple[BaseException, dict] | None = None
 SELF_TEST_STAGES = frozenset(
     {
         "startup",
@@ -314,6 +315,20 @@ TRANSITION_FORBIDDEN_LOG_MARKERS = (
     (b"av_interleaved_write_frame(): Invalid argument", "mux-invalid-argument"),
 )
 INTENTIONAL_RTMP_RECONNECT_EVENT = "forced RTMP sink reconnect"
+MEDIA_DIAGNOSTIC_MARKERS = {
+    **{
+        marker.removeprefix(b"moblin-relay-normalize:restart:").decode("ascii"): marker
+        for marker, _stage in NORMALIZER_RESTART_STAGE_MARKERS
+    },
+    "attached": b"moblin-relay-normalize:state:source-attached",
+    "active": NORMALIZER_BRIDGE_ACTIVE_MARKER,
+    "detached": NORMALIZER_SOURCE_DETACHED_MARKER,
+    "reset-requested": NORMALIZER_RESET_REQUESTED_MARKER,
+    "reset-succeeded": NORMALIZER_RESET_SUCCEEDED_MARKER,
+}
+# Compact, fixed public name; never derive diagnostic keys from log contents.
+MEDIA_DIAGNOSTIC_MARKERS["start-timeout"] = MEDIA_DIAGNOSTIC_MARKERS.pop("output-start-timeout")
+MEDIA_DIAGNOSTIC_TIMED_MARKERS = frozenset({"attached", "active", "start-timeout", "child-exit"})
 
 
 class TestFailure(RuntimeError):
@@ -402,6 +417,8 @@ def persist_self_test_failure_progress(exc: BaseException) -> None:
     if SELF_TEST_WAIT_FAILURE is not None and SELF_TEST_WAIT_FAILURE[0] is exc:
         progress["failure_flags"] = SELF_TEST_WAIT_FAILURE[1]
         progress["failure_wait_seconds"] = SELF_TEST_WAIT_FAILURE[2]
+    if SELF_TEST_MEDIA_FAILURE is not None and SELF_TEST_MEDIA_FAILURE[0] is exc:
+        progress["failure_media"] = SELF_TEST_MEDIA_FAILURE[1]
     atomic_json(SELF_TEST_PROGRESS_FILE, progress)
 
 
@@ -3519,10 +3536,215 @@ def output_format_failure_stage(
     return None
 
 
+class CaptureReaderProgress:
+    """Discard reader output after recognizing only fixed milestones/counts."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.values = {"reader_input": False, "reader_output": False, "reader_frames": 0}
+
+    def drain(self, pipe, *, progress: bool) -> None:
+        pending = b""
+        discarded = False
+        inspected = 0
+        try:
+            while chunk := pipe.read(4096):
+                inspected += len(chunk)
+                # Continue draining indefinitely, but inspect at most 1 MiB per
+                # pipe, with at most one 2 KiB partial line retained in memory.
+                if inspected > 1024 * 1024:
+                    pending = b""
+                    continue
+                parts = chunk.split(b"\n")
+                for index, part in enumerate(parts):
+                    complete = index < len(parts) - 1
+                    if len(pending) + len(part) > 2048:
+                        discarded = True
+                        pending = b""
+                    elif not discarded:
+                        pending += part
+                    if complete:
+                        if not discarded:
+                            self.observe_line(pending.rstrip(b"\r"), progress=progress)
+                        pending = b""
+                        discarded = False
+        except (OSError, ValueError):
+            # Optional diagnostics cannot replace the reader's original result.
+            pass
+
+    def observe_line(self, line: bytes, *, progress: bool) -> None:
+        with self.lock:
+            if progress:
+                match = re.fullmatch(rb"frame=\s*([0-9]{1,5})", line)
+                if match:
+                    self.values["reader_frames"] = max(
+                        self.values["reader_frames"], min(int(match[1]), 10000)
+                    )
+            elif line.startswith(b"Input #0, flv, from "):
+                self.values["reader_input"] = True
+            elif line.startswith(b"Output #0, flv, to "):
+                self.values["reader_output"] = True
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return dict(self.values)
+
+
+def run_capture_reader(command: list[str], diagnostic: CaptureReaderProgress, *, timeout: float):
+    """Keep the original reader deadline while draining both pipes boundedly."""
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+    drains = [
+        threading.Thread(
+            target=diagnostic.drain,
+            args=(pipe,),
+            kwargs={"progress": is_progress},
+            daemon=True,
+        )
+        for pipe, is_progress in ((process.stdout, True), (process.stderr, False))
+    ]
+    try:
+        for drain in drains:
+            drain.start()
+        process.wait(timeout=timeout)
+        return subprocess.CompletedProcess(command, process.returncode)
+    finally:
+        # Never replace TimeoutExpired/the strict reader result with an
+        # optional pipe-close error. kill + wait retains subprocess.run's
+        # previous kill-and-reap behavior on deadline expiry.
+        with contextlib.suppress(OSError):
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+        for drain in drains:
+            with contextlib.suppress(RuntimeError):
+                drain.join(timeout=1)
+        for pipe in (process.stdout, process.stderr):
+            if pipe is not None:
+                with contextlib.suppress(OSError):
+                    pipe.close()
+
+
+class MediaFailureDiagnostics:
+    """Event-local, optional evidence; it never supplies a passing predicate."""
+
+    def __init__(
+        self,
+        scope: str,
+        work: Path,
+        log_path: Path,
+        writer_descriptor: int,
+        *,
+        ignored_supervisor: int | None = None,
+    ) -> None:
+        self.work = work
+        self.started = time.monotonic()
+        self.ignored_supervisor = ignored_supervisor
+        self.descriptor = None
+        self.offset = 0
+        self.uid = os.geteuid()
+        self.values = {"scope": scope, "log_ok": False, "markers": {}, "first_seen": {}}
+        self.reader = CaptureReaderProgress()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self.observe, daemon=True)
+        with contextlib.suppress(OSError, TestFailure):
+            self.descriptor, self.offset = open_validated_log_tail(
+                log_path, writer_descriptor, work, self.uid
+            )
+            self.values["log_ok"] = True
+
+    def sample(self) -> None:
+        elapsed = time.monotonic() - self.started
+        if not math.isfinite(elapsed) or not 0 <= elapsed <= 660:
+            return
+        elapsed = round(elapsed, 3)
+        if self.descriptor is not None and self.values["log_ok"]:
+            try:
+                tail = read_validated_log_tail(self.descriptor, self.offset, self.uid)
+                # Tokens are emitted as complete standalone stderr lines by the
+                # exact native test hook. Prefix/suffix lookalikes do not count.
+                lines = [line.rstrip(b"\r") for line in tail.split(b"\n")[:-1]]
+                counts = {
+                    name: min(lines.count(marker), 255)
+                    for name, marker in MEDIA_DIAGNOSTIC_MARKERS.items()
+                    if marker in lines
+                }
+                if any(counts.get(name, 0) < value for name, value in self.values["markers"].items()):
+                    raise TestFailure("diagnostic marker window regressed")
+                self.values["markers"] = counts
+                for name in MEDIA_DIAGNOSTIC_TIMED_MARKERS & counts.keys():
+                    self.values["first_seen"].setdefault(name, elapsed)
+            except (OSError, TestFailure):
+                # Fail closed for truncated/changed/unreadable evidence. Never
+                # retain old counts and pretend they describe a fresh window.
+                self.values.update(log_ok=False, markers={}, first_seen={})
+        try:
+            supervisors = [
+                pid for pid in matching_test_normalizer_supervisor_ids(self.work)
+                if pid != self.ignored_supervisor
+            ]
+            children = {pid for parent in supervisors for pid in direct_child_process_ids(parent)}
+            self.values["supervisor_count"] = min(len(supervisors), 32)
+            self.values["child_count"] = min(len(children), 32)
+            if supervisors:
+                self.values.setdefault("supervisor_seen_seconds", elapsed)
+            if children:
+                self.values.setdefault("child_seen_seconds", elapsed)
+        except (OSError, TestFailure):
+            # Current counts must not survive a failed scan as stale evidence;
+            # the explicitly historical first-observed timestamps remain true.
+            self.values.pop("supervisor_count", None)
+            self.values.pop("child_count", None)
+
+    def observe(self) -> None:
+        try:
+            while not self.stop_event.is_set():
+                with contextlib.suppress(Exception):
+                    self.sample()
+                self.stop_event.wait(0.25)
+        finally:
+            with contextlib.suppress(Exception):
+                self.sample()
+            # The sampler owns this descriptor. If join times out, it still
+            # closes it when its final read ends; another thread must not close
+            # and potentially reuse an FD while that read remains in flight.
+            if self.descriptor is not None:
+                with contextlib.suppress(OSError):
+                    os.close(self.descriptor)
+                self.descriptor = None
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, _kind, exc, _trace):
+        global SELF_TEST_MEDIA_FAILURE
+        self.stop_event.set()
+        self.thread.join(timeout=1)
+        if not self.thread.is_alive():
+            elapsed = time.monotonic() - self.started
+            if exc is not None and math.isfinite(elapsed) and 0 <= elapsed <= 660:
+                # A nested capture diagnostic is more precise than its outer
+                # crash scope. Preserve only the diagnostic for this exception.
+                if SELF_TEST_MEDIA_FAILURE is None or SELF_TEST_MEDIA_FAILURE[0] is not exc:
+                    value = {**self.values, "elapsed_seconds": round(elapsed, 3)}
+                    if value["scope"] == "capture":
+                        value.update(self.reader.snapshot())
+                    SELF_TEST_MEDIA_FAILURE = (exc, value)
+        return False
+
+
 def capture_final_sink_media_segment(
     work: Path,
     segment_index: int,
     process_metadata_guard,
+    *,
+    reader_diagnostic: CaptureReaderProgress | None = None,
 ) -> tuple[Path, int]:
     """Capture one bounded final-sink sample without probing or decoding it."""
     if type(segment_index) is not int or segment_index < 1:
@@ -3534,7 +3756,10 @@ def capture_final_sink_media_segment(
             "-nostdin",
             "-hide_banner",
             "-loglevel",
-            "error",
+            "info",
+            "-nostats",
+            "-progress",
+            "pipe:1",
             "-xerror",
             "-y",
             "-i",
@@ -3556,11 +3781,9 @@ def capture_final_sink_media_segment(
         ]
         process_metadata_guard(capture_command)
         try:
-            captured = run(
+            captured = run_capture_reader(
                 capture_command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                reader_diagnostic or CaptureReaderProgress(),
                 timeout=15,
             )
         except subprocess.TimeoutExpired as exc:
@@ -4204,6 +4427,7 @@ def main() -> int:
             result_key: str | None = None,
         ) -> None:
             """Stream-copy one stable sink sample without probing on the recovery path."""
+            global SELF_TEST_WAIT_FAILURE
             nonlocal strict_sink_segment_sequence
             before_sample = observer.checked_snapshot(
                 f"{description} strict RTMP sink segment precondition"
@@ -4215,11 +4439,33 @@ def main() -> int:
             ):
                 raise TestFailure("final RTMP sink was not stable before media capture")
             strict_sink_segment_sequence += 1
-            sink_capture, capture_bytes = capture_final_sink_media_segment(
-                work,
-                strict_sink_segment_sequence,
-                assert_clean_process_metadata,
-            )
+            capture_started = time.monotonic()
+            try:
+                with MediaFailureDiagnostics(
+                    "capture", work, dut_log_path, dut_log.fileno()
+                ) as diagnostic:
+                    sink_capture, capture_bytes = capture_final_sink_media_segment(
+                        work,
+                        strict_sink_segment_sequence,
+                        assert_clean_process_metadata,
+                        reader_diagnostic=diagnostic.reader,
+                    )
+            except TestFailure as exc:
+                with contextlib.suppress(Exception):
+                    finished = time.monotonic()
+                    observations = observer.samples_between(capture_started, finished)
+                    current = observations[-1] if observations else {}
+                    previous = observations[-2] if len(observations) >= 2 else {}
+                    flags = safe_wait_failure_flags(
+                        current,
+                        previous,
+                        state_ok=bool(state_predicate(current)),
+                        expected_ingest_ids=before_sample.get("ingest_ids"),
+                    )
+                    elapsed = finished - capture_started
+                    if math.isfinite(elapsed) and 0 <= elapsed <= 660:
+                        SELF_TEST_WAIT_FAILURE = (exc, flags, round(elapsed, 3))
+                raise
             after_sample = observer.checked_snapshot(
                 f"{description} strict RTMP sink segment completion"
             )
@@ -5496,53 +5742,56 @@ def main() -> int:
             or OUTPUT_PATH.encode() not in old_child_command
         ):
             raise TestFailure("normalizer child identity is invalid")
-        supervisor_crash_started = time.monotonic()
-        supervisor_recovery_deadline = (
-            supervisor_crash_started + SUPERVISOR_RESTART_TIMEOUT_SECONDS
-        )
-        if not signal_test_normalizer_supervisor(
-            old_supervisor_pid,
-            work,
-            signal.SIGKILL,
+        with MediaFailureDiagnostics(
+            "crash", work, dut_log_path, dut_log.fileno(), ignored_supervisor=old_supervisor_pid
         ):
-            raise TestFailure("normalizer supervisor identity changed before termination")
-        if not wait_process_exit(old_supervisor_pid, 1.0):
-            raise TestFailure("killed normalizer supervisor remained present")
-        if not wait_process_exit(old_child_pid, 1.0):
-            raise TestFailure("FFmpeg child survived its supervisor")
-        crash_slate = wait_slate_with_live_srt(
-            "supervisor-crash SLATE transition",
-            supervisor_crash_started,
-            initial_ingest_ids,
-        )
-        wait_slate_downstream_recovery(
-            "supervisor-crash SLATE transition",
-            supervisor_crash_started,
-            absolute_deadline=supervisor_recovery_deadline,
-        )
-        mark_self_test_stage("crash-live")
-        crash_current = observer.checked_snapshot("current supervisor-crash LIVE recovery")
-        crash_proof = crash_live_delivery_proof(
-            observer.samples_between(supervisor_crash_started, float(crash_current["t"])),
-            crash_current,
-            started=supervisor_crash_started,
-            deadline=supervisor_recovery_deadline,
-            now=time.monotonic(),
-            expected_ingest_ids=initial_ingest_ids,
-            old_normalized_ids=old_normalizer_ids,
-            expected_sink_id=current_sink_id,
-        )
-        crash_recovery_remaining = supervisor_recovery_deadline - time.monotonic()
-        if crash_recovery_remaining <= 0 and crash_proof is None:
-            raise TestFailure("supervisor-crash LIVE recovery exceeded its absolute deadline")
-        crash_live = wait_healthy_live(
-            "supervisor-crash LIVE recovery",
-            crash_recovery_remaining,
-            not_before=supervisor_crash_started,
-            expected_ingest_ids=initial_ingest_ids,
-            sink_transition_started=supervisor_crash_started,
-            crash_proof=crash_proof,
-        )
+            supervisor_crash_started = time.monotonic()
+            supervisor_recovery_deadline = (
+                supervisor_crash_started + SUPERVISOR_RESTART_TIMEOUT_SECONDS
+            )
+            if not signal_test_normalizer_supervisor(
+                old_supervisor_pid,
+                work,
+                signal.SIGKILL,
+            ):
+                raise TestFailure("normalizer supervisor identity changed before termination")
+            if not wait_process_exit(old_supervisor_pid, 1.0):
+                raise TestFailure("killed normalizer supervisor remained present")
+            if not wait_process_exit(old_child_pid, 1.0):
+                raise TestFailure("FFmpeg child survived its supervisor")
+            crash_slate = wait_slate_with_live_srt(
+                "supervisor-crash SLATE transition",
+                supervisor_crash_started,
+                initial_ingest_ids,
+            )
+            wait_slate_downstream_recovery(
+                "supervisor-crash SLATE transition",
+                supervisor_crash_started,
+                absolute_deadline=supervisor_recovery_deadline,
+            )
+            mark_self_test_stage("crash-live")
+            crash_current = observer.checked_snapshot("current supervisor-crash LIVE recovery")
+            crash_proof = crash_live_delivery_proof(
+                observer.samples_between(supervisor_crash_started, float(crash_current["t"])),
+                crash_current,
+                started=supervisor_crash_started,
+                deadline=supervisor_recovery_deadline,
+                now=time.monotonic(),
+                expected_ingest_ids=initial_ingest_ids,
+                old_normalized_ids=old_normalizer_ids,
+                expected_sink_id=current_sink_id,
+            )
+            crash_recovery_remaining = supervisor_recovery_deadline - time.monotonic()
+            if crash_recovery_remaining <= 0 and crash_proof is None:
+                raise TestFailure("supervisor-crash LIVE recovery exceeded its absolute deadline")
+            crash_live = wait_healthy_live(
+                "supervisor-crash LIVE recovery",
+                crash_recovery_remaining,
+                not_before=supervisor_crash_started,
+                expected_ingest_ids=initial_ingest_ids,
+                sink_transition_started=supervisor_crash_started,
+                crash_proof=crash_proof,
+            )
         if crash_live["normalized_ids"] == old_normalizer_ids:
             raise TestFailure("supervisor crash reused the old normalizer connection")
         mark_self_test_stage("crash-cont")

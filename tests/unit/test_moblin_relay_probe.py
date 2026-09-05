@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import runpy
 import subprocess
@@ -16,6 +17,7 @@ from bootstrap_worker.errors import safe_failure
 from bootstrap_worker.relay_installer import _SELF_TEST_STAGE_CODES
 from scripts.ci_node_onboarding_smoke import (
     SAFE_BOOTSTRAP_DIAGNOSTIC_CODES,
+    print_self_test_progress,
     safe_self_test_progress,
 )
 
@@ -163,6 +165,188 @@ def test_wait_failure_diagnostic_retains_only_boolean_predicate_evidence() -> No
         "failure_flags": flags,
         "failure_wait_seconds": 6.123,
     }
+
+
+def media_diagnostic(scope: str = "crash") -> dict:
+    value = {
+        "scope": scope,
+        "elapsed_seconds": 11.42123,
+        "log_ok": True,
+        "markers": {"attached": 1, "start-timeout": 1},
+        "first_seen": {"attached": 5.12345, "start-timeout": 11.12345},
+        "supervisor_count": 1,
+        "child_count": 0,
+        "supervisor_seen_seconds": 5.12345,
+        "child_seen_seconds": 5.92345,
+    }
+    if scope == "capture":
+        value.update(reader_input=True, reader_output=False, reader_frames=0)
+    return value
+
+
+@pytest.mark.parametrize("scope", ["crash", "capture"])
+def test_failure_media_diagnostic_is_fixed_bounded_projection(scope: str) -> None:
+    value = media_diagnostic(scope)
+    result = safe_self_test_progress(
+        {
+            "job_id": "job",
+            "stage": "crash-live",
+            "elapsed_seconds": 152,
+            "failure_media": value,
+            "raw_stderr": "PRIVATE_FIXTURE_MARKER",
+        },
+        job_id="job",
+    )
+    assert result["failure_media"] == {
+        **value,
+        "elapsed_seconds": 11.421,
+        "first_seen": {"attached": 5.123, "start-timeout": 11.123},
+        "supervisor_seen_seconds": 5.123,
+        "child_seen_seconds": 5.923,
+    }
+    assert "PRIVATE_FIXTURE_MARKER" not in json.dumps(result)
+    assert result["failure_media"]["markers"] is not value["markers"]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"scope": "PRIVATE_FIXTURE"},
+        {"scope": []},
+        {"scope": None},
+        {"log_ok": 1},
+        {"log_ok": "true"},
+        {"elapsed_seconds": True},
+        {"elapsed_seconds": -1},
+        {"elapsed_seconds": 661},
+        {"elapsed_seconds": float("nan")},
+        {"elapsed_seconds": float("inf")},
+        {"elapsed_seconds": 10**1000},
+        {"elapsed_seconds": "PRIVATE_FIXTURE"},
+        {"markers": {"PRIVATE_FIXTURE": 1}},
+        {"markers": {"attached": True}},
+        {"markers": {"attached": 0}},
+        {"markers": {"attached": 256}},
+        {"markers": {"attached": "PRIVATE_FIXTURE"}},
+        {"markers": []},
+        {"first_seen": {"PRIVATE_FIXTURE": 1}},
+        {"first_seen": {"active": 1}},
+        {"first_seen": {"attached": True}},
+        {"first_seen": {"attached": float("nan")}},
+        {"first_seen": {"attached": 12}},
+        {"first_seen": {"attached": -1}},
+        {"first_seen": []},
+        {"supervisor_count": True},
+        {"child_count": 33},
+        {"child_count": -1},
+        {"child_count": "PRIVATE_FIXTURE"},
+        {"supervisor_seen_seconds": float("inf")},
+        {"child_seen_seconds": 12},
+        {"child_seen_seconds": True},
+        {"child_seen_seconds": None},
+        {"reader_input": True},
+        {"stderr": "PRIVATE_FIXTURE"},
+    ],
+)
+def test_failure_media_diagnostic_rejects_every_unknown_or_unsafe_field(change: dict) -> None:
+    value = media_diagnostic()
+    value.update(change)
+    payload = {
+        "job_id": "job",
+        "stage": "crash-live",
+        "elapsed_seconds": 152,
+        "failure_media": value,
+    }
+    assert safe_self_test_progress(payload, job_id="job") == {"progress": "unavailable"}
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"reader_input": 1},
+        {"reader_output": "PRIVATE_FIXTURE"},
+        {"reader_frames": True},
+        {"reader_frames": -1},
+        {"reader_frames": 10001},
+        {"reader_frames": 1.5},
+        {"reader_frames": "PRIVATE_FIXTURE"},
+    ],
+)
+def test_capture_diagnostic_reader_values_are_not_free_text(change: dict) -> None:
+    value = media_diagnostic("capture")
+    value.update(change)
+    assert safe_self_test_progress(
+        {"job_id": "job", "stage": "stall-live", "elapsed_seconds": 127, "failure_media": value},
+        job_id="job",
+    ) == {"progress": "unavailable"}
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "scope",
+        "elapsed_seconds",
+        "log_ok",
+        "markers",
+        "first_seen",
+        "reader_input",
+        "reader_output",
+        "reader_frames",
+    ],
+)
+def test_capture_diagnostic_requires_its_complete_schema(field: str) -> None:
+    value = media_diagnostic("capture")
+    del value[field]
+    assert safe_self_test_progress(
+        {"job_id": "job", "stage": "stall-live", "elapsed_seconds": 127, "failure_media": value},
+        job_id="job",
+    ) == {"progress": "unavailable"}
+
+
+def test_protected_progress_reader_keeps_existing_file_guards_and_bounded_projection(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls = []
+    job_id = "11111111-1111-4111-8111-111111111111"
+
+    def compose(*args, **kwargs):
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            json.dumps(
+                {
+                    "job_id": job_id,
+                    "stage": "crash-live",
+                    "elapsed_seconds": 152,
+                    "failure_media": {**media_diagnostic(), "stderr": "PRIVATE_FIXTURE_MARKER"},
+                }
+            ),
+            "",
+        )
+
+    monkeypatch.setitem(print_self_test_progress.__globals__, "compose", compose)
+    print_self_test_progress(job_id)
+    output = capsys.readouterr().out
+    assert output.strip() == 'Self-test progress diagnostic: {"progress": "unavailable"}'
+    assert "PRIVATE_FIXTURE_MARKER" not in output
+    args, kwargs = calls[0]
+    script = args[-1]
+    assert kwargs == {"max_capture_bytes": 4096}
+    for guard in (
+        "stat.S_ISREG(before.st_mode)",
+        "before.st_uid != 0",
+        "stat.S_IMODE(before.st_mode) != 0o600",
+        "before.st_nlink != 1",
+        "0 < before.st_size <= 2048",
+        "os.O_NOFOLLOW | os.O_NONBLOCK",
+        "before != after",
+        "handle.read(2049)",
+        "len(raw) > 2048",
+        "-5 <= time.time() - before.st_mtime <= 960",
+    ):
+        assert guard in script
 
 
 @pytest.mark.parametrize(
