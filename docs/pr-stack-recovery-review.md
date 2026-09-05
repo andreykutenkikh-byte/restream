@@ -218,6 +218,15 @@ is separate from the unchanged required media/preview/security job, not a replac
 No session-bearing traces are published. Desktop WebKit is not physical iPhone/Moblin
 acceptance. Local Chrome proof alone does not establish final CI success.
 
+The first PR #16 run on `fd6697cb19433bd985e8c4596be24c43bec5a44e`
+installed Chromium 151.0.7922.34 and WebKit 26.5 and passed actual app initialization,
+pairing, session checks and LIVE polling in both engines. Both then exposed the same
+test-harness error: a bare-string `wait_for_function` predicate used JavaScript eval,
+which the application's `script-src 'self'` CSP correctly rejected. The fixture now
+uses explicit function predicates throughout. CSP was neither bypassed nor weakened;
+all browser assertions and both required engines remain. A regression checks this
+test contract. That original failed run is not accepted as final browser success.
+
 The PR descriptions record the final exact HEADs, CI run URLs and results. A final-review
 declaration requires both complete exact-head runs to succeed, including native media
 and both browser engines. Both PRs stay Draft, and even full code CI does not remove the

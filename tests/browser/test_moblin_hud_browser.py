@@ -341,7 +341,7 @@ def test_ordinary_hud_browser_contract(
         # The browser must not open another slot until that old promise settles.
         page.evaluate("window.__hudSmoke.hold = true")
         page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
-        page.wait_for_function("window.__hudSmoke.held === true")
+        page.wait_for_function("() => window.__hudSmoke.held === true")
         held_requests = page.evaluate("window.__hudSmoke.statuses")
         page.evaluate(
             "document.dispatchEvent(new Event('visibilitychange'));"
@@ -384,7 +384,7 @@ def test_ordinary_hud_browser_contract(
 
         # The same consumed link now carries a valid cookie; no replay POST/401.
         before_pair_requests = sum(urlsplit(url).path.endswith("/api/pair") for url in request_urls)
-        page.wait_for_function("window.__hudSmoke.active === 0")
+        page.wait_for_function("() => window.__hudSmoke.active === 0")
         with page.expect_response(
             lambda response: urlsplit(response.url).path == "/moblin-hud/api/status"
         ) as reopened:
@@ -398,9 +398,9 @@ def test_ordinary_hud_browser_contract(
         assert not page_errors and not console_errors
 
         # Exercise persisted-page lifecycle in the real engine, plus a real navigation return.
-        page.wait_for_function("window.__hudSmoke.active === 0")
+        page.wait_for_function("() => window.__hudSmoke.active === 0")
         page.evaluate("window.dispatchEvent(new PageTransitionEvent('pagehide', {persisted:true}))")
-        page.wait_for_function("window.__hudSmoke.active === 0")
+        page.wait_for_function("() => window.__hudSmoke.active === 0")
         stopped_requests = page.evaluate("window.__hudSmoke.statuses")
         page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
         assert page.evaluate("window.__hudSmoke.statuses") == stopped_requests
@@ -411,7 +411,7 @@ def test_ordinary_hud_browser_contract(
                 "window.dispatchEvent(new PageTransitionEvent('pageshow', {persisted:true}))"
             )
         assert resumed.value.status == 200
-        page.wait_for_function("window.__hudSmoke.active === 0")
+        page.wait_for_function("() => window.__hudSmoke.active === 0")
         page.goto("about:blank")
         with page.expect_response(
             lambda response: urlsplit(response.url).path == "/moblin-hud/api/status"
@@ -423,7 +423,7 @@ def test_ordinary_hud_browser_contract(
         phase["name"] = "network"
         page.route("**/moblin-hud/api/status", lambda route: route.abort("failed"), times=1)
         page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
-        page.wait_for_function("document.body.dataset.hudState === 'monitoring'")
+        page.wait_for_function("() => document.body.dataset.hudState === 'monitoring'")
         assert "Не переключайте сервер" in page.locator("[data-hud-recommendation]").inner_text()
         # Actual bounded retry must recover without a manual visibility kick.
         with page.expect_response(
@@ -431,7 +431,7 @@ def test_ordinary_hud_browser_contract(
         ) as retried:
             fixture.heartbeat("LIVE")
         assert retried.value.status == 200
-        page.wait_for_function("document.body.dataset.hudState !== 'monitoring'")
+        page.wait_for_function("() => document.body.dataset.hudState !== 'monitoring'")
         phase["name"] = "normal"
         assert page.evaluate("window.__hudSmoke.maximum") == 1
 
@@ -441,9 +441,9 @@ def test_ordinary_hud_browser_contract(
         )
         assert revoked.status_code == 200
         page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
-        page.wait_for_function("document.body.dataset.hudState === 'revoked'")
+        page.wait_for_function("() => document.body.dataset.hudState === 'revoked'")
         assert page.locator("[data-hud-title]").inner_text() == "Доступ HUD отключён"
-        page.wait_for_function("window.__hudSmoke.active === 0")
+        page.wait_for_function("() => window.__hudSmoke.active === 0")
         requests_at_revoke = page.evaluate("window.__hudSmoke.statuses")
         page.evaluate(
             "window.dispatchEvent(new PageTransitionEvent('pagehide', {persisted:true}));"
