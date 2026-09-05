@@ -11,6 +11,7 @@ import hashlib
 import importlib.machinery
 import importlib.util
 import json
+import math
 import os
 import re
 import resource
@@ -1432,19 +1433,26 @@ def summarize_event_delivery_ledger(ledger: list[dict], expected: tuple[str, ...
         raise TestFailure("event-to-delivery recovery ledger is incomplete")
     recovery_seconds = []
     rotations = 0
+    previous_dts_marker_count = 0
     for item in ledger:
         elapsed = item.get("recovery_seconds")
         rotated = item.get("publisher_rotated")
+        dts_marker_count = item.get("known_dts_marker_count", 0)
         if (
             not isinstance(elapsed, (int, float))
             or isinstance(elapsed, bool)
+            or not math.isfinite(elapsed)
             or elapsed < 0
             or elapsed > RTMP_SINK_RECOVERY_TIMEOUT_SECONDS
             or type(rotated) is not bool
+            or type(dts_marker_count) is not int
+            or dts_marker_count < previous_dts_marker_count
         ):
             raise TestFailure("event-to-delivery recovery ledger is invalid")
+        fresh_dts_markers = dts_marker_count - previous_dts_marker_count
+        previous_dts_marker_count = dts_marker_count
         event = item.get("event")
-        if rotated and event != INTENTIONAL_RTMP_RECONNECT_EVENT:
+        if rotated and event != INTENTIONAL_RTMP_RECONNECT_EVENT and not fresh_dts_markers:
             raise TestFailure("unexpected downstream RTMP publisher rotation")
         if event == INTENTIONAL_RTMP_RECONNECT_EVENT and not rotated:
             raise TestFailure("intentional downstream RTMP reconnect did not rotate publisher")
@@ -1456,6 +1464,19 @@ def summarize_event_delivery_ledger(ledger: list[dict], expected: tuple[str, ...
         "maximum_event_to_delivery_seconds": round(max(recovery_seconds, default=0.0), 3),
         "events_with_publisher_rotation": rotations,
     }
+
+
+def require_accounted_downstream_recovery(delivery: dict, events: dict) -> None:
+    """Retain strict media delivery checks and reject rotations outside proven events."""
+    if (
+        delivery["duplicate_publishers"]
+        or delivery["counter_regression"]
+        or delivery["invalid_samples"]
+        or delivery["max_delivery_outage_seconds"] > RTMP_SINK_RECOVERY_TIMEOUT_SECONDS
+        or not delivery["final_active"]
+        or delivery["id_rotation_count"] != events["events_with_publisher_rotation"]
+    ):
+        raise TestFailure("automatic downstream RTMP recovery validation failed")
 
 
 def observer_health_problem(
@@ -2674,6 +2695,16 @@ def transition_log_failure(tail: bytes) -> str | None:
     return None
 
 
+def known_forward_dts_marker_count(tail: bytes) -> int:
+    """Count only the known native relay-output forward timestamp failure."""
+    return sum(
+        1
+        for line in tail.splitlines()
+        if b"[path " + OUTPUT_PATH.encode("ascii") + b"] [forward " in line
+        and KNOWN_DTS_REGRESSION_MARKER in line
+    )
+
+
 def require_initial_live_log_clean(
     descriptor: int,
     offset: int,
@@ -3115,6 +3146,16 @@ def analyze_decoded_video_frames(capture: Path) -> dict:
         ),
         "stderr_empty": not bool(stderr.strip()),
     }
+
+
+def require_aggregate_portrait_dimensions(decoded_frames: dict) -> None:
+    """Reject observed resolution changes even when recorder decode warnings are diagnostic."""
+    if decoded_frames["landscape_1280x720_frames"] > 0:
+        raise TestFailure("aggregate capture unexpectedly switched back to landscape 1280x720")
+    if decoded_frames["legacy_portrait_720x1280_frames"] > 0:
+        raise TestFailure("aggregate capture unexpectedly switched back to legacy portrait 720x1280")
+    if decoded_frames["unexpected_dimension_frames"] > 0:
+        raise TestFailure("aggregate capture contains frames outside the 1080x1920 portrait profile")
 
 
 def analyze_decoded_audio_timestamps(capture: Path) -> dict:
@@ -4082,6 +4123,17 @@ def main() -> int:
             if recovery_seconds > RTMP_SINK_RECOVERY_TIMEOUT_SECONDS:
                 raise TestFailure(f"{description} exceeded the RTMP sink recovery bound")
             recovered_sink_id = sample["sink_ids"][0]
+            if transition_log_descriptor is None:
+                raise TestFailure("transition log gate was not initialized")
+            # This cumulative count is checkpointed for every event. A marker
+            # consumed by an earlier event cannot authorize a later rotation.
+            known_dts_marker_count = known_forward_dts_marker_count(
+                read_validated_log_tail(
+                    transition_log_descriptor,
+                    transition_log_offset,
+                    os.geteuid(),
+                )
+            )
             if "LIVE" in description or description == INTENTIONAL_RTMP_RECONNECT_EVENT:
                 record_strict_sink_segment(
                     description,
@@ -4098,6 +4150,7 @@ def main() -> int:
                     "event": description,
                     "recovery_seconds": round(recovery_seconds, 3),
                     "publisher_rotated": recovered_sink_id != current_sink_id,
+                    "known_dts_marker_count": known_dts_marker_count,
                 }
             )
             current_sink_id = recovered_sink_id
@@ -5608,14 +5661,7 @@ def main() -> int:
             observer_coverage_started,
             final_finished,
         )
-        if (
-            delivery_summary["duplicate_publishers"]
-            or delivery_summary["counter_regression"]
-            or delivery_summary["invalid_samples"]
-            or delivery_summary["max_delivery_outage_seconds"] > RTMP_SINK_RECOVERY_TIMEOUT_SECONDS
-            or not delivery_summary["final_active"]
-        ):
-            raise TestFailure("automatic downstream RTMP recovery validation failed")
+        require_accounted_downstream_recovery(delivery_summary, event_delivery_summary)
         result["event_to_delivery_recovery"] = event_delivery_ledger
         result["automatic_rtmp_forward_recovery"] = {
             **event_delivery_summary,
@@ -5802,6 +5848,9 @@ def main() -> int:
             and decoded_frames["stderr_empty"]
         )
         result["portrait_capture_guard_passed"] = portrait_frames_ok
+        # The recorder can have decoder artifacts across publisher epochs, but
+        # a positively observed wrong resolution must never be diagnostic-only.
+        require_aggregate_portrait_dimensions(decoded_frames)
 
         mark_self_test_stage("timestamps")
         result["decoded_audio_timestamps"] = analyze_decoded_audio_timestamps(capture)

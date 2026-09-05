@@ -1143,8 +1143,26 @@ def test_self_test_failure_checkpoint_is_atomic_bounded_and_redacted(tmp_path: P
     log.chmod(0o600)
     result_file = tmp_path / "last-result.json"
     globals_ = collect.__globals__  # type: ignore[attr-defined]
+    real_lstat = os.lstat
+    real_fstat = os.fstat
+    log_identity = (log.stat().st_dev, log.stat().st_ino)
 
-    with patch.dict(globals_, {"validate_workdir": lambda path: Path(path).resolve()}):
+    def fixture_root_owner(metadata: os.stat_result) -> os.stat_result:
+        # CI runs as an unprivileged user; production diagnostic files are root-owned.
+        # Preserve the real mode, inode and link count so all other checks still run.
+        if (metadata.st_dev, metadata.st_ino) != log_identity:
+            return metadata
+        fields = list(metadata)
+        fields[4] = 0
+        return os.stat_result(fields)
+
+    with (
+        patch.dict(globals_, {"validate_workdir": lambda path: Path(path).resolve()}),
+        patch.object(
+            os, "lstat", lambda *args, **kwargs: fixture_root_owner(real_lstat(*args, **kwargs))
+        ),
+        patch.object(os, "fstat", lambda fd: fixture_root_owner(real_fstat(fd))),
+    ):
         diagnostics = collect(work, [marker])
         assert len(diagnostics["dut.log"]) <= loaded["FAILURE_DIAGNOSTIC_LINE_LIMIT"]
         persist(
@@ -1169,6 +1187,46 @@ def test_self_test_failure_checkpoint_is_atomic_bounded_and_redacted(tmp_path: P
 
     persist(result_file, {"status": "FAIL", "result_phase": "final"}, [marker])
     assert json.loads(result_file.read_text(encoding="utf-8"))["result_phase"] == "final"
+
+
+@pytest.mark.parametrize("path_uid,opened_uid", [(0, 0), (1001, 0), (0, 1001), (1001, 1001)])
+def test_self_test_diagnostic_reader_requires_root_before_and_after_open(
+    tmp_path: Path, path_uid: int, opened_uid: int
+) -> None:
+    loaded = load_self_test()
+    read = loaded["read_sanitized_failure_log_tail"]
+    failure = loaded["TestFailure"]
+    work = tmp_path / ".run-owner"
+    work.mkdir()
+    log = work / "dut.log"
+    log.write_text("private-test-marker\nlast", encoding="utf-8")
+    real_lstat = os.lstat
+    real_fstat = os.fstat
+    log_identity = (log.stat().st_dev, log.stat().st_ino)
+
+    def fixture_metadata(metadata: os.stat_result, uid: int) -> os.stat_result:
+        if (metadata.st_dev, metadata.st_ino) != log_identity:
+            return metadata
+        fields = list(metadata)
+        fields[0] = stat.S_IFREG | 0o600
+        fields[4] = uid
+        return os.stat_result(fields)
+
+    with (
+        patch.dict(read.__globals__, {"validate_workdir": lambda path: Path(path).resolve()}),  # type: ignore[attr-defined]
+        patch.object(os, "O_CLOEXEC", getattr(os, "O_CLOEXEC", 0), create=True),
+        patch.object(
+            os,
+            "lstat",
+            lambda *args, **kwargs: fixture_metadata(real_lstat(*args, **kwargs), path_uid),
+        ),
+        patch.object(os, "fstat", lambda fd: fixture_metadata(real_fstat(fd), opened_uid)),
+    ):
+        if path_uid == opened_uid == 0:
+            assert read(log, work, [b"private-test-marker"]) == ["[REDACTED]", "last"]
+        else:
+            with pytest.raises(failure, match="(?:unsafe|changed while opening)"):
+                read(log, work, [b"private-test-marker"])
 
 
 def test_self_test_quick_checkpoint_updates_canonical_and_mode_specific_results(
@@ -1881,6 +1939,58 @@ def test_self_test_validates_actual_decoded_pts_on_native_flv_capture() -> None:
     assert "video_pts_dts_offset_clusters_over_normal_reorder" not in event_limits
 
 
+@pytest.mark.parametrize(
+    "width,height,failure_text",
+    [
+        (1080, 1920, None),
+        (1280, 720, "landscape 1280x720"),
+        (720, 1280, "legacy portrait 720x1280"),
+        (1920, 1080, "outside the 1080x1920 portrait profile"),
+    ],
+)
+def test_self_test_rejects_observed_resolution_changes_despite_recorder_decode_artifacts(
+    width: int, height: int, failure_text: str | None
+) -> None:
+    loaded = load_self_test()
+    analyze = loaded["analyze_decoded_video_frames"]
+    require_dimensions = loaded["require_aggregate_portrait_dimensions"]
+    failure = loaded["TestFailure"]
+
+    class FakeProbe:
+        returncode = 1
+
+        def __init__(self) -> None:
+            self.stdout = iter(
+                [
+                    "width=1080|height=1920|pix_fmt=yuv420p|decode_error_flags=0\n",
+                    f"width={width}|height={height}|pix_fmt=yuv420p|decode_error_flags=1\n",
+                    "width=1080|height=1920|pix_fmt=yuv420p|decode_error_flags=0\n",
+                ]
+            )
+
+        def communicate(self, *, timeout: int) -> tuple[str, str]:
+            assert timeout == 60
+            return "", "diagnostic reader decode artifact"
+
+    with patch("subprocess.Popen", return_value=FakeProbe()):
+        decoded = analyze(Path("aggregate-downstream.flv"))
+    assert decoded["frame_count"] == 3
+    assert decoded["ffprobe_exit"] == 1
+    assert decoded["decode_error_flags"]
+    assert not decoded["stderr_empty"]
+    if failure_text is None:
+        require_dimensions(decoded)
+    else:
+        with pytest.raises(failure, match=failure_text):
+            require_dimensions(decoded)
+
+    source = SELF_TEST.read_text(encoding="utf-8")
+    aggregate = source.split('result["decoded_video_frames"] = ', 1)[1].split(
+        'mark_self_test_stage("timestamps")', 1
+    )[0]
+    assert "require_aggregate_portrait_dimensions(decoded_frames)" in aggregate
+
+
 def test_self_test_format_diagnostics_identify_each_safe_predicate() -> None:
     loaded = load_self_test()
     classify = loaded["output_format_failure_stage"]
@@ -2346,12 +2456,16 @@ def test_self_test_initial_live_log_gates_are_fixed_scoped_and_secret_free(
         'mark_self_test_stage("decode")', 1
     )[0]
     assert 'mark_self_test_stage("dts-regression")' in global_check_block
-    delivery_gate = 'raise TestFailure("automatic downstream RTMP recovery validation failed")'
+    delivery_gate = (
+        "require_accounted_downstream_recovery(delivery_summary, event_delivery_summary)"
+    )
     dts_diagnostic = "dts_reconnects = transition_log_tail.count(KNOWN_DTS_REGRESSION_MARKER)"
     assert main_source.index(delivery_gate) < main_source.index(dts_diagnostic)
     assert (
-        'delivery_summary["max_delivery_outage_seconds"] '
-        "> RTMP_SINK_RECOVERY_TIMEOUT_SECONDS" in main_source[: main_source.index(delivery_gate)]
+        'delivery["max_delivery_outage_seconds"] > RTMP_SINK_RECOVERY_TIMEOUT_SECONDS'
+        in SELF_TEST.read_text(encoding="utf-8")
+        .split("def require_accounted_downstream_recovery(", 1)[1]
+        .split("def observer_health_problem(", 1)[0]
     )
 
     with (
@@ -2684,6 +2798,93 @@ def test_self_test_tracks_bounded_rtmp_sink_delivery_without_exposing_ids() -> N
             [{"event": forced_event, "recovery_seconds": 1.0, "publisher_rotated": False}],
             (forced_event,),
         )
+
+
+def test_self_test_forward_rotation_requires_fresh_scoped_timestamp_evidence() -> None:
+    loaded = load_self_test()
+    summarize = loaded["summarize_event_delivery_ledger"]
+    count_markers = loaded["known_forward_dts_marker_count"]
+    failure = loaded["TestFailure"]
+    known = (
+        b"2026/09/05 12:00:00 WAR [path relay-output] [forward rtmp://127.0.0.1/live] "
+        b"DTS is not monotonically increasing, was 200, now is 100\n"
+    )
+    unrelated = (
+        known.replace(b"relay-output", b"iphone-live")
+        + known.replace(b"[forward ", b"[forwarder ")
+        + known.replace(b"[forward ", b"[reader ")
+        + known.replace(b"DTS is not monotonically increasing", b"connection closed")
+        + b"FFmpeg: DTS is not monotonically increasing\n"
+    )
+    assert count_markers(unrelated) == 0
+    assert count_markers(known + unrelated) == 1
+    recovered = {
+        "event": "LIVE",
+        "recovery_seconds": 5.4,
+        "publisher_rotated": True,
+        "known_dts_marker_count": count_markers(known + unrelated),
+    }
+    assert summarize([recovered], ("LIVE",))["events_with_publisher_rotation"] == 1
+    for overrides in (
+        {"recovery_seconds": 15.001},
+        {"recovery_seconds": float("nan")},
+        {"known_dts_marker_count": -1},
+        {"known_dts_marker_count": True},
+        {"known_dts_marker_count": "1"},
+    ):
+        with pytest.raises(failure, match="ledger is invalid"):
+            summarize([{**recovered, **overrides}], ("LIVE",))
+    for previous_rotated in (False, True):
+        # The previous checkpoint consumes evidence even when it did not rotate.
+        stale_ledger = [
+            {**recovered, "event": "previous", "publisher_rotated": previous_rotated},
+            recovered,
+        ]
+        with pytest.raises(failure, match="unexpected downstream RTMP publisher rotation"):
+            summarize(stale_ledger, ("previous", "LIVE"))
+    fresh_ledger = [
+        {**recovered, "event": "previous"},
+        {**recovered, "known_dts_marker_count": count_markers(known + known)},
+    ]
+    assert summarize(fresh_ledger, ("previous", "LIVE"))["events_with_publisher_rotation"] == 2
+
+    source = SELF_TEST.read_text(encoding="utf-8")
+    transition = source.split("def wait_downstream_transition(", 1)[1].split(
+        "def wait_new_authenticated_ingest(", 1
+    )[0]
+    assert "known_forward_dts_marker_count(\n                read_validated_log_tail(" in transition
+    assert '"known_dts_marker_count": known_dts_marker_count' in transition
+
+
+def test_self_test_rejects_unaccounted_rotations_and_delivery_failures() -> None:
+    loaded = load_self_test()
+    require_recovery = loaded["require_accounted_downstream_recovery"]
+    failure = loaded["TestFailure"]
+    delivery = {
+        "duplicate_publishers": False,
+        "counter_regression": False,
+        "invalid_samples": 0,
+        "max_delivery_outage_seconds": 5.4,
+        "final_active": True,
+        "id_rotation_count": 1,
+    }
+    events = {"events_with_publisher_rotation": 1}
+    require_recovery(delivery, events)
+    for overrides in (
+        {"duplicate_publishers": True},
+        {"counter_regression": True},
+        {"invalid_samples": 1},
+        {"max_delivery_outage_seconds": 15.001},
+        {"final_active": False},
+        {"id_rotation_count": 2},
+        {"id_rotation_count": 0},
+    ):
+        with pytest.raises(failure, match="automatic downstream RTMP recovery validation failed"):
+            require_recovery({**delivery, **overrides}, events)
+    source = SELF_TEST.read_text(encoding="utf-8")
+    assert (
+        "require_accounted_downstream_recovery(delivery_summary, event_delivery_summary)" in source
+    )
 
 
 def test_self_test_forces_exact_loopback_rtmp_disconnect_with_fixed_errors() -> None:
