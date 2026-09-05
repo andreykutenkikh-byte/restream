@@ -8,6 +8,7 @@ code intentionally refuses non-HTTPS/non-production control origins.
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import re
@@ -17,7 +18,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any, cast
 from uuid import UUID
 
-from bootstrap_worker.relay_installer import _SELF_TEST_STAGE_CODES
+from bootstrap_worker.relay_installer import _SELF_TEST_STAGE_CODES, RELAY_RELEASE
 from scripts.ci_output_smoke import COMPOSE, APIClient, SmokeFailure
 
 PASSWORD_MARKER = "CI_SSH_PASSWORD_MUST_NEVER_PERSIST_9F3A"  # noqa: S105
@@ -260,7 +261,23 @@ EXPECTED_RELAY_STATUS: dict[str, Any] = {
     "portrait_profile": True,
     "error_code": None,
 }
-SMOKE_STAGES = frozenset(
+NATIVE_RESULT_FAILURES = frozenset(
+    {
+        "native_result_unreadable",
+        "native_result_header",
+        "native_result_same_session",
+        "native_result_supervisor",
+        "native_result_bridge",
+        "native_result_persistent",
+        "native_result_idle",
+        "native_result_continuity",
+        "native_result_forward",
+        "native_result_media",
+        "native_result_secrets",
+        "native_result_cleanup",
+    }
+)
+SMOKE_STAGES = NATIVE_RESULT_FAILURES | frozenset(
     {
         "bootstrap_job",
         "create_job",
@@ -270,6 +287,10 @@ SMOKE_STAGES = frozenset(
         "password_non_persistence",
         "relay_ready",
         "remote_lifecycle",
+        "remote_lifecycle_files",
+        "remote_lifecycle_services",
+        "remote_lifecycle_result",
+        "remote_lifecycle_accounts",
         "revoke",
         "revoke_quiescence",
         "startup",
@@ -769,8 +790,274 @@ def ready_relay(client: APIClient) -> tuple[Mapping[str, Any], Mapping[str, Any]
     return wait_for("ready native relay heartbeat", READY_TIMEOUT_SECONDS, probe)
 
 
+def native_self_test_result_failure(result: Any) -> str | None:
+    """Validate the current quick-test contract without returning report values.
+
+    This same pure function executes in the disposable target; only its fixed
+    failure code leaves the target. Aggregate RTSP recorder artifacts are not
+    the corruption oracle: strict final-RTMP segments and delivery evidence are.
+    """
+
+    def section(name: str) -> dict[str, Any]:
+        value = result.get(name)
+        return value if isinstance(value, dict) else {}
+
+    def number(value: Any, low: float, high: float) -> bool:
+        return type(value) in (int, float) and low <= value <= high and math.isfinite(value)
+
+    def flags(value: dict[str, Any], *names: str) -> bool:
+        return all(value.get(name) is True for name in names)
+
+    if not isinstance(result, dict) or not (
+        result.get("status") == "PASS"
+        and result.get("mode") == "quick"
+        and result.get("result_phase") == "final"
+        and result.get("outage_targets_seconds") == [15, 17, 19]
+    ):
+        return "native_result_header"
+    same = section("same_session_stall")
+    if not flags(
+        same,
+        "srt_connection_preserved",
+        "upstream_processes_preserved",
+        "feeder_thread_preserved",
+        "feeder_remux_preserved",
+        "normalizer_reconnected",
+    ) or not number(same.get("max_capture_no_growth_seconds"), 0, 3):
+        return "native_result_same_session"
+    supervisor = section("supervisor_crash_recovery")
+    if not flags(
+        supervisor,
+        "ffmpeg_parent_death_passed",
+        "srt_connection_preserved",
+        "automatic_rtmp_recovery",
+        "delivery_byte_growth_validated",
+        "rtsp_capture_pause_diagnostic_only",
+    ) or not (
+        supervisor.get("recovery_limit_seconds") == 12.0
+        and number(supervisor.get("total_recovery_seconds"), 0, 12)
+    ):
+        return "native_result_supervisor"
+    bridge = section("repeated_bridge_failure_recovery")
+    if not flags(
+        bridge,
+        "srt_session_preserved",
+        "source_processes_preserved",
+        "slate_available",
+        "live_restored_after_each_failure",
+        "restored_bridge_marker",
+        "automatic_rtmp_recovery",
+        "delivery_byte_growth_validated",
+        "rtsp_capture_pause_diagnostic_only",
+    ) or not (
+        type(bridge.get("forced_ffmpeg_failures")) is int
+        and bridge["forced_ffmpeg_failures"] == 3
+        and bridge.get("source_reset_requested") is False
+        and bridge.get("source_reset_succeeded") is False
+    ):
+        return "native_result_bridge"
+    persistent = section("persistent_input_stall_recovery")
+    if not flags(
+        persistent,
+        "same_srt_connection_confirmed_stalled",
+        "confirmation_grace_observed",
+        "stalled_srt_session_observed_before_recovery",
+        "confirmed_stall_marker_seen",
+        "source_detached_marker_seen",
+        "source_reset_succeeded",
+        "reset_before_transport_idle_timeout",
+        "automatic_srt_recovery",
+        "srt_session_replaced",
+        "source_processes_preserved",
+        "automatic_rtmp_recovery",
+    ) or not (
+        persistent.get("recovery_path") == "exact-api-reset"
+        and number(persistent.get("reset_elapsed_seconds"), 6, 9)
+        and number(persistent.get("max_capture_no_growth_seconds"), 0, 3)
+    ):
+        return "native_result_persistent"
+
+    idle = result.get("srt_idle_expiry_seconds")
+    final = section("final_transition")
+    if not isinstance(idle, list) or len(idle) != 3:
+        return "native_result_idle"
+    idle_events = dict(
+        zip((f"outage {index} SRT idle expiry" for index in range(1, 4)), idle, strict=True)
+    )
+    idle_events["final SRT idle expiry"] = final.get("srt_idle_expiry_seconds")
+    proved = result.get("confirmed_reset_outage_disconnects", [])
+    if not isinstance(proved, list) or len(proved) > 4:
+        return "native_result_idle"
+    seen: set[str] = set()
+    for proof in proved:
+        if not isinstance(proof, dict) or set(proof) != {"event", "elapsed_seconds"}:
+            return "native_result_idle"
+        event = proof["event"]
+        elapsed = proof["elapsed_seconds"]
+        if (
+            not isinstance(event, str)
+            or event not in idle_events
+            or event in seen
+            or not number(elapsed, 6, 8)
+            or elapsed != idle_events[event]
+        ):
+            return "native_result_idle"
+        seen.add(event)
+    for event, elapsed in idle_events.items():
+        if not number(elapsed, 6, 13) or (elapsed < 8 and event not in seen):
+            return "native_result_idle"
+    # The self-test emits an early-disconnect entry only after exact UUID,
+    # continuous byte-counter evidence and fresh ordered reset markers pass.
+    # Rounded 7.999x may serialize as 8.0; no unproved early value is accepted.
+    outages = result.get("outage_max_capture_no_growth_seconds")
+    if not (
+        isinstance(outages, list)
+        and len(outages) == 3
+        and all(number(value, 0, 3) for value in outages)
+        and number(final.get("max_capture_no_growth_seconds"), 0, 3)
+        and number(result.get("overall_max_capture_no_growth_seconds"), 0, 3)
+        and number(result.get("max_metrics_blind_seconds"), 0, 3)
+        and result.get("rtsp_capture_session_preserved") is True
+    ):
+        return "native_result_continuity"
+
+    expected_events = [
+        "initial healthy LIVE",
+        "same-session SLATE transition",
+        "same-session LIVE recovery",
+        "persistent-stall SLATE transition",
+        "persistent-stall LIVE recovery",
+        "supervisor-crash SLATE transition",
+        "supervisor-crash LIVE recovery",
+    ]
+    for index in range(1, 4):
+        expected_events.extend(
+            (
+                f"repeated-failure {index} SLATE transition",
+                f"LIVE after forced bridge failure {index}",
+            )
+        )
+    for index in range(1, 4):
+        expected_events.extend(
+            (f"outage {index} SLATE transition", f"outage {index} LIVE recovery")
+        )
+    expected_events.extend(("forced RTMP sink reconnect", "final SLATE transition"))
+    ledger = result.get("event_to_delivery_recovery")
+    if not isinstance(ledger, list) or len(ledger) != len(expected_events):
+        return "native_result_forward"
+    rotations = 0
+    previous_dts = 0
+    maximum_recovery = 0.0
+    for entry, expected in zip(ledger, expected_events, strict=True):
+        if not isinstance(entry, dict):
+            return "native_result_forward"
+        elapsed = entry.get("recovery_seconds")
+        rotated = entry.get("publisher_rotated")
+        dts = entry.get("known_dts_marker_count")
+        if not (
+            entry.get("event") == expected
+            and isinstance(elapsed, (int, float))
+            and number(elapsed, 0, 15)
+            and type(rotated) is bool
+            and type(dts) is int
+            and dts >= previous_dts
+        ):
+            return "native_result_forward"
+        if expected == "forced RTMP sink reconnect":
+            if not rotated:
+                return "native_result_forward"
+        elif rotated and dts == previous_dts:
+            return "native_result_forward"
+        previous_dts = dts
+        rotations += int(rotated)
+        maximum_recovery = max(maximum_recovery, elapsed)
+    forward = section("automatic_rtmp_forward_recovery")
+    if not (
+        forward.get("recovery_limit_seconds") == 15.0
+        and forward.get("event_count") == len(expected_events)
+        and forward.get("maximum_event_to_delivery_seconds") == round(maximum_recovery, 3)
+        and number(forward.get("max_delivery_outage_seconds"), 0, 15)
+        and forward.get("id_rotation_count") == rotations
+        and forward.get("events_with_publisher_rotation") == rotations
+        and forward.get("duplicate_publishers") is False
+        and forward.get("counter_regression") is False
+        and type(forward.get("invalid_samples")) is int
+        and forward["invalid_samples"] == 0
+        and flags(forward, "forced_disconnect_recovered", "final_active")
+        and number(forward.get("forced_disconnect_max_rtsp_capture_no_growth_seconds"), 0, 3)
+        and forward.get("test_scope") == "isolated-loopback-immediate-failure"
+        and flags(
+            section("rtmp_transition_log_contract"),
+            "dts_reconnects_recovered",
+            "missing_or_unset_timestamps_absent",
+            "mux_invalid_argument_absent",
+        )
+    ):
+        return "native_result_forward"
+
+    strict = section("strict_sink_segment_validation")
+    capture = section("strict_sink_segment_capture")
+    if not (
+        strict.get("segments") == capture.get("segments") == 13
+        and strict.get("capture_bytes") == capture.get("capture_bytes")
+        and all(
+            number(strict.get(key), 1, 10**12)
+            for key in ("capture_bytes", "video_frames", "audio_frames", "keyframes")
+        )
+        and strict.get("temporary_segments_retained") == 0
+        and capture.get("pending_validation") == 0
+        and result.get("landscape_1280x720_regression_absent") is True
+        and result.get("legacy_portrait_720x1280_regression_absent") is True
+    ):
+        return "native_result_media"
+    for name in ("secret_scan_while_live", "secret_scan"):
+        scan = section(name)
+        if not (
+            scan.get("unexpected_file_hits") == []
+            and all(
+                scan.get(key) is False
+                for key in ("journal_hit", "process_cmdline_hit", "process_environment_hit")
+            )
+        ):
+            return "native_result_secrets"
+    if not (
+        flags(result, "test_ports_released", "workdir_removed")
+        and type(result.get("secret_configs_wiped")) is int
+        and result["secret_configs_wiped"] > 0
+        and "cleanup_failure" not in result
+    ):
+        return "native_result_cleanup"
+    return None
+
+
+def native_result_probe_source() -> str:
+    """Send repository code, not secret report contents, across the CI boundary."""
+    return (
+        "from __future__ import annotations\nimport json, math, os, stat\n"
+        + inspect.getsource(native_self_test_result_failure)
+        + """
+failure = 'native_result_unreadable'
+try:
+    descriptor = os.open('/var/lib/moblin-relay/tests/last-quick-result.json',
+                         os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, 'rb') as handle:
+        metadata = os.fstat(handle.fileno())
+        if (stat.S_ISREG(metadata.st_mode) and metadata.st_uid == 0
+                and stat.S_IMODE(metadata.st_mode) == 0o600
+                and metadata.st_nlink == 1 and 0 < metadata.st_size <= 1048576):
+            raw = handle.read(1048577)
+            if len(raw) <= 1048576:
+                failure = native_self_test_result_failure(json.loads(raw))
+except (OSError, ValueError, TypeError, OverflowError):
+    pass
+print(failure or 'NATIVE_SELF_TEST_RESULT_OK')
+"""
+    )
+
+
 def verify_remote_lifecycle() -> None:
-    lifecycle = compose(
+    set_smoke_stage("remote_lifecycle_files")
+    compose(
         "exec",
         "-T",
         "ci-ssh-target",
@@ -779,12 +1066,25 @@ def verify_remote_lifecycle() -> None:
         """
 set -eu
 test "$(cat /etc/moblin-relay/.managed-by-adojapan)" = 'adojapan-moblin-relay:v1'
-test "$(cat /etc/moblin-relay/release)" = '2026.09.04.1'
+test "$(cat /etc/moblin-relay/release)" = "$1"
 test "$(stat -c '%U:%G:%a' /etc/moblin-relay/secrets.json)" = 'root:root:600'
 test "$(stat -c '%U:%G:%a' /etc/adojapan-relay-agent/node.token)" = \
   'restream-agent:restream-agent:600'
 test "$(stat -c '%U:%G:%a' /etc/adojapan-relay-agent/preview-reader.token)" = \
   'restream-agent:restream-agent:600'
+""",
+        "native-lifecycle-files",
+        RELAY_RELEASE,
+    )
+    set_smoke_stage("remote_lifecycle_services")
+    compose(
+        "exec",
+        "-T",
+        "ci-ssh-target",
+        "sh",
+        "-c",
+        """
+set -eu
 systemctl is-active --quiet adojapan-relay-agent.service
 systemctl is-enabled --quiet adojapan-relay-agent.service
 systemctl is-active --quiet adojapan-relay-broker.socket
@@ -803,50 +1103,32 @@ assert node['schema'] == 1
 assert node['srt_port'] == 8890
 assert node['srt_path'] == 'iphone-live'
 assert node['fallback_srt_hosts'] == []
-result = json.loads(
-    Path('/var/lib/moblin-relay/tests/last-quick-result.json').read_text(encoding='utf-8')
-)
-assert result['status'] == 'PASS'
-assert result['mode'] == 'quick'
-assert result['outage_targets_seconds'] == [15, 17, 19]
-assert result['same_session_stall']['srt_connection_preserved'] is True
-assert result['same_session_stall']['normalizer_reconnected'] is True
-assert result['supervisor_crash_recovery']['ffmpeg_parent_death_passed'] is True
-assert result['supervisor_crash_recovery']['srt_connection_preserved'] is True
-recovery = result['repeated_bridge_failure_recovery']
-assert recovery['forced_ffmpeg_failures'] == 3
-assert recovery['circuit_breaker_opened'] is True
-assert recovery['source_reset_succeeded'] is True
-assert recovery['srt_session_replaced'] is True
-assert recovery['source_processes_preserved'] is True
-assert recovery['slate_available'] is True
-assert recovery['fresh_session_live'] is True
-assert recovery['automatic_rtmp_recovery'] is True
-assert recovery['max_capture_no_growth_seconds'] <= 1.5
-persistent = result['persistent_input_stall_recovery']
-assert persistent['stalled_srt_session_observed_before_recovery'] is True
-assert persistent['recovery_path'] == 'exact-api-reset'
-assert persistent['confirmed_stall_marker_seen'] is True
-assert persistent['source_detached_marker_seen'] is True
-assert persistent['source_reset_succeeded'] is True
-assert persistent['reset_before_transport_idle_timeout'] is True
-assert persistent['reset_elapsed_seconds'] < 10.0
-assert persistent['automatic_srt_recovery'] is True
-assert persistent['srt_session_replaced'] is True
-assert persistent['source_processes_preserved'] is True
-assert persistent['automatic_rtmp_recovery'] is True
-assert persistent['max_capture_no_growth_seconds'] <= 1.5
-assert len(result['srt_idle_expiry_seconds']) == 3
-assert all(8.0 <= value <= 13.0 for value in result['srt_idle_expiry_seconds'])
-assert all(value <= 1.5 for value in result['outage_max_capture_no_growth_seconds'])
-assert result['rtsp_capture_session_preserved'] is True
-forward = result['automatic_rtmp_forward_recovery']
-assert forward['recovery_limit_seconds'] == 8.0
-assert forward['maximum_event_to_delivery_seconds'] <= 8.0
-assert forward['max_delivery_outage_seconds'] <= 8.0
-assert forward['forced_disconnect_recovered'] is True
-assert forward['final_active'] is True
 PY
+""",
+    )
+    set_smoke_stage("remote_lifecycle_result")
+    probe = compose(
+        "exec",
+        "-T",
+        "ci-ssh-target",
+        "python3",
+        "-c",
+        native_result_probe_source(),
+        max_capture_bytes=256,
+    )
+    failure = probe.stdout.decode("ascii", errors="replace").strip()
+    if failure in NATIVE_RESULT_FAILURES:
+        set_smoke_stage(failure)
+    require(failure == "NATIVE_SELF_TEST_RESULT_OK", "native self-test result is invalid")
+    set_smoke_stage("remote_lifecycle_accounts")
+    lifecycle = compose(
+        "exec",
+        "-T",
+        "ci-ssh-target",
+        "sh",
+        "-c",
+        """
+set -eu
 for spec in 'moblin-relay|/var/lib/moblin-relay' \
   'restream-agent|/var/lib/adojapan-relay-agent'; do
   name=${spec%%|*}
