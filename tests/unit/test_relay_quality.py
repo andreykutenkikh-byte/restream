@@ -13,6 +13,7 @@ from app.services.relay_quality import (
     MAX_SAMPLES_PER_ROUTE,
     MAX_TRACKED_ROUTES,
     RECOMMENDATION_COOLDOWN_SECONDS,
+    RECOVERY_GRACE_SECONDS,
     STANDBY_HEALTHY_MIN_SECONDS,
     HealthLevel,
     MeasurementConfidence,
@@ -205,14 +206,16 @@ def test_fifty_percent_drop_needs_samples_and_eight_seconds_before_red() -> None
     assert third.health.level == HealthLevel.RED
 
 
-def test_stale_heartbeat_is_immediately_black() -> None:
+def test_stale_heartbeat_is_unknown_and_does_not_assert_video_loss() -> None:
     tracker = RelayQualityTracker()
     warm_stable(tracker)
 
     result = evaluate(tracker, route(heartbeat=HEARTBEAT_BLACK_SECONDS + 0.1), 40)
 
-    assert result.health.level == HealthLevel.BLACK
-    assert "heartbeat_lost" in result.health.reason_codes
+    assert result.health.level == HealthLevel.UNKNOWN
+    assert result.stream_state == "unknown"
+    assert result.health.reason_codes == ("telemetry_unavailable",)
+    assert result.recommendation.action == RecommendationAction.WATCH
 
 
 def test_youtube_failure_is_red_without_claiming_route_loss() -> None:
@@ -331,6 +334,51 @@ def test_missing_media_progress_escalates_from_red_to_black() -> None:
     assert red.health.level == HealthLevel.RED
     assert black.health.level == HealthLevel.BLACK
     assert "media_stalled" in black.health.reason_codes
+
+
+def test_long_zero_byte_live_does_not_erase_ongoing_stall_when_baseline_expires() -> None:
+    tracker = RelayQualityTracker()
+    now = warm_stable(tracker)
+    for elapsed in range(2, 142, 2):
+        result = evaluate(tracker, route(bitrate=0), now + elapsed)
+        if elapsed > 32:
+            assert result.health.level == HealthLevel.BLACK
+            assert "media_stalled" in result.health.reason_codes
+            assert result.recommendation.action == (
+                RecommendationAction.WATCH
+                if elapsed < 2 + RECOVERY_GRACE_SECONDS
+                else RecommendationAction.RECONNECT
+            )
+    assert tracker.baseline_for("hong_kong") is None
+
+
+def test_restored_lower_bitrate_is_assessed_as_degraded_not_still_lost() -> None:
+    tracker = RelayQualityTracker()
+    now = warm_stable(tracker)
+    evaluate(tracker, route(live=False, source="SLATE", bitrate=0), now + 2)
+    first = evaluate(tracker, route(bitrate=2_800_000), now + 4)
+    assert first.health.level == HealthLevel.UNKNOWN
+    assert first.recommendation.action == RecommendationAction.WATCH
+    for elapsed in range(6, 66, 2):
+        restored = evaluate(tracker, route(bitrate=2_800_000), now + elapsed)
+        assert restored.health.level == HealthLevel.YELLOW
+        assert "source_lost" not in restored.health.reason_codes
+
+
+def test_confirmed_process_failure_message_takes_precedence_over_missing_media() -> None:
+    tracker = RelayQualityTracker()
+    now = warm_stable(tracker)
+    failed = replace(route(bitrate=0), service_state="failed", main_process_state="failed")
+    evaluate(tracker, failed, now + 2)
+    result = evaluate(tracker, failed, now + 34)
+    assert result.health.level == HealthLevel.BLACK
+    assert "relay_process_failed" in result.health.reason_codes
+    assert "media_stalled" in result.health.reason_codes
+    assert result.health.title == "Ошибка процесса relay"
+    assert result.health.message == (
+        "Свежая телеметрия подтверждает ошибку процесса relay. Проверьте сервер."
+    )
+    assert result.recommendation.reason_code != "recovery_grace"
 
 
 def test_sample_history_and_route_state_are_bounded() -> None:
