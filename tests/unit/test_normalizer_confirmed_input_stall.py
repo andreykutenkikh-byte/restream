@@ -162,10 +162,7 @@ def test_pre_reset_metrics_or_identity_failure_requires_a_new_full_stall_proof()
         breaker.observe_before_reset(True, (SOURCE_ID, 100), 10.05)
         == loaded["RECOVERY_PREFLIGHT_WAIT"]
     )
-    assert (
-        breaker.observe_before_reset(False, None, 10.10)
-        == loaded["RECOVERY_PREFLIGHT_INVALID"]
-    )
+    assert breaker.observe_before_reset(False, None, 10.10) == loaded["RECOVERY_PREFLIGHT_INVALID"]
     assert breaker.invalidate_unverified_source() is True
     assert breaker.opened is False
     assert breaker.should_attempt(100.0) is False

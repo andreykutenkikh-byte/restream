@@ -584,9 +584,7 @@ def assert_preview_contract(renderer) -> None:
     assert "forward" not in ingest
     assert output["alwaysAvailable"] is True
     assert output["alwaysAvailableFile"] == renderer.SLATE_FILE
-    assert output["forward"] == [
-        {"dest": "rtmps://example.invalid/live2#test-youtube-key"}
-    ]
+    assert output["forward"] == [{"dest": "rtmps://example.invalid/live2#test-youtube-key"}]
     assert "runOnAvailable" not in output
     assert set(config["paths"]) == {"iphone-live", "relay-output"}
 
