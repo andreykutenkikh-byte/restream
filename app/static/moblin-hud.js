@@ -13,13 +13,14 @@
   const IPV4_PATTERN = /(?:^|[^\d.])(?:\d{1,3}\.){3}\d{1,3}(?:$|[^\d.])/;
   const IPV6_PATTERN = /(?:^|[^a-f\d:])(?:[a-f\d]{0,4}:){2,}[a-f\d]{0,4}(?:$|[^a-f\d:])/i;
   const LEVELS = Object.freeze(["unknown", "green", "yellow", "red", "black"]);
-  const STREAM_STATES = Object.freeze(["idle", "active", "ambiguous"]);
+  const STREAM_STATES = Object.freeze(["idle", "active", "ambiguous", "unknown"]);
   const CONFIDENCE = Object.freeze(["active_path_measured", "standby_server_readiness"]);
   const ACTIONS = Object.freeze(["stay", "watch", "switch_recommended", "reconnect", "unavailable"]);
   const TRENDS = Object.freeze(["unknown", "rising", "stable", "falling"]);
   const ALERT_COOLDOWN_MS = 45_000;
   const MUTE_DURATION_MS = 60_000;
   const REQUEST_TIMEOUT_MS = 7_000;
+  const HUD_INSTANCE_KEY = Symbol.for("adojapan.moblinHud.instance");
 
   function safeText(value, fallback = "—", maxLength = 240) {
     if (typeof value !== "string") return fallback;
@@ -210,10 +211,13 @@
     return 5000;
   }
 
-  function shouldSoundTransition(previousLevel, nextLevel, now, lastAlertAt = null, cooldownMs = ALERT_COOLDOWN_MS) {
-    const audibleTransitions = new Set(["green:yellow", "yellow:red", "red:black"]);
-    if (!audibleTransitions.has(`${previousLevel}:${nextLevel}`)) return false;
-    return lastAlertAt === null || now - lastAlertAt >= cooldownMs;
+  function shouldSoundTransition(previousLevel, nextLevel, now, lastAlertAt = null, cooldownMs = ALERT_COOLDOWN_MS, lastAlertLevel = null) {
+    const severity = { green: 0, yellow: 1, red: 2, black: 3 };
+    if (!(previousLevel in severity) || !(nextLevel in severity)) return false;
+    if (severity[nextLevel] <= severity[previousLevel]) return false;
+    return lastAlertAt === null
+      || now - lastAlertAt >= cooldownMs
+      || (lastAlertLevel in severity && severity[nextLevel] > severity[lastAlertLevel]);
   }
 
   class HudPoller {
@@ -244,6 +248,7 @@
       this.generation = 0;
       this.timer = null;
       this.controller = null;
+      this.pendingPoll = null;
       this.errorCount = 0;
       this.lastStatus = null;
     }
@@ -279,12 +284,18 @@
       }
       if (this.controller !== null) {
         this.controller.abort();
-        this.controller = null;
       }
+      this.pendingPoll = null;
     }
 
     schedule(delay, generation) {
       if (!this.running || generation !== this.generation) return;
+      // An aborted fetch still owns its slot until its promise/body settles.
+      // Visibility/page lifecycle events may replace only this pending schedule.
+      if (this.controller !== null) {
+        this.pendingPoll = { delay, generation };
+        return;
+      }
       if (this.timer !== null) this.clearTimeoutFn(this.timer);
       this.timer = this.setTimeoutFn(() => {
         this.timer = null;
@@ -326,6 +337,9 @@
       } finally {
         this.clearTimeoutFn(timeout);
         if (this.controller === controller) this.controller = null;
+        const pending = this.pendingPoll;
+        this.pendingPoll = null;
+        if (pending) this.schedule(pending.delay, pending.generation);
       }
     }
   }
@@ -343,6 +357,7 @@
       this.enabled = false;
       this.mutedUntil = 0;
       this.lastAlertAt = null;
+      this.lastAlertLevel = null;
     }
 
     async toggle() {
@@ -368,8 +383,9 @@
     notify(previousLevel, nextLevel) {
       const now = this.now();
       if (!this.enabled || now < this.mutedUntil) return false;
-      if (!shouldSoundTransition(previousLevel, nextLevel, now, this.lastAlertAt)) return false;
+      if (!shouldSoundTransition(previousLevel, nextLevel, now, this.lastAlertAt, ALERT_COOLDOWN_MS, this.lastAlertLevel)) return false;
       this.lastAlertAt = now;
+      this.lastAlertLevel = nextLevel;
       this.play(nextLevel);
       return true;
     }
@@ -402,12 +418,13 @@
     }
   }
 
-  async function pairFromFragment({ location, history, fetchFn }) {
+  async function pairFromFragment({ location, history, fetchFn, alreadyPaired = false }) {
     const hash = typeof location?.hash === "string" ? location.hash : "";
     let token = parsePairToken(hash);
     if (!hash) return { attempted: false, paired: false };
     const cleanUrl = `${location.pathname || "/moblin-hud"}${location.search || ""}`;
     history.replaceState(null, "", cleanUrl);
+    if (alreadyPaired) return { attempted: false, paired: true };
     if (token === null) return { attempted: true, paired: false };
     const body = JSON.stringify({ token });
     token = null;
@@ -498,13 +515,14 @@
   }
 
   function initializeHud(windowObject) {
-    const pairing = pairFromFragment({
-      location: windowObject.location,
-      history: windowObject.history,
-      fetchFn: windowObject.fetch.bind(windowObject),
-    });
+    const documentObject = windowObject.document;
+    if (documentObject[HUD_INSTANCE_KEY]) return documentObject[HUD_INSTANCE_KEY];
+    // Document-owned identity also survives the script being evaluated twice.
+    const instance = { started: false };
+    Object.defineProperty(documentObject, HUD_INSTANCE_KEY, { value: instance });
     const start = () => {
-      const documentObject = windowObject.document;
+      if (instance.started) return;
+      instance.started = true;
       const renderer = createRenderer(documentObject);
       const audio = new AlertAudio({
         audioContextClass: windowObject.AudioContext || windowObject.webkitAudioContext,
@@ -519,6 +537,8 @@
       });
       let previousLevel = null;
       let terminalSession = false;
+      let pageSuspended = false;
+      let pairingFinished = false;
       const poller = new HudPoller({
         fetchFn: windowObject.fetch.bind(windowObject),
         isHidden: () => documentObject.hidden,
@@ -529,6 +549,7 @@
         },
         onMonitoringOffline() {
           renderer.offline("monitoring");
+          previousLevel = null;
         },
         onRevoked() {
           terminalSession = true;
@@ -538,7 +559,12 @@
         abortControllerClass: windowObject.AbortController,
       });
 
-      select(documentObject, "sound")?.addEventListener("click", () => { void audio.toggle(); });
+      select(documentObject, "sound")?.addEventListener("click", () => {
+        void audio.toggle().catch(() => {
+          audio.destroy();
+          audio.onStateChange(audio);
+        });
+      });
       select(documentObject, "mute")?.addEventListener("click", () => {
         audio.mute();
       });
@@ -552,6 +578,7 @@
       select(documentObject, "logout")?.addEventListener("click", async () => {
         terminalSession = true;
         poller.stop();
+        audio.destroy();
         try {
           await windowObject.fetch("/moblin-hud/api/logout", {
             method: "POST",
@@ -567,18 +594,36 @@
       });
 
       documentObject.addEventListener("visibilitychange", () => {
-        if (!terminalSession) poller.restart(documentObject.hidden ? 10_000 : 0);
+        if (!terminalSession && !pageSuspended && pairingFinished) {
+          poller.restart(documentObject.hidden ? 10_000 : 0);
+        }
       });
       windowObject.addEventListener("pagehide", () => {
-        terminalSession = true;
+        pageSuspended = true;
         poller.stop();
         audio.destroy();
-      }, { once: true });
+        audio.onStateChange(audio);
+        previousLevel = null;
+      });
+      windowObject.addEventListener("pageshow", () => {
+        pageSuspended = false;
+        if (!terminalSession && pairingFinished) poller.start();
+      });
 
+      const pairController = new windowObject.AbortController();
+      const pairTimeout = windowObject.setTimeout(() => pairController.abort(), REQUEST_TIMEOUT_MS);
+      const pairing = pairFromFragment({
+        location: windowObject.location,
+        history: windowObject.history,
+        alreadyPaired: documentObject.body?.dataset.hudPaired === "true",
+        fetchFn: (url, options) => windowObject.fetch(url, { ...options, signal: pairController.signal }),
+      });
       void pairing
         .catch(() => renderer.offline("monitoring"))
         .finally(() => {
-          if (!terminalSession) poller.start();
+          windowObject.clearTimeout(pairTimeout);
+          pairingFinished = true;
+          if (!terminalSession && !pageSuspended) poller.start();
         });
     };
 
@@ -587,6 +632,7 @@
     } else {
       start();
     }
+    return instance;
   }
 
   return {
@@ -604,6 +650,7 @@
     formatSource,
     formatTrend,
     formatYouTube,
+    initializeHud,
     nextPollDelay,
     normalizeStatus,
     pairFromFragment,

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import math
 import re
@@ -307,16 +306,6 @@ def _heartbeat_age(value: Any) -> float | None:
     return max(0.0, (datetime.now(UTC) - parsed).total_seconds())
 
 
-def _heartbeat_band(age: float | None) -> str:
-    if age is None:
-        return "missing"
-    if age > 30:
-        return "lost"
-    if age > 10:
-        return "delayed"
-    return "fresh"
-
-
 def _youtube_forward_state(destinations: list[dict[str, Any]]) -> str:
     enabled = [item for item in destinations if bool(item.get("enabled"))]
     states = {str(item.get("state", "unknown")).lower() for item in enabled}
@@ -324,7 +313,7 @@ def _youtube_forward_state(destinations: list[dict[str, Any]]) -> str:
         return "failed"
     if states & {"running", "live", "active"}:
         return "active"
-    if states & {"starting", "connecting", "reconnecting", "waiting"}:
+    if states & {"starting", "connecting", "reconnecting", "waiting", "waiting_for_input"}:
         return "connecting"
     return "inactive" if enabled or destinations else "unknown"
 
@@ -373,15 +362,19 @@ async def _main_snapshot(request: Request) -> tuple[StreamRouteSnapshot, tuple[A
         available=state != "error",
         live=live,
         ready=state != "error",
-        source="LIVE" if live else "NONE",
+        source="UNKNOWN" if state == "error" else "LIVE" if live else "NONE",
         input_bitrate_bps=_bounded_integer(ingest.get("bitrate_bps"), maximum=1_000_000_000),
         youtube_forward_state=youtube,
         overall_state=overall,
-        heartbeat_age_seconds=0.0 if live else None,
+        # This is a successful direct ingest read, not a relay heartbeat. Its
+        # freshness advances independently from whether media bytes changed.
+        heartbeat_age_seconds=None if state == "error" else 0.0,
         error_code=("youtube_forward_failed" if youtube == "failed" else None),
         recommendation_eligible=False,
         portrait_profile_valid=portrait_valid,
         youtube_configured=bool(destinations),
+        # The ingest API does not report independent service/process/listener
+        # lifecycle. An offline input (or API error) cannot prove manual stop.
     )
     observation = (
         "main",
@@ -448,62 +441,18 @@ def _relay_snapshots(
             portrait_profile_valid=bool(relay_status.get("portrait_profile")),
             youtube_configured=bool(relay_status.get("youtube_url_configured"))
             and bool(relay_status.get("youtube_key_configured")),
+            service_state=str(relay_status.get("service", "unknown")).lower()[:32],
+            main_process_state=str(relay_status.get("main_process", "unknown")).lower()[:32],
+            srt_listener_state=str(relay_status.get("srt_listener", "unknown")).lower()[:32],
         )
         snapshots.append(snapshot)
         observations.append(
             (
                 node_id,
                 relay.get("last_seen_at"),
-                node.get("last_seen_at"),
-                _heartbeat_band(snapshot.heartbeat_age_seconds),
-                snapshot.available,
-                snapshot.live,
-                snapshot.ready,
-                snapshot.source,
-                snapshot.input_bitrate_bps,
-                snapshot.youtube_forward_state,
-                snapshot.overall_state,
-                snapshot.host_cpu_percent,
-                snapshot.host_memory_available_bytes,
-                snapshot.error_code,
-                snapshot.pending_command,
-                snapshot.portrait_profile_valid,
-                snapshot.youtube_configured,
             )
         )
     return snapshots, tuple(observations)
-
-
-def _stream_session_id(request: Request, snapshots: list[StreamRouteSnapshot]) -> str | None:
-    live_ids = sorted(
-        snapshot.route_id
-        for snapshot in snapshots
-        if snapshot.live or snapshot.source.upper() == "LIVE"
-    )
-    active_id = live_ids[0] if len(live_ids) == 1 else None
-    previous_id = request.app.state.moblin_hud_active_route_id
-    if active_id != previous_id:
-        request.app.state.moblin_hud_stream_session_sequence += 1
-        request.app.state.moblin_hud_active_route_id = active_id
-    if active_id is None:
-        return None
-    return f"{active_id}:{request.app.state.moblin_hud_stream_session_sequence}"
-
-
-def _refresh_cached_payload(
-    payload: dict[str, Any], snapshots: list[StreamRouteSnapshot]
-) -> dict[str, Any]:
-    refreshed = copy.deepcopy(payload)
-    by_id = {snapshot.route_id: snapshot for snapshot in snapshots}
-    for field in ("current_route", "standby_route"):
-        route = refreshed.get(field)
-        if not isinstance(route, dict):
-            continue
-        snapshot = by_id.get(str(route.get("route_id", "")))
-        if snapshot is not None:
-            route["heartbeat_age_seconds"] = snapshot.heartbeat_age_seconds
-    refreshed["generated_at"] = datetime.now(UTC).isoformat()
-    return refreshed
 
 
 async def _status_payload(request: Request) -> dict[str, Any]:
@@ -524,24 +473,20 @@ async def _status_payload(request: Request) -> dict[str, Any]:
         main, main_observation = main_result
         relays, relay_observations = relay_result
         snapshots = [main, *relays]
-        main_progress_timer = (
-            int(observed_at // 2)
-            if main.live and not (main.input_bitrate_bps and main.input_bitrate_bps > 0)
-            else None
-        )
-        observation = (main_observation, main_progress_timer, relay_observations)
-        if (
-            isinstance(cached_payload, dict)
-            and observation == request.app.state.moblin_hud_status_observation
-        ):
-            payload = _refresh_cached_payload(cast(dict[str, Any], cached_payload), snapshots)
-            request.app.state.moblin_hud_status_cached_at = observed_at
-            request.app.state.moblin_hud_status_cache = payload
-            return payload
+        previous = request.app.state.moblin_hud_status_observations
+        observations = {str(item[0]): item for item in (main_observation, *relay_observations)}
+        new_sample_ids = {
+            route_id
+            for route_id, identity in observations.items()
+            if previous.get(route_id) != identity
+        }
         evaluation = _quality(request).evaluate(
             snapshots,
             now=observed_at,
-            stream_session_id=_stream_session_id(request, snapshots),
+            # Route/session lifecycle belongs to the tracker. A lost LIVE flag
+            # must never manufacture a new session or clear its recovery clock.
+            stream_session_id=None,
+            new_sample_route_ids=new_sample_ids,
         )
         payload = {
             "scope": "stream_monitor",
@@ -550,16 +495,26 @@ async def _status_payload(request: Request) -> dict[str, Any]:
         }
         request.app.state.moblin_hud_status_cached_at = observed_at
         request.app.state.moblin_hud_status_cache = payload
-        request.app.state.moblin_hud_status_observation = observation
+        request.app.state.moblin_hud_status_observations = {
+            route_id: observations[route_id]
+            for route_id in _quality(request).tracked_route_ids
+            if route_id in observations
+        }
         return payload
 
 
 @router.get("/moblin-hud", response_class=HTMLResponse)
 async def hud_page(request: Request) -> Response:
+    paired = False
+    try:
+        _hud(request).authenticate_session(request.cookies.get(HUD_SESSION_COOKIE))
+        paired = True
+    except HudSessionAuthenticationError:
+        pass
     return _templates(request).TemplateResponse(
         request=request,
         name="moblin_hud.html",
-        context={},
+        context={"hud_paired": paired},
     )
 
 

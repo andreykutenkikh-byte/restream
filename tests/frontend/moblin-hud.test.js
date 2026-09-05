@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
+const vm = require("node:vm");
 
 const {
   ALERT_COOLDOWN_MS,
@@ -19,6 +20,7 @@ const {
   formatSource,
   formatTrend,
   formatYouTube,
+  initializeHud,
   nextPollDelay,
   normalizeStatus,
   pairFromFragment,
@@ -156,6 +158,18 @@ test("page without a pairing fragment neither navigates nor pairs", async () => 
   });
   assert.deepEqual(result, { attempted: false, paired: false });
   assert.equal(touched, false);
+});
+
+test("an authenticated document clears a reused pairing fragment without replaying it", async () => {
+  const cleared = [];
+  const result = await pairFromFragment({
+    location: { hash: `#pair=${validToken}`, pathname: "/moblin-hud", search: "" },
+    history: { replaceState: (_state, _title, url) => cleared.push(url) },
+    alreadyPaired: true,
+    fetchFn: async () => { assert.fail("valid cookie must not replay one-time token"); },
+  });
+  assert.deepEqual(result, { attempted: false, paired: true });
+  assert.deepEqual(cleared, ["/moblin-hud"]);
 });
 
 test("normalizer accepts only the dedicated stream_monitor scope", () => {
@@ -324,6 +338,36 @@ test("visibility restart aborts in-flight work and ignores its stale result", as
   assert.equal(statuses.length, 0);
 });
 
+test("restart waits for aborted fetch settlement before granting the next request slot", async () => {
+  let finish;
+  let requests = 0;
+  const timers = new Map();
+  let timerId = 0;
+  const poller = new HudPoller({
+    fetchFn: () => { requests += 1; return new Promise((resolve) => { finish = resolve; }); },
+    setTimeoutFn: (callback, delay) => { timers.set(++timerId, { callback, delay }); return timerId; },
+    clearTimeoutFn: (timer) => timers.delete(timer),
+    abortControllerClass: FakeAbortController,
+  });
+  poller.running = true;
+  poller.generation = 1;
+  const first = poller.poll();
+  const owner = poller.controller;
+  poller.restart(10_000);
+  poller.restart(0);
+  assert.equal(owner.signal.aborted, true);
+  assert.equal(poller.controller, owner);
+  assert.equal([...timers.values()].filter((timer) => timer.delay === 0).length, 0);
+  await poller.poll();
+  assert.equal(requests, 1);
+  finish(response(statusPayload()));
+  await first;
+  assert.equal(poller.controller, null);
+  assert.equal([...timers.values()].filter((timer) => timer.delay === 0).length, 1);
+  poller.stop();
+  assert.equal(timers.size, 0);
+});
+
 test("a revoked session is a distinct terminal state", async () => {
   let revoked = 0;
   let offline = 0;
@@ -383,12 +427,18 @@ test("stop aborts and invalidates pending generations", () => {
 test("alerts require a real worsening transition and honor cooldown", () => {
   assert.equal(shouldSoundTransition(null, "red", 1000), false);
   assert.equal(shouldSoundTransition("green", "yellow", 1000), true);
-  assert.equal(shouldSoundTransition("green", "red", 1000), false);
+  assert.equal(shouldSoundTransition("green", "red", 1000), true);
+  assert.equal(shouldSoundTransition("green", "black", 1000), true);
+  assert.equal(shouldSoundTransition("yellow", "black", 1000), true);
+  assert.equal(shouldSoundTransition("unknown", "green", 1000), false);
   assert.equal(shouldSoundTransition("yellow", "yellow", 2000), false);
   assert.equal(shouldSoundTransition("red", "yellow", 3000), false);
   assert.equal(shouldSoundTransition("red", "black", 3000), true);
   assert.equal(shouldSoundTransition("yellow", "red", 1000, 900), false);
   assert.equal(shouldSoundTransition("yellow", "red", 1000 + ALERT_COOLDOWN_MS, 1000), true);
+  assert.equal(shouldSoundTransition("yellow", "red", 1100, 1000, ALERT_COOLDOWN_MS, "yellow"), true);
+  assert.equal(shouldSoundTransition("red", "black", 1200, 1100, ALERT_COOLDOWN_MS, "red"), true);
+  assert.equal(shouldSoundTransition("green", "red", 1300, 1200, ALERT_COOLDOWN_MS, "black"), false);
 });
 
 test("WebAudio is created only by an explicit user-triggered toggle", async () => {
@@ -416,9 +466,97 @@ test("WebAudio is created only by an explicit user-triggered toggle", async () =
   await audio.toggle();
   assert.equal(instances, 1);
   assert.deepEqual(played, [660]);
-  assert.equal(audio.notify("green", "red"), false);
-  assert.equal(audio.notify("yellow", "red"), true);
+  assert.equal(audio.notify("green", "red"), true);
+  assert.equal(audio.notify("yellow", "red"), false);
   assert.deepEqual(played, [660, 330, 330]);
+  assert.equal(audio.notify("red", "black"), true);
+  assert.deepEqual(played, [660, 330, 330, 220, 220, 220]);
+});
+
+function ordinaryScriptWindow({ hash = "", paired = false, readyState = "complete" } = {}) {
+  const listeners = (target) => {
+    const handlers = new Map();
+    target.addEventListener = (name, callback) => {
+      if (!handlers.has(name)) handlers.set(name, []);
+      handlers.get(name).push(callback);
+    };
+    target.dispatch = (name) => handlers.get(name)?.forEach((callback) => callback());
+    return target;
+  };
+  const elements = new Map();
+  const requests = [];
+  const timers = new Map();
+  let timerId = 0;
+  const document = listeners({
+    readyState, hidden: false, body: { dataset: { hudPaired: String(paired) } },
+    querySelector: (selector) => {
+      if (!elements.has(selector)) elements.set(selector, listeners({}));
+      return elements.get(selector);
+    },
+  });
+  const window = listeners({
+    document,
+    location: { hash, pathname: "/moblin-hud", search: "" },
+    history: { replaceState: () => { window.location.hash = ""; } },
+    AbortController: FakeAbortController,
+    fetch: async (url) => {
+      requests.push(url);
+      return response(url.endsWith("/status") ? statusPayload() : { paired: true });
+    },
+    setTimeout: (callback, delay) => { timers.set(++timerId, { callback, delay }); return timerId; },
+    clearTimeout: (id) => timers.delete(id),
+  });
+  return { window, requests, timers, elements };
+}
+
+async function flushMicrotasks() {
+  for (let index = 0; index < 12; index += 1) await Promise.resolve();
+}
+
+async function runImmediatePoll(harness) {
+  await flushMicrotasks();
+  const immediate = [...harness.timers.entries()].find(([, timer]) => timer.delay === 0);
+  assert.ok(immediate, "a status poll must be scheduled");
+  harness.timers.delete(immediate[0]);
+  immediate[1].callback();
+  await flushMicrotasks();
+}
+
+test("ordinary window/document script initializes once across duplicate script loads", async () => {
+  const harness = ordinaryScriptWindow({ hash: `#pair=${validToken}`, readyState: "loading" });
+  vm.runInNewContext(javascript, { window: harness.window });
+  vm.runInNewContext(javascript, { window: harness.window });
+  harness.window.document.dispatch("DOMContentLoaded");
+  harness.window.document.dispatch("DOMContentLoaded");
+  await runImmediatePoll(harness);
+  assert.deepEqual(harness.requests, ["/moblin-hud/api/pair", "/moblin-hud/api/status"]);
+  assert.equal(harness.window.document.body.dataset.hudState, "green");
+  const instance = initializeHud(harness.window);
+  assert.equal(instance, initializeHud(harness.window));
+  assert.equal(instance.started, true);
+  assert.equal(harness.requests.length, 2);
+  harness.window.dispatch("pagehide");
+});
+
+test("pagehide/pageshow resumes the same initialized page and logout stays terminal", async () => {
+  const harness = ordinaryScriptWindow({ paired: true, hash: `#pair=${validToken}` });
+  vm.runInNewContext(javascript, { window: harness.window });
+  await runImmediatePoll(harness);
+  assert.deepEqual(harness.requests, ["/moblin-hud/api/status"]);
+  harness.window.dispatch("pagehide");
+  assert.equal(harness.timers.size, 0);
+  harness.window.document.dispatch("visibilitychange");
+  assert.equal(harness.timers.size, 0);
+  harness.window.dispatch("pageshow");
+  await runImmediatePoll(harness);
+  assert.equal(harness.requests.length, 2);
+  harness.elements.get("[data-hud-logout]").dispatch("click");
+  await flushMicrotasks();
+  harness.window.dispatch("pagehide");
+  harness.window.dispatch("pageshow");
+  harness.window.document.dispatch("visibilitychange");
+  assert.equal(harness.timers.size, 0);
+  assert.equal(harness.window.document.body.dataset.hudState, "revoked");
 });
 
 test("alert patterns use one, two, and three tones", async () => {
