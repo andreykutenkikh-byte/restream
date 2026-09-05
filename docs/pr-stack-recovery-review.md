@@ -125,8 +125,31 @@ frontend/shell sources. Exact-head
 completed **SUCCESS**, independently verified from both the run and every job step.
 Native media self-test completed in 370.677 seconds; public bootstrap, heartbeat,
 credential isolation, password non-persistence, revoke, post-onboarding runtime limits
-and cleanup all passed. PR #15 stays Draft. This is the recorded `PR15_GREEN_HEAD` and
-`PR15_GREEN_RUN`, not approval to merge or deploy.
+and cleanup all passed. PR #15 stays Draft. This was the first recorded green base,
+not approval to merge or deploy.
+
+Two later PR #16 runs, on unchanged native runtime, exposed intermittent media
+failures: run 33952161676 timed out while reading a strict 90-frame final RTMP
+segment after LIVE delivery was confirmed; run 33952428440 did not regain the
+normalized LIVE publisher within the existing supervisor-crash recovery deadline,
+although input and downstream SLATE media still grew. Their underlying causes
+remain unproven. No assertion, recovery deadline or security check was relaxed
+to turn these failures into passes.
+
+PR #15 follow-up `bf6f0216c10784f2c9073bff7d563bf002fc215b` adds diagnostic evidence
+only: event-scoped fixed normalizer markers, bounded process counts/first-seen
+times, and reader input/output/frame progress. Raw logs, exception text, URLs,
+identities and credentials are excluded. The root-owned, single-link, no-follow
+checkpoint and strict consumer validation remain enforced. Normal runtime code,
+recovery timings and strict media assertions are unchanged.
+
+This exact head's [CI run 33953963213](https://github.com/andreykutenkikh-byte/restream/actions/runs/33953963213)
+completed **SUCCESS**, including native self-test cleanup at 389.476 seconds,
+post-onboarding limits and CI fixture cleanup. Its local full suite passed 1370
+tests with 19 Windows/POSIX skips; dependency, format/lint/type, frontend, syntax
+and Compose policy gates also passed. It is the new `PR15_GREEN_HEAD` / run.
+A successful diagnostic run does **not** establish that the preceding
+intermittency is fixed; this remains an explicit final-review limitation.
 
 ## HUD baseline, before corrections
 
@@ -147,6 +170,17 @@ checked again. The HUD old base was
 `f83ba125b570e34d362ee184ddc550ef77fa784c`, without conflicts. The rebased stack head was
 `813c34b4b267fb8490f5d1050d6ecab1a5e1e19f`. `git range-diff` marked all five commits
 semantically unchanged. Recovery was neither duplicated nor removed from the stack.
+
+After HUD corrections, exact head `9e00caede3f6ab7a78290d34428aed2f240ce8ce`
+passed full [CI run 33952998824](https://github.com/andreykutenkikh-byte/restream/actions/runs/33952998824):
+1412 Linux Python tests, both real browser engines, media/preview/security and
+native E2E (cleanup at 344.297 seconds). Only after the diagnostic PR #15 follow-up
+also passed its full CI, a second clean/fresh-ref check preceded restacking all
+eight own HUD commits from base `f83ba125b570e34d362ee184ddc550ef77fa784c` onto
+`bf6f0216c10784f2c9073bff7d563bf002fc215b`. All eight range-diff entries were equal;
+the restacked head before this evidence update was
+`439c523b736fbad68544d313672ed32e9e1050c4`. The expected remote lease was the full
+`9e00cae...` SHA above. Final exact-head CI must validate this new stack separately.
 
 ## HUD corrections and regression coverage
 
@@ -191,12 +225,23 @@ The SQLite v6→v7 migration test populates all fourteen legacy tables, includin
 placeholders and administrative/runtime records. It verifies exact legacy rows, schemas
 and sequence state after each of two migration executions, plus foreign-key and integrity
 checks. HUD pairing/session persistence remains digest-only and isolated from admin auth.
+The existing v5→v6 classification test now also removes v7 tables and its migration
+marker before starting: it genuinely begins at schema 5, upgrades twice to the
+current schema, preserves node/job classifications and checks empty HUD tables,
+foreign keys and database integrity. Previously deleting only marker 6 left a
+misleading v7 fixture after the HUD rebase.
+An independent isolated check also built an actual schema-5 database using the
+historical pre-v6 `app/db.py`, populated twelve legacy tables with nineteen
+synthetic rows, and migrated it twice with the current code. Every legacy
+column/value, sequence and old migration marker survived; new classifications,
+empty HUD tables, foreign keys and integrity all passed. Its temporary database
+was removed; no production database was opened for migration.
 
 ## Actual browser evidence and final gate
 
 Local validation includes locked dependency synchronization and installed-package
 compatibility, Ruff format/lint, mypy, the complete Python suite, repository safety,
-79 frontend tests, syntax checks for six JavaScript and fifteen shell files, and four
+81 frontend tests, syntax checks for six JavaScript and fifteen shell files, and four
 Compose configuration variants plus the production-model policy with synthetic values.
 The focused native recovery/bundle/probe/installer suite passed 431 tests (three
 POSIX-only cases run in Linux CI). The Windows full suite's POSIX skips and two default
@@ -234,6 +279,12 @@ fragment and reuses the confirmed session without token replay or another contro
 The real fixture separately checks same-document and full-page cookie reuse. Revoked
 or unconfirmed documents cannot gain a session from a fragment event alone. URL-failure
 assertions expose only booleans, not temporary fixture token values.
+
+The corrected pre-restack exact-head browser job
+[101271120529](https://github.com/andreykutenkikh-byte/restream/actions/runs/33952998824/job/101271120529)
+passed both engines (2 tests, 17.45 seconds): Chromium 151.0.7922.34 and WebKit
+26.5. This is actual browser evidence, not physical iPhone acceptance, and is
+not substituted for the required final restacked-head CI.
 
 The PR descriptions record the final exact HEADs, CI run URLs and results. A final-review
 declaration requires both complete exact-head runs to succeed, including native media
