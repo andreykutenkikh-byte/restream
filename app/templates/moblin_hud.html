@@ -6,10 +6,11 @@
     <meta name="color-scheme" content="dark">
     <meta name="theme-color" content="#080b0e">
     <title>Moblin HUD · AdoJapan Restream</title>
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/static/moblin-hud.css?v=20260904.1">
-    <script src="/static/moblin-hud.js?v=20260904.1" defer></script>
+    <script src="/static/moblin-hud.js?v=20260906.1" defer></script>
   </head>
-  <body data-hud-state="monitoring">
+  <body data-hud-state="monitoring" data-hud-paired="{{ 'true' if hud_paired else 'false' }}">
     <main class="hud" aria-labelledby="hud-title">
       <header class="hud__header">
         <div>

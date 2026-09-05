@@ -45,9 +45,13 @@ RESOURCE_PRESSURE_MIN_SAMPLES = 2
 STANDBY_FRESH_HEARTBEAT_SECONDS = 10.0
 STANDBY_HEALTHY_MIN_SECONDS = 10.0
 RECOMMENDATION_COOLDOWN_SECONDS = 60.0
+# Observation policy, not agent recovery telemetry: the conservative 94-second
+# runtime/observation budget is rounded up to the next 30-second retry period.
+RECOVERY_GRACE_SECONDS = 120.0
+ACTIVE_CONTEXT_RETENTION_SECONDS = 120.0
 
 RouteKind = Literal["main", "relay"]
-StreamState = Literal["idle", "active", "ambiguous"]
+StreamState = Literal["idle", "active", "ambiguous", "unknown"]
 BitrateTrend = Literal["unknown", "rising", "stable", "falling"]
 
 
@@ -97,6 +101,9 @@ class StreamRouteSnapshot:
     recommendation_eligible: bool = True
     portrait_profile_valid: bool = False
     youtube_configured: bool = False
+    service_state: str = "unknown"
+    main_process_state: str = "unknown"
+    srt_listener_state: str = "unknown"
 
     def __post_init__(self) -> None:
         if _SAFE_ROUTE_ID_RE.fullmatch(self.route_id) is None:
@@ -246,6 +253,7 @@ class _RouteState:
     level: HealthLevel = HealthLevel.UNKNOWN
     level_started_at: float | None = None
     last_seen_at: float = 0.0
+    source_lost_started_at: float | None = None
 
     def reset_measurements(self) -> None:
         self.samples.clear()
@@ -287,6 +295,8 @@ class RelayQualityTracker:
         self._session_digest: bytes | None = None
         self._session_initialized = False
         self._active_route_id: str | None = None
+        self._last_active_observed_at: float | None = None
+        self._unknown_context = False
         self._last_recommendation_at: float | None = None
         self._last_recommendation_target: str | None = None
         self._recommendation_episode_active = False
@@ -296,6 +306,11 @@ class RelayQualityTracker:
     def tracked_route_count(self) -> int:
         with self._lock:
             return len(self._states)
+
+    @property
+    def tracked_route_ids(self) -> frozenset[str]:
+        with self._lock:
+            return frozenset(self._states)
 
     def route_sample_count(self, route_id: str) -> int:
         with self._lock:
@@ -322,6 +337,8 @@ class RelayQualityTracker:
             self._session_digest = None
             self._session_initialized = False
             self._active_route_id = None
+            self._last_active_observed_at = None
+            self._unknown_context = False
             self._reset_recommendation_unlocked()
 
     def remove_routes(self, route_ids: Collection[str]) -> None:
@@ -341,6 +358,7 @@ class RelayQualityTracker:
         now: float,
         stream_session_id: str | None,
         active_route_id: str | None = None,
+        new_sample_route_ids: Collection[str] | None = None,
     ) -> RelayQualityEvaluation:
         """Evaluate one full route inventory at a caller-supplied monotonic time.
 
@@ -358,25 +376,98 @@ class RelayQualityTracker:
             current = self._normalize_inventory_unlocked(snapshots)
             self._reset_for_session_unlocked(stream_session_id)
 
-            live_routes = [snapshot for snapshot in current if self._is_live(snapshot)]
+            fresh_ids = (
+                {snapshot.route_id for snapshot in current}
+                if new_sample_route_ids is None
+                else set(new_sample_route_ids)
+            )
+            live_routes = [
+                snapshot
+                for snapshot in current
+                if self._source_is_live(snapshot) and self._heartbeat_is_fresh(snapshot)
+            ]
             if len(live_routes) > 1:
-                self._change_active_route_unlocked(None)
-                self._sample_all_unlocked(current, now=now, active_route_id=None)
+                self._sample_all_unlocked(
+                    current, now=now, active_route_id=None, new_sample_route_ids=fresh_ids
+                )
                 return self._ambiguous_evaluation(now)
 
             requested_active_id = active_route_id or self._active_route_id
             active = self._select_active_route(current, live_routes, requested_active_id)
+            coherent_stopped = active is not None and self.coherent_stop(active)
+            if coherent_stopped:
+                self._change_active_route_unlocked(None)
+                self._unknown_context = False
+                active = None
+            if active is not None:
+                if self._heartbeat_is_fresh(active) and (
+                    self._source_is_live(active) or self._runtime_running(active)
+                ):
+                    if active.route_id in fresh_ids:
+                        self._last_active_observed_at = now
+                elif (
+                    self._last_active_observed_at is not None
+                    and now - self._last_active_observed_at > ACTIVE_CONTEXT_RETENTION_SECONDS
+                ):
+                    active = None
+                    self._unknown_context = True
+            elif requested_active_id is not None and not coherent_stopped:
+                self._unknown_context = True
             selected_id = active.route_id if active is not None else None
             self._change_active_route_unlocked(selected_id)
-            self._sample_all_unlocked(current, now=now, active_route_id=selected_id)
+            self._sample_all_unlocked(
+                current, now=now, active_route_id=selected_id, new_sample_route_ids=fresh_ids
+            )
 
             if active is None:
                 self._recommendation_episode_active = False
+                if coherent_stopped:
+                    return self._idle_evaluation(now)
+                if any(
+                    self._heartbeat_is_fresh(item) and self._process_failed(item)
+                    for item in current
+                ):
+                    return self._initial_process_failure_evaluation()
+                if self._unknown_context or any(
+                    not self._heartbeat_is_fresh(snapshot) for snapshot in current
+                ):
+                    return self._unknown_evaluation(None, now)
                 return self._idle_evaluation(now)
 
             state = self._states[active.route_id]
-            reasons, hard_level = self._sample_health_unlocked(active, state, now)
-            level = self._apply_hysteresis_unlocked(state, reasons, hard_level, now)
+            if (
+                not self._heartbeat_is_fresh(active)
+                or (not active.available and not self._process_failed(active))
+                or (
+                    self._safe_source(active.source) == "UNKNOWN"
+                    and not self._process_failed(active)
+                )
+            ):
+                return self._unknown_evaluation(active, now)
+            self._unknown_context = False
+            new_sample = active.route_id in fresh_ids
+            bitrate = self._valid_bitrate(active.input_bitrate_bps)
+            if self._source_is_live(active) and bitrate is not None and bitrate > 0:
+                if new_sample and (
+                    state.source_lost_started_at is not None
+                    or (
+                        state.level == HealthLevel.BLACK
+                        and state.zero_bitrate_started_at is not None
+                    )
+                ):
+                    state.consecutive_good = 0
+                    state.consecutive_yellow = 0
+                    state.consecutive_red = 0
+                    state.red_started_at = None
+                    state.level = HealthLevel.UNKNOWN
+                    state.level_started_at = now
+                    self._recommendation_episode_active = False
+                if new_sample:
+                    state.source_lost_started_at = None
+            elif not self._source_is_live(active) and state.source_lost_started_at is None:
+                state.source_lost_started_at = now
+            reasons, hard_level = self._sample_health_unlocked(active, state, now, new_sample)
+            level = self._apply_hysteresis_unlocked(state, reasons, hard_level, now, new_sample)
             standby = self._select_standby_unlocked(current, active.route_id, now)
             return self._active_evaluation(active, state, standby, level, reasons, now)
 
@@ -409,6 +500,8 @@ class RelayQualityTracker:
         if self._session_initialized and digest != self._session_digest:
             self._states.clear()
             self._active_route_id = None
+            self._last_active_observed_at = None
+            self._unknown_context = False
             self._reset_recommendation_unlocked()
         self._session_digest = digest
         self._session_initialized = True
@@ -420,6 +513,8 @@ class RelayQualityTracker:
                 state.standby_ready_since = None
             self._reset_recommendation_unlocked()
         self._active_route_id = route_id
+        if route_id is None:
+            self._last_active_observed_at = None
 
     def _reset_recommendation_unlocked(self) -> None:
         self._last_recommendation_at = None
@@ -447,6 +542,7 @@ class RelayQualityTracker:
         *,
         now: float,
         active_route_id: str | None,
+        new_sample_route_ids: Collection[str],
     ) -> None:
         ordered = sorted(
             snapshots,
@@ -458,6 +554,12 @@ class RelayQualityTracker:
         )
         for snapshot in ordered[:MAX_TRACKED_ROUTES]:
             state = self._state_for_unlocked(snapshot.route_id, now)
+            if snapshot.route_id != active_route_id:
+                self._sample_standby_readiness_unlocked(snapshot, state, now)
+            if snapshot.route_id not in new_sample_route_ids or not self._heartbeat_is_fresh(
+                snapshot
+            ):
+                continue
             bitrate = self._valid_bitrate(snapshot.input_bitrate_bps)
             heartbeat = self._valid_non_negative(snapshot.heartbeat_age_seconds)
             state.samples.append(
@@ -470,8 +572,6 @@ class RelayQualityTracker:
             )
             if snapshot.route_id == active_route_id:
                 self._sample_active_measurements_unlocked(snapshot, state, bitrate, now)
-            else:
-                self._sample_standby_readiness_unlocked(snapshot, state, now)
 
     def _sample_active_measurements_unlocked(
         self,
@@ -492,9 +592,14 @@ class RelayQualityTracker:
             if state.offline_started_at is None:
                 state.offline_started_at = now
             elif now - state.offline_started_at >= BASELINE_RESET_OFFLINE_SECONDS:
-                offline_started_at = state.offline_started_at
-                state.reset_measurements()
-                state.offline_started_at = offline_started_at
+                # Expire learned media quality, not the evidence of the outage.
+                # Resetting the failure clock here on every heartbeat would
+                # turn a persistent zero-byte LIVE source back into UNKNOWN.
+                state.baseline_candidates.clear()
+                state.valid_live_samples = 0
+                state.ema_bps = None
+                state.baseline_bps = None
+                state.previous_ema_bps = None
             return
 
         assert bitrate is not None
@@ -533,7 +638,7 @@ class RelayQualityTracker:
             state.standby_ready_since = None
 
     def _sample_health_unlocked(
-        self, snapshot: StreamRouteSnapshot, state: _RouteState, now: float
+        self, snapshot: StreamRouteSnapshot, state: _RouteState, now: float, new_sample: bool
     ) -> tuple[tuple[str, ...], HealthLevel | None]:
         reasons: list[str] = []
         hard_level: HealthLevel | None = None
@@ -545,13 +650,10 @@ class RelayQualityTracker:
         if not snapshot.available:
             reasons.append("route_unavailable")
             hard_level = HealthLevel.BLACK
-        elif heartbeat is None or heartbeat > HEARTBEAT_BLACK_SECONDS:
-            reasons.append("heartbeat_lost")
-            hard_level = HealthLevel.BLACK
-        elif heartbeat > HEARTBEAT_DELAYED_SECONDS:
+        elif heartbeat is not None and heartbeat > HEARTBEAT_DELAYED_SECONDS:
             reasons.append("heartbeat_delayed")
 
-        if snapshot.kind == "main" and overall in _PROCESS_FAILED_STATES:
+        if self._process_failed(snapshot):
             reasons.append("relay_process_failed")
             hard_level = HealthLevel.BLACK
         elif overall in _DEGRADED_OVERALL_STATES:
@@ -579,7 +681,8 @@ class RelayQualityTracker:
 
         if youtube in _YOUTUBE_FAILED_STATES:
             reasons.append("youtube_forward_failed")
-            hard_level = HealthLevel.RED
+            if hard_level != HealthLevel.BLACK:
+                hard_level = HealthLevel.RED
         elif youtube in _YOUTUBE_CONNECTING_STATES:
             if state.youtube_connecting_started_at is None:
                 state.youtube_connecting_started_at = now
@@ -589,20 +692,22 @@ class RelayQualityTracker:
             state.youtube_connecting_started_at = None
 
         cpu = self._valid_percentage(snapshot.host_cpu_percent)
-        if cpu is not None and cpu >= CPU_PRESSURE_PERCENT:
-            state.cpu_pressure_samples += 1
-        else:
-            state.cpu_pressure_samples = 0
+        if new_sample:
+            if cpu is not None and cpu >= CPU_PRESSURE_PERCENT:
+                state.cpu_pressure_samples += 1
+            else:
+                state.cpu_pressure_samples = 0
         if state.cpu_pressure_samples >= RESOURCE_PRESSURE_MIN_SAMPLES:
             reasons.append("cpu_pressure")
             if cpu is not None and cpu >= CPU_CRITICAL_PERCENT:
                 reasons.append("cpu_critical")
 
         memory_ratio = self._memory_available_ratio(snapshot)
-        if memory_ratio is not None and memory_ratio < MEMORY_PRESSURE_RATIO:
-            state.memory_pressure_samples += 1
-        else:
-            state.memory_pressure_samples = 0
+        if new_sample:
+            if memory_ratio is not None and memory_ratio < MEMORY_PRESSURE_RATIO:
+                state.memory_pressure_samples += 1
+            else:
+                state.memory_pressure_samples = 0
         if state.memory_pressure_samples >= RESOURCE_PRESSURE_MIN_SAMPLES:
             reasons.append("memory_pressure")
             if memory_ratio is not None and memory_ratio < MEMORY_CRITICAL_RATIO:
@@ -622,6 +727,7 @@ class RelayQualityTracker:
         reasons: tuple[str, ...],
         hard_level: HealthLevel | None,
         now: float,
+        new_sample: bool,
     ) -> HealthLevel:
         good = reasons == ("healthy",)
         red_candidate = any(
@@ -637,12 +743,12 @@ class RelayQualityTracker:
         )
         yellow_candidate = not good
 
-        if good:
+        if good and new_sample:
             state.consecutive_good += 1
             state.consecutive_yellow = 0
             state.consecutive_red = 0
             state.red_started_at = None
-        else:
+        elif new_sample:
             state.consecutive_good = 0
             state.consecutive_yellow = state.consecutive_yellow + 1 if yellow_candidate else 0
             if red_candidate:
@@ -717,7 +823,56 @@ class RelayQualityTracker:
         now: float,
     ) -> RelayQualityEvaluation:
         health = self._health_assessment(level, reasons, state, now)
-        recommendation = self._recommendation_unlocked(level, standby, now)
+        if "source_lost" in reasons and not self._process_failed(active):
+            health = HealthAssessment(
+                level=level,
+                title="Входящее видео пропало",
+                message=(
+                    "Сервер передаёт заставку. Ожидаем восстановления связи"
+                    if self._normalized(active.source) == "slate"
+                    and self._runtime_running(active)
+                    and self._normalized(active.youtube_forward_state) in _YOUTUBE_ACTIVE_STATES
+                    else "Входящий источник недоступен. Ожидаем восстановления связи."
+                ),
+                reason_codes=health.reason_codes,
+                confidence=health.confidence,
+                state_duration_seconds=health.state_duration_seconds,
+            )
+        loss_started = state.source_lost_started_at
+        if loss_started is None and "media_stalled" in reasons and not self._process_failed(active):
+            loss_started = state.zero_bitrate_started_at
+            health = HealthAssessment(
+                level=level,
+                title="Нет подтверждённого входящего видеопотока",
+                message=(
+                    "Свежая телеметрия не подтверждает поступление медиаданных. "
+                    "Ожидаем восстановления связи."
+                ),
+                reason_codes=health.reason_codes,
+                confidence=health.confidence,
+                state_duration_seconds=health.state_duration_seconds,
+            )
+        in_grace = (
+            loss_started is not None
+            and now - loss_started < RECOVERY_GRACE_SECONDS
+            and not self._process_failed(active)
+        )
+        if in_grace:
+            recommendation = self._watch_recommendation(
+                "recovery_grace", "Ожидаем автоматического восстановления связи."
+            )
+        elif (reasons == ("healthy",) and level != HealthLevel.GREEN) or (
+            self._source_is_live(active)
+            and level == HealthLevel.BLACK
+            and "media_stalled" not in reasons
+            and not self._process_failed(active)
+        ):
+            self._recommendation_episode_active = False
+            recommendation = self._watch_recommendation(
+                "recovering_source", "Входящий поток восстановлен. Проверяем стабильность."
+            )
+        else:
+            recommendation = self._recommendation_unlocked(level, standby, now)
         return RelayQualityEvaluation(
             stream_state="active",
             health=health,
@@ -757,11 +912,19 @@ class RelayQualityTracker:
 
         if standby is None:
             return RouteRecommendation(
-                action=RecommendationAction.WATCH,
+                action=(
+                    RecommendationAction.RECONNECT
+                    if level == HealthLevel.BLACK
+                    else RecommendationAction.WATCH
+                ),
                 target_route_id=None,
                 target_display_name=None,
                 confidence=MeasurementConfidence.ACTIVE_PATH_MEASURED,
-                reason="Связь нестабильна. Доступного резервного сервера сейчас нет.",
+                reason=(
+                    "Переподключите поток в Moblin. Готового резервного сервера сейчас нет."
+                    if level == HealthLevel.BLACK
+                    else "Связь нестабильна. Доступного резервного сервера сейчас нет."
+                ),
                 reason_code="no_healthy_standby",
             )
 
@@ -811,7 +974,7 @@ class RelayQualityTracker:
             HealthLevel.UNKNOWN: "Состояние уточняется",
             HealthLevel.GREEN: "ЭФИР СТАБИЛЕН",
             HealthLevel.YELLOW: "СВЯЗЬ УХУДШАЕТСЯ",
-            HealthLevel.RED: "СМЕНИТЕ СЕРВЕР",
+            HealthLevel.RED: "ПОТОК НЕСТАБИЛЕН",
             HealthLevel.BLACK: "ПОТОК ПОТЕРЯН",
         }
         messages = {
@@ -833,8 +996,12 @@ class RelayQualityTracker:
             displayed_reasons = ("recovering",)
         return HealthAssessment(
             level=level,
-            title=titles[level],
-            message=messages[level],
+            title="Ошибка процесса relay" if "relay_process_failed" in reasons else titles[level],
+            message=(
+                "Свежая телеметрия подтверждает ошибку процесса relay. Проверьте сервер."
+                if "relay_process_failed" in reasons
+                else messages[level]
+            ),
             reason_codes=displayed_reasons,
             confidence=MeasurementConfidence.ACTIVE_PATH_MEASURED,
             state_duration_seconds=max(0.0, now - started_at),
@@ -886,19 +1053,61 @@ class RelayQualityTracker:
             ),
         )
 
+    @staticmethod
+    def _watch_recommendation(reason_code: str, reason: str) -> RouteRecommendation:
+        return RouteRecommendation(
+            action=RecommendationAction.WATCH,
+            target_route_id=None,
+            target_display_name=None,
+            confidence=MeasurementConfidence.ACTIVE_PATH_MEASURED,
+            reason=reason,
+            reason_code=reason_code,
+        )
+
+    def _unknown_evaluation(
+        self, snapshot: StreamRouteSnapshot | None, now: float
+    ) -> RelayQualityEvaluation:
+        self._recommendation_episode_active = False
+        return RelayQualityEvaluation(
+            stream_state="unknown",
+            health=HealthAssessment(
+                level=HealthLevel.UNKNOWN,
+                title="Нет свежей телеметрии",
+                message=(
+                    "Состояние видеопотока неизвестно. "
+                    "Потеря мониторинга не означает остановку эфира."
+                ),
+                reason_codes=("telemetry_unavailable",),
+                confidence=MeasurementConfidence.ACTIVE_PATH_MEASURED,
+                state_duration_seconds=0.0,
+            ),
+            current_route=(
+                self._route_view(snapshot, self._states[snapshot.route_id])
+                if snapshot is not None
+                else None
+            ),
+            standby_route=None,
+            recommendation=self._watch_recommendation(
+                "telemetry_unavailable", "Ожидаем свежих данных мониторинга."
+            ),
+        )
+
     def _route_view(self, snapshot: StreamRouteSnapshot, state: _RouteState) -> RouteQualityView:
+        fresh = self._heartbeat_is_fresh(snapshot)
         return RouteQualityView(
             route_id=snapshot.route_id,
             display_name=snapshot.display_name.strip(),
             kind=snapshot.kind,
-            source=self._safe_source(snapshot.source),
-            input_bitrate_bps=self._valid_bitrate(snapshot.input_bitrate_bps),
+            source=self._safe_source(snapshot.source) if fresh else "UNKNOWN",
+            input_bitrate_bps=self._valid_bitrate(snapshot.input_bitrate_bps) if fresh else None,
             ema_input_bitrate_bps=(round(state.ema_bps) if state.ema_bps is not None else None),
             stable_baseline_bps=(
                 round(state.baseline_bps) if state.baseline_bps is not None else None
             ),
             bitrate_trend=self._trend(state),
-            youtube_forward_state=self._safe_youtube_state(snapshot.youtube_forward_state),
+            youtube_forward_state=(
+                self._safe_youtube_state(snapshot.youtube_forward_state) if fresh else "unknown"
+            ),
             overall_state=self._safe_overall_state(snapshot.overall_state),
             heartbeat_age_seconds=self._valid_non_negative(snapshot.heartbeat_age_seconds),
             host_cpu_percent=self._valid_percentage(snapshot.host_cpu_percent),
@@ -906,6 +1115,26 @@ class RelayQualityTracker:
                 snapshot.host_memory_available_bytes
             ),
             host_memory_total_bytes=self._valid_non_negative_int(snapshot.host_memory_total_bytes),
+        )
+
+    def _initial_process_failure_evaluation(self) -> RelayQualityEvaluation:
+        # A confirmed broken process is reportable even before observing LIVE,
+        # but does not prove which route carried a broadcast before restart.
+        return RelayQualityEvaluation(
+            stream_state="unknown",
+            health=HealthAssessment(
+                level=HealthLevel.BLACK,
+                title="Ошибка процесса relay",
+                message="Свежая телеметрия подтверждает ошибку процесса relay. Проверьте сервер.",
+                reason_codes=("relay_process_failed",),
+                confidence=MeasurementConfidence.ACTIVE_PATH_MEASURED,
+                state_duration_seconds=0.0,
+            ),
+            current_route=None,
+            standby_route=None,
+            recommendation=self._watch_recommendation(
+                "relay_process_failed", "Проверьте процесс relay на сервере."
+            ),
         )
 
     @staticmethod
@@ -935,6 +1164,37 @@ class RelayQualityTracker:
     def _heartbeat_is_fresh(snapshot: StreamRouteSnapshot) -> bool:
         age = RelayQualityTracker._valid_non_negative(snapshot.heartbeat_age_seconds)
         return age is not None and age <= HEARTBEAT_BLACK_SECONDS
+
+    @staticmethod
+    def _runtime_running(snapshot: StreamRouteSnapshot) -> bool:
+        return (
+            RelayQualityTracker._normalized(snapshot.service_state) == "active"
+            and RelayQualityTracker._normalized(snapshot.main_process_state) == "running"
+        )
+
+    @staticmethod
+    def _process_failed(snapshot: StreamRouteSnapshot) -> bool:
+        return (
+            RelayQualityTracker._normalized(snapshot.service_state) == "failed"
+            or RelayQualityTracker._normalized(snapshot.main_process_state) == "failed"
+            or RelayQualityTracker._normalized(snapshot.overall_state)
+            in {"process_failed", "service_failed", "stopped_unexpectedly"}
+        )
+
+    @staticmethod
+    def coherent_stop(snapshot: StreamRouteSnapshot) -> bool:
+        """NONE alone, unavailable metrics, and process failures are not a stop."""
+        return (
+            RelayQualityTracker._heartbeat_is_fresh(snapshot)
+            and RelayQualityTracker._normalized(snapshot.service_state) == "inactive"
+            and RelayQualityTracker._normalized(snapshot.main_process_state) == "stopped"
+            and RelayQualityTracker._normalized(snapshot.srt_listener_state) == "closed"
+            and RelayQualityTracker._normalized(snapshot.source) == "none"
+            and RelayQualityTracker._normalized(snapshot.youtube_forward_state)
+            in {"inactive", "stopped", "disabled"}
+            and snapshot.error_code is None
+            and not RelayQualityTracker._process_failed(snapshot)
+        )
 
     @staticmethod
     def _standby_is_ready(snapshot: StreamRouteSnapshot) -> bool:
