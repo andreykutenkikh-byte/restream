@@ -724,6 +724,93 @@ async def test_self_test_failure_rejects_an_unknown_diagnostic() -> None:
     assert captured.value.code == "relay_self_test_failed"
 
 
+@pytest.mark.parametrize(
+    "operation,expected_code",
+    [
+        ("apt-get -qq update", "relay_dependency_install_failed"),
+        ("curl --fail --location", "mediamtx_download_failed"),
+        ("ffmpeg -nostdin", "relay_slate_generation_failed"),
+    ],
+)
+@pytest.mark.parametrize("failure_kind", ["nonzero", "transport", "timeout"])
+async def test_install_failure_preserves_exact_operation_and_timeout(
+    operation: str, expected_code: str, failure_kind: str
+) -> None:
+    def responder(command: str, stdin: SecretStr | None) -> RemoteResult:
+        del stdin
+        if operation in command:
+            if failure_kind == "nonzero":
+                return RemoteResult(1, "private-command-output", "private-command-error")
+            raise BootstrapError(
+                "remote_command_timeout" if failure_kind == "timeout" else "remote_command_failed",
+                "private-transport-detail",
+            )
+        return RemoteResult(0)
+
+    with pytest.raises(BootstrapError) as captured:
+        await RemoteRelayInstaller().install(
+            FakeSession(responder),
+            PrivilegeContext(PrivilegeMode.ROOT),
+            receipt(),
+            timeouts=TimeoutPolicy(),
+        )
+    assert captured.value.code == expected_code + ("_timeout" if failure_kind == "timeout" else "")
+    assert "private-" not in str(captured.value)
+
+
+@pytest.mark.parametrize("operation", ["agent", "self-test"])
+@pytest.mark.parametrize("failure_kind", ["nonzero", "transport", "timeout"])
+@pytest.mark.parametrize("diagnostic_kind", ["known", "untrusted", "read-failed", "nonzero"])
+async def test_install_remote_failure_still_reads_only_its_bounded_stage(
+    operation: str, failure_kind: str, diagnostic_kind: str
+) -> None:
+    self_test = operation == "self-test"
+    command_marker = (
+        "self-test --quick >/dev/null 2>&1" if self_test else "sh deploy/hk-relay-agent/install.sh"
+    )
+    diagnostic_marker = "self_test_stage_value=$(cat" if self_test else "stage_value=$(cat"
+    known_stage = "stuck-kicked" if self_test else "copy"
+    known_code = (
+        "relay_self_test_persistent_stall_reset_failed" if self_test else "relay_agent_copy_failed"
+    )
+    fallback_code = "relay_self_test_failed" if self_test else "relay_agent_install_failed"
+
+    def responder(command: str, stdin: SecretStr | None) -> RemoteResult:
+        del stdin
+        if command_marker in command:
+            if failure_kind == "nonzero":
+                return RemoteResult(1)
+            raise BootstrapError(
+                "remote_command_timeout" if failure_kind == "timeout" else "remote_command_failed",
+                "private-remote-error",
+            )
+        if diagnostic_marker in command:
+            if diagnostic_kind == "read-failed":
+                raise BootstrapError("remote_command_failed", "private-diagnostic-error")
+            if diagnostic_kind == "nonzero":
+                return RemoteResult(1, known_stage)
+            return RemoteResult(0, known_stage if diagnostic_kind == "known" else "private-stage")
+        return RemoteResult(0)
+
+    session = FakeSession(responder)
+    with pytest.raises(BootstrapError) as captured:
+        await RemoteRelayInstaller().install(
+            session,
+            PrivilegeContext(PrivilegeMode.ROOT),
+            receipt(),
+            timeouts=TimeoutPolicy(),
+        )
+    expected = known_code if diagnostic_kind == "known" else fallback_code
+    assert captured.value.code == expected + ("_timeout" if failure_kind == "timeout" else "")
+    assert "private-" not in str(captured.value)
+    diagnostics = [item for item in session.commands if diagnostic_marker in item[0]]
+    assert len(diagnostics) == 1
+    assert diagnostics[0][2] == TimeoutPolicy().command_seconds
+    assert '"$(wc -c <' in diagnostics[0][0] and "-le 16" in diagnostics[0][0]
+    assert "test ! -L" in diagnostics[0][0]
+    assert len(session.commands) == session.commands.index(diagnostics[0]) + 1
+
+
 async def test_final_check_requires_agent_and_broker_but_relay_inactive_disabled() -> None:
     session = FakeSession()
     prepared = receipt()

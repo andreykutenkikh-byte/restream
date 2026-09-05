@@ -35,6 +35,30 @@ def test_bootstrap_diagnostic_code_is_strictly_allowlisted() -> None:
     assert safe_bootstrap_diagnostic_code({"safe_error": "invalid"}) == "unknown"
 
 
+def test_bootstrap_timeout_diagnostics_are_fixed_and_bounded() -> None:
+    for code in _SELF_TEST_STAGE_CODES.values():
+        timeout_code = code + "_timeout"
+        assert len(timeout_code) <= 96
+        assert (
+            safe_bootstrap_diagnostic_code({"safe_error": {"code": timeout_code}}) == timeout_code
+        )
+    for code in (
+        "relay_dependency_install_failed_timeout",
+        "mediamtx_download_failed_timeout",
+        "mediamtx_archive_invalid_timeout",
+        "mediamtx_binary_invalid_timeout",
+        "mediamtx_license_missing_timeout",
+        "relay_slate_generation_failed_timeout",
+        "relay_agent_copy_failed_timeout",
+        "remote_command_timeout",
+    ):
+        assert safe_bootstrap_diagnostic_code({"safe_error": {"code": code}}) == code
+    assert (
+        safe_bootstrap_diagnostic_code({"safe_error": {"code": "private-secret-failed_timeout"}})
+        == "unknown"
+    )
+
+
 def test_native_safe_failure_code_is_allowlisted() -> None:
     for code in (
         "relay_self_test_failed",

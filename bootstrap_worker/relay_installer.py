@@ -31,7 +31,7 @@ from bootstrap_worker.models import (
     TargetIdentity,
     TimeoutPolicy,
 )
-from bootstrap_worker.ssh import RemoteSession
+from bootstrap_worker.ssh import RemoteResult, RemoteSession
 
 RELAY_RELEASE = "2026.09.05.1"
 RELAY_CONTROL_ORIGIN = "https://restream.adojapan.ru"
@@ -659,9 +659,32 @@ class RemoteRelayInstaller:
         timeout: float,
         code: str,
     ) -> None:
-        result = await privilege.run(session, command, timeout=timeout)
+        try:
+            result = await privilege.run(session, command, timeout=timeout)
+        except BootstrapError as exc:
+            if exc.code not in {"remote_command_failed", "remote_command_timeout"}:
+                raise
+            suffix = "_timeout" if exc.code == "remote_command_timeout" else ""
+            raise safe_failure(code + suffix) from exc
         if result.exit_status != 0:
             raise safe_failure(code)
+
+    async def _run_diagnosable(
+        self,
+        session: RemoteSession,
+        privilege: PrivilegeContext,
+        command: str,
+        *,
+        timeout: float,
+    ) -> tuple[RemoteResult | None, BootstrapError | None]:
+        try:
+            return await privilege.run(session, command, timeout=timeout), None
+        except BootstrapError as exc:
+            if exc.code not in {"remote_command_failed", "remote_command_timeout"}:
+                raise
+            # Preserve failure while allowing one bounded read of the fixed
+            # operation's root-owned diagnostic stage before rollback.
+            return None, exc
 
     async def install(
         self,
@@ -854,8 +877,9 @@ class RemoteRelayInstaller:
         # manifest verification and preserves relay enabled/active state.
         receipt.agent_start_attempted = True
         agent_stage = shlex.quote(f"/run/adojapan-relay-install.{receipt.job_id}.stage")
-        agent_install = await privilege.run(
+        agent_install, agent_command_failure = await self._run_diagnosable(
             session,
+            privilege,
             "systemctl stop adojapan-relay-agent.service 2>/dev/null || true; "
             "systemctl stop adojapan-relay-broker.service 2>/dev/null || true; "
             "agent_status=0; "
@@ -867,9 +891,10 @@ class RemoteRelayInstaller:
             'exit "$agent_status"',
             timeout=timeouts.package_seconds,
         )
-        if agent_install.exit_status != 0:
-            diagnostic = await privilege.run(
+        if agent_install is None or agent_install.exit_status != 0:
+            diagnostic, _diagnostic_failure = await self._run_diagnosable(
                 session,
+                privilege,
                 "stage_value=; "
                 f"if test -f {agent_stage} && test ! -L {agent_stage} && "
                 f"test \"$(stat -c '%u:%a' {agent_stage})\" = '0:600' && "
@@ -879,8 +904,20 @@ class RemoteRelayInstaller:
                 "printf '%s' \"$stage_value\"",
                 timeout=timeouts.command_seconds,
             )
-            stage_code = _AGENT_INSTALL_STAGE_CODES.get(diagnostic.stdout.strip())
-            raise safe_failure(stage_code or "relay_agent_install_failed")
+            stage_code = _AGENT_INSTALL_STAGE_CODES.get(
+                diagnostic.stdout.strip()
+                if diagnostic is not None and diagnostic.exit_status == 0
+                else ""
+            )
+            suffix = (
+                "_timeout"
+                if agent_command_failure is not None
+                and agent_command_failure.code == "remote_command_timeout"
+                else ""
+            )
+            raise safe_failure(
+                (stage_code or "relay_agent_install_failed") + suffix
+            ) from agent_command_failure
         await self._run_checked(
             session,
             privilege,
@@ -901,8 +938,9 @@ class RemoteRelayInstaller:
             code="relay_unit_verify_failed",
         )
         self_test_stage = shlex.quote(f"/run/moblin-relay-self-test.{receipt.job_id}.stage")
-        self_test = await privilege.run(
+        self_test, self_test_command_failure = await self._run_diagnosable(
             session,
+            privilege,
             "self_test_status=0; "
             f"rm -f -- {self_test_stage} || exit $?; "
             f"MOBLIN_RELAY_SELF_TEST_STAGE_FILE={self_test_stage} "
@@ -913,9 +951,10 @@ class RemoteRelayInstaller:
             'exit "$self_test_status"',
             timeout=timeouts.package_seconds,
         )
-        if self_test.exit_status != 0:
-            diagnostic = await privilege.run(
+        if self_test is None or self_test.exit_status != 0:
+            diagnostic, _diagnostic_failure = await self._run_diagnosable(
                 session,
+                privilege,
                 "self_test_stage_value=; "
                 f"if test -f {self_test_stage} && test ! -L {self_test_stage} && "
                 f"test \"$(stat -c '%u:%a:%h' {self_test_stage})\" = '0:600:1' && "
@@ -925,8 +964,20 @@ class RemoteRelayInstaller:
                 "printf '%s' \"$self_test_stage_value\"",
                 timeout=timeouts.command_seconds,
             )
-            stage_code = _SELF_TEST_STAGE_CODES.get(diagnostic.stdout.strip())
-            raise safe_failure(stage_code or "relay_self_test_failed")
+            stage_code = _SELF_TEST_STAGE_CODES.get(
+                diagnostic.stdout.strip()
+                if diagnostic is not None and diagnostic.exit_status == 0
+                else ""
+            )
+            suffix = (
+                "_timeout"
+                if self_test_command_failure is not None
+                and self_test_command_failure.code == "remote_command_timeout"
+                else ""
+            )
+            raise safe_failure(
+                (stage_code or "relay_self_test_failed") + suffix
+            ) from self_test_command_failure
 
         token_temp = shlex.quote(f"{AGENT_ETC_ROOT}/.node.token.{receipt.job_id}.tmp")
         await self._run_checked(

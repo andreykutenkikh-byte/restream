@@ -86,6 +86,7 @@ def safe_failure(code: str) -> BootstrapError:
             "Существующий ключ узла нельзя безопасно заменить в текущем состоянии."
         ),
         "remote_command_failed": "Не удалось выполнить безопасный шаг установки.",
+        "remote_command_timeout": "Безопасный шаг установки превысил отведённое время.",
         "remote_upload_failed": "Не удалось безопасно загрузить файлы установки.",
         "agent_install_failed": "Node Agent не удалось установить.",
         "agent_enrollment_failed": (
@@ -494,7 +495,12 @@ def safe_failure(code: str) -> BootstrapError:
         "job_not_found": "Задача подключения сервера не найдена.",
         "invalid_job_state": "Операция недоступна в текущем состоянии задачи.",
     }
-    return BootstrapError(code, messages.get(code, "Подключение сервера не выполнено."))
+    message = messages.get(code)
+    if message is None and code.endswith("_timeout"):
+        base_message = messages.get(code.removesuffix("_timeout"))
+        if base_message is not None:
+            message = "Превышено время выполнения шага. " + base_message
+    return BootstrapError(code, message or "Подключение сервера не выполнено.")
 
 
 __all__ = [

@@ -47,7 +47,9 @@ ACTIVE_JOB_STATES: Final = frozenset(
 )
 TERMINAL_JOB_STATES: Final = frozenset({"completed", "cancelled", "failed"})
 ALL_JOB_STATES: Final = ACTIVE_JOB_STATES | TERMINAL_JOB_STATES
-_SAFE_ERROR_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+# Existing recovery phase codes reach 72 characters; a fixed timeout suffix
+# must also survive the worker-to-panel boundary without becoming bootstrap_failed.
+_SAFE_ERROR_CODE = re.compile(r"[a-z][a-z0-9_]{0,95}")
 SYNC_FAILURE_GRACE_SECONDS: Final = 30.0
 SYNC_FAILURE_MIN_ATTEMPTS: Final = 3
 WORKER_OVERALL_TIMEOUT_SECONDS: Final = 900.0
@@ -929,6 +931,8 @@ class BootstrapCoordinator:
         current_step = str(view.get("current_step", state))
         safe_error = _mapping_or_empty(view.get("safe_error"))
         code = str(safe_error.get("code", "")) or None
+        if code is not None and not _SAFE_ERROR_CODE.fullmatch(code):
+            code = "bootstrap_failed"
         message = _safe_message(safe_error.get("message")) if safe_error else None
         now = _now()
         finished_at = now if state in TERMINAL_JOB_STATES else None

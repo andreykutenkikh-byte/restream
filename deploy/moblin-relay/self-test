@@ -2697,11 +2697,20 @@ def transition_log_failure(tail: bytes) -> str | None:
 
 def known_forward_dts_marker_count(tail: bytes) -> int:
     """Count only the known native relay-output forward timestamp failure."""
+    # MediaMTX v1.20.1 internal/forward/dest_handler.go logs protocol, position
+    # and eight hexadecimal UUID characters, not a destination URL. The test
+    # DUT has exactly one RTMP forward destination, therefore position is 1.
+    pattern = re.compile(
+        rb"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} ERR "
+        rb"\[path " + re.escape(OUTPUT_PATH.encode("ascii"))
+        + rb"\] \[RTMP dest 1 [0-9a-f]{8}\] "
+        + re.escape(KNOWN_DTS_REGRESSION_MARKER)
+        + rb"(?:, .*)?$"
+    )
     return sum(
         1
         for line in tail.splitlines()
-        if b"[path " + OUTPUT_PATH.encode("ascii") + b"] [forward " in line
-        and KNOWN_DTS_REGRESSION_MARKER in line
+        if pattern.fullmatch(line)
     )
 
 

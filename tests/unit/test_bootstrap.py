@@ -214,6 +214,60 @@ def test_worker_hostname_populates_before_agent_heartbeat(
     assert dict(node) == {"hostname": "edge-01", "status": "installing"}
 
 
+@pytest.mark.asyncio()
+@pytest.mark.parametrize(
+    "code,expected",
+    [
+        (
+            "relay_self_test_auth_exclusivity_normalizer_confirmed_input_stall_failed",
+            "relay_self_test_auth_exclusivity_normalizer_confirmed_input_stall_failed",
+        ),
+        (
+            "relay_self_test_auth_exclusivity_normalizer_confirmed_input_stall_failed_timeout",
+            "relay_self_test_auth_exclusivity_normalizer_confirmed_input_stall_failed_timeout",
+        ),
+        ("x" * 96, "x" * 96),
+        ("x" * 97, "bootstrap_failed"),
+        ("rtmps://example.invalid/not-an-error-code", "bootstrap_failed"),
+    ],
+)
+async def test_native_failure_codes_survive_worker_persistence_and_panel_rendering(
+    bootstrap_components: tuple[Database, FakeBootstrapClient, BootstrapCoordinator],
+    code: str,
+    expected: str,
+) -> None:
+    database, client, coordinator = bootstrap_components
+    accepted = await coordinator.create_job(
+        address="example.test",
+        port=22,
+        username="root",
+        password=SecretStr("temporary"),
+        expected_host_fingerprint=None,
+    )
+    client.view = {
+        **client.view,
+        "state": "failed",
+        "current_step": "failed",
+        "safe_error": {"code": code, "message": "Safe native test failure"},
+        # Enlarging the error-code bound must not enlarge the separate step-name bound.
+        "steps": [
+            {"name": "x" * 64, "state": "failed"},
+            {"name": "x" * 65, "state": "failed"},
+        ],
+    }
+    rendered = await coordinator.get_job(accepted["job_id"])
+    assert rendered["safe_error"]["code"] == expected
+    assert rendered["steps"] == [{"name": "x" * 64, "state": "failed"}]
+    with database.connect() as connection:
+        persisted = connection.execute(
+            "SELECT safe_error_code FROM node_install_jobs WHERE id = ?",
+            (accepted["job_id"],),
+        ).fetchone()[0]
+    assert persisted == expected
+    # A subsequent terminal read no longer depends on the worker response.
+    assert (await coordinator.get_job(accepted["job_id"]))["safe_error"]["code"] == expected
+
+
 def test_completed_worker_poll_preserves_heartbeat_owned_hostname(
     bootstrap_components: tuple[Database, FakeBootstrapClient, BootstrapCoordinator],
 ) -> None:

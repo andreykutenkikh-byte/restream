@@ -2805,15 +2805,23 @@ def test_self_test_forward_rotation_requires_fresh_scoped_timestamp_evidence() -
     summarize = loaded["summarize_event_delivery_ledger"]
     count_markers = loaded["known_forward_dts_marker_count"]
     failure = loaded["TestFailure"]
+    # Pinned MediaMTX v1.20.1 DestHandler.Log emits [RTMP dest <pos> <8hex>].
     known = (
-        b"2026/09/05 12:00:00 WAR [path relay-output] [forward rtmp://127.0.0.1/live] "
+        b"2026/09/05 12:00:00 ERR [path relay-output] [RTMP dest 1 a12bc345] "
         b"DTS is not monotonically increasing, was 200, now is 100\n"
     )
     unrelated = (
         known.replace(b"relay-output", b"iphone-live")
-        + known.replace(b"[forward ", b"[forwarder ")
-        + known.replace(b"[forward ", b"[reader ")
+        + known.replace(b"RTMP dest 1", b"RTMP dest 2")
+        + known.replace(b"RTMP dest 1", b"SRT dest 1")
+        + known.replace(b"a12bc345", b"a12bc34")
+        + known.replace(b"a12bc345", b"a12bc3456")
+        + known.replace(b"a12bc345", b"not-hex!")
+        + known.replace(b" ERR ", b" WAR ")
+        + known.replace(b"[RTMP dest 1 a12bc345]", b"[forward rtmp://127.0.0.1/live]")
         + known.replace(b"DTS is not monotonically increasing", b"connection closed")
+        + b"untrusted prefix "
+        + known
         + b"FFmpeg: DTS is not monotonically increasing\n"
     )
     assert count_markers(unrelated) == 0

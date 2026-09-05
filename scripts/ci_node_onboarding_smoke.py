@@ -193,6 +193,7 @@ SAFE_BOOTSTRAP_DIAGNOSTIC_CODES = frozenset(
         "relay_self_test_cleanup_failed",
         "relay_slate_generation_failed",
         "remote_command_failed",
+        "remote_command_timeout",
         "remote_relay_account_conflict",
         "remote_relay_conflict",
         "remote_upload_failed",
@@ -204,6 +205,9 @@ SAFE_BOOTSTRAP_DIAGNOSTIC_CODES = frozenset(
         "target_resolution_changed",
         "unsupported_relay_operating_system",
     }
+)
+SAFE_BOOTSTRAP_DIAGNOSTIC_CODES |= frozenset(
+    code + "_timeout" for code in SAFE_BOOTSTRAP_DIAGNOSTIC_CODES if not code.endswith("_timeout")
 )
 SAFE_HEARTBEAT_DIAGNOSTIC_CODES = frozenset(
     {
