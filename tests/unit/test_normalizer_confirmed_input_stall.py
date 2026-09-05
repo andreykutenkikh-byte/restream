@@ -162,10 +162,7 @@ def test_pre_reset_metrics_or_identity_failure_requires_a_new_full_stall_proof()
         breaker.observe_before_reset(True, (SOURCE_ID, 100), 10.05)
         == loaded["RECOVERY_PREFLIGHT_WAIT"]
     )
-    assert (
-        breaker.observe_before_reset(False, None, 10.10)
-        == loaded["RECOVERY_PREFLIGHT_INVALID"]
-    )
+    assert breaker.observe_before_reset(False, None, 10.10) == loaded["RECOVERY_PREFLIGHT_INVALID"]
     assert breaker.invalidate_unverified_source() is True
     assert breaker.opened is False
     assert breaker.should_attempt(100.0) is False
@@ -259,8 +256,11 @@ def test_normalizer_wires_confirmed_stall_to_exact_source_recovery() -> None:
     source = NORMALIZER.read_text(encoding="utf-8")
     supervisor = source.split("def run_supervisor(", 1)[1].split("def main()", 1)[0]
 
-    assert "watchdog.ingest_connection_id == source_id" in supervisor
-    assert "ConfirmedInputStallGate(\n                        source_id," in supervisor
+    assert "confirmed_input_stall = watchdog.confirmed_stall_gate(source_id)" in supervisor
+    carry = source.split("def confirmed_stall_gate(", 1)[1].split("def observe_output(", 1)[0]
+    assert "self.ingest_connection_id != source_id" in carry
+    assert "self.failure_reason != RESTART_REASON_VERIFIED_STALL" in carry
+    assert "ConfirmedInputStallGate(source_id, self.ingest_counter, self.joint_idle_since)" in carry
     assert "recovery.open_after_confirmed_input_stall(" in supervisor
     kick_call = (
         "kick_srt_source(\n"

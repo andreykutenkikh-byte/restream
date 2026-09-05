@@ -1610,9 +1610,12 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         transition_helper
     )
     assert '"initial_live_rtmp_sink_media"' in transition_helper
-    assert "SLATE" not in transition_helper.split(
-        'if "LIVE" in description or description == INTENTIONAL_RTMP_RECONNECT_EVENT:', 1
-    )[0].split("recovered_sink_id =", 1)[1]
+    assert (
+        "SLATE"
+        not in transition_helper.split(
+            'if "LIVE" in description or description == INTENTIONAL_RTMP_RECONNECT_EVENT:', 1
+        )[0].split("recovered_sink_id =", 1)[1]
+    )
     assert 'stop_primary_srt_source("final continuity transition")' in continuity_block
     assert "final_slate = wait_slate_with_live_srt(" in continuity_block
     assert (
@@ -1682,9 +1685,9 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     assert decode_block.index('mark_self_test_stage("format")') < decode_block.index(
         "format_failure = output_format_failure_stage("
     )
-    mixed_format_check = decode_block.split(
-        "format_failure = output_format_failure_stage(", 1
-    )[1].split("if format_failure", 1)[0]
+    mixed_format_check = decode_block.split("format_failure = output_format_failure_stage(", 1)[
+        1
+    ].split("if format_failure", 1)[0]
     assert "check_b_frames=False" in mixed_format_check
     sink_capture_helper = source.split("def capture_final_sink_media_segment(", 1)[1].split(
         "def validate_final_sink_media_segment(", 1
@@ -1697,7 +1700,7 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     )
     assert "check_b_frames=False" not in sink_validation_helper
     assert 'f"sink-proof-{segment_index:03d}.flv"' in sink_capture_helper
-    assert 'str(VIDEO_GOP_FRAMES + VIDEO_FPS)' in sink_capture_helper
+    assert "str(VIDEO_GOP_FRAMES + VIDEO_FPS)" in sink_capture_helper
     assert '"-c",\n            "copy"' in sink_capture_helper
     assert "stream_signature(" not in sink_capture_helper
     assert "video_gop_signature(" not in sink_capture_helper
@@ -1732,9 +1735,7 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     assert continuity_block.index("capture_observer.finish()") < continuity_block.index(
         "safe_stop(reader)"
     )
-    assert continuity_block.index("observer.finish()") < continuity_block.index(
-        "safe_stop(reader)"
-    )
+    assert continuity_block.index("observer.finish()") < continuity_block.index("safe_stop(reader)")
     main_after_continuity = source.split('mark_self_test_stage("continuity")', 1)[1]
     assert main_after_continuity.index("validate_final_sink_media_segment(") < (
         main_after_continuity.index('mark_self_test_stage("secrets")')
@@ -1748,9 +1749,9 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     assert decode_block.index('mark_self_test_stage("decoder")') < decode_block.index(
         "decode = run("
     )
-    aggregate_decode_command = decode_block.split("decode = run(", 1)[1].split(
-        "decode_text =", 1
-    )[0]
+    aggregate_decode_command = decode_block.split("decode = run(", 1)[1].split("decode_text =", 1)[
+        0
+    ]
     assert '"-err_detect"' in aggregate_decode_command
     assert '"explode"' in aggregate_decode_command
     assert '"-xerror"' not in aggregate_decode_command
@@ -2213,12 +2214,15 @@ def test_self_test_same_session_failure_classifier_is_fixed_and_secret_free() ->
     assert secret not in identity_stage
     assert stage([sample(1.2, 101, ingest_live=False, ingest_ids=[])]) == "stall-i-off"
     assert stage([sample(1.2, 100)]) == "stall-i-byte"
-    assert stage(
-        [
-            sample(1.2, 101),
-            sample(1.2 + loaded["CAPTURE_NO_GROWTH_LIMIT_SECONDS"] + 0.1, 101),
-        ]
-    ) == "stall-i-byte"
+    assert (
+        stage(
+            [
+                sample(1.2, 101),
+                sample(1.2 + loaded["CAPTURE_NO_GROWTH_LIMIT_SECONDS"] + 0.1, 101),
+            ]
+        )
+        == "stall-i-byte"
+    )
     assert stage([sample(1.2, 101, normalized=False, normalized_ids=[])]) == "stall-norm"
     assert stage([sample(1.2, 101, forward=False)]) == "stall-sink"
     assert stage([sample(1.2, 101)]) == "stall-live"
@@ -2326,9 +2330,7 @@ def test_self_test_initial_live_log_gates_are_fixed_scoped_and_secret_free(
     }
     assert loaded["RTMP_SINK_RECOVERY_TIMEOUT_SECONDS"] == 15.0
     main_source = SELF_TEST.read_text(encoding="utf-8").split("def main()", 1)[1]
-    global_log_open = (
-        "transition_log_descriptor, transition_log_offset = open_validated_log_tail("
-    )
+    global_log_open = "transition_log_descriptor, transition_log_offset = open_validated_log_tail("
     global_log_check = "transition_failure = transition_log_failure("
     assert (
         main_source.index('mark_self_test_stage("auth-source")')
@@ -2349,8 +2351,7 @@ def test_self_test_initial_live_log_gates_are_fixed_scoped_and_secret_free(
     assert main_source.index(delivery_gate) < main_source.index(dts_diagnostic)
     assert (
         'delivery_summary["max_delivery_outage_seconds"] '
-        "> RTMP_SINK_RECOVERY_TIMEOUT_SECONDS"
-        in main_source[: main_source.index(delivery_gate)]
+        "> RTMP_SINK_RECOVERY_TIMEOUT_SECONDS" in main_source[: main_source.index(delivery_gate)]
     )
 
     with (
@@ -2919,11 +2920,11 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
     assert output_gate.observe(("normalizer-a", 120)) is True
     assert output_gate.observe(("normalizer-b", 130)) is False
 
-    assert loaded["VERIFIED_STALL_TIMEOUT_SECONDS"] == 0.50
-    assert loaded["OUTPUT_IDLE_FALLBACK_SECONDS"] == 0.90
+    assert loaded["VERIFIED_STALL_TIMEOUT_SECONDS"] == 2.0
+    assert loaded["OUTPUT_IDLE_FALLBACK_SECONDS"] == 2.5
     assert loaded["REQUIRED_IDLE_OBSERVATIONS"] == 2
     assert loaded["REQUIRED_VERIFIED_STALL_OBSERVATIONS"] == 3
-    assert loaded["METRICS_BLIND_TIMEOUT_SECONDS"] == 0.75
+    assert loaded["METRICS_BLIND_TIMEOUT_SECONDS"] == 2.0
     assert (
         loaded["VERIFIED_STALL_TIMEOUT_SECONDS"]
         + (2 * loaded["MEDIA_POLL_INTERVAL_SECONDS"])
@@ -2939,6 +2940,13 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
         < self_test["CAPTURE_NO_GROWTH_LIMIT_SECONDS"]
     )
 
+    # Exercise the state-machine boundaries below on a compressed virtual clock.
+    # Production 2/2.5 s pause tolerance is tested independently in
+    # test_normalizer_transient_pauses.py; the native 3 s gate above is unchanged.
+    clock_globals = watchdog_type.__init__.__globals__
+    clock_globals["VERIFIED_STALL_TIMEOUT_SECONDS"] = 0.50
+    clock_globals["OUTPUT_IDLE_FALLBACK_SECONDS"] = 0.90
+    clock_globals["METRICS_BLIND_TIMEOUT_SECONDS"] = 0.75
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
     assert watchdog.observe_output(True, ("normalizer-a", 120), 1.05) == (True, True)
     assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
@@ -3143,6 +3151,12 @@ def test_normalizer_bridge_active_diagnostic_is_fixed_and_secret_free(capsys) ->
 def test_normalizer_watchdog_records_a_fixed_failure_reason() -> None:
     loaded = load_normalizer()
     watchdog_type = loaded["MediaWatchdog"]
+    # Failure-code checks use the same compressed virtual clock as the
+    # state-machine boundary checks, not the production pause policy.
+    clock_globals = watchdog_type.__init__.__globals__
+    clock_globals["VERIFIED_STALL_TIMEOUT_SECONDS"] = 0.50
+    clock_globals["OUTPUT_IDLE_FALLBACK_SECONDS"] = 0.90
+    clock_globals["METRICS_BLIND_TIMEOUT_SECONDS"] = 0.75
 
     cases: list[tuple[str, object]] = []
 

@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import importlib.machinery
 import importlib.util
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 import types
@@ -151,41 +153,41 @@ def assert_normalizer_contract(normalizer) -> None:
     assert output_gate.observe(("connection-a", 120)) is True
     assert output_gate.observe(("connection-b", 130)) is False
 
-    assert normalizer.VERIFIED_STALL_TIMEOUT_SECONDS == 0.50
-    assert normalizer.OUTPUT_IDLE_FALLBACK_SECONDS == 0.90
+    assert normalizer.VERIFIED_STALL_TIMEOUT_SECONDS == 2.0
+    assert normalizer.OUTPUT_IDLE_FALLBACK_SECONDS == 2.5
     assert normalizer.REQUIRED_IDLE_OBSERVATIONS == 2
     assert normalizer.REQUIRED_VERIFIED_STALL_OBSERVATIONS == 3
-    assert normalizer.METRICS_BLIND_TIMEOUT_SECONDS == 0.75
+    assert normalizer.METRICS_BLIND_TIMEOUT_SECONDS == 2.0
     assert (
         normalizer.VERIFIED_STALL_TIMEOUT_SECONDS
         + (2 * normalizer.MEDIA_POLL_INTERVAL_SECONDS)
         + normalizer.CHILD_STOP_GRACE_SECONDS
         + (1024 / 48000)
-        < 1.1
+        < 3.0
     )
     assert (
         normalizer.OUTPUT_IDLE_FALLBACK_SECONDS
         + normalizer.MEDIA_POLL_INTERVAL_SECONDS
         + normalizer.CHILD_STOP_GRACE_SECONDS
         + (1024 / 48000)
-        < 1.0
+        < 3.0
     )
 
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
     assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
-    assert watchdog.observe_output(True, ("connection-a", 120), 1.49) == (True, True)
-    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.49, 1.491) is True
-    assert watchdog.observe_output(True, ("connection-a", 120), 1.552) == (True, True)
-    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.552, 1.553) is False
+    assert watchdog.observe_output(True, ("connection-a", 120), 2.99) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 2.99, 2.991) is True
+    assert watchdog.observe_output(True, ("connection-a", 120), 3.052) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 3.052, 3.053) is False
 
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
     assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
-    assert watchdog.observe_output(True, ("connection-a", 120), 1.60) == (True, True)
-    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.60, 1.601) is True
-    assert watchdog.observe_output(True, ("connection-a", 120), 1.61) == (True, True)
-    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.61, 1.611) is False
+    assert watchdog.observe_output(True, ("connection-a", 120), 3.10) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 3.10, 3.101) is True
+    assert watchdog.observe_output(True, ("connection-a", 120), 3.11) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 3.11, 3.111) is False
 
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     for observed_at, ingest_counter in ((1.05, 500), (1.10, 501), (1.15, 502)):
@@ -203,10 +205,10 @@ def assert_normalizer_contract(normalizer) -> None:
 
     assert watchdog.observe_output(True, ("connection-a", 121), 1.21) == (True, True)
     assert watchdog.observe_ingest(True, ("ingest-a", 502), 1.21, 1.211) is True
-    assert watchdog.observe_output(True, ("connection-a", 121), 1.60) == (True, True)
-    assert watchdog.observe_ingest(True, ("ingest-a", 502), 1.60, 1.601) is True
-    assert watchdog.observe_output(True, ("connection-a", 121), 1.72) == (True, True)
-    assert watchdog.observe_ingest(True, ("ingest-a", 502), 1.72, 1.721) is False
+    assert watchdog.observe_output(True, ("connection-a", 121), 3.10) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 502), 3.10, 3.101) is True
+    assert watchdog.observe_output(True, ("connection-a", 121), 3.22) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 502), 3.22, 3.221) is False
 
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     for observed_at, ingest_counter in (
@@ -216,7 +218,7 @@ def assert_normalizer_contract(normalizer) -> None:
         (1.35, 503),
         (1.45, 504),
         (1.55, 505),
-        (1.899, 506),
+        (3.499, 506),
     ):
         assert watchdog.observe_output(True, ("connection-a", 120), observed_at) == (
             True,
@@ -231,15 +233,15 @@ def assert_normalizer_contract(normalizer) -> None:
             )
             is True
         )
-    assert watchdog.observe_output(True, ("connection-a", 120), 1.901) == (False, False)
+    assert watchdog.observe_output(True, ("connection-a", 120), 3.501) == (False, False)
 
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
     assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
     assert watchdog.observe_output(True, ("connection-a", 120), 1.10) == (True, True)
     assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.10, 1.30) is True
-    assert watchdog.observe_output(True, ("connection-a", 120), 1.56) == (True, True)
-    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.56, 1.561) is False
+    assert watchdog.observe_output(True, ("connection-a", 120), 3.06) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 3.06, 3.061) is False
 
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
@@ -251,10 +253,10 @@ def assert_normalizer_contract(normalizer) -> None:
     assert watchdog.joint_unchanged_observations == 0
     assert watchdog.observe_output(True, ("connection-a", 120), 1.11) == (True, True)
     assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.11, 1.111) is True
-    assert watchdog.observe_output(True, ("connection-a", 120), 1.55) == (True, True)
-    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.55, 1.551) is True
-    assert watchdog.observe_output(True, ("connection-a", 120), 1.62) == (True, True)
-    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.62, 1.621) is False
+    assert watchdog.observe_output(True, ("connection-a", 120), 3.05) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 3.05, 3.051) is True
+    assert watchdog.observe_output(True, ("connection-a", 120), 3.12) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 3.12, 3.121) is False
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
     assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
@@ -264,10 +266,10 @@ def assert_normalizer_contract(normalizer) -> None:
     assert watchdog.joint_unchanged_observations == 0
     assert watchdog.observe_output(True, ("connection-a", 120), 1.11) == (True, True)
     assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.11, 1.111) is True
-    assert watchdog.observe_output(True, ("connection-a", 120), 1.55) == (True, True)
-    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.55, 1.551) is True
-    assert watchdog.observe_output(True, ("connection-a", 120), 1.62) == (True, True)
-    assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.62, 1.621) is False
+    assert watchdog.observe_output(True, ("connection-a", 120), 3.05) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 3.05, 3.051) is True
+    assert watchdog.observe_output(True, ("connection-a", 120), 3.12) == (True, True)
+    assert watchdog.observe_ingest(True, ("ingest-a", 500), 3.12, 3.121) is False
     watchdog = normalizer.MediaWatchdog(("connection-a", 120), 1.0)
     assert watchdog.observe_output(True, ("connection-a", 120), 1.05) == (True, True)
     assert watchdog.observe_ingest(True, None, 1.05, 1.051) is False
@@ -584,9 +586,7 @@ def assert_preview_contract(renderer) -> None:
     assert "forward" not in ingest
     assert output["alwaysAvailable"] is True
     assert output["alwaysAvailableFile"] == renderer.SLATE_FILE
-    assert output["forward"] == [
-        {"dest": "rtmps://example.invalid/live2#test-youtube-key"}
-    ]
+    assert output["forward"] == [{"dest": "rtmps://example.invalid/live2#test-youtube-key"}]
     assert "runOnAvailable" not in output
     assert set(config["paths"]) == {"iphone-live", "relay-output"}
 
@@ -697,11 +697,294 @@ def assert_token_reader_contract(renderer) -> None:
             raise AssertionError("unsafe preview token permissions were accepted")
 
 
+def assert_runtime_service_contract(renderer, normalizer) -> None:
+    service = Path(__file__).with_name("moblin-relay.service").read_text(encoding="utf-8")
+    settings = [line.strip() for line in service.splitlines() if not line.startswith("#")]
+    assert "User=moblin-relay" in settings
+    assert "Group=moblin-relay" in settings
+    assert not any(line.startswith("RuntimeDirectory") for line in settings)
+    assert not any(line.startswith("ReadWritePaths=/run/moblin-relay") for line in settings)
+    assert any(line.startswith("ReadOnlyPaths=-/run/moblin-relay ") for line in settings)
+    renderer_command = (
+        "ExecStartPre=+/usr/bin/python3 -I /usr/local/libexec/moblin-relay-render-config"
+    )
+    preflight_command = (
+        "ExecStartPre=/usr/bin/python3 -I "
+        "/opt/moblin-relay/libexec/moblin-relay-normalize --check-control-credential"
+    )
+    start_command = "ExecStart=/opt/moblin-relay/bin/mediamtx /run/moblin-relay/mediamtx.json"
+    assert settings.index(renderer_command) < settings.index(preflight_command)
+    assert settings.index(preflight_command) < settings.index(start_command)
+    assert (
+        "ExecStopPost=+/usr/bin/python3 -I /usr/local/libexec/moblin-relay-render-config --cleanup"
+    ) in settings
+    assert Path("/run/moblin-relay") == renderer.RUNTIME_DIR
+    assert renderer.CONTROL_TOKEN_FILE == normalizer.CONTROL_TOKEN_FILE
+
+
+def assert_runtime_ownership_contract(renderer, normalizer) -> None:
+    """Exercise real Linux permissions as the unprivileged service, without systemd."""
+    if os.name != "posix" or os.geteuid() != 0:
+        print("Runtime credential ownership: SKIP (requires Linux root)")
+        return
+    try:
+        account = renderer.pwd.getpwnam("moblin-relay")
+        relay_uid, relay_gid = account.pw_uid, account.pw_gid
+    except KeyError:
+        relay_uid = relay_gid = 65534
+    assert relay_uid != 0 and relay_gid != 0
+
+    def as_user(uid: int, gid: int, action) -> None:
+        child = os.fork()
+        if child == 0:
+            try:
+                os.setgroups([])
+                os.setgid(gid)
+                os.setuid(uid)
+                action()
+            except BaseException:
+                os._exit(1)
+            os._exit(0)
+        _, status = os.waitpid(child, 0)
+        assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+
+    with tempfile.TemporaryDirectory() as temporary:
+        parent = Path(temporary)
+        parent.chmod(0o711)
+        runtime = parent / "moblin-relay"
+        token_file = runtime / "control-api.token"
+        config_file = runtime / "mediamtx.json"
+        token_value = b"T" * 43
+        with patch.multiple(
+            renderer,
+            RUNTIME_DIR=runtime,
+            RUNTIME_FILE=config_file,
+            CONTROL_TOKEN_FILE=token_file,
+        ):
+            directory_fd = renderer.open_runtime_directory(relay_gid, create=True)
+            assert directory_fd is not None
+            try:
+                renderer.atomic_write_runtime_file(
+                    token_file, token_value + b"\n", relay_gid, directory_fd
+                )
+                renderer.atomic_write_runtime_file(config_file, b"{}\n", relay_gid, directory_fd)
+            finally:
+                os.close(directory_fd)
+
+            assert runtime.stat().st_uid == 0
+            assert stat.S_IMODE(runtime.stat().st_mode) == 0o750
+            for path in (token_file, config_file):
+                entry = path.stat()
+                assert (entry.st_uid, entry.st_gid, stat.S_IMODE(entry.st_mode)) == (
+                    0,
+                    relay_gid,
+                    0o640,
+                )
+
+            def check_relay_read_only() -> None:
+                token = normalizer.read_control_token(token_file)
+                assert token == token_value
+                token[:] = b"\0" * len(token)
+                assert config_file.read_bytes() == b"{}\n"
+                for path in (token_file, config_file):
+                    try:
+                        descriptor = os.open(path, os.O_WRONLY)
+                    except PermissionError:
+                        pass
+                    else:
+                        os.close(descriptor)
+                        raise AssertionError("relay account can write a root-owned secret")
+                try:
+                    runtime.rename(parent / "renamed-runtime")
+                except PermissionError:
+                    pass
+                else:
+                    raise AssertionError("relay account can replace the runtime directory")
+
+            as_user(relay_uid, relay_gid, check_relay_read_only)
+
+            def check_credential_rejected() -> None:
+                try:
+                    normalizer.read_control_token(token_file)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("unsafe or unreadable control credential was accepted")
+
+            outsider_uid = 65533 if relay_uid != 65533 else 65532
+            outsider_gid = 65533 if relay_gid != 65533 else 65532
+            as_user(outsider_uid, outsider_gid, check_credential_rejected)
+
+            # Reproduce RuntimeDirectory's recursive chown before a new Exec command.
+            for path in (runtime, token_file, config_file):
+                os.chown(path, relay_uid, relay_gid)
+            as_user(relay_uid, relay_gid, check_credential_rejected)
+            try:
+                renderer.open_runtime_directory(relay_gid, create=True)
+            except SystemExit as exc:
+                assert str(exc) == "unsafe relay runtime directory permissions"
+            else:
+                raise AssertionError("renderer adopted a service-owned runtime directory")
+            for path in (runtime, token_file, config_file):
+                os.chown(path, 0, relay_gid)
+            as_user(relay_uid, relay_gid, check_relay_read_only)
+
+            # Interrupted root writes are removed; unrelated files are preserved.
+            stale_temp = runtime / (".control-api.token." + "a" * 32)
+            stale_temp.write_bytes(token_value)
+            os.chown(stale_temp, 0, relay_gid)
+            stale_temp.chmod(0o640)
+            foreign = runtime / "unrelated-file"
+            foreign.write_bytes(b"preserve")
+            try:
+                renderer.cleanup_runtime_files(relay_gid)
+            except SystemExit as exc:
+                assert str(exc) == "unexpected files remain in relay runtime directory"
+            else:
+                raise AssertionError("cleanup ignored unrelated runtime contents")
+            assert foreign.read_bytes() == b"preserve"
+            assert not any(path.exists() for path in (token_file, config_file, stale_temp))
+            foreign.unlink()
+            renderer.cleanup_runtime_files(relay_gid)
+            assert not runtime.exists()
+            renderer.cleanup_runtime_files(relay_gid)
+
+            # Reject a runtime symlink without modifying its target or permissions.
+            target = parent / "unrelated-directory"
+            target.mkdir(mode=0o700)
+            runtime.symlink_to(target, target_is_directory=True)
+            for action in (
+                lambda: renderer.open_runtime_directory(relay_gid, create=True),
+                lambda: renderer.cleanup_runtime_files(relay_gid),
+            ):
+                try:
+                    action()
+                except SystemExit as exc:
+                    assert str(exc) == "unsafe relay runtime directory permissions"
+                else:
+                    raise AssertionError("runtime symlink was accepted")
+            assert stat.S_IMODE(target.stat().st_mode) == 0o700
+            runtime.unlink()
+
+            # A failed renderer can leave the first installed secret; the stop
+            # hook must still clean it without requiring the source secret file.
+            original_write = renderer.atomic_write_runtime_file
+
+            def fail_config_write(path, payload, gid, descriptor) -> None:
+                if path == config_file:
+                    raise OSError("synthetic configuration write failure")
+                original_write(path, payload, gid, descriptor)
+
+            with (
+                patch.object(
+                    renderer,
+                    "validate_secret_file",
+                    return_value={
+                        "srt": {
+                            "user": "test_publisher",
+                            "password": "publisher-password-0123456789",
+                            "passphrase": "passphrase-0123456789",
+                        },
+                        "youtube": {
+                            "url": "rtmps://example.invalid/live2",
+                            "key": "test-youtube-key",
+                        },
+                    },
+                ),
+                patch.object(renderer, "read_preview_token", return_value=None),
+                patch.object(renderer, "atomic_write_runtime_file", fail_config_write),
+            ):
+                try:
+                    renderer.render_runtime_config(relay_gid)
+                except OSError:
+                    pass
+                else:
+                    raise AssertionError("synthetic render failure did not fire")
+            assert token_file.is_file() and not config_file.exists()
+
+            # Unsafe entries are preserved but cannot prevent removing the
+            # validated generated token/config on the failed-start stop hook.
+            config_file.symlink_to(target)
+            try:
+                renderer.cleanup_runtime_files(relay_gid)
+            except SystemExit as exc:
+                assert str(exc) == "unsafe relay runtime file during cleanup"
+            else:
+                raise AssertionError("unsafe runtime file was accepted during cleanup")
+            assert config_file.is_symlink() and target.is_dir()
+            assert not token_file.exists()
+            config_file.unlink()
+            renderer.cleanup_runtime_files(relay_gid)
+            assert not runtime.exists()
+
+            # Interrupt each initialization ownership change. Cleanup may remove
+            # these root-only partial artifacts while normal rendering rejects
+            # a pre-existing directory that does not meet the service contract.
+            runtime.mkdir(mode=0o700)
+            os.chown(runtime, 0, 0)
+            try:
+                renderer.open_runtime_directory(relay_gid, create=True)
+            except SystemExit as exc:
+                assert str(exc) == "unsafe relay runtime directory permissions"
+            else:
+                raise AssertionError("incomplete runtime directory was accepted for startup")
+            renderer.cleanup_runtime_files(relay_gid)
+            assert not runtime.exists()
+
+            directory_fd = renderer.open_runtime_directory(relay_gid, create=True)
+            assert directory_fd is not None
+            try:
+                with patch.object(
+                    renderer.os,
+                    "fchown",
+                    side_effect=OSError("synthetic ownership change interruption"),
+                ):
+                    try:
+                        renderer.atomic_write_runtime_file(
+                            token_file, token_value, relay_gid, directory_fd
+                        )
+                    except OSError:
+                        pass
+                    else:
+                        raise AssertionError("synthetic ownership interruption did not fire")
+                assert not os.listdir(directory_fd)
+                # SIGKILL skips the writer's finally cleanup; reproduce its
+                # root:root pre-chown file and keep a finalized token alongside.
+                incomplete_temp = runtime / (".mediamtx.json." + "b" * 32)
+                incomplete_temp.touch(mode=0o600)
+                os.chown(incomplete_temp, 0, 0)
+                renderer.atomic_write_runtime_file(
+                    token_file, token_value + b"\n", relay_gid, directory_fd
+                )
+            finally:
+                os.close(directory_fd)
+            renderer.cleanup_runtime_files(relay_gid)
+            assert not runtime.exists()
+
+            # Under systemd ReadOnlyPaths, the stop hook cannot rmdir the bind
+            # mount itself. It must remove the secrets and leave a safe empty
+            # directory even after interrupted root:root initialization.
+            runtime.mkdir(mode=0o700)
+            os.chown(runtime, 0, 0)
+            with patch.object(Path, "rmdir", side_effect=OSError(errno.EBUSY, "synthetic mount")):
+                renderer.cleanup_runtime_files(relay_gid)
+            assert runtime.stat().st_uid == 0
+            assert runtime.stat().st_gid == relay_gid
+            assert stat.S_IMODE(runtime.stat().st_mode) == 0o750
+            assert not list(runtime.iterdir())
+            renderer.cleanup_runtime_files(relay_gid)
+            assert not runtime.exists()
+    print("Runtime credential ownership and cleanup: PASS")
+
+
 def main() -> int:
     renderer = load_renderer()
+    normalizer = load_normalizer()
     assert_preview_contract(renderer)
     assert_token_reader_contract(renderer)
-    assert_normalizer_contract(load_normalizer())
+    assert_normalizer_contract(normalizer)
+    assert_runtime_service_contract(renderer, normalizer)
+    assert_runtime_ownership_contract(renderer, normalizer)
     print("Renderer and normalizer contract: PASS")
     return 0
 
