@@ -60,6 +60,7 @@ SELF_TEST_STAGE_FILE = os.environ.pop("MOBLIN_RELAY_SELF_TEST_STAGE_FILE", "")
 SELF_TEST_STARTED_MONOTONIC = time.monotonic()
 SELF_TEST_PROGRESS_FILE = Path("/run/moblin-relay-self-test.progress.json")
 SELF_TEST_LAST_PROGRESS: dict = {}
+SELF_TEST_WAIT_FAILURE: tuple[BaseException, dict, float] | None = None
 SELF_TEST_STAGES = frozenset(
     {
         "startup",
@@ -398,6 +399,9 @@ def persist_self_test_failure_progress(exc: BaseException) -> None:
             lines.append(trace.tb_lineno)
         trace = trace.tb_next
     progress = {**SELF_TEST_LAST_PROGRESS, "failure_lines": lines[-8:]}
+    if SELF_TEST_WAIT_FAILURE is not None and SELF_TEST_WAIT_FAILURE[0] is exc:
+        progress["failure_flags"] = SELF_TEST_WAIT_FAILURE[1]
+        progress["failure_wait_seconds"] = SELF_TEST_WAIT_FAILURE[2]
     atomic_json(SELF_TEST_PROGRESS_FILE, progress)
 
 
@@ -1385,6 +1389,43 @@ def sink_delivery_active(sample: dict, expected_id: str | None = None) -> bool:
     )
 
 
+def safe_wait_failure_flags(
+    sample: dict,
+    previous_sample: dict,
+    *,
+    state_ok: bool,
+    expected_ingest_ids: list[str] | None,
+) -> dict[str, bool]:
+    """Expose fixed predicate booleans, never identities, counters or locators."""
+    ingest_ids = sample.get("ingest_ids")
+    sink_ids = sample.get("sink_ids")
+    flags = {
+        key: sample.get(key) is True
+        for key in ("live", "normalized", "path_ready", "ingest_live")
+    }
+    flags.update(
+        {
+            "metrics_ok": sample.get("dut_metrics_ok") is True
+            and sample.get("sink_metrics_ok") is True,
+            "core_alive": all(
+                sample.get(f"{name}_alive") is True for name in ("dut", "sink", "reader")
+            ),
+            "ingest_one": isinstance(ingest_ids, list) and len(ingest_ids) == 1,
+            "sink_one": isinstance(sink_ids, list) and len(sink_ids) == 1,
+            "sink_growth": bool(
+                sink_delivery_active(sample)
+                and sink_delivery_active(previous_sample)
+                and sink_ids == previous_sample.get("sink_ids")
+                and sample["sink_bytes"] > previous_sample["sink_bytes"]
+            ),
+            "state_ok": state_ok is True,
+        }
+    )
+    if expected_ingest_ids is not None:
+        flags["ingest_match"] = ingest_ids == expected_ingest_ids
+    return flags
+
+
 class SinkDeliveryGrowthGate:
     """Require two increasing byte observations from one RTMP publisher."""
 
@@ -1412,6 +1453,79 @@ class SinkDeliveryGrowthGate:
             return False
         self.inbound_bytes = inbound_bytes
         return grew
+
+
+def crash_live_delivery_proof(
+    samples: list[dict],
+    current: dict,
+    *,
+    started: float,
+    deadline: float,
+    now: float,
+    expected_ingest_ids: list[str],
+    old_normalized_ids: list[str],
+    expected_sink_id: str,
+) -> dict | None:
+    """Reuse only completed, still-current LIVE delivery proof from this crash."""
+    if (
+        not samples or samples[-1] != current or len(expected_ingest_ids) != 1
+        or len(old_normalized_ids) != 1
+        or any(type(value) not in (int, float) for value in (started, deadline, now))
+        or not all(math.isfinite(value) for value in (started, deadline, now))
+        or deadline != started + SUPERVISOR_RESTART_TIMEOUT_SECONDS
+    ):
+        return None
+    previous = None
+    proof = None
+    last_finished = started
+    last_observed = None
+    try:
+        if not 0 <= now - float(current["finished"]) <= 0.5:
+            return None
+        for sample in samples:
+            observed, finished = float(sample["t"]), float(sample["finished"])
+            if (
+                not math.isfinite(observed) or not math.isfinite(finished)
+                or not started <= observed <= finished <= now
+                or observed < last_finished
+                or (last_observed is not None and observed <= last_observed)
+                or finished - observed > 0.5
+            ):
+                return None
+            normalized_ids = sample.get("normalized_ids")
+            last_observed = observed
+            valid = bool(
+                complete_metrics_sample(sample)
+                and all(sample.get(f"{name}_alive") for name in ("dut", "sink", "reader"))
+                and sample.get("live") and sample.get("normalized") and sample.get("path_ready")
+                and sample.get("ingest_live") and sample.get("ingest_ids") == expected_ingest_ids
+                and isinstance(normalized_ids, list) and len(normalized_ids) == 1
+                and normalized_ids != old_normalized_ids
+                and sink_delivery_active(sample, expected_sink_id)
+            )
+            if not valid:
+                if proof is not None:
+                    return None
+                previous = None
+                last_finished = finished
+                continue
+            if previous is not None:
+                if (
+                    observed - last_finished > 0.5
+                    or normalized_ids != previous.get("normalized_ids")
+                    or sample["sink_ids"] != previous["sink_ids"]
+                    or sample["sink_bytes"] < previous["sink_bytes"]
+                ):
+                    return None
+                if sample["sink_bytes"] > previous["sink_bytes"] and finished <= deadline:
+                    proof = sample
+            previous = sample
+            last_finished = finished
+        if proof is None or not 0 <= now - float(proof["finished"]) <= 0.5:
+            return None
+        return proof
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
 
 
 def summarize_downstream_delivery(samples: list[dict], started: float, finished: float) -> dict:
@@ -4242,7 +4356,9 @@ def main() -> int:
             *,
             not_before: float = 0.0,
             health_check=None,
+            expected_ingest_ids: list[str] | None = None,
         ) -> dict:
+            global SELF_TEST_WAIT_FAILURE
             growth_gate = SinkDeliveryGrowthGate()
 
             def recovered(item: dict) -> bool:
@@ -4251,13 +4367,33 @@ def main() -> int:
                     return False
                 return growth_gate.observe(item)
 
-            return observer.wait_sample(
-                description,
-                recovered,
-                timeout,
-                not_before=not_before,
-                health_check=health_check,
-            )
+            wait_started = time.monotonic()
+            try:
+                return observer.wait_sample(
+                    description,
+                    recovered,
+                    timeout,
+                    not_before=not_before,
+                    health_check=health_check,
+                )
+            except TestFailure as exc:
+                # Optional diagnostics must never replace the original failed
+                # predicate or change whether the self-test passes.
+                with contextlib.suppress(Exception):
+                    wait_finished = time.monotonic()
+                    observations = observer.samples_between(wait_started, wait_finished)
+                    sample = observations[-1] if observations else {}
+                    previous = observations[-2] if len(observations) >= 2 else {}
+                    flags = safe_wait_failure_flags(
+                        sample,
+                        previous,
+                        state_ok=bool(state_predicate(sample)),
+                        expected_ingest_ids=expected_ingest_ids,
+                    )
+                    wait_seconds = wait_finished - wait_started
+                    if math.isfinite(wait_seconds) and 0 <= wait_seconds <= 660:
+                        SELF_TEST_WAIT_FAILURE = (exc, flags, round(wait_seconds, 3))
+                raise
 
         def wait_downstream_transition(
             description: str,
@@ -4266,21 +4402,36 @@ def main() -> int:
             timeout: float,
             *,
             health_check=None,
+            expected_ingest_ids: list[str] | None = None,
+            crash_proof: dict | None = None,
         ) -> dict:
             nonlocal current_sink_id
             remaining = min(
                 timeout,
                 RTMP_SINK_RECOVERY_TIMEOUT_SECONDS - (time.monotonic() - transition_started),
             )
-            if remaining <= 0:
+            if crash_proof is not None:
+                if (
+                    description != "supervisor-crash LIVE recovery"
+                    or not state_predicate(crash_proof)
+                    or not sink_delivery_active(crash_proof, current_sink_id)
+                    or not transition_started <= float(crash_proof["t"])
+                    <= float(crash_proof["finished"])
+                    <= transition_started + SUPERVISOR_RESTART_TIMEOUT_SECONDS
+                ):
+                    raise TestFailure("invalid crash-event delivery proof")
+                sample = crash_proof
+            elif remaining <= 0:
                 raise TestFailure(f"{description} exceeded the RTMP sink recovery bound")
-            sample = wait_sink_delivery_growth(
-                description,
-                state_predicate,
-                remaining,
-                not_before=transition_started,
-                health_check=health_check,
-            )
+            else:
+                sample = wait_sink_delivery_growth(
+                    description,
+                    state_predicate,
+                    remaining,
+                    not_before=transition_started,
+                    health_check=health_check,
+                    expected_ingest_ids=expected_ingest_ids,
+                )
             recovery_seconds = float(sample.get("finished", sample["t"])) - transition_started
             if recovery_seconds > RTMP_SINK_RECOVERY_TIMEOUT_SECONDS:
                 raise TestFailure(f"{description} exceeded the RTMP sink recovery bound")
@@ -4350,6 +4501,7 @@ def main() -> int:
             not_before: float = 0.0,
             expected_ingest_ids: list[str] | None = None,
             sink_transition_started: float | None = None,
+            crash_proof: dict | None = None,
         ) -> dict:
             def live_state(sample: dict) -> bool:
                 return bool(
@@ -4368,6 +4520,8 @@ def main() -> int:
                     sink_transition_started,
                     live_state,
                     timeout,
+                    expected_ingest_ids=expected_ingest_ids,
+                    crash_proof=crash_proof,
                 )
             return observer.wait_sample(
                 description,
@@ -5367,8 +5521,19 @@ def main() -> int:
             absolute_deadline=supervisor_recovery_deadline,
         )
         mark_self_test_stage("crash-live")
+        crash_current = observer.checked_snapshot("current supervisor-crash LIVE recovery")
+        crash_proof = crash_live_delivery_proof(
+            observer.samples_between(supervisor_crash_started, float(crash_current["t"])),
+            crash_current,
+            started=supervisor_crash_started,
+            deadline=supervisor_recovery_deadline,
+            now=time.monotonic(),
+            expected_ingest_ids=initial_ingest_ids,
+            old_normalized_ids=old_normalizer_ids,
+            expected_sink_id=current_sink_id,
+        )
         crash_recovery_remaining = supervisor_recovery_deadline - time.monotonic()
-        if crash_recovery_remaining <= 0:
+        if crash_recovery_remaining <= 0 and crash_proof is None:
             raise TestFailure("supervisor-crash LIVE recovery exceeded its absolute deadline")
         crash_live = wait_healthy_live(
             "supervisor-crash LIVE recovery",
@@ -5376,6 +5541,7 @@ def main() -> int:
             not_before=supervisor_crash_started,
             expected_ingest_ids=initial_ingest_ids,
             sink_transition_started=supervisor_crash_started,
+            crash_proof=crash_proof,
         )
         if crash_live["normalized_ids"] == old_normalizer_ids:
             raise TestFailure("supervisor crash reused the old normalizer connection")

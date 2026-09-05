@@ -280,6 +280,319 @@ def test_self_test_aggregate_decoder_uses_full_process_deadline() -> None:
         exec(block, namespace)  # noqa: S102 - fixed, repository-owned decoder AST
 
 
+def test_self_test_wait_failure_flags_never_copy_identities_or_counters() -> None:
+    namespace = load_self_test()
+    flags = namespace["safe_wait_failure_flags"]
+    sample = {
+        "live": True,
+        "normalized": True,
+        "path_ready": True,
+        "ingest_live": True,
+        "dut_metrics_ok": True,
+        "sink_metrics_ok": True,
+        "dut_alive": True,
+        "sink_alive": True,
+        "reader_alive": True,
+        "ingest_ids": ["PRIVATE_INGEST_ID"],
+        "sink_ids": ["PRIVATE_SINK_ID"],
+        "sink_bytes": 12346,
+        "forward": True,
+        "private_key": "PRIVATE_KEY",
+    }
+    actual = flags(
+        sample,
+        {**sample, "sink_bytes": 12345},
+        state_ok=True,
+        expected_ingest_ids=["PRIVATE_INGEST_ID"],
+    )
+    assert len(actual) == 11
+    assert all(value is True for value in actual.values())
+    assert "PRIVATE" not in json.dumps(actual)
+    assert "1234" not in json.dumps(actual)
+    changed = flags(
+        {**sample, "live": "PRIVATE_KEY", "sink_ids": [], "ingest_ids": ["a", "b"]},
+        sample,
+        state_ok=False,
+        expected_ingest_ids=["PRIVATE_INGEST_ID"],
+    )
+    for key in ("live", "sink_one", "ingest_one", "sink_growth", "ingest_match", "state_ok"):
+        assert changed[key] is False
+    assert "ingest_match" not in flags({}, {}, state_ok=False, expected_ingest_ids=None)
+
+
+@pytest.mark.parametrize("diagnostic_failed", [False, True])
+def test_self_test_wait_telemetry_preserves_failure_and_deadline(diagnostic_failed: bool) -> None:
+    namespace = load_self_test()
+    tree = ast.parse(SELF_TEST.read_text(encoding="utf-8"))
+    helper = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "wait_sink_delivery_growth"
+    )
+    exec(  # noqa: S102 - fixed, repository-owned waiting helper AST
+        compile(ast.Module(body=[helper], type_ignores=[]), str(SELF_TEST), "exec"), namespace
+    )
+    failure = namespace["TestFailure"]("PRIVATE_EXCEPTION_MESSAGE")
+
+    def failed_wait(_description, _predicate, timeout, **kwargs):
+        assert timeout == 12
+        assert kwargs["not_before"] == 100
+        raise failure
+
+    namespace["observer"] = SimpleNamespace(
+        wait_sample=failed_wait,
+        samples_between=lambda *_args: [],
+    )
+    namespace["time"] = SimpleNamespace(monotonic=iter([100.0, 103.0]).__next__)
+
+    def state_predicate(_sample):
+        if diagnostic_failed:
+            raise ValueError("PRIVATE_DIAGNOSTIC_ERROR")
+        return False
+
+    with pytest.raises(namespace["TestFailure"]) as caught:
+        namespace["wait_sink_delivery_growth"](
+            "private wait label",
+            state_predicate,
+            12,
+            not_before=100,
+            expected_ingest_ids=["PRIVATE_EXPECTED_ID"],
+        )
+    assert caught.value is failure
+    if diagnostic_failed:
+        assert namespace["SELF_TEST_WAIT_FAILURE"] is None
+        return
+    saved_exception, flags, elapsed = namespace["SELF_TEST_WAIT_FAILURE"]
+    assert saved_exception is failure
+    assert elapsed == 3.0
+    assert "PRIVATE" not in json.dumps(flags)
+    assert all(value is False for value in flags.values())
+
+
+def crash_delivery_fixture():
+    base = {
+        "dut_metrics_ok": True,
+        "sink_metrics_ok": True,
+        "dut_alive": True,
+        "sink_alive": True,
+        "reader_alive": True,
+        "live": True,
+        "normalized": True,
+        "path_ready": True,
+        "ingest_live": True,
+        "ingest_ids": ["current-ingest"],
+        "normalized_ids": ["new-normalizer"],
+        "sink_ids": ["current-sink"],
+        "forward": True,
+    }
+    samples = [
+        {**base, "t": 111.74, "finished": 111.75, "sink_bytes": 100},
+        {**base, "t": 111.95, "finished": 111.96, "sink_bytes": 101},
+    ]
+    options = {
+        "started": 100.0,
+        "deadline": 112.0,
+        "now": 111.97,
+        "expected_ingest_ids": ["current-ingest"],
+        "old_normalized_ids": ["old-normalizer"],
+        "expected_sink_id": "current-sink",
+    }
+    return samples, options
+
+
+def test_self_test_reuses_already_completed_crash_delivery_without_extending_deadline() -> None:
+    namespace = load_self_test()
+    samples, options = crash_delivery_fixture()
+    proof = namespace["crash_live_delivery_proof"]
+    assert proof(samples, samples[-1], **options) == samples[-1]
+    # The observer's next poll would be after the 12-second deadline. The
+    # already-completed event proof remains valid only with a fresh LIVE tail.
+    samples.append({**samples[-1], "t": 112.15, "finished": 112.16, "sink_bytes": 102})
+    options["now"] = 112.17
+    assert proof(samples, samples[-1], **options) == samples[-2]
+    assert namespace["SUPERVISOR_RESTART_TIMEOUT_SECONDS"] == 12
+    assert namespace["RTMP_SINK_RECOVERY_TIMEOUT_SECONDS"] == 15
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "pre_event",
+        "late_finish",
+        "duplicate",
+        "reordered",
+        "same_counter",
+        "regression",
+        "wrong_ingest",
+        "old_normalizer",
+        "normalizer_rotation",
+        "sink_rotation",
+        "blind",
+        "gap",
+        "single_sample",
+        "stale_current",
+        "nonfinite",
+        "wrong_deadline",
+        "tail_slate",
+        "tail_blind",
+        "tail_regression",
+        "tail_ingest",
+        "tail_forward",
+        "tail_flat",
+        "different_current",
+    ],
+)
+def test_self_test_rejects_invalid_crash_delivery_history(invalid: str) -> None:
+    namespace = load_self_test()
+    samples, options = crash_delivery_fixture()
+    if invalid == "pre_event":
+        samples[0].update(t=99.7, finished=99.71)
+        samples[1].update(t=99.9, finished=99.91)
+    elif invalid == "late_finish":
+        samples[1]["finished"] = 112.01
+        options["now"] = 112.02
+    elif invalid == "duplicate":
+        samples[1].update(t=111.74, finished=111.75)
+    elif invalid == "reordered":
+        samples.reverse()
+    elif invalid == "same_counter":
+        samples[1]["sink_bytes"] = 100
+    elif invalid == "regression":
+        samples[1]["sink_bytes"] = 99
+    elif invalid == "wrong_ingest":
+        samples[1]["ingest_ids"] = ["other-ingest"]
+    elif invalid == "old_normalizer":
+        samples[1]["normalized_ids"] = ["old-normalizer"]
+    elif invalid == "normalizer_rotation":
+        samples[1]["normalized_ids"] = ["other-normalizer"]
+    elif invalid == "sink_rotation":
+        samples[1]["sink_ids"] = ["other-sink"]
+    elif invalid == "blind":
+        samples[1]["dut_metrics_ok"] = False
+    elif invalid == "gap":
+        samples[0].update(t=110.9, finished=110.91)
+    elif invalid == "single_sample":
+        del samples[0]
+    elif invalid == "stale_current":
+        options["now"] = 112.51
+    elif invalid == "nonfinite":
+        samples[1]["finished"] = float("nan")
+    elif invalid == "wrong_deadline":
+        options["deadline"] = 115.0
+    elif invalid.startswith("tail_"):
+        if invalid == "tail_flat":
+            samples[0].update(t=111.0, finished=111.01)
+            samples[1].update(t=111.2, finished=111.21)
+            samples.extend(
+                {**samples[-1], "t": value, "finished": value + 0.01}
+                for value in (111.4, 111.6, 111.8, 111.95)
+            )
+            assert namespace["crash_live_delivery_proof"](samples, samples[-1], **options) is None
+            return
+        tail = {**samples[-1], "t": 112.05, "finished": 112.06, "sink_bytes": 102}
+        options["now"] = 112.07
+        if invalid == "tail_slate":
+            tail["live"] = False
+        elif invalid == "tail_blind":
+            tail["sink_metrics_ok"] = False
+        elif invalid == "tail_regression":
+            tail["sink_bytes"] = 99
+        elif invalid == "tail_ingest":
+            tail["ingest_ids"] = ["other-ingest"]
+        elif invalid == "tail_forward":
+            tail["forward"] = False
+        samples.append(tail)
+    current = samples[-1]
+    if invalid == "different_current":
+        current = {**current, "sink_bytes": 999}
+    assert namespace["crash_live_delivery_proof"](samples, current, **options) is None
+
+
+@pytest.mark.parametrize(
+    "case", ["reused", "late_proof", "fresh_wait", "expired_without_proof", "other_event"]
+)
+def test_crash_proof_skips_only_duplicate_wait_not_strict_capture_or_ledger(case: str) -> None:
+    namespace = load_self_test()
+    tree = ast.parse(SELF_TEST.read_text(encoding="utf-8"))
+    helper = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "wait_downstream_transition"
+    )
+    factory = ast.FunctionDef(
+        name="make_transition",
+        args=ast.arguments(posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]),
+        body=[
+            ast.Assign(
+                targets=[ast.Name(id="current_sink_id", ctx=ast.Store())],
+                value=ast.Constant(value="current-sink"),
+            ),
+            helper,
+            ast.Return(value=ast.Name(id=helper.name, ctx=ast.Load())),
+        ],
+        decorator_list=[],
+    )
+    exec(  # noqa: S102 - fixed, repository-owned transition helper AST
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[factory], type_ignores=[])),
+            str(SELF_TEST),
+            "exec",
+        ),
+        namespace,
+    )
+    samples, _options = crash_delivery_fixture()
+    sample = samples[-1]
+    wait_calls, capture_calls, ledger = [], [], []
+
+    def wait_growth(*args, **kwargs):
+        wait_calls.append((args, kwargs))
+        return sample
+
+    namespace.update(
+        time=SimpleNamespace(monotonic=lambda: 111.0 if case == "fresh_wait" else 112.01),
+        os=SimpleNamespace(geteuid=lambda: 0),
+        transition_log_descriptor=99,
+        transition_log_offset=0,
+        read_validated_log_tail=lambda *_args: b"",
+        wait_sink_delivery_growth=wait_growth,
+        record_strict_sink_segment=lambda *args, **kwargs: capture_calls.append((args, kwargs)),
+        event_delivery_ledger=ledger,
+    )
+    transition = namespace["make_transition"]()
+    description = "other LIVE event" if case == "other_event" else "supervisor-crash LIVE recovery"
+    supplied = None if case in {"fresh_wait", "expired_without_proof"} else sample
+    if case == "late_proof":
+        supplied = {**sample, "t": 112.0, "finished": 112.001}
+    if case in {"late_proof", "expired_without_proof", "other_event"}:
+        with pytest.raises(namespace["TestFailure"]):
+            transition(description, 100.0, lambda item: item["live"], 0, crash_proof=supplied)
+        assert not wait_calls and not capture_calls and not ledger
+        return
+    result = transition(
+        description,
+        100.0,
+        lambda item: item["live"],
+        1.0 if case == "fresh_wait" else 0,
+        crash_proof=supplied,
+    )
+    assert result == sample
+    assert len(wait_calls) == int(case == "fresh_wait")
+    if wait_calls:
+        assert wait_calls[0][0][2] == 1.0
+        assert wait_calls[0][1]["not_before"] == 100.0
+    assert len(capture_calls) == 1
+    assert capture_calls[0][0][0] == description
+    assert capture_calls[0][0][2] == "current-sink"
+    assert ledger == [
+        {
+            "event": description,
+            "recovery_seconds": 11.96,
+            "publisher_rotated": False,
+            "known_dts_marker_count": 0,
+        }
+    ]
+
+
 def node_config(
     public_host: str,
     *,
@@ -3252,7 +3565,8 @@ def test_self_test_distinguishes_unknown_metrics_from_media_outage() -> None:
 
     main_source = SELF_TEST.read_text().split("def main()", 1)[1]
     assert "observer.snapshot()" not in main_source
-    assert main_source.count("observer.checked_snapshot(") == 9
+    assert main_source.count("observer.checked_snapshot(") == 10
+    assert 'observer.checked_snapshot("current supervisor-crash LIVE recovery")' in main_source
     assert 'observer.checked_snapshot("same-session resume baseline")' in main_source
     assert '"same-session LIVE recovery diagnosis"' in main_source
     assert "capture_observer = CaptureObserver(capture)" in main_source

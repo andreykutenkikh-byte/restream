@@ -316,6 +316,21 @@ def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
     elapsed = payload.get("elapsed_seconds")
     segment = payload.get("strict_segment_index")
     failure_lines = payload.get("failure_lines")
+    failure_flags = payload.get("failure_flags")
+    failure_wait = payload.get("failure_wait_seconds")
+    allowed_flags = {
+        "live",
+        "normalized",
+        "path_ready",
+        "ingest_live",
+        "metrics_ok",
+        "core_alive",
+        "ingest_one",
+        "sink_one",
+        "sink_growth",
+        "state_ok",
+        "ingest_match",
+    }
     if (
         not isinstance(stage, str)
         or stage not in _SELF_TEST_STAGE_CODES
@@ -332,6 +347,24 @@ def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
                 or any(type(line) is not int or not 1 <= line <= 20_000 for line in failure_lines)
             )
         )
+        or (
+            failure_flags is not None
+            and (
+                not isinstance(failure_flags, dict)
+                or not failure_flags
+                or not set(failure_flags) <= allowed_flags
+                or any(type(value) is not bool for value in failure_flags.values())
+            )
+        )
+        or (
+            failure_wait is not None
+            and (
+                not isinstance(failure_wait, (int, float))
+                or isinstance(failure_wait, bool)
+                or not 0 <= failure_wait <= 660
+                or not math.isfinite(failure_wait)
+            )
+        )
     ):
         return unavailable
     result: dict[str, Any] = {"stage": stage, "elapsed_seconds": round(elapsed, 3)}
@@ -339,6 +372,10 @@ def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
         result["strict_segment_index"] = segment
     if failure_lines is not None:
         result["failure_lines"] = failure_lines
+    if failure_flags is not None:
+        result["failure_flags"] = failure_flags
+    if failure_wait is not None:
+        result["failure_wait_seconds"] = round(failure_wait, 3)
     return result
 
 
@@ -366,7 +403,7 @@ try:
     before = path.lstat()
     if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0
             or stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != 1
-            or not 0 < before.st_size <= 512
+            or not 0 < before.st_size <= 1024
             or not -5 <= time.time() - before.st_mtime <= 960):
         raise ValueError('unavailable')
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -374,14 +411,15 @@ try:
         after = os.fstat(handle.fileno())
         if before != after:
             raise ValueError('unavailable')
-        raw = handle.read(513)
-    if len(raw) > 512:
+        raw = handle.read(1025)
+    if len(raw) > 1024:
         raise ValueError('unavailable')
     value = json.loads(raw)
     if not isinstance(value, dict):
         raise ValueError('unavailable')
     print(json.dumps({key: value.get(key) for key in
-        ('job_id', 'stage', 'elapsed_seconds', 'strict_segment_index', 'failure_lines')}))
+        ('job_id', 'stage', 'elapsed_seconds', 'strict_segment_index', 'failure_lines',
+         'failure_flags', 'failure_wait_seconds')}))
 except (OSError, ValueError):
     print('{}')
 """,

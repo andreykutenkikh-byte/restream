@@ -132,6 +132,39 @@ def test_progress_diagnostic_retains_only_fixed_stage_and_bounded_numbers() -> N
     }
 
 
+def test_wait_failure_diagnostic_retains_only_boolean_predicate_evidence() -> None:
+    flags = {
+        "live": True,
+        "normalized": True,
+        "path_ready": True,
+        "ingest_live": True,
+        "metrics_ok": True,
+        "core_alive": True,
+        "ingest_one": True,
+        "sink_one": False,
+        "sink_growth": False,
+        "state_ok": True,
+        "ingest_match": True,
+    }
+    result = safe_self_test_progress(
+        {
+            "job_id": "job",
+            "stage": "crash-live",
+            "elapsed_seconds": 152.9,
+            "failure_flags": flags,
+            "failure_wait_seconds": 6.12345,
+            "sink_ids": ["PRIVATE_FIXTURE_ID"],
+        },
+        job_id="job",
+    )
+    assert result == {
+        "stage": "crash-live",
+        "elapsed_seconds": 152.9,
+        "failure_flags": flags,
+        "failure_wait_seconds": 6.123,
+    }
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -156,6 +189,17 @@ def test_progress_diagnostic_retains_only_fixed_stage_and_bounded_numbers() -> N
         {"failure_lines": [0]},
         {"failure_lines": ["PRIVATE_FIXTURE"]},
         {"failure_lines": "PRIVATE_FIXTURE"},
+        {"failure_flags": {"live": "PRIVATE_FIXTURE"}},
+        {"failure_flags": {"private_url": True}},
+        {"failure_flags": {"live": 1}},
+        {"failure_flags": []},
+        {"failure_flags": {}},
+        {"failure_wait_seconds": True},
+        {"failure_wait_seconds": float("nan")},
+        {"failure_wait_seconds": float("inf")},
+        {"failure_wait_seconds": 10**1000},
+        {"failure_wait_seconds": -1},
+        {"failure_wait_seconds": 661},
     ],
 )
 def test_progress_diagnostic_rejects_untrusted_or_stale_fields(change: dict) -> None:
