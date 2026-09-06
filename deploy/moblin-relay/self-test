@@ -3965,6 +3965,8 @@ class CaptureReaderProgress:
                 # Continue draining indefinitely, but inspect at most 1 MiB per
                 # pipe, with at most one 2 KiB partial line retained in memory.
                 if inspected > 1024 * 1024:
+                    with self.lock:
+                        self.values["reader_inspection_limited"] = True
                     pending = b""
                     continue
                 parts = chunk.split(b"\n")
@@ -4005,6 +4007,30 @@ class CaptureReaderProgress:
                 self.values["reader_output"] = True
                 self.mark_time("reader_output_seconds")
             elif self.started is not None and not self.values["reader_input"]:
+                # These are parser log observations, not decoded frames. Keep
+                # only exact FFmpeg n5.1.9 h2645_parse.c types; no raw log text
+                # or decoder-context address survives the match.
+                nal = re.fullmatch(
+                    rb"\[h264 @ (?:0x)?[0-9a-fA-F]{1,16}\] nal_unit_type: "
+                    rb"(1\(Coded slice of a non-IDR picture\)|5\(IDR\)|7\(SPS\)|8\(PPS\)), "
+                    rb"nal_ref_idc: [0-3]",
+                    line,
+                )
+                if nal:
+                    elapsed = time.monotonic() - self.started
+                    if math.isfinite(elapsed) and 0 <= elapsed <= 660:
+                        name = {
+                            b"1(Coded slice of a non-IDR picture)": "non_idr",
+                            b"5(IDR)": "idr", b"7(SPS)": "sps", b"8(PPS)": "pps",
+                        }[nal[1]]
+                        observed = round(elapsed, 3)
+                        events = self.values.setdefault("reader_nal_events", {})
+                        event = events.setdefault(
+                            name, {"count": 0, "first_seconds": observed, "last_seconds": observed}
+                        )
+                        # Saturating counts are lower bounds, not packet totals.
+                        event["count"] = min(event["count"] + 1, 255)
+                        event["last_seconds"] = observed
                 # Exact FFmpeg n5.1.9 libavformat/demux.c debug milestones.
                 # Emit only local elapsed time; context identity stays private.
                 probe = re.fullmatch(
@@ -4036,7 +4062,12 @@ class CaptureReaderProgress:
 
     def snapshot(self) -> dict:
         with self.lock:
-            return dict(self.values)
+            result = dict(self.values)
+            if "reader_nal_events" in result:
+                result["reader_nal_events"] = {
+                    name: dict(event) for name, event in result["reader_nal_events"].items()
+                }
+            return result
 
 
 def run_capture_reader(command: list[str], diagnostic: CaptureReaderProgress, *, timeout: float):

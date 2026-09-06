@@ -378,7 +378,15 @@ def _safe_failure_media(value: Any) -> dict[str, Any] | None:
         return None
     if scope == "capture":
         required |= reader
-        optional |= reader_timings.keys() | set(probe_timings) | {"reader_media_seconds"}
+        optional |= (
+            reader_timings.keys()
+            | set(probe_timings)
+            | {
+                "reader_media_seconds",
+                "reader_nal_events",
+                "reader_inspection_limited",
+            }
+        )
     if not required <= value.keys() or not value.keys() <= required | optional:
         return None
     elapsed = value["elapsed_seconds"]
@@ -408,6 +416,32 @@ def _safe_failure_media(value: Any) -> dict[str, Any] | None:
     ):
         return None
     if scope == "capture":
+        if "reader_inspection_limited" in value and value["reader_inspection_limited"] is not True:
+            return None
+        if "reader_nal_events" in value:
+            events = value["reader_nal_events"]
+            if (
+                not isinstance(events, dict)
+                or not events
+                or not events.keys() <= {"sps", "pps", "idr", "non_idr"}
+            ):
+                return None
+            for event in events.values():
+                if (
+                    not isinstance(event, dict)
+                    or event.keys() != {"count", "first_seconds", "last_seconds"}
+                    or type(event["count"]) is not int
+                    or not 1 <= event["count"] <= 255
+                    or not _diagnostic_seconds(event["first_seconds"], elapsed)
+                    or not _diagnostic_seconds(event["last_seconds"], elapsed)
+                    or event["first_seconds"] > event["last_seconds"]
+                    or (
+                        "reader_input_seconds" in value
+                        and _diagnostic_seconds(value["reader_input_seconds"], elapsed)
+                        and event["last_seconds"] > value["reader_input_seconds"]
+                    )
+                ):
+                    return None
         for name in probe_timings:
             if name in value and not _diagnostic_seconds(value[name], elapsed):
                 return None
@@ -440,6 +474,15 @@ def _safe_failure_media(value: Any) -> dict[str, Any] | None:
     result["elapsed_seconds"] = round(elapsed, 3)
     result["markers"] = dict(markers)
     result["first_seen"] = {name: round(seconds, 3) for name, seconds in first_seen.items()}
+    if "reader_nal_events" in value:
+        result["reader_nal_events"] = {
+            name: {
+                "count": event["count"],
+                "first_seconds": round(event["first_seconds"], 3),
+                "last_seconds": round(event["last_seconds"], 3),
+            }
+            for name, event in value["reader_nal_events"].items()
+        }
     for name in (
         "supervisor_seen_seconds",
         "child_seen_seconds",

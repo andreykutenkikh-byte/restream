@@ -256,3 +256,45 @@ the unchanged 2 KiB loader limit. Atomic writing, correlation, root-only files,
 the 64 KiB result limit and all pass/fail media/recovery assertions are preserved.
 New diagnostic evidence still requires exact-head Linux execution; this is not
 a claim that the unresolved hard-cut failure has been repaired.
+
+## Reconnect reader: identify incomplete input probing
+
+The next Linux [run 34051598056](https://github.com/andreykutenkikh-byte/restream/actions/runs/34051598056)
+on `71dfb24` failed earlier, at the unchanged persistent-stall LIVE reader. Its
+15.013-second deadline expired with zero output frames. The FLV
+`Before avformat_find_stream_info` milestone was observed at 1.063 seconds, but
+neither its matching `After` nor input/output initialization was observed.
+All final flow flags were true. This localizes the observed wait after RTMP
+opening and inside input probing; aggregate byte growth does not prove that
+both usable audio and video packets reached this reader. The independent
+pinned-Linux reader counterfactual passed again. Neither result closes the
+earlier hard-cut failure or constitutes a full green CI.
+
+FFmpeg's [FLV stream-info analysis](https://github.com/FFmpeg/FFmpeg/blob/n5.1.9/libavformat/demux.c#L2242)
+can examine up to 90 media seconds while stream information remains incomplete.
+Codec identifiers alone do not establish dimensions, pixel format, audio
+parameters or first DTS. This limit is not a wall-clock delivery deadline.
+The unchanged 15-second capture remains fatal; reducing probing without
+establishing the missing evidence would not explain this failure.
+
+The existing bounded debug-log drain now retains only exact SPS/PPS/IDR/non-IDR
+parser-event counts and relative first/last observations before input
+initialization. Counts saturate at 255 and are observations, not decoded frames.
+Crossing the existing 1 MiB inspection limit is marked explicitly; no raw log
+text or decoder address is retained. Missing events mean not observed, not
+proven absent. This does not positively identify missing audio, and it changes
+neither the reader's arguments nor the capture/validation requirements.
+
+A subsequent bounded local probe included the previously missing topology:
+the always-available 12-second SLATE path, native AAC-normalizer command,
+RTMP forward, separate sink and long-lived RTSP recorder. The 72-second source
+continued across a same-session pause, an exact isolated SRT reset and a final
+hard cut. Readers were admitted on actual output/sink growth, not a preliminary
+90-video-packet wait. All four unchanged 90-frame/15-second readers and full
+format/GOP/PTS/DTS/A/V/decode validators passed. The persistent recovery reader
+completed in 3.742 seconds (probe 0.203–2.117); active source byte-clock ratios
+were 1.000382, 0.999950 and 0.999965. Final-cut ordinary audio/video stopped at
+about two seconds, and the actual watchdog rejected the stalled source at
+4.056 seconds. Owned cleanup passed. This FFmpeg 5.1.2 / MediaMTX 1.20.1
+Windows loopback result does not reproduce or explain the Linux CI failures;
+it does not authorize another pacing, resampler or deadline change.
