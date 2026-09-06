@@ -80,6 +80,95 @@ def test_capture_reader_diagnostic_inspection_budget_keeps_draining() -> None:
     assert reader.snapshot()["reader_input"] is False
 
 
+PROBE_BEFORE = (
+    b"[flv @ 0x1234] Before avformat_find_stream_info() pos: 13 "
+    b"bytes read:32768 seeks:0 nb_streams:0"
+)
+PROBE_AFTER = (
+    b"[flv @ 0x1234] After avformat_find_stream_info() pos: 50000 "
+    b"bytes read:65536 seeks:0 frames:75"
+)
+
+
+@pytest.mark.parametrize("late_connection", [True, False])
+def test_reader_probe_milestones_distinguish_pre_analysis_delay(monkeypatch, late_connection):
+    namespace = load_self_test()
+    reader = namespace["CaptureReaderProgress"](started=100)
+    monkeypatch.setattr(time, "monotonic", lambda: 108 if late_connection else 100.2)
+    reader.drain(io.BytesIO(PROBE_BEFORE + b"\n"), progress=False)
+    monkeypatch.setattr(time, "monotonic", lambda: 109)
+    reader.drain(io.BytesIO(PROBE_AFTER + b"\n"), progress=False)
+    reader.observe_line(b"Input #0, flv, from PRIVATE:", progress=False)
+    snapshot = reader.snapshot()
+    assert snapshot["reader_probe_start_seconds"] == (8 if late_connection else 0.2)
+    assert snapshot["reader_probe_end_seconds"] == snapshot["reader_input_seconds"] == 9
+    assert "0x1234" not in repr(vars(reader))
+    assert "PRIVATE" not in repr(vars(reader))
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        b"rtmp://private.invalid/" + PROBE_BEFORE,
+        b"PRIVATE " + PROBE_BEFORE,
+        PROBE_BEFORE + b" PRIVATE",
+        PROBE_BEFORE.replace(b"flv", b"mpegts"),
+        PROBE_BEFORE.replace(b"0x1234", b"PRIVATE"),
+        PROBE_BEFORE.replace(b"0x1234", b"0x" + b"1" * 17),
+        PROBE_BEFORE.replace(b"Before", b"Beforehand"),
+        PROBE_BEFORE.replace(b"nb_streams", b"frames"),
+        PROBE_BEFORE.replace(b"pos: 13", b"pos: -1"),
+        PROBE_BEFORE.replace(b"bytes read:32768", b"bytes read:" + b"1" * 20),
+        PROBE_AFTER,
+    ],
+)
+def test_reader_probe_milestones_reject_lookalikes_and_end_without_start(monkeypatch, line):
+    namespace = load_self_test()
+    reader = namespace["CaptureReaderProgress"](started=100)
+    monkeypatch.setattr(time, "monotonic", lambda: 101)
+    reader.observe_line(line, progress=False)
+    assert reader.snapshot() == {"reader_input": False, "reader_output": False, "reader_frames": 0}
+    assert "PRIVATE" not in repr(vars(reader))
+
+
+def test_reader_probe_phase_requires_matching_context_and_monotonic_stderr_order(monkeypatch):
+    namespace = load_self_test()
+    reader = namespace["CaptureReaderProgress"](started=100)
+    monkeypatch.setattr(time, "monotonic", lambda: 101)
+    reader.observe_line(PROBE_BEFORE, progress=True)
+    assert "reader_probe_start_seconds" not in reader.snapshot()
+    reader.observe_line(PROBE_BEFORE, progress=False)
+    reader.observe_line(PROBE_AFTER.replace(b"0x1234", b"0x5678"), progress=False)
+    reader.observe_line(PROBE_AFTER.replace(b"frames", b"nb_streams"), progress=False)
+    monkeypatch.setattr(time, "monotonic", lambda: 100.5)
+    reader.observe_line(PROBE_AFTER, progress=False)
+    assert "reader_probe_end_seconds" not in reader.snapshot()
+    monkeypatch.setattr(time, "monotonic", lambda: 102)
+    reader.observe_line(PROBE_AFTER, progress=False)
+    monkeypatch.setattr(time, "monotonic", lambda: 103)
+    reader.observe_line(PROBE_BEFORE, progress=False)
+    reader.observe_line(PROBE_AFTER, progress=False)
+    assert reader.snapshot()["reader_probe_start_seconds"] == 1
+    assert reader.snapshot()["reader_probe_end_seconds"] == 2
+    assert reader.probe_context is None
+    other = namespace["CaptureReaderProgress"](started=100)
+    other.observe_line(b"Input #0, flv, from PRIVATE:", progress=False)
+    other.observe_line(PROBE_BEFORE, progress=False)
+    assert "reader_probe_start_seconds" not in other.snapshot()
+
+
+def test_reader_debug_probe_observation_keeps_existing_drain_bounds(monkeypatch):
+    namespace = load_self_test()
+    reader = namespace["CaptureReaderProgress"](started=100)
+    monkeypatch.setattr(time, "monotonic", lambda: 101)
+    pipe = io.BytesIO(b"x" * (1024 * 1024 + 4096) + b"\n" + PROBE_BEFORE + b"\n")
+    reader.drain(pipe, progress=False)
+    assert pipe.tell() == len(pipe.getvalue())
+    assert "reader_probe_start_seconds" not in reader.snapshot()
+    reader.drain(io.BytesIO(b"x" * 2049 + PROBE_BEFORE + b"\n"), progress=False)
+    assert "reader_probe_start_seconds" not in reader.snapshot()
+
+
 @pytest.mark.parametrize("late_start", [True, False])
 def test_capture_reader_timeline_distinguishes_late_probe_from_frame_plateau(
     monkeypatch, late_start
@@ -187,8 +276,10 @@ def test_strict_capture_diagnostics_preserve_deadline_assertions_and_partial_cle
 
     def failed_reader(command, diagnostic, *, timeout):
         assert timeout == 15
+        assert command[command.index("-loglevel") + 1] == "debug"
         assert command[command.index("-frames:v") + 1] == "90"
         assert command[command.index("-c") + 1] == "copy"
+        assert not {"-analyzeduration", "-probesize", "-fflags"}.intersection(command)
         assert "-xerror" in command
         assert command[command.index("-progress") + 1] == "pipe:1"
         assert guarded == [command]

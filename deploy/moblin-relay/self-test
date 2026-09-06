@@ -3567,6 +3567,7 @@ class CaptureReaderProgress:
     def __init__(self, *, started: float | None = None) -> None:
         self.lock = threading.Lock()
         self.started = started
+        self.probe_context: int | None = None
         self.values = {"reader_input": False, "reader_output": False, "reader_frames": 0}
 
     def mark_time(self, name: str, *, latest: bool = False) -> None:
@@ -3628,6 +3629,35 @@ class CaptureReaderProgress:
             elif line.startswith(b"Output #0, flv, to "):
                 self.values["reader_output"] = True
                 self.mark_time("reader_output_seconds")
+            elif self.started is not None and not self.values["reader_input"]:
+                # Exact FFmpeg n5.1.9 libavformat/demux.c debug milestones.
+                # Emit only local elapsed time; context identity stays private.
+                probe = re.fullmatch(
+                    rb"\[flv @ (0x[0-9a-fA-F]{1,16})\] (Before|After) "
+                    rb"avformat_find_stream_info\(\) pos: [0-9]{1,19} "
+                    rb"bytes read:[0-9]{1,19} seeks:[0-9]{1,10} "
+                    rb"(nb_streams|frames):[0-9]{1,10}",
+                    line,
+                )
+                if probe:
+                    context = int(probe[1], 16)
+                    if probe.groups()[1:] == (b"Before", b"nb_streams"):
+                        if "reader_probe_start_seconds" not in self.values:
+                            self.mark_time("reader_probe_start_seconds")
+                            if "reader_probe_start_seconds" in self.values:
+                                self.probe_context = context
+                    elif (
+                        probe.groups()[1:] == (b"After", b"frames")
+                        and self.probe_context == context
+                        and "reader_probe_start_seconds" in self.values
+                    ):
+                        self.mark_time("reader_probe_end_seconds")
+                        if self.values.get("reader_probe_end_seconds", -1) < self.values[
+                            "reader_probe_start_seconds"
+                        ]:
+                            self.values.pop("reader_probe_end_seconds", None)
+                        else:
+                            self.probe_context = None
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -3800,7 +3830,7 @@ def capture_final_sink_media_segment(
             "-nostdin",
             "-hide_banner",
             "-loglevel",
-            "info",
+            "debug",
             "-nostats",
             "-progress",
             "pipe:1",

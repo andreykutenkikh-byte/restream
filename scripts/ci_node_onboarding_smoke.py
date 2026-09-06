@@ -370,6 +370,7 @@ def _safe_failure_media(value: Any) -> dict[str, Any] | None:
         "reader_first_frame_seconds": "reader_frames",
         "reader_last_frame_seconds": "reader_frames",
     }
+    probe_timings = ("reader_probe_start_seconds", "reader_probe_end_seconds")
     if not isinstance(value, dict) or not required <= value.keys():
         return None
     scope = value.get("scope")
@@ -377,7 +378,7 @@ def _safe_failure_media(value: Any) -> dict[str, Any] | None:
         return None
     if scope == "capture":
         required |= reader
-        optional |= reader_timings.keys() | {"reader_media_seconds"}
+        optional |= reader_timings.keys() | set(probe_timings) | {"reader_media_seconds"}
     if not required <= value.keys() or not value.keys() <= required | optional:
         return None
     elapsed = value["elapsed_seconds"]
@@ -407,11 +408,23 @@ def _safe_failure_media(value: Any) -> dict[str, Any] | None:
     ):
         return None
     if scope == "capture":
+        for name in probe_timings:
+            if name in value and not _diagnostic_seconds(value[name], elapsed):
+                return None
+        if "reader_probe_end_seconds" in value and (
+            "reader_probe_start_seconds" not in value
+            or value["reader_probe_end_seconds"] < value["reader_probe_start_seconds"]
+        ):
+            return None
         for name, evidence in reader_timings.items():
             if name in value and (
                 not value[evidence] or not _diagnostic_seconds(value[name], elapsed)
             ):
                 return None
+        if "reader_input_seconds" in value and any(
+            value[name] > value["reader_input_seconds"] for name in probe_timings if name in value
+        ):
+            return None
         if (
             "reader_first_frame_seconds" in value
             and "reader_last_frame_seconds" in value
@@ -431,6 +444,7 @@ def _safe_failure_media(value: Any) -> dict[str, Any] | None:
         "supervisor_seen_seconds",
         "child_seen_seconds",
         *reader_timings,
+        *probe_timings,
         "reader_media_seconds",
     ):
         if name in result:

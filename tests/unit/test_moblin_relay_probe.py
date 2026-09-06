@@ -224,6 +224,56 @@ READER_WALL_TIMINGS = (
 READER_TIMINGS = (*READER_WALL_TIMINGS, "reader_media_seconds")
 
 
+@pytest.mark.parametrize("with_end", [False, True])
+def test_capture_probe_phase_timings_are_optional_and_safely_projected(with_end):
+    value = {**media_diagnostic("capture"), "reader_probe_start_seconds": 0.12345}
+    if with_end:
+        value["reader_probe_end_seconds"] = 1.23456
+    result = safe_self_test_progress(
+        {"job_id": "job", "stage": "outage-live", "elapsed_seconds": 152, "failure_media": value},
+        job_id="job",
+    )
+    assert result["failure_media"]["reader_probe_start_seconds"] == 0.123
+    if with_end:
+        assert result["failure_media"]["reader_probe_end_seconds"] == 1.235
+    assert value["reader_probe_start_seconds"] == 0.12345
+
+
+@pytest.mark.parametrize("field", ["reader_probe_start_seconds", "reader_probe_end_seconds"])
+@pytest.mark.parametrize(
+    "invalid", [True, None, -0.001, 11.422, float("nan"), float("inf"), 10**1000, "PRIVATE"]
+)
+def test_capture_probe_phase_timings_reject_unsafe_values(field, invalid):
+    value = {**media_diagnostic("capture"), "reader_probe_start_seconds": 0, field: invalid}
+    assert safe_self_test_progress(
+        {"job_id": "job", "stage": "outage-live", "elapsed_seconds": 152, "failure_media": value},
+        job_id="job",
+    ) == {"progress": "unavailable"}
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"reader_probe_end_seconds": 1.0},
+        {"reader_probe_start_seconds": 2.0, "reader_probe_end_seconds": 1.0},
+        {"reader_probe_start_seconds": 2.0, "reader_input_seconds": 1.0},
+        {
+            "reader_probe_start_seconds": 0.0,
+            "reader_probe_end_seconds": 2.0,
+            "reader_input_seconds": 1.0,
+        },
+        {"scope": "crash", "reader_probe_start_seconds": 0.0},
+        {"reader_probe_start_seconds": 0.0, "probe_context": "PRIVATE"},
+    ],
+)
+def test_capture_probe_projection_rejects_missing_or_reordered_phase_evidence(fields):
+    value = {**media_diagnostic("capture"), **fields}
+    assert safe_self_test_progress(
+        {"job_id": "job", "stage": "outage-live", "elapsed_seconds": 152, "failure_media": value},
+        job_id="job",
+    ) == {"progress": "unavailable"}
+
+
 def test_capture_reader_timing_projection_distinguishes_acquisition_from_media_time() -> None:
     value = {
         **media_diagnostic("capture"),
@@ -361,6 +411,8 @@ def strict_reader_timings(count: int = 13) -> list[dict]:
                 **media_diagnostic("capture"),
                 "reader_output": True,
                 "reader_frames": 90,
+                "reader_probe_start_seconds": 0.12345,
+                "reader_probe_end_seconds": 1.02345,
                 "reader_input_seconds": 1.12345,
                 "reader_output_seconds": 2.12345,
                 "reader_first_frame_seconds": 2.23456,
@@ -377,6 +429,8 @@ def test_success_reader_timings_project_bounded_capture_rows(count: int) -> None
     value = strict_reader_timings(count)
     result = safe_strict_sink_reader_timings(value)
     assert result is not None and len(result) == count
+    assert result[0]["diagnostic"]["reader_probe_start_seconds"] == 0.123
+    assert result[0]["diagnostic"]["reader_probe_end_seconds"] == 1.023
     assert result[0]["diagnostic"]["reader_first_frame_seconds"] == 2.235
     assert result[0]["diagnostic"]["reader_media_seconds"] == 20.988
     assert result[0]["diagnostic"] is not value[0]["diagnostic"]
