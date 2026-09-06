@@ -96,6 +96,25 @@ def test_four_second_source_diagnostic_reports_bytes_pts_and_nominal_send_time(
     )
 
 
+def test_transport_clock_normalization_fixes_measured_finite_source_bias_not_real_drift():
+    helper = runpy.run_path(str(HELPER), run_name="_clock_fixture_test")
+    rate = helper["transport_clock_rate"]
+    source_bytes, chunk_bytes, byte_rate = 4_800_768, 10_528, 1_125_000
+    actual_seconds, pts_span = 4.241209, 3.966667
+    # Exact Linux CI measurement: video PTS omits finite mux padding, despite
+    # correct byte pacing. Keep reporting that ratio, but do not call it drift.
+    assert pts_span / actual_seconds == pytest.approx(0.935268, abs=1e-6)
+    assert pts_span / actual_seconds < 0.95
+    assert rate(source_bytes, chunk_bytes, byte_rate, actual_seconds) == pytest.approx(
+        1.003957, abs=1e-6
+    )
+    assert 0.95 <= rate(source_bytes, chunk_bytes, byte_rate, actual_seconds) <= 1.05
+    assert rate(source_bytes, chunk_bytes, byte_rate, 8.920063) < 0.60
+    nominal_seconds = (source_bytes - chunk_bytes) / byte_rate
+    assert rate(source_bytes, chunk_bytes, byte_rate, nominal_seconds / 0.94) < 0.95
+    assert rate(source_bytes, chunk_bytes, byte_rate, nominal_seconds / 1.06) > 1.05
+
+
 @pytest.mark.parametrize("case", ["old", "single", "fixed"])
 @pytest.mark.parametrize("jitter", [0.003, 0.010])
 def test_real_media_helper_replays_exact_removed_clock_policies(monkeypatch, case, jitter):
@@ -160,10 +179,10 @@ def test_media_gate_preserves_original_cases_and_adds_bounded_cliff_cases(
         generated.append(duration)
         return directory / "source.ts", b"complete fixed media"
 
-    def measure(case, directory, source, payload, *, jitter=0.003, duration=8):
+    def measure(case, directory, source, payload, *, jitter=0.003, duration=8, rate_basis="video"):
         assert source == directory / "source.ts"
         assert payload == b"complete fixed media"
-        captures.append((case, jitter, duration))
+        captures.append((case, jitter, duration, rate_basis))
         return rates[len(captures) - 1]
 
     monkeypatch.setitem(main.__globals__, "make_transport", make)
@@ -175,10 +194,10 @@ def test_media_gate_preserves_original_cases_and_adds_bounded_cliff_cases(
             main()
     assert generated == [8, 4]
     assert captures == [
-        ("old", 0.003, 8),
-        ("fixed", 0.003, 8),
-        ("single", 0.010, 4),
-        ("fixed", 0.010, 4),
+        ("old", 0.003, 8, "video"),
+        ("fixed", 0.003, 8, "video"),
+        ("single", 0.010, 4, "transport"),
+        ("fixed", 0.010, 4, "transport"),
     ]
     assert helper["CAPTURE_TIMEOUT_SECONDS"] == 20.0
     assert helper["MAX_CAPTURE_BYTES"] == 12 * 1024 * 1024
@@ -186,6 +205,6 @@ def test_media_gate_preserves_original_cases_and_adds_bounded_cliff_cases(
     assert first_line == (
         "Real media clock rates before assertions: "
         f"old_3ms={rates[0]:.6f} bounded_3ms={rates[1]:.6f} "
-        f"single_10ms={rates[2]:.6f} bounded_10ms={rates[3]:.6f}"
+        f"single_10ms_transport={rates[2]:.6f} bounded_10ms_transport={rates[3]:.6f}"
     )
     assert "complete fixed media" not in first_line

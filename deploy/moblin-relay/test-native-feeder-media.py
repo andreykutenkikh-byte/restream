@@ -121,7 +121,10 @@ def media_clock_rate(
     *,
     jitter=WAKEUP_JITTER_SECONDS,
     duration=SOURCE_DURATION_SECONDS,
+    rate_basis="video",
 ):
+    if rate_basis not in {"video", "transport"}:
+        raise ProbeFailure("invalid media clock rate basis")
     namespace = load_feeder(case)
     cls = namespace["PacedMPEGTSFeeder"]
     sent = SimpleNamespace(digest=hashlib.sha256(), size=0, first=None, last=None, max_gap=0.0)
@@ -222,18 +225,33 @@ def media_clock_rate(
     timestamps = probe_packets(capture, case)
     pts_span = max(timestamps) - min(timestamps)
     sent_seconds = sent.last - sent.first
-    rate = pts_span / sent_seconds
+    video_rate = pts_span / sent_seconds
+    transport_rate = transport_clock_rate(
+        len(source_payload),
+        namespace["LIVE_FEED_CHUNK_BYTES"],
+        namespace["LIVE_TRANSPORT_MUX_RATE_BITS_PER_SECOND"] / 8,
+        sent_seconds,
+    )
     print(
         "Real media clock measurement: "
         f"case={case} duration_seconds={duration} jitter_seconds={jitter:.6f} "
         f"source_bytes={len(source_payload)} sent_bytes={sent.size} received_bytes={received_size} "
         f"video_packets={len(timestamps)} pts_span_seconds={pts_span:.6f} "
-        f"send_seconds={sent_seconds:.6f} rate={rate:.6f} max_send_gap_seconds={sent.max_gap:.6f} "
+        f"send_seconds={sent_seconds:.6f} video_rate={video_rate:.6f} "
+        f"transport_rate={transport_rate:.6f} rate_basis={rate_basis} "
+        f"max_send_gap_seconds={sent.max_gap:.6f} "
         f"wait_count={waits.count} max_wait_overrun_seconds={waits.max_overrun:.6f} "
         f"waits_beyond_frame_credit={waits.beyond_credit}",
         flush=True,
     )
-    return rate
+    return video_rate if rate_basis == "video" else transport_rate
+
+
+def transport_clock_rate(source_bytes, chunk_bytes, bytes_per_second, sent_seconds):
+    # A finite CBR MPEG-TS file contains mux padding outside the video's first
+    # to last PTS span. The first datagram is immediate, so its complete byte
+    # count must be excluded from the expected first-to-last send duration.
+    return (source_bytes - chunk_bytes) / bytes_per_second / sent_seconds
 
 
 def probe_packets(capture, case):
@@ -326,6 +344,7 @@ def main():
                 payload,
                 jitter=CLIFF_JITTER_SECONDS,
                 duration=CLIFF_DURATION_SECONDS,
+                rate_basis="transport",
             )
             for case in ("single", "fixed")
         ]
@@ -334,7 +353,7 @@ def main():
     print(
         "Real media clock rates before assertions: "
         f"old_3ms={old_rate:.6f} bounded_3ms={fixed_rate:.6f} "
-        f"single_10ms={cliff_rates[0]:.6f} bounded_10ms={cliff_rates[1]:.6f}",
+        f"single_10ms_transport={cliff_rates[0]:.6f} bounded_10ms_transport={cliff_rates[1]:.6f}",
         flush=True,
     )
     if not 0 < old_rate < 0.90:
@@ -351,7 +370,7 @@ def main():
         flush=True,
     )
     print(
-        "One-frame catch-up media clock verified: "
+        "One-frame catch-up transport clock verified: "
         f"single_interval_rate={cliff_rates[0]:.3f} bounded_rate={cliff_rates[1]:.3f}; "
         "ordered delivery and cleanup passed",
         flush=True,
