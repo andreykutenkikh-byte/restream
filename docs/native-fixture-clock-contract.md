@@ -298,3 +298,32 @@ about two seconds, and the actual watchdog rejected the stalled source at
 4.056 seconds. Owned cleanup passed. This FFmpeg 5.1.2 / MediaMTX 1.20.1
 Windows loopback result does not reproduce or explain the Linux CI failures;
 it does not authorize another pacing, resampler or deadline change.
+
+## Repeated failure on the restacked HUD head
+
+PR15 `a4feee1` passed full Linux CI 34053170259, including all 13 strict readers.
+The own-HUD-only restack `c5a3543` then failed native `stuck-live` in
+[CI 34054147945](https://github.com/andreykutenkikh-byte/restream/actions/runs/34054147945),
+despite its actual Chromium/WebKit browser job passing. The unchanged native
+reader timed out at 15.008 seconds with zero output frames. Probing started at
+0.936 seconds; SPS/PPS and an IDR were observed at about 7.177 seconds, then six
+non-IDR parser events between 7.592 and 8.634 seconds. All final flow flags
+were true. The independent reader-clock test and cleanup passed again.
+
+Those seven decoder observations do not establish source frame rate: FFmpeg's
+stream-info path can stop invoking the H.264 decoder after enough pictures
+establish its delay, while timestamp/audio analysis continues. Decoder work,
+interleaving and diagnostic drain scheduling all affect observation times.
+No cause is assigned to source pacing from these timestamps alone.
+
+The fixture now retains a fixed-size sending-clock summary for its current
+unpaused episode: successful datagram count, first-to-last dispatch span,
+transport ratio, last-dispatch age, largest dispatch gap and schedule phase
+discarded by the existing rebase branches. The first datagram's immediate credit
+is excluded from the ratio. Intentional pause/resume starts a new episode; a
+short, paused, invalid or unavailable sample is unknown. Socket-write acceptance
+does not prove receiver consumption or encoded-media delivery. One additional
+monotonic observation follows each successful send, under the existing locking
+discipline; no new thread, history buffer, pacing decision, reader argument,
+deadline or runtime behavior is introduced. Both successful and failed strict
+capture diagnostics can retain this bounded summary for comparison.

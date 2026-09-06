@@ -228,6 +228,16 @@ def test_maximal_media_checkpoint_is_atomically_written_under_two_kib(monkeypatc
         reader_probe_start_seconds=659.999,
         reader_probe_end_seconds=659.999,
         reader_media_seconds=659.999,
+        source_clock={
+            "state": "known",
+            "packets": 1_000_000,
+            "seconds": 659.999,
+            "ratio": 4.0,
+            "last_age": 659.999,
+            "max_gap": 659.999,
+            "discarded": 659.999,
+            "rebases": 1_000_000,
+        },
         reader_nal_events={
             name: {"count": 255, "first_seconds": 659.999, "last_seconds": 659.999}
             for name in NAL_TYPES

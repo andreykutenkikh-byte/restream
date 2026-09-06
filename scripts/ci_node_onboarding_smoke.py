@@ -359,6 +359,32 @@ def _diagnostic_seconds(value: Any, maximum: float = 660) -> bool:
     return type(value) in {int, float} and 0 <= value <= maximum and math.isfinite(value)
 
 
+def _safe_source_clock(value: Any) -> dict[str, Any] | None:
+    """Project only one fixture sending episode, never transport identities."""
+    if not isinstance(value, dict):
+        return None
+    if value == {"state": "unknown"}:
+        return {"state": "unknown"}
+    seconds = {"seconds", "last_age", "max_gap", "discarded"}
+    if (
+        value.keys() != {"state", "packets", "ratio", "rebases"} | seconds
+        or value["state"] != "known"
+        or type(value["packets"]) is not int
+        or not 2 <= value["packets"] <= 1_000_000
+        or type(value["rebases"]) is not int
+        or not 0 <= value["rebases"] <= 1_000_000
+        or any(not _diagnostic_seconds(value[name]) for name in seconds)
+        or value["seconds"] < 1
+        or value["max_gap"] > value["seconds"]
+        or not _diagnostic_seconds(value["ratio"], 4)
+    ):
+        return None
+    return {
+        **{name: value[name] for name in ("state", "packets", "rebases")},
+        **{name: round(value[name], 6) for name in (*sorted(seconds), "ratio")},
+    }
+
+
 def _safe_failure_media(value: Any) -> dict[str, Any] | None:
     """Reject the entire nested diagnostic on any non-schema value; never reflect text."""
     required = {"scope", "elapsed_seconds", "log_ok", "markers", "first_seen"}
@@ -385,6 +411,7 @@ def _safe_failure_media(value: Any) -> dict[str, Any] | None:
                 "reader_media_seconds",
                 "reader_nal_events",
                 "reader_inspection_limited",
+                "source_clock",
             }
         )
     if not required <= value.keys() or not value.keys() <= required | optional:
@@ -416,6 +443,8 @@ def _safe_failure_media(value: Any) -> dict[str, Any] | None:
     ):
         return None
     if scope == "capture":
+        if "source_clock" in value and _safe_source_clock(value["source_clock"]) is None:
+            return None
         if "reader_inspection_limited" in value and value["reader_inspection_limited"] is not True:
             return None
         if "reader_nal_events" in value:
@@ -474,6 +503,8 @@ def _safe_failure_media(value: Any) -> dict[str, Any] | None:
     result["elapsed_seconds"] = round(elapsed, 3)
     result["markers"] = dict(markers)
     result["first_seen"] = {name: round(seconds, 3) for name, seconds in first_seen.items()}
+    if "source_clock" in value:
+        result["source_clock"] = _safe_source_clock(value["source_clock"])
     if "reader_nal_events" in value:
         result["reader_nal_events"] = {
             name: {

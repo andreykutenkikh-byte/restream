@@ -2862,6 +2862,61 @@ class PacedMPEGTSFeeder(threading.Thread):
         self._paused = False
         self._stop_requested = False
         self._failure_kind: str | None = None
+        self._reset_clock_stats()
+
+    def _reset_clock_stats(self) -> None:
+        # Called at construction or under the existing condition at resume ack.
+        self._clock_packets = 0
+        self._clock_bytes = 0
+        self._clock_first_bytes = 0
+        self._clock_first = None
+        self._clock_last = None
+        self._clock_max_gap = 0.0
+        self._clock_discarded = 0.0
+        self._clock_rebases = 0
+        self._clock_regressed = False
+
+    def clock_snapshot(self) -> dict:
+        """Bounded current-episode transport evidence, never a passing predicate."""
+        with self._condition:
+            unknown = {"state": "unknown"}
+            if (
+                self._paused
+                or self._pause_requested
+                or self._clock_regressed
+                or not 2 <= self._clock_packets <= 1_000_000
+                or not 0 <= self._clock_rebases <= 1_000_000
+                or self._clock_first is None
+                or self._clock_last is None
+            ):
+                return unknown
+            seconds = self._clock_last - self._clock_first
+            last_age = time.monotonic() - self._clock_last
+            if not math.isfinite(seconds) or not 1 <= seconds <= 660:
+                return unknown
+            ratio = (
+                (self._clock_bytes - self._clock_first_bytes) / self._bytes_per_second / seconds
+            )
+            if (
+                not math.isfinite(ratio)
+                or not 0 <= ratio <= 4
+                or any(
+                    not math.isfinite(value) or not 0 <= value <= 660
+                    for value in (last_age, self._clock_max_gap, self._clock_discarded)
+                )
+                or self._clock_max_gap > seconds
+            ):
+                return unknown
+            return {
+                "state": "known",
+                "packets": self._clock_packets,
+                "seconds": round(seconds, 6),
+                "ratio": round(ratio, 6),
+                "last_age": round(last_age, 6),
+                "max_gap": round(self._clock_max_gap, 6),
+                "discarded": round(self._clock_discarded, 6),
+                "rebases": self._clock_rebases,
+            }
 
     @property
     def failure_kind(self) -> str | None:
@@ -3010,6 +3065,7 @@ class PacedMPEGTSFeeder(threading.Thread):
                             pacing_anchor = time.monotonic()
                             paced_bytes = 0
                             burst_count = 0
+                            self._reset_clock_stats()
                             self._condition.notify_all()
 
                     while len(pending) < LIVE_FEED_CHUNK_BYTES:
@@ -3042,6 +3098,9 @@ class PacedMPEGTSFeeder(threading.Thread):
                             # Force a real wait before a fourth datagram even
                             # then; phase debt alone is not a hard burst bound.
                             interval = len(pending) / self._bytes_per_second
+                            if self._clock_packets:
+                                self._clock_discarded += now - deadline + interval
+                                self._clock_rebases += 1
                             pacing_anchor += now - deadline + interval
                             burst_count = 0
                             self._condition.wait(interval)
@@ -3053,6 +3112,9 @@ class PacedMPEGTSFeeder(threading.Thread):
                             # rate under repeated 10 ms scheduling delays. Allow
                             # at most one video frame's transport credit instead;
                             # discard larger lag, never flush a long-stall backlog.
+                            if self._clock_packets:
+                                self._clock_discarded += now - deadline
+                                self._clock_rebases += 1
                             pacing_anchor += now - deadline
                     try:
                         sent = sender.sendto(pending, self._destination)
@@ -3062,7 +3124,20 @@ class PacedMPEGTSFeeder(threading.Thread):
                     if sent != len(pending):
                         self._fail("socket")
                         return
+                    # One diagnostic-only clock read per successful datagram;
+                    # recording under the existing lock never feeds pacing.
+                    dispatched = time.monotonic()
                     with self._condition:
+                        if self._clock_last is None:
+                            self._clock_first = dispatched
+                            self._clock_first_bytes = sent
+                        else:
+                            gap = dispatched - self._clock_last
+                            self._clock_regressed |= gap < 0 or not math.isfinite(gap)
+                            self._clock_max_gap = max(self._clock_max_gap, gap)
+                        self._clock_last = dispatched
+                        self._clock_packets += 1
+                        self._clock_bytes += sent
                         if not self._ready and not self._stop_requested:
                             self._ready = True
                             self._condition.notify_all()
@@ -4121,10 +4196,12 @@ class MediaFailureDiagnostics:
         writer_descriptor: int,
         *,
         ignored_supervisor: int | None = None,
+        source_clock=None,
     ) -> None:
         self.work = work
         self.started = time.monotonic()
         self.ignored_supervisor = ignored_supervisor
+        self.source_clock = source_clock
         self.descriptor = None
         self.offset = 0
         self.uid = os.geteuid()
@@ -4204,6 +4281,10 @@ class MediaFailureDiagnostics:
 
     def __exit__(self, _kind, exc, _trace):
         global SELF_TEST_MEDIA_FAILURE
+        if self.source_clock is not None:
+            self.values["source_clock"] = {"state": "unknown"}
+            with contextlib.suppress(Exception):
+                self.values["source_clock"] = self.source_clock()
         self.stop_event.set()
         self.thread.join(timeout=1)
         if not self.thread.is_alive():
@@ -4922,7 +5003,12 @@ def main() -> int:
             capture_started = time.monotonic()
             try:
                 with MediaFailureDiagnostics(
-                    "capture", work, dut_log_path, dut_log.fileno()
+                    "capture", work, dut_log_path, dut_log.fileno(),
+                    source_clock=(
+                        lambda source=feeder: (
+                            source.clock_snapshot() if source is not None else {"state": "unknown"}
+                        )
+                    ),
                 ) as diagnostic:
                     sink_capture, capture_bytes = capture_final_sink_media_segment(
                         work,
