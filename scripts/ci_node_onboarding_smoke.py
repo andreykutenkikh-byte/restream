@@ -472,6 +472,85 @@ def safe_strict_sink_reader_timings(value: Any) -> list[dict[str, Any]] | None:
     return result
 
 
+def _safe_failure_flow(value: Any) -> dict[str, Any] | None:
+    """Project only outage-local, identity-free sampled counter evidence."""
+    required = {"elapsed_seconds", "sample_count", "log_ok", "markers", "channels"}
+    optional = {"sample_window_seconds", "max_observation_gap_seconds"}
+    if not isinstance(value, dict) or not required <= value.keys() <= required | optional:
+        return None
+    elapsed, count = value["elapsed_seconds"], value["sample_count"]
+    if (
+        not _diagnostic_seconds(elapsed)
+        or type(count) is not int
+        or not 0 <= count <= 4096
+        or type(value["log_ok"]) is not bool
+        or not isinstance(value["markers"], dict)
+        or not value["markers"].keys() <= _MEDIA_DIAGNOSTIC_MARKERS
+        or any(type(n) is not int or not 1 <= n <= 255 for n in value["markers"].values())
+        or (not value["log_ok"] and value["markers"])
+    ):
+        return None
+
+    def interval(item: Any) -> bool:
+        return (
+            isinstance(item, list)
+            and len(item) == 2
+            and all(_diagnostic_seconds(n, elapsed) for n in item)
+            and item[0] <= item[1]
+        )
+
+    if count:
+        if (
+            not optional <= value.keys()
+            or not interval(value["sample_window_seconds"])
+            or not _diagnostic_seconds(value["max_observation_gap_seconds"], elapsed)
+        ):
+            return None
+    elif optional & value.keys():
+        return None
+    channels = value["channels"]
+    if not isinstance(channels, dict) or channels.keys() != {
+        "ingest_path",
+        "ingest_transport",
+        "normalized",
+        "sink",
+    }:
+        return None
+    projected_channels: dict[str, Any] = {}
+    for name, channel in channels.items():
+        if not isinstance(channel, dict) or not isinstance(channel.get("state"), str):
+            return None
+        if channel["state"] == "growth":
+            growth = channel.get("last_growth_seconds")
+            if (
+                count < 2
+                or channel.keys() != {"state", "last_growth_seconds"}
+                or not isinstance(growth, list)
+                or not interval(growth)
+                or not value["sample_window_seconds"][0]
+                <= growth[0]
+                <= growth[1]
+                <= value["sample_window_seconds"][1]
+            ):
+                return None
+        elif (
+            channel.keys() != {"state"}
+            or channel["state"] not in {"unknown", "unchanged"}
+            or (count < 2 and channel["state"] != "unknown")
+        ):
+            return None
+        projected_channels[name] = dict(channel)
+        if channel["state"] == "growth":
+            projected_channels[name]["last_growth_seconds"] = list(channel["last_growth_seconds"])
+    # JSON-safe fixed keys, enums and bounded numbers are the entire schema.
+    result: dict[str, Any] = dict(value)
+    result["markers"] = dict(value["markers"])
+    result["channels"] = projected_channels
+    if count:
+        result["sample_window_seconds"] = list(value["sample_window_seconds"])
+    return result
+
+
 def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
     """Only fixed stage names and bounded numbers may reach the CI log."""
     unavailable = {"progress": "unavailable"}
@@ -485,6 +564,8 @@ def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
     failure_wait = payload.get("failure_wait_seconds")
     failure_media = payload.get("failure_media")
     safe_media = _safe_failure_media(failure_media) if failure_media is not None else None
+    failure_flow = payload.get("failure_flow")
+    safe_flow = _safe_failure_flow(failure_flow) if failure_flow is not None else None
     allowed_flags = {
         "live",
         "normalized",
@@ -533,6 +614,10 @@ def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
             )
         )
         or (failure_media is not None and safe_media is None)
+        or (
+            failure_flow is not None
+            and (safe_flow is None or stage != "outage-normal" or failure_media is not None)
+        )
     ):
         return unavailable
     result: dict[str, Any] = {"stage": stage, "elapsed_seconds": round(elapsed, 3)}
@@ -546,6 +631,8 @@ def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
         result["failure_wait_seconds"] = round(failure_wait, 3)
     if safe_media is not None:
         result["failure_media"] = safe_media
+    if safe_flow is not None:
+        result["failure_flow"] = safe_flow
     return result
 
 
@@ -589,7 +676,7 @@ try:
         raise ValueError('unavailable')
     print(json.dumps({key: value.get(key) for key in
         ('job_id', 'stage', 'elapsed_seconds', 'strict_segment_index', 'failure_lines',
-         'failure_flags', 'failure_wait_seconds', 'failure_media')}))
+         'failure_flags', 'failure_wait_seconds', 'failure_media', 'failure_flow')}))
 except (OSError, ValueError):
     print('{}')
 """,

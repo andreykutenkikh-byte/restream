@@ -154,6 +154,19 @@ jobs:
       - name: SSH bootstrap and native Moblin Relay end-to-end smoke
         run: uv run --locked python scripts/ci_node_onboarding_smoke.py
 
+      - name: Strict native reader clock counterfactual
+        shell: bash
+        run: |
+          # Reuse the installed pinned binary only inside the CI SSH fixture.
+          # Stage source through stdin because /tmp is a live tmpfs mount.
+          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml \
+            exec -T ci-ssh-target python3 -c \
+            'import pathlib,sys; data=sys.stdin.buffer.read(); target=pathlib.Path("/tmp/adojapan-ci-clock-helper.py"); target.write_bytes(data); target.chmod(0o600); assert data and target.read_bytes() == data' \
+            < deploy/moblin-relay/test-native-feeder-media.py
+          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml \
+            exec -T -e CI_NATIVE_READER_CLOCK=isolated-fixture ci-ssh-target \
+            python3 - < deploy/moblin-relay/test-native-reader-clock.py
+
       - name: Post-onboarding runtime limits
         run: sh scripts/check_runtime_limits.sh
 

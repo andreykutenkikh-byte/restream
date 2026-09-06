@@ -62,6 +62,7 @@ SELF_TEST_PROGRESS_FILE = Path("/run/moblin-relay-self-test.progress.json")
 SELF_TEST_LAST_PROGRESS: dict = {}
 SELF_TEST_WAIT_FAILURE: tuple[BaseException, dict, float] | None = None
 SELF_TEST_MEDIA_FAILURE: tuple[BaseException, dict] | None = None
+SELF_TEST_FLOW_FAILURE: tuple[BaseException, dict] | None = None
 SELF_TEST_STAGES = frozenset(
     {
         "startup",
@@ -425,6 +426,8 @@ def persist_self_test_failure_progress(exc: BaseException) -> None:
         progress["failure_wait_seconds"] = SELF_TEST_WAIT_FAILURE[2]
     if SELF_TEST_MEDIA_FAILURE is not None and SELF_TEST_MEDIA_FAILURE[0] is exc:
         progress["failure_media"] = SELF_TEST_MEDIA_FAILURE[1]
+    if SELF_TEST_FLOW_FAILURE is not None and SELF_TEST_FLOW_FAILURE[0] is exc:
+        progress["failure_flow"] = SELF_TEST_FLOW_FAILURE[1]
     atomic_json(SELF_TEST_PROGRESS_FILE, progress)
 
 
@@ -1468,6 +1471,99 @@ def safe_wait_failure_flags(
     if expected_ingest_ids is not None:
         flags["ingest_match"] = ingest_ids == expected_ingest_ids
     return flags
+
+
+def record_outage_flow_failure(
+    failure: BaseException,
+    observer: Observer,
+    started: float,
+    finished: float,
+    log_descriptor: int,
+    log_offset: int,
+) -> None:
+    """Retain sampled growth intervals, not precise packet times or raw counters."""
+    global SELF_TEST_FLOW_FAILURE
+    SELF_TEST_FLOW_FAILURE = None
+    elapsed = finished - started
+    if not math.isfinite(elapsed) or not 0 <= elapsed <= 660:
+        return
+    samples = observer.samples_between(started, finished)
+    if len(samples) > 4096:
+        return
+    previous_finish = started
+    for sample in samples:
+        first, last = sample.get("t"), sample.get("finished")
+        if (
+            type(first) not in {int, float}
+            or type(last) not in {int, float}
+            or not previous_finish <= first <= last <= finished
+        ):
+            return
+        previous_finish = last
+    value = {
+        "elapsed_seconds": round(elapsed, 3),
+        "sample_count": len(samples),
+        "log_ok": False,
+        "markers": {},
+        "channels": {},
+    }
+    if samples:
+        value["sample_window_seconds"] = [
+            round(samples[0]["t"] - started, 3),
+            round(samples[-1]["finished"] - started, 3),
+        ]
+        # Include HTTP sampling duration and both unobserved event edges.
+        gaps = [samples[0]["finished"] - started, finished - samples[-1]["t"]]
+        gaps.extend(
+            right["finished"] - left["t"] for left, right in zip(samples, samples[1:], strict=False)
+        )
+        value["max_observation_gap_seconds"] = round(max(gaps), 3)
+    for name, counter, identity, metric in (
+        ("ingest_path", "ingest_bytes", "ingest_ids", "dut_metrics_ok"),
+        ("ingest_transport", "ingest_transport_bytes", "ingest_ids", "dut_metrics_ok"),
+        ("normalized", "normalized_bytes", "normalized_ids", "dut_metrics_ok"),
+        ("sink", "sink_bytes", "sink_ids", "sink_metrics_ok"),
+    ):
+        channel = {"state": "unknown"}
+        value["channels"][name] = channel
+        if len(samples) < 2:
+            continue
+        ids = samples[0].get(identity)
+        if (
+            not isinstance(ids, list) or len(ids) != 1 or not isinstance(ids[0], str)
+            or not ids[0] or ids[0] == "missing-id"
+        ):
+            continue
+        if any(
+            sample.get(metric) is not True
+            or sample.get(identity) != ids
+            or type(sample.get(counter)) is not int
+            or not 0 <= sample[counter] <= 2**63 - 1
+            for sample in samples
+        ) or any(
+            right[counter] < left[counter] for left, right in zip(samples, samples[1:], strict=False)
+        ):
+            continue
+        channel["state"] = "unchanged"
+        for left, right in zip(samples, samples[1:], strict=False):
+            if right[counter] > left[counter]:
+                channel.update(
+                    state="growth",
+                    last_growth_seconds=[
+                        round(left["t"] - started, 3),
+                        round(right["finished"] - started, 3),
+                    ],
+                )
+    with contextlib.suppress(OSError, TestFailure):
+        tail = read_validated_log_tail(log_descriptor, log_offset, os.geteuid())
+        lines = [line.rstrip(b"\r") for line in tail.split(b"\n")[:-1]]
+        value["markers"] = {
+            name: min(lines.count(marker), 255)
+            for name, marker in MEDIA_DIAGNOSTIC_MARKERS.items()
+            if marker in lines
+        }
+        value["log_ok"] = True
+    SELF_TEST_FLOW_FAILURE = (failure, value)
 
 
 class SinkDeliveryGrowthGate:
@@ -4901,13 +4997,40 @@ def main() -> int:
             description: str,
             transition_started: float,
             expected_ingest_ids: list[str] | None,
+            *,
+            hard_source_cut: bool = False,
         ) -> dict:
-            remaining = LIVE_TO_SLATE_DEADLINE_SECONDS - (time.monotonic() - transition_started)
+            # A hard network cut can leave buffered media draining before the
+            # unchanged 2s/2.5s watchdog idle proof even begins. Its contract is
+            # detach before the earliest natural SRT expiry, not 4.5s from cut.
+            # Keep the shorter bound for pauses and normalizer/child failures.
+            limit = (
+                SRT_IDLE_LOWER_BOUND_SECONDS if hard_source_cut else LIVE_TO_SLATE_DEADLINE_SECONDS
+            )
+            deadline = transition_started + limit
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TestFailure(f"{description} exceeded the SLATE deadline")
-            sample = observer.wait_sample(
-                description,
-                lambda item: (
+            if hard_source_cut and (
+                not isinstance(expected_ingest_ids, list) or len(expected_ingest_ids) != 1
+                or not isinstance(expected_ingest_ids[0], str) or not expected_ingest_ids[0]
+            ):
+                raise TestFailure("hard-cut SLATE proof requires the original SRT connection")
+
+            def slate_state(item: dict) -> bool:
+                if hard_source_cut:
+                    first, last = item.get("t"), item.get("finished")
+                    if (
+                        type(first) not in {int, float} or type(last) not in {int, float}
+                        or not transition_started <= first <= last < deadline
+                    ):
+                        return False
+                    if (
+                        item.get("ingest_live") is not True
+                        or item.get("ingest_ids") != expected_ingest_ids
+                    ):
+                        raise TestFailure("hard-cut SRT connection disappeared before SLATE proof")
+                return bool(
                     not item.get("normalized")
                     and not item.get("live")
                     and (
@@ -4918,12 +5041,16 @@ def main() -> int:
                         )
                     )
                     and item.get("path_ready")
-                ),
+                )
+
+            sample = observer.wait_sample(
+                description,
+                slate_state,
                 remaining,
                 not_before=transition_started,
             )
             elapsed = float(sample["t"]) - transition_started
-            if elapsed > LIVE_TO_SLATE_DEADLINE_SECONDS:
+            if elapsed > limit:
                 raise TestFailure(f"{description} exceeded the SLATE deadline")
             return sample
 
@@ -6123,11 +6250,21 @@ def main() -> int:
             ):
                 raise TestFailure(f"primary source survived outage {index} shutdown")
             mark_self_test_stage("outage-normal")
-            detached = wait_slate_with_live_srt(
-                f"outage {index} SLATE transition",
-                outage_started,
-                outage_ingest_ids,
-            )
+            try:
+                detached = wait_slate_with_live_srt(
+                    f"outage {index} SLATE transition",
+                    outage_started,
+                    outage_ingest_ids,
+                    hard_source_cut=True,
+                )
+            except TestFailure as exc:
+                # Existing observations only: no new polling or deadline work.
+                with contextlib.suppress(Exception):
+                    record_outage_flow_failure(
+                        exc, observer, outage_started, time.monotonic(),
+                        transition_log_descriptor, outage_reset_log_offset,
+                    )
+                raise
             to_slate = float(detached["t"]) - outage_started
             wait_slate_capture_growth(
                 f"outage {index} SLATE capture growth",
@@ -6295,6 +6432,7 @@ def main() -> int:
             "final SLATE transition",
             final_started,
             final_ingest_ids,
+            hard_source_cut=True,
         )
         wait_slate_capture_growth("final SLATE capture growth", final_slate)
         _final_expired, final_srt_idle = wait_srt_idle_expiry(
