@@ -22,9 +22,13 @@ CLOCK_HELPER = Path("/tmp/adojapan-ci-clock-helper.py")  # noqa: S108 - verified
 MEDIAMTX = Path("/opt/moblin-relay/bin/mediamtx")
 FFMPEG = "/usr/bin/ffmpeg"
 JITTER_SECONDS = 0.022
-WORK_SECONDS = 110.0  # At most ten further seconds for owned-process cleanup.
+# Two extra GOP intervals per gate add <=4/.25 + 4/.95 =20.211s
+# across the paired clocks; 22s covers that bounded added measurement work.
+# The strict reader still has 15s, with at most ten further seconds for cleanup.
+WORK_SECONDS = 132.0
 PHASE_AGE_SECONDS = 0.2
 RATE_BOUNDS = {"single": (0.25, 0.31), "fixed": (0.95, 1.05)}
+PHASE_GOPS = 4  # One complete eight-second source loop; each GOP is two seconds.
 ANNEX_B_FILTERS = "h264_mp4toannexb,dump_extra=freq=keyframe"
 VIDEO_CONTRACT = {
     "codec_name": "h264",
@@ -118,31 +122,100 @@ class PhaseObserver(threading.Thread):
 
 def stable_gops(frames, case):
     keys = [frame for frame in frames if frame[3]]
-    if len(keys) < 3:
+    if len(keys) < PHASE_GOPS + 1:
         return None
-    keys = keys[-3:]
-    rates = []
+    keys = keys[-(PHASE_GOPS + 1) :]
     for left, right in pairwise(keys):
         require(right[0] - left[0] == 60, "observer GOP length changed")
         require(abs(right[1] - left[1] - 2) < 0.002, "observer GOP timeline changed")
         require(right[2] > left[2], "observer wall clock did not advance")
-        rates.append(2 / (right[2] - left[2]))
+    rate = (2 * PHASE_GOPS) / (keys[-1][2] - keys[0][2])
     low, high = RATE_BOUNDS[case]
     # Startup analysis may release old frames together. Never use that burst
-    # as a live phase gate; bounded polling waits for two complete steady GOPs.
-    return (keys[-1], rates) if all(low <= rate <= high for rate in rates) else None
+    # as a live phase gate. Individual GOP arrival intervals vary with encoded
+    # packet/VBV and read buffering, even at an exact transport clock. Compare
+    # a complete source period, while retaining every GOP's media-time checks.
+    return (keys[-1], [rate]) if low <= rate <= high else None
 
 
-def validate_phase(frames, gate, spawned, case):
+def phase_evidence(frames, case, started, observed, measure, byte_rate, chunk_bytes):
+    """Project only bounded numbers; diagnostics never alter phase acceptance."""
+
+    def number(value, maximum):
+        return (
+            round(value, 6)
+            if type(value) in (int, float) and math.isfinite(value) and 0 <= value <= maximum
+            else None
+        )
+
+    def difference(right, left, maximum=WORK_SECONDS):
+        if all(type(value) in (int, float) and math.isfinite(value) for value in (right, left)):
+            return number(right - left, maximum)
+        return None
+
+    valid = len(frames) <= 512 and all(
+        len(frame) == 4
+        and type(frame[0]) is int
+        and number(frame[0], 10000) is not None
+        and number(frame[1], 600) is not None
+        and type(frame[2]) in (int, float)
+        and math.isfinite(frame[2])
+        and type(frame[3]) is bool
+        for frame in frames
+    )
+    keys = [frame for frame in frames if frame[3]] if valid else []
+    intervals = []
+    for left, right in pairwise(keys[-3:]):
+        media = difference(right[1], left[1], 600)
+        wall = difference(right[2], left[2])
+        intervals.append(
+            {
+                "media_seconds": media,
+                "wall_seconds": wall,
+                "rate": number(media / wall, 10000) if media is not None and wall else None,
+            }
+        )
+    sent_seconds = difference(measure.get("last"), measure.get("first"))
+    sent_bytes = difference(measure.get("bytes"), chunk_bytes, 2**31)
+    rate = None
+    if sent_seconds and sent_bytes is not None and number(byte_rate, 10**7):
+        rate = number(sent_bytes / sent_seconds / byte_rate, 10000)
+    period_seconds = (
+        difference(keys[-1][2], keys[-(PHASE_GOPS + 1)][2]) if len(keys) >= PHASE_GOPS + 1 else None
+    )
+    return {
+        "case": case if case in RATE_BOUNDS else "unknown",
+        "phase_age_seconds": difference(observed, started),
+        "samples_valid": valid,
+        "retained_frames": len(frames) if valid else None,
+        "retained_keys": len(keys) if valid else None,
+        "first_retained_frame_seconds": difference(frames[0][2], started)
+        if valid and frames
+        else None,
+        "last_idr_age_seconds": difference(observed, keys[-1][2]) if keys else None,
+        "idr_intervals": intervals,
+        "period_rate": number(2 * PHASE_GOPS / period_seconds, 10000) if period_seconds else None,
+        "transport_rate": rate,
+        "transport_seconds": sent_seconds,
+    }
+
+
+def validate_phase(frames, gate, spawned, case, prior_frames):
     require(0 <= spawned - gate[2] <= PHASE_AGE_SECONDS, "strict reader missed IDR phase")
     following = [frame for frame in frames if frame[3] and frame[0] > gate[0]]
     require(len(following) >= 2, "reader interval lacks two subsequent IDRs")
-    interval = [gate, *following]
+    prior = [frame for frame in prior_frames if frame[3]]
+    require(len(prior) >= 3 and prior[-1] == gate, "capture prior IDR context changed")
+    # Keep the pre-gate evidence immutable: it can leave the observer's bounded
+    # deque during capture. Two GOPs on each side cover the full source period
+    # without waiting for more than the existing two post-reader IDRs.
+    interval = [*prior[-3:], *following]
     for left, right in pairwise(interval):
         require(right[0] - left[0] == 60, "capture GOP continuity failed")
         require(abs(right[1] - left[1] - 2) < 0.002, "capture PTS continuity failed")
-        rate = 2 / (right[2] - left[2]) if right[2] > left[2] else 0
-        require(RATE_BOUNDS[case][0] <= rate <= RATE_BOUNDS[case][1], "capture rate changed")
+        require(right[2] > left[2], "capture wall clock did not advance")
+    rate = (2 * PHASE_GOPS) / (interval[PHASE_GOPS][2] - interval[0][2])
+    require(RATE_BOUNDS[case][0] <= rate <= RATE_BOUNDS[case][1], "capture rate changed")
     return round(following[0][2] - spawned, 6)
 
 
@@ -535,18 +608,35 @@ def run_case(case, namespace, live, prepared, work, deadline):
                 break
             time.sleep(0.025)
         require(ready, "fresh sink path did not become ready")
+        phase_started = time.monotonic()
         phase_process = start(observer_command, subprocess.PIPE)
         observer = PhaseObserver(phase_process.stderr)
         observer.start()
         phase_deadline = min(deadline - 20, time.monotonic() + 45)
         gate = None
+        frames = []
+        prior_frames = ()
         while time.monotonic() < phase_deadline:
             healthy()
-            phase = stable_gops(observer.snapshot(), case)
+            frames = observer.snapshot()
+            phase = stable_gops(frames, case)
             if phase and time.monotonic() - phase[0][2] <= PHASE_AGE_SECONDS:
                 gate = phase[0]
+                prior_frames = tuple(frames)
                 break
             time.sleep(0.005)
+        with lock:
+            phase_measure = dict(measure)
+        evidence = phase_evidence(
+            frames,
+            case,
+            phase_started,
+            time.monotonic(),
+            phase_measure,
+            byte_rate,
+            namespace["LIVE_FEED_CHUNK_BYTES"],
+        )
+        print(json.dumps({"phase_gate": evidence | {"established": gate is not None}}), flush=True)
         require(gate is not None, "stable live IDR phase not established")
         require(deadline - time.monotonic() >= 18, "insufficient strict reader budget")
         with lock:
@@ -584,7 +674,7 @@ def run_case(case, namespace, live, prepared, work, deadline):
         with lock:
             after = dict(measure)
         frames = finish_phase(observer, gate, case, deadline, healthy)
-        next_idr = validate_phase(frames, gate, spawned[0], case)
+        next_idr = validate_phase(frames, gate, spawned[0], case, prior_frames)
         rate = (after["bytes"] - before["bytes"]) / (after["last"] - before["last"]) / byte_rate
         require(RATE_BOUNDS[case][0] <= rate <= RATE_BOUNDS[case][1], "feeder rate changed")
         require(after["waits"] > before["waits"], "scheduler injection was not exercised")

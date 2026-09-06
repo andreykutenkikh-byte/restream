@@ -43,15 +43,49 @@ loopback listeners, temporary configuration and owned media processes. It does
 not invoke service lifecycle, self-test main or credential-writing routines.
 
 Old and repaired feeders receive the same 22 ms scheduler-delay injection. A
-continuously drained observer establishes two steady 60-frame / two-media-second
-GOP intervals. One unchanged native reader is launched just after an observed
-IDR, and phase/rate are checked again afterwards. The old case must fail by the
+continuously drained observer establishes a complete eight-media-second source
+period using five IDRs. Every adjacent GOP must still contain 60 frames and two
+media seconds. One unchanged native reader is launched within 200 ms after an
+observed IDR, and phase/rate are checked again afterwards. The old case must fail by the
 specific 15-second reader timeout while input/output and partial frames grow;
 other errors are failures of the counterfactual. The repaired case must pass
 the unchanged 90-frame capture and full format/GOP/PTS/DTS/A/V/decode validator.
 There are no reader retries or reduced probe settings. Observation after reader
 completion never extends the reader's deadline. Work and owned cleanup are
 bounded; only fixed reasons and numeric diagnostics reach CI logs.
+
+Per-GOP arrival time is not the transport clock: encoded packet sizes and
+buffering can delay one IDR and advance the next relative to a uniform media
+timeline. Actual local FFmpeg 5.1.2 / pinned MediaMTX tests using a high-resolution
+clock recorded complementary fixed-clock intervals of 2.222995 / 1.761156 seconds
+(apparent rates 0.900 / 1.136), while the pair averaged 1.004. The unchanged strict
+reader nevertheless captured all 90 frames. Independent MPEG-TS packet-position
+probes also show nonuniform GOP byte spans with continuous frame PTS, while a
+complete four-GOP source loop approaches eight transport seconds. The magnitude
+varies between generated fixtures; it is not a fixed per-GOP correction factor.
+
+The rate bands remain 0.25–0.31 for the old clock and 0.95–1.05 for the repaired
+clock, applied to one complete source period. Post-capture measurement uses the
+two preceding and two following GOPs, with the preceding observations preserved
+immutably before they can leave the 512-frame deque. All observed GOP structure
+and timestamp checks remain mandatory, including later already-observed IDRs.
+The 45-second phase gate, 200 ms launch phase, 15-second reader, 90-frame target,
+and wait for only two following IDRs are unchanged. The overall work budget is
+132 seconds: the extra two GOPs at each phase gate add at most
+`4 / 0.25 + 4 / 0.95 = 20.211` seconds, covered by 22 additional seconds over the
+previous 110. This adds bounded measurement work, not time for a failing reader;
+owned-process cleanup retains its separate ten-second maximum.
+
+A local paired execution with MediaMTX 1.20.1 and FFmpeg 5.1.2 passed the corrected
+measurement: the old clock timed out at the unchanged reader deadline with 72
+growing frames (transport rate 0.285732); the repaired clock captured all 90
+frames and passed the unchanged format/GOP/PTS/DTS/A/V/decode validator
+(transport rate 1.003710, last frame at 4.741 seconds). Both fixtures cleaned up
+their processes/listeners and temporary media. This Windows reproduction used
+QPC as its high-resolution monotonic clock: Python 3.12's local GetTickCount64
+clock has a 15.625 ms resolution and is not equivalent to Linux's clock. A scoped
+timer-resolution request was restored on exit. Neither adaptation is a runtime
+or CI code change. Pinned Linux exact-head CI is still required for acceptance.
 
 The paired source is eight seconds: 240 video frames and 375 AAC frames share
 that boundary. The earlier four-second source has half an AAC frame at its end.

@@ -419,24 +419,200 @@ def test_source_seam_runs_bounded_copy_and_checks_output_before_reading(
     command, options = calls[1]
     assert command[command.index("-select_streams") + 1] == "v:0"
     assert "-show_packets" in command and options["timeout"] == 10
-    assert helper["WORK_SECONDS"] == 110
+    assert helper["WORK_SECONDS"] == 132
 
 
 @pytest.mark.parametrize("case,rate", [("single", 0.298), ("fixed", 0.991)])
-def test_phase_requires_two_complete_live_gop_intervals(helper, case, rate):
-    sequence = frames(rate)
-    assert helper["stable_gops"](sequence[:120], case) is None
-    gate, rates = helper["stable_gops"](sequence[:121], case)
-    assert gate == sequence[120]
-    assert rates == pytest.approx([rate, rate])
-    assert helper["validate_phase"](sequence, gate, gate[2] + 0.1, case) == pytest.approx(
-        2 / rate - 0.1, abs=1e-6
-    )
+def test_phase_requires_one_complete_source_period(helper, case, rate):
+    sequence = frames(rate, count=361)
+    assert helper["stable_gops"](sequence[:240], case) is None
+    gate, rates = helper["stable_gops"](sequence[:241], case)
+    assert gate == sequence[240]
+    assert rates == pytest.approx([rate])
+    assert helper["validate_phase"](
+        sequence, gate, gate[2] + 0.1, case, tuple(sequence[:241])
+    ) == pytest.approx(2 / rate - 0.1, abs=1e-6)
 
 
 def test_initial_probe_burst_cannot_authorize_reader_phase(helper):
-    assert helper["stable_gops"](frames(20)[:121], "fixed") is None
-    assert helper["stable_gops"](frames(1)[:121], "single") is None
+    assert helper["stable_gops"](frames(20), "fixed") is None
+    assert helper["stable_gops"](frames(1), "single") is None
+
+
+def frames_with_gop_wall_intervals(intervals):
+    sequence, elapsed = [], 0.0
+    for gop, interval in enumerate(intervals):
+        sequence.extend(
+            (gop * 60 + index, gop * 2 + index / 30, elapsed + interval * index / 60, index == 0)
+            for index in range(60)
+        )
+        elapsed += interval
+    sequence.append((len(intervals) * 60, len(intervals) * 2, elapsed, True))
+    return sequence
+
+
+@pytest.mark.parametrize(
+    "case,intervals",
+    [
+        ("single", [7.032, 6.781, 7.776805, 6.242581]),
+        ("fixed", [1.989599, 1.932437, 2.222995, 1.761156]),
+    ],
+)
+def test_actual_complementary_arrival_variation_is_not_a_wrong_source_clock(
+    helper, case, intervals
+):
+    # Actual pinned-MediaMTX/FFmpeg5.1.2 loopback measurements using QPC:
+    # the fixed following GOP pair reads .900/1.136, but repays its delay.
+    # Keep the same rate band on all four GOPs of the complete source period.
+    sequence = frames_with_gop_wall_intervals(intervals)
+    low, high = helper["RATE_BOUNDS"][case]
+    assert not all(low <= 2 / interval <= high for interval in intervals)
+    gate, rates = helper["stable_gops"](sequence, case)
+    assert gate == sequence[-1]
+    assert rates == pytest.approx([8 / sum(intervals)])
+    gate = sequence[120]
+    prior = tuple(sequence[:121])
+    # Model eviction of all pre-gate frames from the live observer deque.
+    assert helper["validate_phase"](sequence[121:], gate, gate[2] + 0.1, case, prior) == (
+        pytest.approx(intervals[2] - 0.1)
+    )
+    evidence = helper["phase_evidence"](sequence, case, 0, sequence[-1][2], {}, 1125000, 10528)
+    assert evidence["period_rate"] == pytest.approx(rates[0], abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    "case,rate",
+    [("single", 0.249999), ("single", 0.310001), ("fixed", 0.949999), ("fixed", 1.050001)],
+)
+def test_complete_period_still_rejects_source_clock_just_outside_original_rate_band(
+    helper, case, rate
+):
+    sequence = frames(rate)
+    assert helper["stable_gops"](sequence, case) is None
+    gate = sequence[120]
+    with pytest.raises(helper["ProbeFailure"], match="capture rate changed"):
+        helper["validate_phase"](sequence, gate, gate[2] + 0.1, case, tuple(sequence[:121]))
+
+
+@pytest.mark.parametrize("change", ["missing", "replaced_gate", "prior_pts", "extra_gop"])
+def test_period_validation_keeps_immutable_prior_context_and_all_observed_gop_checks(
+    helper, change
+):
+    sequence = frames(count=301)
+    gate = sequence[120]
+    prior = tuple(sequence[:121])
+    if change == "missing":
+        prior = prior[61:]
+    elif change == "replaced_gate":
+        prior = (*prior[:-1], (gate[0], gate[1], gate[2] + 0.01, True))
+    elif change == "prior_pts":
+        prior = ((0, 0.01, 0, True), *prior[1:])
+    else:
+        index, pts, wall, key = sequence[300]
+        sequence[300] = (index + 1, pts, wall, key)
+    with pytest.raises(helper["ProbeFailure"]):
+        helper["validate_phase"](sequence, gate, gate[2] + 0.1, "fixed", prior)
+
+
+def test_added_period_measurement_budget_does_not_change_strict_reader_or_phase_limits(helper):
+    # Two added 2s media intervals per clock need <=16 +4.211 wall seconds.
+    added = 4 / helper["RATE_BOUNDS"]["single"][0] + 4 / helper["RATE_BOUNDS"]["fixed"][0]
+    assert 20 < added < 22
+    assert helper["WORK_SECONDS"] == 110 + 22
+    assert helper["PHASE_AGE_SECONDS"] == 0.2 and helper["PHASE_GOPS"] == 4
+    source = HELPER.read_text(encoding="utf-8")
+    assert "self.frames = deque(maxlen=512)" in source
+    assert "prior_frames = tuple(frames)" in source
+    assert "phase_deadline = min(deadline - 20, time.monotonic() + 45)" in source
+
+
+@pytest.mark.parametrize("rate", [0.298, 1.0, 20.0])
+def test_phase_diagnostic_distinguishes_live_rate_from_probe_burst_without_changing_gate(
+    helper, rate
+):
+    base, chunk, byte_rate = 1000000.0, 10528, 1125000
+    sequence = frames(rate, start=base, count=121)
+    accepted = helper["stable_gops"](sequence, "single")
+    observed = sequence[-1][2] + 0.05
+    measured = {
+        "bytes": chunk + byte_rate * 4,
+        "first": base,
+        "last": sequence[-1][2],
+        "secret": "rtmp://secret.invalid/key",
+    }
+    evidence = helper["phase_evidence"](
+        sequence, "single", base - 0.1, observed, measured, byte_rate, chunk
+    )
+    assert evidence["retained_frames"] == 121 and evidence["retained_keys"] == 3
+    assert evidence["samples_valid"] is True
+    assert evidence["first_retained_frame_seconds"] == 0.1
+    assert evidence["last_idr_age_seconds"] == 0.05
+    assert evidence["phase_age_seconds"] == pytest.approx(4 / rate + 0.15, abs=1e-6)
+    assert evidence["transport_rate"] == pytest.approx(rate, abs=1e-6)
+    assert (
+        evidence["idr_intervals"]
+        == [{"media_seconds": 2.0, "wall_seconds": round(2 / rate, 6), "rate": round(rate, 6)}] * 2
+    )
+    assert helper["stable_gops"](sequence, "single") == accepted
+    encoded = json.dumps(evidence, allow_nan=False)
+    assert len(encoded) < 2048
+    assert "secret" not in encoded and "1000000" not in encoded and "rtmp" not in encoded
+
+
+def test_phase_diagnostic_exposes_no_parsed_frames_without_inventing_a_rate(helper):
+    evidence = helper["phase_evidence"]([], "single", 100, 145, {}, 1125000, 10528)
+    assert evidence == {
+        "case": "single",
+        "phase_age_seconds": 45,
+        "samples_valid": True,
+        "retained_frames": 0,
+        "retained_keys": 0,
+        "first_retained_frame_seconds": None,
+        "last_idr_age_seconds": None,
+        "idr_intervals": [],
+        "period_rate": None,
+        "transport_rate": None,
+        "transport_seconds": None,
+    }
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), -1, "rtmp://secret.invalid/key"])
+def test_phase_diagnostic_rejects_invalid_and_unbounded_numeric_observations(helper, invalid):
+    sequence = [(0, invalid, 10, True)]
+    evidence = helper["phase_evidence"](
+        sequence,
+        "rtmp://secret.invalid/key",
+        10,
+        143,
+        {"bytes": invalid, "first": invalid, "last": invalid},
+        invalid,
+        10528,
+    )
+    assert evidence["case"] == "unknown"
+    assert evidence["samples_valid"] is False
+    assert evidence["retained_frames"] is None and evidence["idr_intervals"] == []
+    assert evidence["phase_age_seconds"] is None and evidence["transport_rate"] is None
+    assert "secret" not in json.dumps(evidence, allow_nan=False)
+
+
+def test_phase_diagnostic_bounds_samples_and_prints_before_timeout_assertion(helper):
+    evidence = helper["phase_evidence"](
+        frames(count=513),
+        "fixed",
+        0,
+        17.1,
+        {"bytes": 2**31 + 10529, "first": 0, "last": 133},
+        1125000,
+        10528,
+    )
+    assert evidence["samples_valid"] is False and evidence["transport_rate"] is None
+    assert evidence["transport_seconds"] is None
+    source = HELPER.read_text(encoding="utf-8")
+    assert source.index('print(json.dumps({"phase_gate":') < source.index(
+        'require(gate is not None, "stable live IDR phase not established")'
+    )
+    assert "phase_deadline = min(deadline - 20, time.monotonic() + 45)" in source
+    assert helper["RATE_BOUNDS"] == {"single": (0.25, 0.31), "fixed": (0.95, 1.05)}
 
 
 @pytest.mark.parametrize("rate,case", [(0.25, "single"), (1.0, "fixed")])
@@ -484,19 +660,21 @@ def test_post_capture_observation_keeps_outer_deadline(helper, monkeypatch):
 def test_post_capture_phase_checks_fail_closed(helper, change, error):
     sequence = frames()
     gate = sequence[120]
+    prior = tuple(sequence[:121])
     spawned = gate[2] + (0.201 if change == "late" else 0.1)
     if change == "missing":
         sequence = sequence[:240]
     elif change in {"rate", "gop", "pts"}:
-        index, pts, wall, key = sequence[180]
-        sequence[180] = (
+        target = 240 if change == "rate" else 180
+        index, pts, wall, key = sequence[target]
+        sequence[target] = (
             index + (change == "gop"),
             pts + (change == "pts"),
             wall + (change == "rate"),
             key,
         )
     with pytest.raises(helper["ProbeFailure"], match=error):
-        helper["validate_phase"](sequence, gate, spawned, "fixed")
+        helper["validate_phase"](sequence, gate, spawned, "fixed", prior)
 
 
 def test_only_exact_old_15_second_timeout_with_growing_frames_is_expected(helper):
@@ -663,7 +841,7 @@ def test_main_proves_old_bsf_then_loops_prepared_source_but_validates_original(h
     assert events[2][1].name == events[4][1].name == "prepared-source.ts"
     assert events[-2][1:] == events[-1][1:]
     assert events[-1][1] == events[3][1] and events[-1][2] == events[4][1]
-    assert helper["WORK_SECONDS"] == 110 and helper["JITTER_SECONDS"] == 0.022
+    assert helper["WORK_SECONDS"] == 132 and helper["JITTER_SECONDS"] == 0.022
 
 
 def test_validation_probe_timeout_is_capped_by_remaining_outer_budget(
