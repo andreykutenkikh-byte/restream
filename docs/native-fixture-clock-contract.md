@@ -34,7 +34,11 @@ transport acceptance remains 0.95–1.05, with byte integrity checked separately
 ## Strict-reader counterfactual
 
 `test-native-reader-clock.py` runs only in the disposable CI SSH fixture after
-native onboarding. It reuses the pinned MediaMTX binary, but creates its own
+the native onboarding attempt, including a failed attempt. The original native
+failure stays fatal; this independent check neither retries nor replaces it.
+It requires the already-installed pinned MediaMTX binary and fails explicitly
+if that prerequisite is missing. Earlier setup failures and cancellation do
+not trigger this check. It creates its own
 loopback listeners, temporary configuration and owned media processes. It does
 not invoke service lifecycle, self-test main or credential-writing routines.
 

@@ -14,6 +14,27 @@ ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / "deploy/moblin-relay/test-native-reader-clock.py"
 
 
+def test_ci_runs_independent_counterfactual_after_native_failure_without_masking_it():
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    native = workflow.split(
+        "      - name: SSH bootstrap and native Moblin Relay end-to-end smoke\n", 1
+    )[1].split("      - name:", 1)[0]
+    reader = workflow.split("      - name: Strict native reader clock counterfactual\n", 1)[
+        1
+    ].split("      - name:", 1)[0]
+    assert "id: native_onboarding" in native
+    assert "run: uv run --locked python scripts/ci_node_onboarding_smoke.py" in native
+    assert "if:" not in native
+    assert (
+        "if: ${{ !cancelled() && (success() || steps.native_onboarding.outcome == 'failure') }}"
+        in reader
+    )
+    assert "CI_NATIVE_READER_CLOCK=isolated-fixture" in reader
+    assert "< deploy/moblin-relay/test-native-reader-clock.py" in reader
+    assert "continue-on-error" not in native + reader
+    assert "|| true" not in native + reader
+
+
 @pytest.fixture
 def helper():
     return runpy.run_path(str(HELPER), run_name="_reader_clock_test")

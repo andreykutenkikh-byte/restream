@@ -566,6 +566,7 @@ def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
     safe_media = _safe_failure_media(failure_media) if failure_media is not None else None
     failure_flow = payload.get("failure_flow")
     safe_flow = _safe_failure_flow(failure_flow) if failure_flow is not None else None
+    initial_live_reason = payload.get("failure_initial_live_reason")
     allowed_flags = {
         "live",
         "normalized",
@@ -618,6 +619,22 @@ def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
             failure_flow is not None
             and (safe_flow is None or stage != "outage-normal" or failure_media is not None)
         )
+        or (
+            initial_live_reason is not None
+            and (
+                stage != "live-normalize"
+                or not isinstance(initial_live_reason, str)
+                or initial_live_reason
+                not in {
+                    "missing-pts",
+                    "timestamps-unset",
+                    "mux-invalid-argument",
+                    "child-exit",
+                    "output-start-timeout",
+                    "bridge-active-missing",
+                }
+            )
+        )
     ):
         return unavailable
     result: dict[str, Any] = {"stage": stage, "elapsed_seconds": round(elapsed, 3)}
@@ -633,6 +650,8 @@ def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
         result["failure_media"] = safe_media
     if safe_flow is not None:
         result["failure_flow"] = safe_flow
+    if initial_live_reason is not None:
+        result["failure_initial_live_reason"] = initial_live_reason
     return result
 
 
@@ -676,7 +695,8 @@ try:
         raise ValueError('unavailable')
     print(json.dumps({key: value.get(key) for key in
         ('job_id', 'stage', 'elapsed_seconds', 'strict_segment_index', 'failure_lines',
-         'failure_flags', 'failure_wait_seconds', 'failure_media', 'failure_flow')}))
+         'failure_flags', 'failure_wait_seconds', 'failure_media', 'failure_flow',
+         'failure_initial_live_reason')}))
 except (OSError, ValueError):
     print('{}')
 """,

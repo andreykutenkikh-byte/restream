@@ -13,6 +13,15 @@ from test_moblin_relay_bundle import load_normalizer, load_self_test
 
 from scripts.ci_node_onboarding_smoke import safe_self_test_progress
 
+INITIAL_LIVE_REASONS = (
+    "missing-pts",
+    "timestamps-unset",
+    "mux-invalid-argument",
+    "child-exit",
+    "output-start-timeout",
+    "bridge-active-missing",
+)
+
 
 def sample(timestamp: float, sink_bytes: int) -> dict:
     return {
@@ -575,3 +584,130 @@ def test_actual_watchdog_valid_metrics_can_outlive_old_source_cut_oracle():
     assert now < fixture["SRT_IDLE_LOWER_BOUND_SECONDS"]
     assert namespace["VERIFIED_STALL_TIMEOUT_SECONDS"] == 2.0
     assert namespace["OUTPUT_IDLE_FALLBACK_SECONDS"] == 2.5
+
+
+@pytest.mark.parametrize(
+    "gate,reason",
+    [
+        (gate, reason)
+        for gate in ("wait_initial_live_bridge_active", "require_initial_live_log_clean")
+        for reason in INITIAL_LIVE_REASONS
+        if gate == "wait_initial_live_bridge_active" or reason != "bridge-active-missing"
+    ],
+)
+def test_initial_live_gate_persists_only_exact_fixed_reason(monkeypatch, gate, reason):
+    namespace = load_self_test()
+    function = namespace[gate]
+    state = function.__globals__
+    markers = {reason: marker for marker, reason in namespace["INITIAL_LIVE_FORBIDDEN_LOG_MARKERS"]}
+    tail = markers.get(reason, b"") + b" PRIVATE_URL rtmps://private.invalid/live\n"
+    monkeypatch.setitem(state, "read_validated_log_tail", lambda *_args: tail)
+    arguments = {"timeout": 0} if gate == "wait_initial_live_bridge_active" else {}
+    with pytest.raises(namespace["TestFailure"]) as caught:
+        function(1, 2, 0, **arguments)
+    assert str(caught.value) == f"initial LIVE log gate failed: {reason}"
+    assert state["SELF_TEST_INITIAL_LIVE_FAILURE"] == (caught.value, reason)
+
+    checkpoints = []
+    monkeypatch.setitem(state, "SELF_TEST_STAGE_FILE", "unused-fixture-stage")
+    monkeypatch.setitem(
+        state,
+        "SELF_TEST_LAST_PROGRESS",
+        {
+            "job_id": "test-job",
+            "stage": "live-normalize",
+            "elapsed_seconds": 88.117,
+        },
+    )
+    monkeypatch.setitem(state, "mark_self_test_stage", lambda *_args, **_kwargs: None)
+    monkeypatch.setitem(state, "atomic_json", lambda _path, value: checkpoints.append(value))
+    state["persist_self_test_failure_progress"](caught.value)
+    checkpoint = checkpoints[-1]
+    assert checkpoint["failure_initial_live_reason"] == reason
+    assert safe_self_test_progress(checkpoint, job_id="test-job") == {
+        key: value for key, value in checkpoint.items() if key != "job_id"
+    }
+    assert "PRIVATE" not in json.dumps(checkpoint)
+    assert "rtmps" not in json.dumps(checkpoint)
+    assert len(json.dumps(checkpoint, indent=2).encode()) < 2048
+
+    # Identical exception text is not authority to reuse another failure's evidence.
+    state["persist_self_test_failure_progress"](namespace["TestFailure"](str(caught.value)))
+    assert "failure_initial_live_reason" not in checkpoints[-1]
+    state["SELF_TEST_LAST_PROGRESS"]["stage"] = "outage-normal"
+    state["persist_self_test_failure_progress"](caught.value)
+    assert "failure_initial_live_reason" not in checkpoints[-1]
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "PRIVATE_URL",
+        "missing-pts PRIVATE_URL",
+        "PRIVATE_missing-pts",
+        "missing-pts\n",
+        "Missing-pts",
+        "",
+        True,
+        1,
+        [],
+        {},
+    ],
+)
+def test_initial_live_reason_projection_rejects_non_schema_values(reason):
+    payload = {
+        "job_id": "test-job",
+        "stage": "live-normalize",
+        "elapsed_seconds": 1,
+        "failure_initial_live_reason": reason,
+    }
+    assert safe_self_test_progress(payload, job_id="test-job") == {"progress": "unavailable"}
+
+
+@pytest.mark.parametrize("stage", ["auth-source", "norm-flap", "outage-normal", "cleanup"])
+def test_initial_live_reason_projection_rejects_wrong_stage(stage):
+    payload = {
+        "job_id": "test-job",
+        "stage": stage,
+        "elapsed_seconds": 1,
+        "failure_initial_live_reason": "child-exit",
+    }
+    assert safe_self_test_progress(payload, job_id="test-job") == {"progress": "unavailable"}
+
+
+def test_initial_live_reason_rejects_unknown_internal_reason():
+    namespace = load_self_test()
+    failure = namespace["initial_live_gate_failure"]("PRIVATE_INTERNAL_REASON")
+    assert str(failure) == "invalid internal initial LIVE diagnostic reason"
+    assert (
+        namespace["initial_live_gate_failure"].__globals__["SELF_TEST_INITIAL_LIVE_FAILURE"] is None
+    )
+    assert namespace["INITIAL_LIVE_FAILURE_REASONS"] == frozenset(INITIAL_LIVE_REASONS)
+
+
+def test_progress_reader_transfers_initial_live_reason_without_raw_error(monkeypatch, capsys):
+    from scripts import ci_node_onboarding_smoke as smoke
+
+    job_id = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+
+    def compose(*args, **kwargs):
+        assert "'failure_initial_live_reason'" in args[-1]
+        assert "before.st_size <= 2048" in args[-1]
+        assert kwargs["max_capture_bytes"] == 4096
+        return SimpleNamespace(
+            stdout=json.dumps(
+                {
+                    "job_id": job_id,
+                    "stage": "live-normalize",
+                    "elapsed_seconds": 88.117,
+                    "failure_initial_live_reason": "child-exit",
+                    "failure": "PRIVATE_EXCEPTION",
+                }
+            )
+        )
+
+    monkeypatch.setattr(smoke, "compose", compose)
+    smoke.print_self_test_progress(job_id)
+    output = capsys.readouterr().out
+    assert '"failure_initial_live_reason": "child-exit"' in output
+    assert "PRIVATE" not in output

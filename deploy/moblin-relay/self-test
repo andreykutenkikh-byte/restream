@@ -63,6 +63,7 @@ SELF_TEST_LAST_PROGRESS: dict = {}
 SELF_TEST_WAIT_FAILURE: tuple[BaseException, dict, float] | None = None
 SELF_TEST_MEDIA_FAILURE: tuple[BaseException, dict] | None = None
 SELF_TEST_FLOW_FAILURE: tuple[BaseException, dict] | None = None
+SELF_TEST_INITIAL_LIVE_FAILURE: tuple[BaseException, str] | None = None
 SELF_TEST_STAGES = frozenset(
     {
         "startup",
@@ -316,6 +317,9 @@ INITIAL_LIVE_FORBIDDEN_LOG_MARKERS = (
     (NORMALIZER_CHILD_EXIT_MARKER, "child-exit"),
     (b"moblin-relay-normalize:restart:output-start-timeout", "output-start-timeout"),
 )
+INITIAL_LIVE_FAILURE_REASONS = frozenset(
+    reason for _marker, reason in INITIAL_LIVE_FORBIDDEN_LOG_MARKERS
+) | {"bridge-active-missing"}
 TRANSITION_FORBIDDEN_LOG_MARKERS = (
     (b"Packet is missing PTS", "missing-pts"),
     (b"Timestamps are unset in a packet", "timestamps-unset"),
@@ -428,6 +432,13 @@ def persist_self_test_failure_progress(exc: BaseException) -> None:
         progress["failure_media"] = SELF_TEST_MEDIA_FAILURE[1]
     if SELF_TEST_FLOW_FAILURE is not None and SELF_TEST_FLOW_FAILURE[0] is exc:
         progress["failure_flow"] = SELF_TEST_FLOW_FAILURE[1]
+    if (
+        SELF_TEST_INITIAL_LIVE_FAILURE is not None
+        and SELF_TEST_INITIAL_LIVE_FAILURE[0] is exc
+        and progress["stage"] == "live-normalize"
+        and SELF_TEST_INITIAL_LIVE_FAILURE[1] in INITIAL_LIVE_FAILURE_REASONS
+    ):
+        progress["failure_initial_live_reason"] = SELF_TEST_INITIAL_LIVE_FAILURE[1]
     atomic_json(SELF_TEST_PROGRESS_FILE, progress)
 
 
@@ -3150,6 +3161,16 @@ def known_forward_dts_marker_count(tail: bytes) -> int:
     )
 
 
+def initial_live_gate_failure(reason: str) -> TestFailure:
+    """Bind one allowlisted reason to its exact exception, never child output."""
+    global SELF_TEST_INITIAL_LIVE_FAILURE
+    if reason not in INITIAL_LIVE_FAILURE_REASONS:
+        return TestFailure("invalid internal initial LIVE diagnostic reason")
+    failure = TestFailure(f"initial LIVE log gate failed: {reason}")
+    SELF_TEST_INITIAL_LIVE_FAILURE = (failure, reason)
+    return failure
+
+
 def require_initial_live_log_clean(
     descriptor: int,
     offset: int,
@@ -3157,7 +3178,7 @@ def require_initial_live_log_clean(
 ) -> None:
     reason = initial_live_log_failure(read_validated_log_tail(descriptor, offset, expected_uid))
     if reason is not None:
-        raise TestFailure(f"initial LIVE log gate failed: {reason}")
+        raise initial_live_gate_failure(reason)
 
 
 def wait_initial_live_bridge_active(
@@ -3174,11 +3195,11 @@ def wait_initial_live_bridge_active(
         tail = read_validated_log_tail(descriptor, offset, expected_uid)
         reason = initial_live_log_failure(tail)
         if reason is not None:
-            raise TestFailure(f"initial LIVE log gate failed: {reason}")
+            raise initial_live_gate_failure(reason)
         if NORMALIZER_BRIDGE_ACTIVE_MARKER in tail:
             return
         if time.monotonic() >= deadline:
-            raise TestFailure("initial LIVE log gate failed: bridge-active-missing")
+            raise initial_live_gate_failure("bridge-active-missing")
         time.sleep(0.025)
 
 
