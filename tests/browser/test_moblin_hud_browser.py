@@ -239,15 +239,23 @@ def _poll(page: Any) -> dict[str, Any]:
     assert response.status == 200
     payload = response.json()
     page.wait_for_function(
-        "level => document.body.dataset.hudState === level", arg=payload["health"]["level"]
+        "value => document.body.dataset.hudState === value.level && "
+        "document.querySelector('[data-hud-server-time]').textContent === value.generatedAt",
+        arg={"level": payload["health"]["level"], "generatedAt": payload["generated_at"]},
     )
     return payload
 
 
-def _soundless_fetch_probe() -> str:
+def _browser_activity_probe() -> str:
     return """(() => {
       const fetch = window.fetch.bind(window);
-      const probe = window.__hudSmoke = { active: 0, maximum: 0, statuses: 0 };
+      const probe = window.__hudSmoke = { active: 0, maximum: 0, statuses: 0, audioStarts: 0 };
+      // Observe native WebAudio without replacing alert decisions or playback.
+      const startOscillator = OscillatorNode.prototype.start;
+      OscillatorNode.prototype.start = function (...args) {
+        probe.audioStarts += 1;
+        return startOscillator.apply(this, args);
+      };
       window.fetch = async (...args) => {
         if (args[0] !== '/moblin-hud/api/status') return fetch(...args);
         probe.active += 1;
@@ -288,7 +296,7 @@ def test_ordinary_hud_browser_contract(
     console_errors: list[tuple[str, str, str]] = []
     phase = {"name": "normal"}
     with browser.new_context(ignore_https_errors=True) as context:
-        context.add_init_script(_soundless_fetch_probe())
+        context.add_init_script(_browser_activity_probe())
         page = context.new_page()
         page.set_default_timeout(10_000)
         page.on("request", lambda request: request_urls.append(request.url))
@@ -331,6 +339,21 @@ def test_ordinary_hud_browser_contract(
             "window.__hudSmoke.instance === document[Symbol.for('adojapan.moblinHud.instance')]"
         )
         assert len([url for url in request_urls if urlsplit(url).path.endswith("/api/pair")]) == 1
+        assert page.evaluate("window.__hudSmoke.audioStarts") == 0
+        page.locator("[data-hud-sound]").click()
+        page.wait_for_function("() => window.__hudSmoke.audioStarts === 1")
+        # Actual API/evaluator warm-up is unknown, not an unrendered page.
+        # Losing LIVE before three good heartbeats must produce an alarm.
+        fixture.heartbeat("LIVE")
+        assert _poll(page)["health"]["level"] == "unknown"
+        assert page.evaluate("window.__hudSmoke.audioStarts") == 1
+        fixture.heartbeat("SLATE")
+        assert _poll(page)["health"]["level"] == "black"
+        page.wait_for_function("() => window.__hudSmoke.audioStarts === 4")
+        fixture.heartbeat("SLATE")
+        assert _poll(page)["health"]["level"] == "black"
+        assert page.evaluate("window.__hudSmoke.audioStarts") == 4
+        page.locator("[data-hud-sound]").click()
         for _ in range(8):
             fixture.heartbeat("LIVE")
             status = _poll(page)

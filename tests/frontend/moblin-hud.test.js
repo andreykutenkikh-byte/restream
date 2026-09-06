@@ -474,6 +474,35 @@ test("WebAudio is created only by an explicit user-triggered toggle", async () =
   assert.deepEqual(played, [660, 330, 330, 220, 220, 220]);
 });
 
+test("confirmed alarms after a rendered unknown state are not suppressed as first render", () => {
+  for (const level of ["yellow", "red", "black"]) {
+    assert.equal(shouldSoundTransition(null, level, 1000), false);
+    assert.equal(shouldSoundTransition("unknown", level, 1000), true);
+    assert.equal(shouldSoundTransition(level, level, 2000), false);
+    assert.equal(shouldSoundTransition(level, "unknown", 2000), false);
+    assert.equal(shouldSoundTransition("unknown", level, 2000, 1000, ALERT_COOLDOWN_MS, level), false);
+  }
+  assert.equal(shouldSoundTransition(null, "unknown", 1000), false);
+  assert.equal(shouldSoundTransition("unknown", "green", 2000), false);
+  assert.equal(shouldSoundTransition("unknown", "unknown", 2000), false);
+  assert.equal(shouldSoundTransition("unknown", "black", 2000, 1000, ALERT_COOLDOWN_MS, "red"), true);
+});
+
+test("unknown-to-failure audio still requires opt-in and honors mute", async () => {
+  let now = 1000;
+  const audio = new AlertAudio({ now: () => now });
+  const played = [];
+  audio.play = level => { played.push(level); };
+  assert.equal(audio.notify("unknown", "black"), false);
+  audio.enabled = true;
+  audio.mute();
+  assert.equal(audio.notify("unknown", "black"), false);
+  now += MUTE_DURATION_MS;
+  assert.equal(audio.notify("unknown", "black"), true);
+  assert.equal(audio.notify("black", "black"), false);
+  assert.deepEqual(played, ["black"]);
+});
+
 function ordinaryScriptWindow({ hash = "", paired = false, readyState = "complete" } = {}) {
   const listeners = (target) => {
     const handlers = new Map();

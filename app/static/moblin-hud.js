@@ -212,7 +212,9 @@
   }
 
   function shouldSoundTransition(previousLevel, nextLevel, now, lastAlertAt = null, cooldownMs = ALERT_COOLDOWN_MS, lastAlertLevel = null) {
-    const severity = { green: 0, yellow: 1, red: 2, black: 3 };
+    // A rendered warm-up/unknown state is not the first render (null).
+    // Confirmed failure during warm-up must still alert; recovery to green does not.
+    const severity = { unknown: 0, green: 0, yellow: 1, red: 2, black: 3 };
     if (!(previousLevel in severity) || !(nextLevel in severity)) return false;
     if (severity[nextLevel] <= severity[previousLevel]) return false;
     return lastAlertAt === null
