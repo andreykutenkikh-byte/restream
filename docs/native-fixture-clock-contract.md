@@ -81,6 +81,14 @@ and wait for only two following IDRs are unchanged. The overall work budget is
 previous 110. This adds bounded measurement work, not time for a failing reader;
 owned-process cleanup retains its separate ten-second maximum.
 
+Pinned Linux [CI 34049534760](https://github.com/andreykutenkikh-byte/restream/actions/runs/34049534760)
+on `3987e8f` subsequently passed the complete independent counterfactual: the old
+clock reached its expected 15-second timeout with 61 growing frames at transport
+rate 0.296917; the repaired clock delivered 90 frames by 5.222 seconds at rate 1.0,
+with the full format/GOP/PTS/DTS/A/V/decode gate and owned cleanup passing. Native
+rollback no longer prevents this independent test. This was not a full green CI:
+the main native scenario failed separately, as documented below.
+
 A local paired execution with MediaMTX 1.20.1 and FFmpeg 5.1.2 passed the corrected
 measurement: the old clock timed out at the unchanged reader deadline with 72
 growing frames (transport rate 0.285732); the repaired clock captured all 90
@@ -212,3 +220,39 @@ identity change or metrics failure, attempt limits and cooldown are unchanged.
 Output-fallback without corroboration and FFmpeg/PTS errors alone still cannot
 authorize a reset. This candidate normalizer intentionally differs from the
 previously audited deployed file; it has not been deployed to production.
+
+## Hard-cut failure: distinguish transport growth from packet delivery
+
+The same `3987e8f` Linux run failed the existing eight-second hard-cut gate at
+`outage-normal`. Thirty-nine complete metrics samples covered cut+0.163–7.828 s,
+with a maximum observation gap of 0.205 s. Unique SRT transport bytes were flat;
+ingest-path growth ended in the observed 1.776–1.980 s interval. Normalizer and
+sink RTMP connection bytes still grew in the 7.625–7.828 s interval. No watchdog
+marker was recorded. Those counters include protocol framing and audio/video;
+they do not establish seven seconds of buffered video or an exclusive cause.
+
+Two bounded local probes used actual SRT → RTSP → normalizer commands, repeated
+child replacements and packet traces. One also crossed the current 72-second
+source loop and ran three unchanged 90-frame readers. Both stopped ordinary
+video/audio delivery at about two seconds after the cut, with only terminal
+packets on natural closure. They did not reproduce the CI tail or demonstrate
+uptime-scale padding from `first_pts=0`. No resampler, watchdog, eight-second
+pre-expiry gate or recovery deadline is changed on that hypothesis.
+
+Failure-only diagnosis now reuses the existing `capture.flv` and its existing
+file-size observations. A bounded FLV header walk separates AVC/AAC data tags,
+excluding configuration/end/script tags, and records only counts, relative
+observed-append times and PTS spans. Payloads are skipped, never logged. The scan
+runs only after a failure, with a 65,536-tag / three-second cap; unsafe, malformed
+or uncorrelatable evidence is unknown. A partial final tag is excluded and marked
+explicitly: counts cover the completed prefix, so zero is not proof of no packet
+in that partial tail. These are capture-branch observations, not exact normalizer
+emission timestamps or a fresh decode test. The path's media-byte counter is also
+extracted from the already-fetched metrics response, separately from connection
+bytes. No extra network request, media reader or runtime FFmpeg option is added.
+
+Failure checkpoints use compact JSON to retain this allowlisted evidence under
+the unchanged 2 KiB loader limit. Atomic writing, correlation, root-only files,
+the 64 KiB result limit and all pass/fail media/recovery assertions are preserved.
+New diagnostic evidence still requires exact-head Linux execution; this is not
+a claim that the unresolved hard-cut failure has been repaired.

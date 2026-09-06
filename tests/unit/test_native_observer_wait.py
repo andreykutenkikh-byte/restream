@@ -106,7 +106,9 @@ def test_observer_timeout_retains_last_distinct_flags_and_safe_checkpoint(monkey
         {"job_id": "test-job", "stage": "outage-normal", "elapsed_seconds": 2.0},
     )
     monkeypatch.setitem(state, "mark_self_test_stage", lambda *_args, **_kwargs: None)
-    monkeypatch.setitem(state, "atomic_json", lambda _path, value: checkpoints.append(value))
+    monkeypatch.setitem(
+        state, "atomic_json", lambda _path, value, **_kwargs: checkpoints.append(value)
+    )
     state["persist_self_test_failure_progress"](failure)
     checkpoint = checkpoints[0]
     assert safe_self_test_progress(checkpoint, job_id="test-job") == {
@@ -429,7 +431,9 @@ def test_outage_flow_checkpoint_keeps_fixed_two_kib_limit_and_exception_identity
         ),
     )
     monkeypatch.setitem(state, "mark_self_test_stage", lambda *_args, **_kwargs: None)
-    monkeypatch.setitem(state, "atomic_json", lambda _path, value: checkpoints.append(value))
+    monkeypatch.setitem(
+        state, "atomic_json", lambda _path, value, **_kwargs: checkpoints.append(value)
+    )
     state["persist_self_test_failure_progress"](failure)
     checkpoint = checkpoints[-1]
     checkpoint["failure_lines"] = [20000] * 8
@@ -641,7 +645,9 @@ def test_initial_live_gate_persists_only_exact_fixed_reason(monkeypatch, gate, r
         },
     )
     monkeypatch.setitem(state, "mark_self_test_stage", lambda *_args, **_kwargs: None)
-    monkeypatch.setitem(state, "atomic_json", lambda _path, value: checkpoints.append(value))
+    monkeypatch.setitem(
+        state, "atomic_json", lambda _path, value, **_kwargs: checkpoints.append(value)
+    )
     state["persist_self_test_failure_progress"](caught.value)
     checkpoint = checkpoints[-1]
     assert checkpoint["failure_initial_live_reason"] == reason

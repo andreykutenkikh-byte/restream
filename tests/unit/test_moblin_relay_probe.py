@@ -782,7 +782,7 @@ def test_failure_checkpoint_contains_source_line_numbers_not_exception_text(
     monkeypatch.setitem(state, "SELF_TEST_STAGE_FILE", "configured")
     monkeypatch.setitem(state, "SELF_TEST_LAST_PROGRESS", checkpoint)
     monkeypatch.setitem(state, "mark_self_test_stage", lambda *args, **kwargs: None)
-    monkeypatch.setitem(state, "atomic_json", lambda path, value: writes.append(value))
+    monkeypatch.setitem(state, "atomic_json", lambda path, value, **_kwargs: writes.append(value))
     # Give only the inner test-generated frame the exact self-test filename.
     # The outer pytest frame and exception text must not be serialized.
     code = compile("raise RuntimeError('PRIVATE_TRACEBACK_FIXTURE')", str(SELF_TEST), "exec")

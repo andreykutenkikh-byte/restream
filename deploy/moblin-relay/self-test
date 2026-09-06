@@ -441,7 +441,9 @@ def persist_self_test_failure_progress(exc: BaseException) -> None:
         and SELF_TEST_INITIAL_LIVE_FAILURE[1] in INITIAL_LIVE_FAILURE_REASONS
     ):
         progress["failure_initial_live_reason"] = SELF_TEST_INITIAL_LIVE_FAILURE[1]
-    atomic_json(SELF_TEST_PROGRESS_FILE, progress)
+    # Preserve the existing 2 KiB checkpoint limit with structured failure
+    # evidence, not indentation. Normal progress/results remain human-readable.
+    atomic_json(SELF_TEST_PROGRESS_FILE, progress, compact=True)
 
 
 def validate_preview_renderer_contract() -> dict:
@@ -812,13 +814,17 @@ def service_is_active() -> bool:
     )
 
 
-def atomic_json(path: Path, value: dict, mode: int = 0o600) -> None:
+def atomic_json(path: Path, value: dict, mode: int = 0o600, *, compact: bool = False) -> None:
     fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary_path = Path(temporary)
     try:
         os.fchmod(fd, mode)
         with os.fdopen(fd, "w", encoding="utf-8") as fp:
-            json.dump(value, fp, ensure_ascii=True, sort_keys=True, indent=2)
+            json.dump(
+                value, fp, ensure_ascii=True, sort_keys=True,
+                indent=None if compact else 2,
+                separators=(",", ":") if compact else None,
+            )
             fp.write("\n")
             fp.flush()
             os.fsync(fp.fileno())
@@ -1140,6 +1146,7 @@ class Observer(threading.Thread):
                 "normalized": False,
                 "normalized_ids": [],
                 "normalized_bytes": None,
+                "normalized_media_bytes": None,
                 "forward": False,
                 "sink_ids": [],
                 "sink_bytes": None,
@@ -1208,6 +1215,14 @@ class Observer(threading.Thread):
                 ]
                 if len(normalizer_counters) == 1:
                     sample["normalized_bytes"] = normalizer_counters[0]
+                normalized_media_counters = [
+                    int(value)
+                    for labels, value in parse_metrics(dut_metrics, "paths_inbound_bytes")
+                    if labels.get("name") == OUTPUT_PATH and labels.get("state") == "ready"
+                    and value >= 0 and value.is_integer()
+                ]
+                if len(normalized_media_counters) == 1:
+                    sample["normalized_media_bytes"] = normalized_media_counters[0]
                 sample["live"] = sample["ingest_live"] and sample["normalized"]
             except OSError:
                 pass
@@ -1347,6 +1362,159 @@ class Observer(threading.Thread):
                     (latest[1] - first[1]) / self.clock_ticks / (latest[0] - first[0]) * 100.0
                 )
         return averages
+
+
+def capture_track_failure_summary(
+    capture: Path, samples: list[dict], started: float, finished: float
+) -> dict:
+    """Inspect only FLV framing after failure; append observations are not emission times."""
+    unknown = {"state": "unknown"}
+    descriptor = None
+    deadline = time.monotonic() + 3.0
+    try:
+        if (
+            type(started) not in {int, float} or type(finished) not in {int, float}
+            or not math.isfinite(started) or not math.isfinite(finished)
+            or not 0 <= finished - started <= 660
+            or not isinstance(samples, list) or len(samples) > 16_384
+            or not hasattr(os, "O_NOFOLLOW")
+        ):
+            return unknown
+        window = []
+        for sample in samples:
+            if time.monotonic() >= deadline or not isinstance(sample, dict):
+                return unknown
+            observed = sample.get("t")
+            if type(observed) not in {int, float} or not math.isfinite(observed):
+                return unknown
+            if started <= observed <= finished:
+                size = sample.get("capture_size")
+                if sample.get("capture_ok") is not True or type(size) is not int or not 13 <= size <= 2**31:
+                    return unknown
+                window.append((observed, size))
+        window.sort()
+        if len(window) < 2 or any(
+            right[0] <= left[0] or right[1] < left[1]
+            for left, right in zip(window, window[1:])
+        ):
+            return unknown
+        baseline, limit = window[0][1], window[-1][1]
+        parent = os.lstat(capture.parent)
+        path_metadata = os.lstat(capture)
+        if (
+            not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0
+            or stat.S_IMODE(parent.st_mode) & 0o077
+        ):
+            return unknown
+
+        def trusted(metadata) -> bool:
+            return bool(
+                stat.S_ISREG(metadata.st_mode) and metadata.st_uid == 0
+                and metadata.st_nlink == 1 and not stat.S_IMODE(metadata.st_mode) & 0o022
+                and limit <= metadata.st_size <= 2**31
+            )
+
+        if not trusted(path_metadata):
+            return unknown
+        identity = (path_metadata.st_dev, path_metadata.st_ino)
+        descriptor = os.open(
+            capture,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0),
+        )
+        opened = os.fstat(descriptor)
+        if not trusted(opened) or identity != (opened.st_dev, opened.st_ino):
+            return unknown
+
+        def read_at(offset: int, length: int) -> bytes:
+            if time.monotonic() >= deadline or offset + length > limit:
+                raise ValueError("capture framing unavailable")
+            os.lseek(descriptor, offset, os.SEEK_SET)
+            value = os.read(descriptor, length)
+            if len(value) != length:
+                raise ValueError("capture framing incomplete")
+            return value
+
+        if read_at(0, 9) != b"FLV\x01\x05\x00\x00\x00\x09" or read_at(9, 4) != b"\x00" * 4:
+            return unknown
+        offset, tags, sample_index = 13, 0, 1
+        partial_tail = False
+        tracks = {"video": {"packets": 0}, "audio": {"packets": 0}}
+        first_pts = {}
+        last_pts = {}
+        while offset < limit:
+            if tags >= 65_536:
+                return unknown
+            if limit - offset < 11:
+                partial_tail = True
+                break
+            header = read_at(offset, 11)
+            kind, size = header[0], int.from_bytes(header[1:4], "big")
+            if kind not in {8, 9, 18} or header[8:11] != b"\x00" * 3:
+                return unknown
+            end = offset + 11 + size + 4
+            if end > limit:
+                partial_tail = True
+                break
+            if int.from_bytes(read_at(end - 4, 4), "big") != size + 11:
+                return unknown
+            track, pts = None, None
+            dts = int.from_bytes(header[4:7], "big") + (header[7] << 24)
+            if kind == 9:
+                if size < 5:
+                    return unknown
+                prefix = read_at(offset + 11, 5)
+                if prefix[0] & 15 != 7 or not 1 <= prefix[0] >> 4 <= 5 or prefix[1] not in {0, 1, 2}:
+                    return unknown
+                if prefix[1] == 1:
+                    if size == 5:
+                        return unknown
+                    track = "video"
+                    pts = (dts + int.from_bytes(prefix[2:5], "big", signed=True)) / 1000
+            elif kind == 8:
+                if size < 2:
+                    return unknown
+                prefix = read_at(offset + 11, 2)
+                if prefix[0] >> 4 != 10 or prefix[1] not in {0, 1}:
+                    return unknown
+                if prefix[1] == 1:
+                    if size == 2:
+                        return unknown
+                    track, pts = "audio", dts / 1000
+            if track is not None and end > baseline:
+                while window[sample_index][1] < end:
+                    sample_index += 1
+                if track in last_pts and pts < last_pts[track]:
+                    return unknown
+                first_pts.setdefault(track, pts)
+                last_pts[track] = pts
+                span = pts - first_pts[track]
+                if not math.isfinite(span) or not 0 <= span <= 660:
+                    return unknown
+                tracks[track]["packets"] += 1
+                tracks[track]["last_observed_seconds"] = round(window[sample_index][0] - started, 3)
+                tracks[track]["pts_span_seconds"] = round(span, 3)
+            offset, tags = end, tags + 1
+        for metadata in (os.fstat(descriptor), os.lstat(capture)):
+            if (
+                not trusted(metadata) or identity != (metadata.st_dev, metadata.st_ino)
+                or metadata.st_size < opened.st_size
+            ):
+                return unknown
+        if time.monotonic() >= deadline:
+            return unknown
+        return {
+            "state": "known",
+            "partial_tail": partial_tail,
+            "sample_window_seconds": [round(window[0][0] - started, 3), round(window[-1][0] - started, 3)],
+            **tracks,
+        }
+    except (OSError, ValueError, TypeError, IndexError, OverflowError):
+        return unknown
+    finally:
+        if descriptor is not None:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
 
 
 class CaptureObserver(threading.Thread):
@@ -1493,6 +1661,8 @@ def record_outage_flow_failure(
     finished: float,
     log_descriptor: int,
     log_offset: int,
+    *,
+    capture_observer: CaptureObserver | None = None,
 ) -> None:
     """Retain sampled growth intervals, not precise packet times or raw counters."""
     global SELF_TEST_FLOW_FAILURE
@@ -1531,12 +1701,17 @@ def record_outage_flow_failure(
             right["finished"] - left["t"] for left, right in zip(samples, samples[1:], strict=False)
         )
         value["max_observation_gap_seconds"] = round(max(gaps), 3)
-    for name, counter, identity, metric in (
+    channel_fields = [
         ("ingest_path", "ingest_bytes", "ingest_ids", "dut_metrics_ok"),
         ("ingest_transport", "ingest_transport_bytes", "ingest_ids", "dut_metrics_ok"),
         ("normalized", "normalized_bytes", "normalized_ids", "dut_metrics_ok"),
         ("sink", "sink_bytes", "sink_ids", "sink_metrics_ok"),
-    ):
+    ]
+    if any("normalized_media_bytes" in sample for sample in samples):
+        channel_fields.append(
+            ("normalized_path", "normalized_media_bytes", "normalized_ids", "dut_metrics_ok")
+        )
+    for name, counter, identity, metric in channel_fields:
         channel = {"state": "unknown"}
         value["channels"][name] = channel
         if len(samples) < 2:
@@ -1576,6 +1751,12 @@ def record_outage_flow_failure(
             if marker in lines
         }
         value["log_ok"] = True
+    if capture_observer is not None:
+        with capture_observer.lock:
+            captured = [dict(item) for item in capture_observer.samples]
+        value["capture_tracks"] = capture_track_failure_summary(
+            capture_observer.capture, captured, started, finished,
+        )
     SELF_TEST_FLOW_FAILURE = (failure, value)
 
 
@@ -5730,6 +5911,7 @@ def main() -> int:
                     record_outage_flow_failure(
                         exc, observer, same_session_started, time.monotonic(),
                         transition_log_descriptor, pause_log_offset,
+                        capture_observer=capture_observer,
                     )
                 raise
             mark_self_test_stage("stall-capture")
@@ -5908,6 +6090,7 @@ def main() -> int:
                     record_outage_flow_failure(
                         exc, observer, stuck_started, time.monotonic(),
                         stuck_log_descriptor, stuck_log_offset,
+                        capture_observer=capture_observer,
                     )
                 raise
             pre_reset = observer.checked_snapshot("persistent-stall pre-reset proof")
@@ -6375,6 +6558,7 @@ def main() -> int:
                     record_outage_flow_failure(
                         exc, observer, outage_started, time.monotonic(),
                         transition_log_descriptor, outage_reset_log_offset,
+                        capture_observer=capture_observer,
                     )
                 raise
             to_slate = float(detached["t"]) - outage_started

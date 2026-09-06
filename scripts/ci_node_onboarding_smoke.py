@@ -472,10 +472,56 @@ def safe_strict_sink_reader_timings(value: Any) -> list[dict[str, Any]] | None:
     return result
 
 
+def _safe_capture_tracks(value: Any, elapsed: float) -> dict[str, Any] | None:
+    if value == {"state": "unknown"}:
+        return {"state": "unknown"}
+    if (
+        not isinstance(value, dict)
+        or value.keys() != {"state", "video", "audio", "sample_window_seconds", "partial_tail"}
+        or value["state"] != "known"
+        or type(value["partial_tail"]) is not bool
+    ):
+        return None
+    window = value["sample_window_seconds"]
+    if (
+        not isinstance(window, list)
+        or len(window) != 2
+        or not all(_diagnostic_seconds(n, elapsed) for n in window)
+        or not window[0] <= window[1]
+    ):
+        return None
+    result: dict[str, Any] = {
+        "state": "known",
+        "sample_window_seconds": list(window),
+        "partial_tail": value["partial_tail"],
+    }
+    for name in ("video", "audio"):
+        track = value[name]
+        if not isinstance(track, dict) or type(track.get("packets")) is not int:
+            return None
+        count = track["packets"]
+        if not 0 <= count <= 65536:
+            return None
+        required = (
+            {"packets", "last_observed_seconds", "pts_span_seconds"} if count else {"packets"}
+        )
+        if track.keys() != required:
+            return None
+        if count and (
+            not _diagnostic_seconds(track["last_observed_seconds"], elapsed)
+            or not window[0] <= track["last_observed_seconds"] <= window[1]
+            or not _diagnostic_seconds(track["pts_span_seconds"], 660)
+        ):
+            return None
+        result[name] = dict(track)
+    return result
+
+
 def _safe_failure_flow(value: Any) -> dict[str, Any] | None:
     """Project only outage-local, identity-free sampled counter evidence."""
     required = {"elapsed_seconds", "sample_count", "log_ok", "markers", "channels"}
-    optional = {"sample_window_seconds", "max_observation_gap_seconds"}
+    windows = {"sample_window_seconds", "max_observation_gap_seconds"}
+    optional = windows | {"capture_tracks"}
     if not isinstance(value, dict) or not required <= value.keys() <= required | optional:
         return None
     elapsed, count = value["elapsed_seconds"], value["sample_count"]
@@ -501,20 +547,18 @@ def _safe_failure_flow(value: Any) -> dict[str, Any] | None:
 
     if count:
         if (
-            not optional <= value.keys()
+            not windows <= value.keys()
             or not interval(value["sample_window_seconds"])
             or not _diagnostic_seconds(value["max_observation_gap_seconds"], elapsed)
         ):
             return None
-    elif optional & value.keys():
+    elif windows & value.keys():
         return None
     channels = value["channels"]
-    if not isinstance(channels, dict) or channels.keys() != {
-        "ingest_path",
-        "ingest_transport",
-        "normalized",
-        "sink",
-    }:
+    base_channels = {"ingest_path", "ingest_transport", "normalized", "sink"}
+    if not isinstance(channels, dict) or not (
+        base_channels <= channels.keys() <= base_channels | {"normalized_path"}
+    ):
         return None
     projected_channels: dict[str, Any] = {}
     for name, channel in channels.items():
@@ -546,6 +590,11 @@ def _safe_failure_flow(value: Any) -> dict[str, Any] | None:
     result: dict[str, Any] = dict(value)
     result["markers"] = dict(value["markers"])
     result["channels"] = projected_channels
+    if "capture_tracks" in value:
+        tracks = _safe_capture_tracks(value["capture_tracks"], elapsed)
+        if tracks is None:
+            return None
+        result["capture_tracks"] = tracks
     if count:
         result["sample_window_seconds"] = list(value["sample_window_seconds"])
     return result
