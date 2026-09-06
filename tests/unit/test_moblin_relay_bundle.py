@@ -2536,10 +2536,17 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     helper_block = source.split("def stop_primary_srt_source", 1)[1].split(
         "def reject_with_helper", 1
     )[0]
+    # Cut the transport before cleanup consumes the outage budget. The actual
+    # nested-function regression in test_native_source_shutdown_order.py models
+    # delayed feeder cleanup and verifies failure paths retain owned processes.
     assert (
-        helper_block.index("feeder.finish()")
-        < helper_block.index("safe_stop(primary_helper, force=True)")
+        helper_block.index("safe_stop(primary_helper, force=True)")
+        < helper_block.index("primary_helper = None")
+        < helper_block.index("feeder.finish()")
+        < helper_block.index("feeder = None")
         < helper_block.index("safe_stop(publisher, force=True)")
+        < helper_block.index("publisher = None")
+        < helper_block.index("wait_ports_released(")
     )
     assert "feeder = None" in helper_block
     assert "primary_helper = None" in helper_block
