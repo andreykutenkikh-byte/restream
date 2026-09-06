@@ -244,14 +244,28 @@ def validate_loop_packets(payload, duration):
         ),
         "source seam video contract changed",
     )
-    seam = duration * 30
-    require(
-        duration in (4, 8) and seam < len(packets) <= seam + 8, "source seam packet count failed"
-    )
+    require(duration in (4, 8) and isinstance(packets, list), "source seam input bounds failed")
     pts = [float(packet["pts_time"]) for packet in packets]
     require(
         all(math.isfinite(value) and 0 <= value <= 20 for value in pts),
         "source seam PTS bounds failed",
+    )
+    print(
+        json.dumps(
+            {
+                "source_loop_probe": {
+                    "duration_seconds": duration,
+                    "video_packets": len(packets),
+                    "first_pts_seconds": round(pts[0], 6) if pts else None,
+                    "last_pts_seconds": round(pts[-1], 6) if pts else None,
+                }
+            }
+        ),
+        flush=True,
+    )
+    seam = duration * 30
+    require(
+        duration in (4, 8) and seam < len(packets) <= seam + 8, "source seam packet count failed"
     )
     require(
         all(packet["flags"] in ("K_", "__") for packet in packets),

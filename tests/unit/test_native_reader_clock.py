@@ -167,6 +167,22 @@ def test_source_seam_accepts_only_original_negative_and_aligned_positive(
     assert evidence["seam_error_seconds"] == pytest.approx(seam_error, abs=1e-6)
 
 
+def test_source_seam_count_failure_retains_only_bounded_numeric_evidence(helper, capsys):
+    data = json.loads(loop_probe_payload(4))
+    data["packets"] = data["packets"][:120]
+    data["secret"] = "rtmp://secret.invalid/key"
+    with pytest.raises(helper["ProbeFailure"], match="packet count failed"):
+        helper["validate_loop_packets"](json.dumps(data), 4)
+    assert json.loads(capsys.readouterr().out) == {
+        "source_loop_probe": {
+            "duration_seconds": 4,
+            "video_packets": 120,
+            "first_pts_seconds": 1.4,
+            "last_pts_seconds": 5.366667,
+        }
+    }
+
+
 @pytest.mark.parametrize(
     "change",
     ["no_old_seam", "bad_new_seam", "extra_gap", "gop", "profile", "count", "bounds", "size"],
