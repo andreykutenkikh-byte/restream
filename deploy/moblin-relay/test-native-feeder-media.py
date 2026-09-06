@@ -231,6 +231,13 @@ def probe_packets(capture, case):
 def main():
     if os.environ.get("CI_NATIVE_FEEDER_CLOCK") != "isolated-fixture":
         raise ProbeFailure("real media clock probe requires the isolated CI fixture")
+    for path, name in (
+        (SELF_TEST, "staged self-test"),
+        (Path("/usr/bin/ffmpeg"), "FFmpeg"),
+        (Path(FFPROBE), "FFprobe"),
+    ):
+        if not path.is_file():
+            raise ProbeFailure(f"isolated fixture prerequisite missing: {name}")
     with tempfile.TemporaryDirectory(prefix="native-feeder-clock-") as temporary:
         directory = Path(temporary)
         transport, payload = make_transport(directory)

@@ -135,8 +135,12 @@ jobs:
       - name: Native fixture media clock under scheduler jitter
         shell: bash
         run: |
+          # /tmp is tmpfs: Docker's archive/cp path cannot stage its live mount.
+          # Write through exec and verify the exact bytes inside the container.
           docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml \
-            cp deploy/moblin-relay/self-test ci-ssh-target:/tmp/adojapan-ci-clock-self-test.py
+            exec -T ci-ssh-target python3 -c \
+            'import pathlib,sys; data=sys.stdin.buffer.read(); target=pathlib.Path("/tmp/adojapan-ci-clock-self-test.py"); target.write_bytes(data); target.chmod(0o600); assert data and target.read_bytes() == data' \
+            < deploy/moblin-relay/self-test
           docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml \
             exec -T -e CI_NATIVE_FEEDER_CLOCK=isolated-fixture ci-ssh-target \
             python3 - < deploy/moblin-relay/test-native-feeder-media.py
