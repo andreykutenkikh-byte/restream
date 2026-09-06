@@ -184,10 +184,34 @@ def test_bundle_loader_has_a_fixed_reviewed_allowlist() -> None:
     assert "deploy/hk-relay-agent/install.sh" in names
     assert "relay_agent/__init__.py" in names
     assert "relay_agent/broker.py" in names
+    assert "relay_agent/history.py" in names
     assert "deploy/moblin-relay/README.md" not in names
     assert "deploy/moblin-relay/node.json.example" not in names
     assert "deploy/moblin-relay/test-render-config.py" not in names
     assert all(payload for payload in bundle.values())
+
+
+def test_native_bundle_contains_every_internal_agent_import() -> None:
+    """An existing host import cannot hide a missing module on a fresh server."""
+    root = Path(__file__).resolve().parents[2]
+    bundle = load_relay_bundle(root)
+    names = {str(path) for path in bundle}
+    for path, payload in bundle.items():
+        if path.suffix != ".py":
+            continue
+        for node in ast.walk(ast.parse(payload)):
+            modules: list[str] = []
+            if isinstance(node, ast.Import):
+                modules.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                if node.level:
+                    modules.append("relay_agent." + node.module)
+                else:
+                    modules.append(node.module)
+            for module in modules:
+                if module.startswith("relay_agent."):
+                    required = module.replace(".", "/") + ".py"
+                    assert required in names, f"{path} imports missing bundled module {required}"
 
 
 async def test_prepare_stages_token_only_as_a_mode_0600_sftp_payload() -> None:

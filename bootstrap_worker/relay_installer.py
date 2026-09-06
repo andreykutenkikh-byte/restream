@@ -89,6 +89,7 @@ _AGENT_MODULE_PAYLOADS = (
     "broker.py",
     "client.py",
     "errors.py",
+    "history.py",
     "journal.py",
     "metrics.py",
     "models.py",

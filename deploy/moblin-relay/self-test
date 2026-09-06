@@ -2661,9 +2661,12 @@ class PacedMPEGTSFeeder(threading.Thread):
                         if now < deadline:
                             self._condition.wait(deadline - now)
                             continue
-                        if now > deadline:
-                            # Drop accumulated wall-clock lag, never transport bytes.
-                            # The following datagram remains one full interval away.
+                        if now >= deadline + len(pending) / self._bytes_per_second:
+                            # Preserve the media clock through ordinary wakeup jitter.
+                            # Rebasing every late wakeup would add that lateness to
+                            # every packet interval and continuously slow the source.
+                            # Once a complete interval is missed, discard the lag so
+                            # a delayed sender cannot flush a catch-up packet burst.
                             pacing_anchor += now - deadline
                     try:
                         sent = sender.sendto(pending, self._destination)
