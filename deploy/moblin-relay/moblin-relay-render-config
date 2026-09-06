@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import base64
+import contextlib
+import errno
 import grp
 import hashlib
 import json
@@ -12,7 +14,7 @@ import pwd
 import re
 import secrets
 import stat
-import tempfile
+import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -30,6 +32,7 @@ CONTROL_API_USER = "relay-recovery"
 CONTROL_TOKEN_PATTERN = re.compile(rb"[A-Za-z0-9_-]{43}\Z")
 PREVIEW_TOKEN_PATTERN = re.compile(rb"[A-Za-z0-9._~+/=-]{32,512}\Z")
 PREVIEW_TOKEN_MAX_FILE_BYTES = 513
+RUNTIME_TEMP_PATTERN = re.compile(r"\.(?:mediamtx\.json|control-api\.token)\.[0-9a-f]{32}\Z")
 
 
 def die(message: str) -> None:
@@ -225,28 +228,133 @@ def generate_control_token() -> bytearray:
     return token
 
 
-def atomic_write_runtime_file(path: Path, payload: bytes, relay_gid: int) -> None:
-    """Atomically install one root/relay runtime file into the tmpfs directory."""
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=RUNTIME_DIR)
-    temporary_path = Path(temporary)
+def open_runtime_directory(
+    relay_gid: int, *, create: bool = False, for_cleanup: bool = False
+) -> int | None:
+    """Pin a root-owned directory below a root-owned, non-writable parent."""
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent_fd = os.open(RUNTIME_DIR.parent, flags)
     try:
-        os.fchmod(fd, 0o640)
-        os.fchown(fd, 0, relay_gid)
+        parent = os.fstat(parent_fd)
+        if parent.st_uid != 0 or stat.S_IMODE(parent.st_mode) & 0o022:
+            die("unsafe relay runtime parent permissions")
+        created = False
+        if create:
+            try:
+                os.mkdir(RUNTIME_DIR.name, mode=0o750, dir_fd=parent_fd)
+                created = True
+            except FileExistsError:
+                pass
+        try:
+            before = os.stat(RUNTIME_DIR.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            if not create:
+                return None
+            raise
+        if not stat.S_ISDIR(before.st_mode) or before.st_uid != 0:
+            die("unsafe relay runtime directory permissions")
+        directory_fd = os.open(RUNTIME_DIR.name, flags, dir_fd=parent_fd)
+        try:
+            opened = os.fstat(directory_fd)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                die("relay runtime directory changed while opening")
+            if created:
+                os.fchown(directory_fd, 0, relay_gid)
+                os.fchmod(directory_fd, 0o750)
+                opened = os.fstat(directory_fd)
+            # Cleanup also handles a renderer killed between mkdir and fchown.
+            allowed_groups = {0, relay_gid} if for_cleanup else {relay_gid}
+            allowed_modes = {0o700, 0o750} if for_cleanup else {0o750}
+            if (
+                opened.st_uid != 0
+                or opened.st_gid not in allowed_groups
+                or stat.S_IMODE(opened.st_mode) not in allowed_modes
+            ):
+                die("unsafe relay runtime directory permissions")
+            return directory_fd
+        except BaseException:
+            os.close(directory_fd)
+            raise
+    finally:
+        os.close(parent_fd)
+
+
+def cleanup_runtime_files(relay_gid: int) -> None:
+    """Remove only our validated runtime secrets, including interrupted writes."""
+    directory_fd = open_runtime_directory(relay_gid, for_cleanup=True)
+    if directory_fd is None:
+        return
+    try:
+        unsafe_entry = False
+        for name in os.listdir(directory_fd):
+            is_temporary = RUNTIME_TEMP_PATTERN.fullmatch(name) is not None
+            if name not in {RUNTIME_FILE.name, CONTROL_TOKEN_FILE.name} and not is_temporary:
+                continue
+            entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            # A temporary file may precede fchown/fchmod; payload writes follow
+            # both. Final secret files retain the exact root/relay contract.
+            allowed_groups = {0, relay_gid} if is_temporary else {relay_gid}
+            allowed_modes = {0o600, 0o640} if is_temporary else {0o640}
+            if (
+                not stat.S_ISREG(entry.st_mode)
+                or entry.st_uid != 0
+                or entry.st_gid not in allowed_groups
+                or stat.S_IMODE(entry.st_mode) not in allowed_modes
+                or entry.st_nlink != 1
+            ):
+                unsafe_entry = True
+                continue
+            os.unlink(name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+        if unsafe_entry:
+            die("unsafe relay runtime file during cleanup")
+        if os.listdir(directory_fd):
+            die("unexpected files remain in relay runtime directory")
+        # The fixed parent is root-owned and not writable by the relay account.
+        before = RUNTIME_DIR.lstat()
+        opened = os.fstat(directory_fd)
+        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+            die("relay runtime directory changed during cleanup")
+        try:
+            RUNTIME_DIR.rmdir()
+        except OSError as exc:
+            # ReadOnlyPaths makes this directory a bind mount for ExecStopPost.
+            # The secrets are already gone; its empty mount point can remain.
+            if exc.errno != errno.EBUSY or os.listdir(directory_fd):
+                raise
+            # Repair only this proven-empty directory after partial creation so
+            # the next start cannot be blocked by a pre-fchown interruption.
+            os.fchown(directory_fd, 0, relay_gid)
+            os.fchmod(directory_fd, 0o750)
+    finally:
+        os.close(directory_fd)
+
+
+def atomic_write_runtime_file(
+    path: Path, payload: bytes, relay_gid: int, directory_fd: int
+) -> None:
+    """Atomically install one root/relay runtime file into the tmpfs directory."""
+    if path not in {RUNTIME_FILE, CONTROL_TOKEN_FILE} or path.parent != RUNTIME_DIR:
+        die("invalid relay runtime file")
+    temporary = f".{path.name}.{secrets.token_hex(16)}"
+    fd = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o640,
+        dir_fd=directory_fd,
+    )
+    try:
         with os.fdopen(fd, "wb") as fp:
+            os.fchmod(fp.fileno(), 0o640)
+            os.fchown(fp.fileno(), 0, relay_gid)
             fp.write(payload)
             fp.flush()
             os.fsync(fp.fileno())
-        os.replace(temporary_path, path)
-        directory_fd = os.open(RUNTIME_DIR, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        os.replace(temporary, path.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.fsync(directory_fd)
     finally:
-        try:
-            temporary_path.unlink()
-        except FileNotFoundError:
-            pass
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=directory_fd)
 
 
 def build_runtime_config(
@@ -343,9 +451,7 @@ def build_runtime_config(
     }
 
 
-def main() -> None:
-    if os.geteuid() != 0:
-        die("runtime config renderer must run as root")
+def render_runtime_config(relay_gid: int) -> None:
     data = validate_secret_file()
     try:
         srt = data["srt"]
@@ -366,13 +472,13 @@ def main() -> None:
     validate_youtube(url, key)
 
     preview_token = read_preview_token()
-    relay_gid = grp.getgrnam("moblin-relay").gr_gid
-    RUNTIME_DIR.mkdir(mode=0o750, parents=True, exist_ok=True)
-    os.chown(RUNTIME_DIR, 0, relay_gid)
-    os.chmod(RUNTIME_DIR, 0o750)
+    directory_fd = open_runtime_directory(relay_gid, create=True)
+    if directory_fd is None:
+        die("relay runtime directory is missing")
 
-    control_token = generate_control_token()
+    control_token = bytearray()
     try:
+        control_token = generate_control_token()
         config = build_runtime_config(
             user,
             password,
@@ -395,11 +501,28 @@ def main() -> None:
             CONTROL_TOKEN_FILE,
             bytes(control_token) + b"\n",
             relay_gid,
+            directory_fd,
         )
-        atomic_write_runtime_file(RUNTIME_FILE, serialized, relay_gid)
+        atomic_write_runtime_file(RUNTIME_FILE, serialized, relay_gid, directory_fd)
     finally:
+        os.close(directory_fd)
         for index in range(len(control_token)):
             control_token[index] = 0
+
+
+def main() -> None:
+    if os.geteuid() != 0:
+        die("runtime config renderer must run as root")
+    if sys.argv[1:] not in ([], ["--cleanup"]):
+        die("invalid runtime config renderer arguments")
+    try:
+        relay_gid = grp.getgrnam("moblin-relay").gr_gid
+        if sys.argv[1:] == ["--cleanup"]:
+            cleanup_runtime_files(relay_gid)
+        else:
+            render_runtime_config(relay_gid)
+    except (KeyError, OSError):
+        die("relay runtime configuration operation failed")
 
 
 if __name__ == "__main__":

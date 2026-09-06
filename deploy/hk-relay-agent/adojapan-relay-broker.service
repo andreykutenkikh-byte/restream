@@ -34,5 +34,5 @@ RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
-ReadWritePaths=/etc/moblin-relay -/run/lock/moblin-relay -/run/moblin-relay
+ReadWritePaths=/etc/moblin-relay -/run/lock/moblin-relay -/run/moblin-relay /var/lib/adojapan-relay-history
 ReadOnlyPaths=/usr/local/sbin/relayctl /var/lib/moblin-relay/slate.mp4

@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import fcntl
 import ipaddress
 import json
 import os
 import re
+import runpy
 import stat
 import subprocess
 import sys
@@ -30,6 +32,7 @@ SRT_PORT = 8890
 SRT_PATH = "iphone-live"
 MAX_FALLBACK_SRT_HOSTS = 4
 OUTPUT_PATH = "relay-output"
+HISTORY_PROGRAM = Path("/usr/local/lib/adojapan-relay-agent/relay_agent/history.py")
 RTSP_PORT = 8554
 RTMP_PORT = 1935
 CONTROL_API_PORT = 9997
@@ -788,6 +791,29 @@ def classify_incident(message: str) -> tuple[str, str, str] | None:
     """Map an untrusted journal message to fixed, non-sensitive operator text."""
 
     lowered = message.casefold()
+    credential_prefix = "moblin-relay-normalize:credential-check:"
+    credential_at = lowered.find(credential_prefix)
+    if credential_at >= 0:
+        reason = lowered[credential_at + len(credential_prefix) :].strip()
+        reasons = {
+            "missing": "The local recovery credential is missing",
+            "metadata-unavailable": "The local recovery credential metadata cannot be read",
+            "parent-owner-unsafe": "The recovery runtime directory is not owned by root",
+            "file-owner-unsafe": "The recovery credential file is not owned by root",
+            "metadata-unsafe": "The recovery credential permissions or file type are unsafe",
+            "read-denied": "The relay service user cannot open its recovery credential",
+            "file-changed": "The recovery credential changed during validation",
+            "oversized": "The recovery credential file exceeds its allowed size",
+            "read-failed": "The recovery credential could not be read",
+            "format-invalid": "The recovery credential has an invalid format",
+            "unavailable": "The recovery credential check failed",
+        }
+        if reason in reasons:
+            return (
+                "SRT recovery",
+                "RECOVERY_CREDENTIAL_" + reason.upper().replace("-", "_"),
+                reasons[reason],
+            )
     restart_prefix = "moblin-relay-normalize:restart:"
     restart_at = lowered.find(restart_prefix)
     if restart_at >= 0:
@@ -837,8 +863,7 @@ def classify_incident(message: str) -> tuple[str, str, str] | None:
         return (
             "YouTube-forward",
             "DELIVERY_TIMESTAMP_REGRESSION",
-            "The server detected a video timestamp discontinuity; "
-            "forwarding retries automatically",
+            "The server detected a video timestamp discontinuity; forwarding retries automatically",
         )
 
     youtube_marker = "rtmps" in lowered or "forward" in lowered
@@ -1091,6 +1116,112 @@ def cmd_incidents() -> int:
     return 0
 
 
+def history_timestamp(raw: str) -> int:
+    try:
+        value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if value.tzinfo is None:
+            raise ValueError
+        timestamp = int(value.timestamp())
+        if timestamp < 0:
+            raise ValueError
+        return timestamp
+    except (ValueError, OverflowError):
+        raise argparse.ArgumentTypeError(
+            "Use an ISO timestamp with timezone, for example ...Z"
+        ) from None
+
+
+def load_history_reader():
+    # This optional component ships with the existing broker. Never import code
+    # from the working directory, a user-writable package, or a symlink.
+    for parent in HISTORY_PROGRAM.parents:
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError("history reader unavailable")
+    info = HISTORY_PROGRAM.lstat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_mode & 0o022
+        or info.st_nlink != 1
+        or info.st_size > 256 * 1024
+    ):
+        raise ValueError("history reader unavailable")
+    return runpy.run_path(str(HISTORY_PROGRAM), run_name="_relay_history_read_only")["read_history"]
+
+
+def cmd_history(args: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="sudo relayctl history")
+    parser.add_argument("--since", type=history_timestamp)
+    parser.add_argument("--until", type=history_timestamp)
+    parser.add_argument("--limit", type=int, default=10_000)
+    parser.add_argument("--json", action="store_true")
+    options = parser.parse_args(args)
+    until = options.until if options.until is not None else int(time.time())
+    since = options.since if options.since is not None else max(0, until - 6 * 3600)
+    if since > until or not 1 <= options.limit <= 10_000:
+        print("Invalid history range or limit (1..10000).", file=sys.stderr)
+        return 2
+    try:
+        result = load_history_reader()(since=since, until=until, limit=options.limit)
+    except (OSError, ValueError, KeyError, ImportError):
+        print(
+            "History reader is unavailable. Install the matching relay broker package.",
+            file=sys.stderr,
+        )
+        return 1
+    if options.json:
+        print(json.dumps(result, ensure_ascii=True, allow_nan=False))
+        return 0 if result.get("error_code") == "none" else 1
+    if result.get("error_code") != "none":
+        print("History is unavailable or has not been collected yet.", file=sys.stderr)
+        return 1
+    rows = result["rows"]
+    print("Relay history (UTC; server-side measurements, not YouTube viewer confirmation)")
+    if not rows:
+        print("No samples in this time range.")
+        return 0
+    for label, value in (
+        ("First sample", rows[0]["timestamp"]),
+        ("Last sample", rows[-1]["timestamp"]),
+    ):
+        print(f"{label}: {datetime.fromtimestamp(value, tz=UTC_TIMEZONE).isoformat()}")
+    print(f"Samples: {len(rows)}; retention: 7 days; target interval: 5 seconds")
+    if result.get("truncated"):
+        print("WARNING: export is truncated; narrow the time range to see every sample.")
+    for source in ("LIVE", "SLATE", "NONE", "UNKNOWN"):
+        print(f"{source} samples: {sum(row['source'] == source for row in rows)}")
+    for label, field, scale, unit in (
+        ("Input unique bitrate", "input_unique_bitrate_bps", 1_000_000, "Mbit/s"),
+        ("Normalizer output bitrate", "output_rtmp_bitrate_bps", 1_000_000, "Mbit/s"),
+        ("YouTube outbound bitrate", "youtube_outbound_bitrate_bps", 1_000_000, "Mbit/s"),
+        ("SRT RTT", "srt_rtt_ms", 1, "ms"),
+    ):
+        values = [row[field] / scale for row in rows if isinstance(row.get(field), (int, float))]
+        if values:
+            print(
+                f"{label}: min {min(values):.3f}; avg {sum(values) / len(values):.3f}; "
+                f"max {max(values):.3f} {unit}; valid samples {len(values)}"
+            )
+        else:
+            print(f"{label}: no valid samples")
+    for field in (
+        "srt_packets_received_loss_delta",
+        "srt_packets_received_drop_delta",
+        "srt_packets_received_retrans_delta",
+    ):
+        values = [row[field] for row in rows if isinstance(row.get(field), (int, float))]
+        print(f"{field}: {sum(values) if values else 'unavailable'}")
+    print(
+        "Missing/reset/reconnected measurements are null, not zero. Packet categories may overlap."
+    )
+    print(
+        "For exact samples: sudo relayctl history --json "
+        "--since <ISO-with-timezone> --until <ISO-with-timezone>"
+    )
+    return 0
+
+
 def build_moblin_urls() -> dict[str, object]:
     data = load_secrets()
     try:
@@ -1216,7 +1347,7 @@ def cmd_rollback(args: list[str]) -> int:
 
 def usage() -> None:
     print("Usage: sudo relayctl <command>")
-    print("Commands: configure-youtube, start, stop, status, health, incidents, logs,")
+    print("Commands: configure-youtube, start, stop, status, health, incidents, logs, history,")
     print("          self-test, show-moblin-url, rollback --dry-run")
 
 
@@ -1240,6 +1371,8 @@ def main() -> int:
         return cmd_logs()
     if command == "incidents" and not args:
         return cmd_incidents()
+    if command == "history":
+        return cmd_history(args)
     if command == "show-moblin-url" and not args:
         return cmd_show_moblin_url()
     if command == "self-test" and not args:

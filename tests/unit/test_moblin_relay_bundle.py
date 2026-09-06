@@ -3988,11 +3988,11 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
     assert output_gate.observe(("normalizer-a", 120)) is True
     assert output_gate.observe(("normalizer-b", 130)) is False
 
-    assert loaded["VERIFIED_STALL_TIMEOUT_SECONDS"] == 0.50
-    assert loaded["OUTPUT_IDLE_FALLBACK_SECONDS"] == 0.90
+    assert loaded["VERIFIED_STALL_TIMEOUT_SECONDS"] == 2.0
+    assert loaded["OUTPUT_IDLE_FALLBACK_SECONDS"] == 2.5
     assert loaded["REQUIRED_IDLE_OBSERVATIONS"] == 2
     assert loaded["REQUIRED_VERIFIED_STALL_OBSERVATIONS"] == 3
-    assert loaded["METRICS_BLIND_TIMEOUT_SECONDS"] == 0.75
+    assert loaded["METRICS_BLIND_TIMEOUT_SECONDS"] == 2.0
     assert (
         loaded["VERIFIED_STALL_TIMEOUT_SECONDS"]
         + (2 * loaded["MEDIA_POLL_INTERVAL_SECONDS"])
@@ -4008,6 +4008,13 @@ def test_normalizer_uses_a_secret_free_liveness_supervisor() -> None:
         < self_test["CAPTURE_NO_GROWTH_LIMIT_SECONDS"]
     )
 
+    # Exercise the state-machine boundaries below on a compressed virtual clock.
+    # Production 2/2.5 s pause tolerance is tested independently in
+    # test_normalizer_transient_pauses.py; the native 3 s gate above is unchanged.
+    clock_globals = watchdog_type.__init__.__globals__
+    clock_globals["VERIFIED_STALL_TIMEOUT_SECONDS"] = 0.50
+    clock_globals["OUTPUT_IDLE_FALLBACK_SECONDS"] = 0.90
+    clock_globals["METRICS_BLIND_TIMEOUT_SECONDS"] = 0.75
     watchdog = watchdog_type(("normalizer-a", 120), 1.0)
     assert watchdog.observe_output(True, ("normalizer-a", 120), 1.05) == (True, True)
     assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.05, 1.051) is True
@@ -4212,6 +4219,12 @@ def test_normalizer_bridge_active_diagnostic_is_fixed_and_secret_free(capsys) ->
 def test_normalizer_watchdog_records_a_fixed_failure_reason() -> None:
     loaded = load_normalizer()
     watchdog_type = loaded["MediaWatchdog"]
+    # Failure-code checks use the same compressed virtual clock as the
+    # state-machine boundary checks, not the production pause policy.
+    clock_globals = watchdog_type.__init__.__globals__
+    clock_globals["VERIFIED_STALL_TIMEOUT_SECONDS"] = 0.50
+    clock_globals["OUTPUT_IDLE_FALLBACK_SECONDS"] = 0.90
+    clock_globals["METRICS_BLIND_TIMEOUT_SECONDS"] = 0.75
 
     cases: list[tuple[str, object]] = []
 

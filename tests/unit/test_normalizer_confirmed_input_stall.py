@@ -256,8 +256,11 @@ def test_normalizer_wires_confirmed_stall_to_exact_source_recovery() -> None:
     source = NORMALIZER.read_text(encoding="utf-8")
     supervisor = source.split("def run_supervisor(", 1)[1].split("def main()", 1)[0]
 
-    assert "watchdog.ingest_connection_id == source_id" in supervisor
-    assert "ConfirmedInputStallGate(\n                        source_id," in supervisor
+    assert "confirmed_input_stall = watchdog.confirmed_stall_gate(source_id)" in supervisor
+    carry = source.split("def confirmed_stall_gate(", 1)[1].split("def observe_output(", 1)[0]
+    assert "self.ingest_connection_id != source_id" in carry
+    assert "self.failure_reason != RESTART_REASON_VERIFIED_STALL" in carry
+    assert "ConfirmedInputStallGate(source_id, self.ingest_counter, self.joint_idle_since)" in carry
     assert "recovery.open_after_confirmed_input_stall(" in supervisor
     kick_call = (
         "kick_srt_source(\n"

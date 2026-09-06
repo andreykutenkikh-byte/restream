@@ -27,6 +27,7 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 from relay_agent.errors import RelayAgentError
+from relay_agent.history import HistoryCollector
 from relay_agent.models import JsonObject, RelaySnapshot
 from relay_agent.security import effective_uid
 
@@ -1174,14 +1175,17 @@ def _enable_child_subreaper() -> None:
     _subreaper_enabled = True
 
 
-def _reap_adopted_children() -> None:
-    if not _subreaper_enabled:
+def _reap_adopted_children(worker_group_id: int) -> None:
+    # Workers create their own session/process group before running relayctl.
+    # Never waitpid(-1): the history thread owns a concurrent systemctl Popen;
+    # consuming its exit status makes Popen interpret ECHILD as exit code zero.
+    if not _subreaper_enabled or worker_group_id <= 1:
         return
     deadline = time.monotonic() + 0.25
     nohang = int(getattr(os, "WNOHANG", 1))
     while True:
         try:
-            adopted_pid, _ = _waitpid_nointr(-1, nohang)
+            adopted_pid, _ = _waitpid_nointr(-worker_group_id, nohang)
         except ChildProcessError:
             return
         if adopted_pid > 0:
@@ -1204,9 +1208,9 @@ def _terminate_worker(pid: int) -> None:
     try:
         _waitpid_nointr(pid)
     except ChildProcessError:
-        _reap_adopted_children()
+        _reap_adopted_children(pid)
         return
-    _reap_adopted_children()
+    _reap_adopted_children(pid)
 
 
 def _encode_worker_header(state: tuple[bool, bool] | None) -> bytes:
@@ -1469,7 +1473,7 @@ def _run_reconciliation(
         waited_pid, status = _waitpid_nointr(pid)
     except ChildProcessError:
         return False
-    _reap_adopted_children()
+    _reap_adopted_children(pid)
     return waited_pid == pid and status == 0 and bytes(result) == b"\x01"
 
 
@@ -1642,7 +1646,7 @@ def _execute_bounded_request_with_lock(
         waited_pid, status = _waitpid_nointr(pid)
     except ChildProcessError:
         return _failed_worker_response()
-    _reap_adopted_children()
+    _reap_adopted_children(pid)
     frame = _decode_worker_frame(bytes(wire_response))
     if waited_pid != pid or status != 0 or frame is None or not frame[1]:
         state = frame[0] if frame is not None else None
@@ -1724,8 +1728,20 @@ def main() -> int:
         _enable_child_subreaper()
         listener = _systemd_listener()
         broker = RelayBroker()
+        # History lives in the long-running root process, independently of
+        # HTTPS heartbeat requests and the command worker's transaction lock.
+        history: HistoryCollector | None = None
+        try:
+            history = HistoryCollector()
+            history.start()
+        except Exception:
+            print("relay_history_collection_failed", file=sys.stderr)
         with listener:
-            serve(listener, expected_uid=expected_uid, broker=broker)
+            try:
+                serve(listener, expected_uid=expected_uid, broker=broker)
+            finally:
+                if history is not None:
+                    history.close()
     except (KeyError, OSError, RelayAgentError):
         return 1
     return 0

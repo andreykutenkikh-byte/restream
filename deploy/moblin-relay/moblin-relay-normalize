@@ -55,15 +55,16 @@ MEDIA_POLL_INTERVAL_SECONDS = 0.05
 # Corroborate a fast output stall with the ingest counter.  RTMP transport bytes
 # can briefly plateau while healthy; the longer output-only fallback still
 # catches a wedged normalizer without treating that batching as a source outage.
-# A brief userspace pause or one delayed metrics scrape is not a dead media
-# path.  This stays comfortably below the 2 s SRT latency and 1 s downstream
-# continuity budget while avoiding false restarts on constrained relay nodes.
-VERIFIED_STALL_TIMEOUT_SECONDS = 0.50
+# Allow short network/batching pauses to recover in the existing FFmpeg process.
+# The former 0.50/0.90 s thresholds were a suspected contributor to repeated
+# restart cycles in the Sep 5 stream. Two seconds leaves room inside the 3 s native
+# downstream no-growth gate; a restart can cost a whole additional GOP.
+VERIFIED_STALL_TIMEOUT_SECONDS = 2.0
 # Leave enough room for the corroborating ingest scrape to complete before an
 # output-only timeout is classified.  Otherwise scheduler jitter can turn the
 # same network stall into a breaker-eligible output failure.
-OUTPUT_IDLE_FALLBACK_SECONDS = 0.90
-METRICS_BLIND_TIMEOUT_SECONDS = 0.75
+OUTPUT_IDLE_FALLBACK_SECONDS = 2.5
+METRICS_BLIND_TIMEOUT_SECONDS = 2.0
 OUTPUT_START_TIMEOUT_SECONDS = 6.0
 # A verified short stall first falls back to SLATE.  Only the same hook-bound
 # SRT publisher remaining present without a single additional media byte for
@@ -158,9 +159,7 @@ RECOVERY_EVENT_TOKENS = {
     RECOVERY_RESULT_REJECTED: "moblin-relay-normalize:recovery:reset-failed-rejected",
     RECOVERY_RESULT_RESPONSE: "moblin-relay-normalize:recovery:reset-failed-response",
     RECOVERY_EVENT_EXHAUSTED: ("moblin-relay-normalize:recovery:attempts-exhausted"),
-    RECOVERY_EVENT_SOURCE_RESUMED: (
-        "moblin-relay-normalize:recovery:source-resumed-before-reset"
-    ),
+    RECOVERY_EVENT_SOURCE_RESUMED: ("moblin-relay-normalize:recovery:source-resumed-before-reset"),
 }
 RECOVERY_SUCCESS_RESULTS = frozenset({RECOVERY_RESULT_KICKED, RECOVERY_RESULT_GONE})
 RECOVERY_FAILURE_RESULTS = frozenset(
@@ -230,13 +229,26 @@ def validated_control_token_path(raw_value: str) -> Path:
     return Path(raw_value)
 
 
+class ControlCredentialError(ValueError):
+    """An allowlisted diagnostic, never a token, path or OS exception message."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__("control credential unavailable")
+
+
 def read_control_token(token_file: Path) -> bytearray:
     """Read a bounded root-owned API credential without following links."""
     try:
         parent = token_file.parent.lstat()
         before = token_file.lstat()
     except OSError as exc:
-        raise ValueError("control credential unavailable") from exc
+        code = "missing" if isinstance(exc, FileNotFoundError) else "metadata-unavailable"
+        raise ControlCredentialError(code) from exc
+    if parent.st_uid != 0:
+        raise ControlCredentialError("parent-owner-unsafe")
+    if before.st_uid != 0:
+        raise ControlCredentialError("file-owner-unsafe")
     if (
         not stat.S_ISDIR(parent.st_mode)
         or parent.st_uid != 0
@@ -249,7 +261,7 @@ def read_control_token(token_file: Path) -> bytearray:
         or before.st_nlink != 1
         or not 43 <= before.st_size <= CONTROL_TOKEN_MAX_FILE_BYTES
     ):
-        raise ValueError("control credential unavailable")
+        raise ControlCredentialError("metadata-unsafe")
 
     flags = os.O_RDONLY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
@@ -257,7 +269,7 @@ def read_control_token(token_file: Path) -> bytearray:
     try:
         descriptor = os.open(token_file, flags)
     except OSError as exc:
-        raise ValueError("control credential unavailable") from exc
+        raise ControlCredentialError("read-denied") from exc
     payload = bytearray()
     try:
         opened = os.fstat(descriptor)
@@ -272,10 +284,10 @@ def read_control_token(token_file: Path) -> bytearray:
             or opened.st_mtime_ns != before.st_mtime_ns
             or opened.st_ctime_ns != before.st_ctime_ns
         ):
-            raise ValueError("control credential unavailable")
+            raise ControlCredentialError("file-changed")
         payload = bytearray(os.read(descriptor, CONTROL_TOKEN_MAX_FILE_BYTES + 1))
         if os.read(descriptor, 1):
-            raise ValueError("control credential unavailable")
+            raise ControlCredentialError("oversized")
         after = os.fstat(descriptor)
         if (
             (after.st_dev, after.st_ino, after.st_size)
@@ -283,11 +295,13 @@ def read_control_token(token_file: Path) -> bytearray:
             or after.st_mtime_ns != opened.st_mtime_ns
             or after.st_ctime_ns != opened.st_ctime_ns
         ):
-            raise ValueError("control credential unavailable")
+            raise ControlCredentialError("file-changed")
     except (OSError, ValueError) as exc:
         for index in range(len(payload)):
             payload[index] = 0
-        raise ValueError("control credential unavailable") from exc
+        if isinstance(exc, ControlCredentialError):
+            raise
+        raise ControlCredentialError("read-failed") from exc
     finally:
         os.close(descriptor)
 
@@ -296,8 +310,45 @@ def read_control_token(token_file: Path) -> bytearray:
     if CONTROL_TOKEN_PATTERN.fullmatch(payload) is None:
         for index in range(len(payload)):
             payload[index] = 0
-        raise ValueError("control credential unavailable")
+        raise ControlCredentialError("format-invalid")
     return payload
+
+
+CONTROL_CREDENTIAL_ERROR_CODES = frozenset(
+    {
+        "missing",
+        "metadata-unavailable",
+        "parent-owner-unsafe",
+        "file-owner-unsafe",
+        "metadata-unsafe",
+        "read-denied",
+        "file-changed",
+        "oversized",
+        "read-failed",
+        "format-invalid",
+        "unavailable",
+    }
+)
+
+
+def emit_credential_failure(error: ValueError) -> None:
+    code = getattr(error, "code", "unavailable")
+    if code not in CONTROL_CREDENTIAL_ERROR_CODES:
+        code = "unavailable"
+    print("moblin-relay-normalize:credential-check:" + code, file=sys.stderr, flush=True)
+
+
+def check_control_credential() -> int:
+    """Run as the actual service user before MediaMTX starts sending anything."""
+    try:
+        token = read_control_token(CONTROL_TOKEN_FILE)
+    except ValueError as exc:
+        emit_credential_failure(exc)
+        return 1
+    for index in range(len(token)):
+        token[index] = 0
+    print("moblin-relay-normalize:credential-check:ready", file=sys.stderr, flush=True)
+    return 0
 
 
 def kick_srt_source(api_port: int, source_id: str, token_file: Path) -> str:
@@ -306,7 +357,8 @@ def kick_srt_source(api_port: int, source_id: str, token_file: Path) -> str:
     validated_source_id(source_id)
     try:
         token = read_control_token(token_file)
-    except ValueError:
+    except ValueError as exc:
+        emit_credential_failure(exc)
         return RECOVERY_RESULT_CREDENTIAL
 
     credentials = bytearray(CONTROL_API_USER.encode("ascii"))
@@ -472,10 +524,7 @@ class RecoveryCircuitBreaker:
     def cancel_after_source_resumed(self) -> bool:
         """Cancel pending recovery as soon as exact-source media grows."""
         if self.completed or not (
-            self.opened
-            or self.exhausted
-            or self.attempts > 0
-            or self.confirmed_counter is not None
+            self.opened or self.exhausted or self.attempts > 0 or self.confirmed_counter is not None
         ):
             return False
         self.failures.clear()
@@ -796,6 +845,21 @@ class MediaWatchdog:
         self.joint_idle_since = None
         self.joint_unchanged_observations = 0
 
+    def confirmed_stall_gate(self, source_id: str) -> ConfirmedInputStallGate | None:
+        # Carry forward only the already-observed, uninterrupted same-counter
+        # interval. Restarting the six-second timer after a two-second watchdog
+        # delay would needlessly delay recovery beyond the transport idle gate.
+        # Missing metrics, byte growth and identity changes discard this proof.
+        if (
+            self.failure_reason != RESTART_REASON_VERIFIED_STALL
+            or self.ingest_connection_id != source_id
+            or self.ingest_counter is None
+            or self.joint_idle_since is None
+            or self.joint_unchanged_observations < REQUIRED_VERIFIED_STALL_OBSERVATIONS
+        ):
+            return None
+        return ConfirmedInputStallGate(source_id, self.ingest_counter, self.joint_idle_since)
+
     def observe_output(
         self,
         successful: bool,
@@ -1063,9 +1127,7 @@ def run_supervisor(
                 progressed = False
                 growth_confirmed = False
                 if successful and ingest_sample is not None:
-                    progressed, growth_confirmed = ingest_gate.observe_with_progress(
-                        ingest_sample
-                    )
+                    progressed, growth_confirmed = ingest_gate.observe_with_progress(ingest_sample)
                     if (
                         recovery.source_has_resumed(ingest_sample) or progressed
                     ) and recovery.cancel_after_source_resumed():
@@ -1108,11 +1170,7 @@ def run_supervisor(
                         if not source_attached_emitted:
                             emit_state_event(STATE_EVENT_SOURCE_ATTACHED)
                             source_attached_emitted = True
-                    if (
-                        ingest_sample is not None
-                        and growth_confirmed
-                        and now >= restart_not_before
-                    ):
+                    if ingest_sample is not None and growth_confirmed and now >= restart_not_before:
                         supervisor_pid = os.getpid()
                         parent_death_setup = make_parent_death_setup(supervisor_pid)
                         try:
@@ -1168,18 +1226,7 @@ def run_supervisor(
                 failure_reason = watchdog.failure_reason or RESTART_REASON_WATCHDOG_UNKNOWN
                 emit_restart_reason(failure_reason)
                 recovery.record_failure(failure_reason, now)
-                if (
-                    failure_reason == RESTART_REASON_VERIFIED_STALL
-                    and watchdog.ingest_connection_id == source_id
-                    and watchdog.ingest_counter is not None
-                ):
-                    confirmed_input_stall = ConfirmedInputStallGate(
-                        source_id,
-                        watchdog.ingest_counter,
-                        time.monotonic(),
-                    )
-                else:
-                    confirmed_input_stall = None
+                confirmed_input_stall = watchdog.confirmed_stall_gate(source_id)
                 ingest_reader.close()
                 stop_child(child, force=True)
                 child = None
@@ -1198,6 +1245,8 @@ def run_supervisor(
 
 
 def main() -> int:
+    if sys.argv[1:] == ["--check-control-credential"]:
+        return check_control_credential()
     if sys.argv[1:] == [SUPERVISOR_ARGUMENT]:
         try:
             rtsp_port = validated_port(os.environ.get(SAFE_RTSP_PORT_ENV, ""))

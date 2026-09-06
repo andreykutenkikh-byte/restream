@@ -66,6 +66,22 @@ jobs:
       - name: Tests
         run: uv run --locked pytest
 
+      - name: Relay runtime credential ownership
+        run: sudo python3 deploy/moblin-relay/test-render-config.py
+
+      - name: Relay history Linux isolation
+        run: sudo python3 -B -m scripts.check_relay_history_linux
+
+      - name: Relay runtime systemd ownership
+        shell: bash
+        run: |
+          if [ -d /run/systemd/system ] && command -v systemd-run >/dev/null 2>&1; then
+            sudo python3 scripts/check_relay_runtime_systemd.py \
+              --normalizer "$PWD/deploy/moblin-relay/moblin-relay-normalize"
+          else
+            printf '%s\n' 'Systemd runtime ownership: SKIP (systemd unavailable)'
+          fi
+
       - name: Repository safety policy
         run: uv run --locked python scripts/check_repository.py
 
