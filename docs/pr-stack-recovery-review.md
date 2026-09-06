@@ -7,7 +7,46 @@ service lifecycle operation, production package installation, key rotation,
 connection reset, production fault injection or agent publication. Earlier
 separately authorized runtime work is not attributed to this completion pass.
 
-## Current candidate — September 7 restack
+## Current candidate — September 7 final restack
+
+This section supersedes the dated checkpoints below; their old leases and
+pending-browser language are historical, not instructions for another push.
+The verified new PR15 base is `4ce6fb77be195198d57fd837a1570c5ff1d42702`:
+[CI 34056325858](https://github.com/andreykutenkikh-byte/restream/actions/runs/34056325858)
+passed completely with 2042 Linux Python tests, 44 frontend tests, native
+onboarding/recovery, all 13 strict 90-frame readers (3.279–5.238 seconds), full
+format/GOP/PTS/DTS/A/V/decode checks, independent reader, resource limits and
+cleanup. Native duration was 374.543 seconds. Eleven LIVE sending episodes
+measured 0.999995–1.000005 of the configured byte clock, maximum dispatch gap
+14.662 ms and no discarded schedule phase. SLATE-only episodes correctly
+reported an unknown source clock. This is observed-run evidence, not an
+exclusive explanation of earlier intermittent failures.
+
+The old HUD base is `a4feee1dc64c9e0917f91145db4111020b113c5c`; its current
+local and expected remote HUD head is
+`c5a35439ddd753dde1512665e2bc23a8fac921ce` with fourteen own commits. This
+documentation update is the fifteenth own commit. Only those own commits are
+eligible for the next restack, using the exact c5a35439 expected remote lease
+after verifying it has not changed. The final rebased HUD head still requires
+its own complete CI before final-review readiness can be declared.
+
+The preceding c5a35439 [run 34054147945](https://github.com/andreykutenkikh-byte/restream/actions/runs/34054147945)
+failed native stuck-live while both actual browser engines passed all four
+cases in 17.08 seconds (Chromium 151.0.7922.34 / WebKit 26.5), including the
+updated native audio-start assertions. Thus the earlier pending-audio wording
+below no longer describes c5a35439. This remains desktop-browser evidence,
+not physical iPhone acceptance, and not acceptance of the future rebased head.
+
+PR15 added only passive bounded source-clock diagnostics after that failure;
+the following isolated result-validator dependency omission was reproduced and
+fixed with one embedded-function line and five real isolated-exec regressions.
+The prior 81e30059 run stopped at remote_lifecycle_result, not stuck-live.
+Pacing, runtime commands, media assertions and deadlines were not changed by
+these diagnostic commits. No PR merge, deployment or production mutation was
+performed. Final exact-head acceptance belongs in the PR descriptions and the
+completion report; this document does not assert a future successful HUD run.
+
+## Historical checkpoint — September 7 first restack
 
 This section supersedes status language in the dated chronology below. Statements
 such as "latest base" or "remaining blocker" there describe that historical
