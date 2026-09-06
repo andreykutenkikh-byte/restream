@@ -225,10 +225,47 @@ startup/progress evidence and the accurate `reset-live` stage. Its full
 passed: 1556 Python tests, 44 frontend tests, real media/security/native checks
 and cleanup. The real clock comparison measured old/fixed rates 0.739/0.991;
 all thirteen strict captures reached 90 frames in 3.477–5.081 seconds. This is
-the current verified `PR15_GREEN_HEAD` / run. The follow-up is diagnostic;
+the first verified September 6 `PR15_GREEN_HEAD` / run. The follow-up is diagnostic;
 its successful run does not establish the cause or resolution of the preceding
 71-frame timeout. That failure remains a blocker to an unconditional
 `PR15_AND_PR16_READY_FOR_FINAL_REVIEW` declaration.
+
+### Second September 6 media failure and fault-injection correction
+
+Restacked HUD head `e75c5795267548ebdf50ef255efb34638228afa4` passed its actual
+Chromium/WebKit browser job (four tests, 19.61 seconds), 1647 Linux Python tests
+and 87 frontend tests in
+[run 34014962860](https://github.com/andreykutenkikh-byte/restream/actions/runs/34014962860).
+The complete run nevertheless failed: native `outage-normal` at 241.44 seconds,
+trace 6043 → 4825 → 1293, was the source-stop → SLATE predicate missing its
+unchanged 4.5-second deadline. Last predicate values were not retained. This is
+distinct from the earlier 90-frame reader timeout. CI cleanup passed; the
+post-onboarding limits step was skipped, not accepted.
+
+Review found a concrete fault-injection ordering flaw: the outage clock started
+before waiting for feeder cleanup, while the independent SRT helper could still
+drain buffered media. PR15 `ce7f33598c9d6b5129a4a15d2b8e885559ab72bf` cuts and
+verifies the actual SRT sender first, then performs feeder/publisher cleanup.
+Five deterministic tests execute the actual nested shutdown function, comparing
+old/new order with modeled 30 ms, 500 ms and 1.5 s cleanup delays and preserving
+owned processes on failure. This proves the ordering flaw, not its unobserved
+duration in that failed CI run.
+
+The same follow-up records existing allowlisted predicate flags on generic
+observer timeouts. It caches the actual predicate result without re-evaluating
+stateful predicates; incomplete/stale observations cannot fabricate success,
+and diagnostic failure cannot replace the original exception. Eight new cases
+verify these boundaries and secret-free checkpoint projection. No runtime file,
+4.5/12/15-second deadline, same-SRT requirement, 8–13-second expiry rule or
+strict media assertion was weakened.
+
+This new exact PR15 head passed
+[full CI 34015805255](https://github.com/andreykutenkikh-byte/restream/actions/runs/34015805255):
+1569 Linux Python tests, 44 frontend tests, real clock rates old/fixed
+0.743/0.993, native cleanup at 350.339 seconds and all thirteen strict captures
+at 90 frames in 3.322–5.126 seconds. Post-onboarding limits and cleanup passed.
+It is the latest verified PR15 base. A complete green run verifies that head's
+coverage; it does not retrospectively prove the cause of every prior timeout.
 
 ## HUD baseline, before corrections
 
@@ -271,6 +308,15 @@ the rebased head before this documentation update was
 and required explicit push lease, are `5fb7b584ed17f03e352e8352137010f638e5b679`.
 The final new HUD exact HEAD must pass its own full CI; earlier green runs do
 not validate this new stack. The PR description records its final SHA and run.
+
+After the second PR15 full success, all ten own HUD commits (including the
+logout correction) were rebased from `df9307f9bd07ac69e67e2f79822bf70d512d4e97`
+onto `ce7f33598c9d6b5129a4a15d2b8e885559ab72bf`. All ten range-diff entries were
+equal; pre-documentation head `9dec449363854ac1cdfdf6628a7f261c0f2ff7ab` has
+identical native/agent/bootstrap content to that base. The explicit expected
+remote lease is `e75c5795267548ebdf50ef255efb34638228afa4`. Final exact-head
+results are recorded in the PR description after completion, with no reuse of
+the failed old-head run as acceptance.
 
 ## HUD corrections and regression coverage
 
