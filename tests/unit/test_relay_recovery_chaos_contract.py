@@ -137,6 +137,7 @@ def test_repeated_bridge_failures_preserve_growing_srt_and_restore_live() -> Non
         'mark_self_test_stage("reset-slate")',
         "wait_slate_with_live_srt(",
         "wait_slate_downstream_recovery(",
+        'mark_self_test_stage("reset-live")',
         "final_replacement = wait_healthy_live(",
         "NORMALIZER_BRIDGE_ACTIVE_MARKER",
         'mark_self_test_stage("reset-source")',

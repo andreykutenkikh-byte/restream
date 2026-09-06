@@ -358,6 +358,9 @@ def safe_failure(code: str) -> BootstrapError:
         "relay_self_test_reset_slate_failed": (
             "Заставка не сохранила выход во время автоматического восстановления."
         ),
+        "relay_self_test_reset_live_failed": (
+            "LIVE-выход после отказа обработчика не прошёл проверку восстановления и чтения видео."
+        ),
         "relay_self_test_reset_circuit_failed": (
             "Автоматическое восстановление не распознало повторные отказы медиамоста."
         ),

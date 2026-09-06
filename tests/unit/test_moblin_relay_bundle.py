@@ -80,6 +80,46 @@ def test_capture_reader_diagnostic_inspection_budget_keeps_draining() -> None:
     assert reader.snapshot()["reader_input"] is False
 
 
+@pytest.mark.parametrize("late_start", [True, False])
+def test_capture_reader_timeline_distinguishes_late_probe_from_frame_plateau(
+    monkeypatch, late_start
+) -> None:
+    namespace = load_self_test()
+    reader = namespace["CaptureReaderProgress"](started=100)
+    monkeypatch.setattr(time, "monotonic", lambda: 112 if late_start else 100.2)
+    reader.observe_line(b"Input #0, flv, from PRIVATE:", progress=False)
+    reader.observe_line(b"Output #0, flv, to PRIVATE:", progress=False)
+    reader.observe_line(b"frame=1", progress=True)
+    monkeypatch.setattr(time, "monotonic", lambda: 114.5 if late_start else 102.5)
+    reader.observe_line(b"frame=71", progress=True)
+    reader.observe_line(b"out_time_us=2366667", progress=True)
+    monkeypatch.setattr(time, "monotonic", lambda: 115)
+    reader.observe_line(b"frame=71", progress=True)
+    reader.observe_line(b"out_time_us=PRIVATE", progress=True)
+    reader.observe_line(b"out_time_us=999999999999999999", progress=True)
+    snapshot = reader.snapshot()
+    assert snapshot["reader_frames"] == 71
+    assert (
+        snapshot["reader_input_seconds"]
+        == snapshot["reader_output_seconds"]
+        == (12 if late_start else 0.2)
+    )
+    assert snapshot["reader_first_frame_seconds"] == (12 if late_start else 0.2)
+    assert snapshot["reader_last_frame_seconds"] == (14.5 if late_start else 2.5)
+    assert snapshot["reader_media_seconds"] == 2.367
+    assert "PRIVATE" not in repr(vars(reader))
+
+
+@pytest.mark.parametrize("observed", [99, float("nan"), float("inf"), 761])
+def test_capture_reader_timeline_rejects_invalid_or_unbounded_clock(monkeypatch, observed):
+    namespace = load_self_test()
+    reader = namespace["CaptureReaderProgress"](started=100)
+    monkeypatch.setattr(time, "monotonic", lambda: observed)
+    reader.observe_line(b"Input #0, flv, from PRIVATE:", progress=False)
+    reader.observe_line(b"frame=3", progress=True)
+    assert reader.snapshot() == {"reader_input": True, "reader_output": False, "reader_frames": 3}
+
+
 def test_capture_reader_real_dual_pipe_flood_cannot_deadlock_or_return_text() -> None:
     namespace = load_self_test()
     reader = namespace["CaptureReaderProgress"]()
@@ -299,6 +339,9 @@ def test_media_diagnostic_maximum_fixed_checkpoint_fits_reader_and_exposes_no_me
         join=lambda **_kwargs: diagnostic.observe(), is_alive=lambda: False
     )
     diagnostic.reader.observe_line(b"frame=99999", progress=True)
+    diagnostic.reader.observe_line(b"Input #0, flv, from PRIVATE:", progress=False)
+    diagnostic.reader.observe_line(b"Output #0, flv, to PRIVATE:", progress=False)
+    diagnostic.reader.observe_line(b"out_time_us=659999000", progress=True)
     error = namespace["TestFailure"]("PRIVATE_EXCEPTION")
     diagnostic.__exit__(type(error), error, None)
     checkpoint = {

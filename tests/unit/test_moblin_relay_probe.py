@@ -2,24 +2,30 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import runpy
+import stat
 import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from test_ci_native_result_contract import native_result as native_result
 
 from bootstrap_worker.errors import safe_failure
 from bootstrap_worker.relay_installer import _SELF_TEST_STAGE_CODES
+from scripts import ci_node_onboarding_smoke as smoke
 from scripts.ci_node_onboarding_smoke import (
     SAFE_BOOTSTRAP_DIAGNOSTIC_CODES,
     print_self_test_progress,
     safe_self_test_progress,
+    safe_strict_sink_reader_timings,
 )
+from scripts.ci_output_smoke import SmokeFailure
 
 SELF_TEST = Path(__file__).resolve().parents[2] / "deploy" / "moblin-relay" / "self-test"
 
@@ -103,6 +109,7 @@ def test_probe_nonzero_exit_and_stderr_are_preserved_for_strict_assertions() -> 
         "sink-video",
         "sink-audio",
         "sink-timestamps",
+        "reset-live",
     ],
 )
 def test_continuity_substages_survive_safe_failure_mapping(stage: str) -> None:
@@ -206,6 +213,324 @@ def test_failure_media_diagnostic_is_fixed_bounded_projection(scope: str) -> Non
     }
     assert "PRIVATE_FIXTURE_MARKER" not in json.dumps(result)
     assert result["failure_media"]["markers"] is not value["markers"]
+
+
+READER_WALL_TIMINGS = (
+    "reader_input_seconds",
+    "reader_output_seconds",
+    "reader_first_frame_seconds",
+    "reader_last_frame_seconds",
+)
+READER_TIMINGS = (*READER_WALL_TIMINGS, "reader_media_seconds")
+
+
+def test_capture_reader_timing_projection_distinguishes_acquisition_from_media_time() -> None:
+    value = {
+        **media_diagnostic("capture"),
+        "reader_output": True,
+        "reader_frames": 71,
+        "reader_input_seconds": 7.12345,
+        "reader_output_seconds": 8.12345,
+        "reader_first_frame_seconds": 8.23456,
+        "reader_last_frame_seconds": 11.42123,
+        # Buffered media time can exceed this capture's elapsed wall time.
+        "reader_media_seconds": 20.98765,
+    }
+    result = safe_self_test_progress(
+        {"job_id": "job", "stage": "crash-live", "elapsed_seconds": 152, "failure_media": value},
+        job_id="job",
+    )
+    assert {name: result["failure_media"][name] for name in READER_TIMINGS} == {
+        "reader_input_seconds": 7.123,
+        "reader_output_seconds": 8.123,
+        "reader_first_frame_seconds": 8.235,
+        "reader_last_frame_seconds": 11.421,
+        "reader_media_seconds": 20.988,
+    }
+    assert value["reader_first_frame_seconds"] == 8.23456
+
+
+@pytest.mark.parametrize("field", READER_TIMINGS)
+def test_capture_reader_timing_fields_are_individually_optional(field: str) -> None:
+    value = {
+        **media_diagnostic("capture"),
+        "reader_output": True,
+        "reader_frames": 1,
+        field: 0.0,
+    }
+    result = safe_self_test_progress(
+        {"job_id": "job", "stage": "crash-live", "elapsed_seconds": 152, "failure_media": value},
+        job_id="job",
+    )
+    assert result["failure_media"][field] == 0.0
+    assert not (set(READER_TIMINGS) - {field}) & result["failure_media"].keys()
+
+
+@pytest.mark.parametrize("field", READER_WALL_TIMINGS)
+@pytest.mark.parametrize(
+    "invalid", [True, None, -0.001, 11.422, float("nan"), float("inf"), 10**1000, "PRIVATE_TIMING"]
+)
+def test_capture_reader_wall_timings_reject_unsafe_values(field: str, invalid) -> None:
+    value = {
+        **media_diagnostic("capture"),
+        "reader_output": True,
+        "reader_frames": 1,
+        field: invalid,
+    }
+    assert safe_self_test_progress(
+        {"job_id": "job", "stage": "crash-live", "elapsed_seconds": 152, "failure_media": value},
+        job_id="job",
+    ) == {"progress": "unavailable"}
+
+
+@pytest.mark.parametrize(
+    ("field", "evidence", "unobserved"),
+    [
+        ("reader_input_seconds", "reader_input", False),
+        ("reader_output_seconds", "reader_output", False),
+        ("reader_first_frame_seconds", "reader_frames", 0),
+        ("reader_last_frame_seconds", "reader_frames", 0),
+    ],
+)
+def test_capture_reader_timing_requires_its_observed_milestone(
+    field: str, evidence: str, unobserved
+) -> None:
+    value = {**media_diagnostic("capture"), field: 1.0, evidence: unobserved}
+    assert safe_self_test_progress(
+        {"job_id": "job", "stage": "crash-live", "elapsed_seconds": 152, "failure_media": value},
+        job_id="job",
+    ) == {"progress": "unavailable"}
+
+
+def test_capture_reader_frame_timing_cannot_regress() -> None:
+    value = {
+        **media_diagnostic("capture"),
+        "reader_frames": 71,
+        "reader_first_frame_seconds": 2.0,
+        "reader_last_frame_seconds": 1.0,
+    }
+    assert safe_self_test_progress(
+        {"job_id": "job", "stage": "crash-live", "elapsed_seconds": 152, "failure_media": value},
+        job_id="job",
+    ) == {"progress": "unavailable"}
+
+
+@pytest.mark.parametrize("seconds", [0, 1.23456, 660])
+def test_capture_reader_media_time_has_its_own_bound(seconds: float) -> None:
+    value = {**media_diagnostic("capture"), "reader_media_seconds": seconds}
+    result = safe_self_test_progress(
+        {"job_id": "job", "stage": "crash-live", "elapsed_seconds": 152, "failure_media": value},
+        job_id="job",
+    )
+    assert result["failure_media"]["reader_media_seconds"] == round(seconds, 3)
+
+
+@pytest.mark.parametrize(
+    "invalid", [True, None, -0.001, 660.001, float("nan"), float("inf"), 10**1000, "PRIVATE_TIMING"]
+)
+def test_capture_reader_media_time_rejects_unsafe_values(invalid) -> None:
+    value = {**media_diagnostic("capture"), "reader_media_seconds": invalid}
+    assert safe_self_test_progress(
+        {"job_id": "job", "stage": "crash-live", "elapsed_seconds": 152, "failure_media": value},
+        job_id="job",
+    ) == {"progress": "unavailable"}
+
+
+@pytest.mark.parametrize("field", READER_TIMINGS)
+def test_reader_timing_cannot_appear_in_crash_scope(field: str) -> None:
+    value = {**media_diagnostic("crash"), field: 1.0}
+    assert safe_self_test_progress(
+        {"job_id": "job", "stage": "crash-live", "elapsed_seconds": 152, "failure_media": value},
+        job_id="job",
+    ) == {"progress": "unavailable"}
+
+
+def test_capture_reader_unknown_timing_field_still_rejects_entire_diagnostic() -> None:
+    value = {**media_diagnostic("capture"), "reader_private_seconds": 1.0}
+    assert safe_self_test_progress(
+        {"job_id": "job", "stage": "crash-live", "elapsed_seconds": 152, "failure_media": value},
+        job_id="job",
+    ) == {"progress": "unavailable"}
+
+
+def strict_reader_timings(count: int = 13) -> list[dict]:
+    return [
+        {
+            "segment": index,
+            "diagnostic": {
+                **media_diagnostic("capture"),
+                "reader_output": True,
+                "reader_frames": 90,
+                "reader_input_seconds": 1.12345,
+                "reader_output_seconds": 2.12345,
+                "reader_first_frame_seconds": 2.23456,
+                "reader_last_frame_seconds": 5.23456,
+                "reader_media_seconds": 20.98765,
+            },
+        }
+        for index in range(1, count + 1)
+    ]
+
+
+@pytest.mark.parametrize("count", [1, 13, 32])
+def test_success_reader_timings_project_bounded_capture_rows(count: int) -> None:
+    value = strict_reader_timings(count)
+    result = safe_strict_sink_reader_timings(value)
+    assert result is not None and len(result) == count
+    assert result[0]["diagnostic"]["reader_first_frame_seconds"] == 2.235
+    assert result[0]["diagnostic"]["reader_media_seconds"] == 20.988
+    assert result[0]["diagnostic"] is not value[0]["diagnostic"]
+    assert value[0]["diagnostic"]["reader_first_frame_seconds"] == 2.23456
+
+
+@pytest.mark.parametrize("invalid", [None, {}, "PRIVATE_FIXTURE", [], strict_reader_timings(33)])
+def test_success_reader_timings_reject_unsafe_container(invalid) -> None:
+    assert safe_strict_sink_reader_timings(invalid) is None
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"segment": True},
+        {"segment": 0},
+        {"segment": 33},
+        {"segment": "PRIVATE_FIXTURE"},
+        {"segment": []},
+        {"raw_stderr": "PRIVATE_FIXTURE"},
+        {"diagnostic": media_diagnostic("crash")},
+        {"diagnostic": {**media_diagnostic("capture"), "stderr": "PRIVATE_FIXTURE"}},
+        {"diagnostic": {**media_diagnostic("capture"), "reader_input_seconds": float("nan")}},
+    ],
+)
+def test_success_reader_timings_reject_entire_list_on_any_unsafe_row(change: dict) -> None:
+    value = strict_reader_timings()
+    value[-1].update(change)
+    assert safe_strict_sink_reader_timings(value) is None
+
+
+def test_success_reader_timings_require_complete_unique_rows() -> None:
+    assert safe_strict_sink_reader_timings([{"segment": 1}]) is None
+    assert safe_strict_sink_reader_timings([{"diagnostic": media_diagnostic("capture")}]) is None
+    assert safe_strict_sink_reader_timings([None]) is None
+    value = strict_reader_timings()
+    value[-1]["segment"] = 1
+    assert safe_strict_sink_reader_timings(value) is None
+
+
+@pytest.mark.parametrize("count", [1, 12, 13, 14, 32])
+def test_native_result_optional_reader_timings_must_match_capture_count(
+    native_result: dict, count: int
+) -> None:
+    native_result["strict_sink_reader_timings"] = strict_reader_timings(count)
+    assert smoke.native_self_test_result_failure(native_result) == (
+        None if count == 13 else "native_result_media"
+    )
+
+
+@pytest.mark.parametrize("invalid", [None, [], "PRIVATE_FIXTURE", [{"segment": 1}]])
+def test_native_result_rejects_present_but_invalid_reader_timings(
+    native_result: dict, invalid
+) -> None:
+    native_result["strict_sink_reader_timings"] = invalid
+    assert smoke.native_self_test_result_failure(native_result) == "native_result_media"
+
+
+@pytest.mark.parametrize("failure", [None, "header", "timings"])
+def test_remote_result_probe_projects_only_successful_safe_reader_timings(
+    native_result: dict,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str | None,
+) -> None:
+    native_result["strict_sink_reader_timings"] = strict_reader_timings()
+    native_result["raw_report"] = "PRIVATE_FIXTURE_REPORT"
+    if failure == "header":
+        native_result["status"] = "PRIVATE_FIXTURE_STATUS"
+    elif failure == "timings":
+        native_result["strict_sink_reader_timings"][-1]["diagnostic"]["stderr"] = "PRIVATE_FIXTURE"
+    raw = json.dumps(native_result).encode()
+
+    class Reader(io.BytesIO):
+        def fileno(self) -> int:
+            return 17
+
+    monkeypatch.setattr(os, "open", lambda *_args: 17)
+    monkeypatch.setattr(os, "O_NOFOLLOW", 0x20000, raising=False)
+    monkeypatch.setattr(os, "O_NONBLOCK", 0x800, raising=False)
+    monkeypatch.setattr(os, "fdopen", lambda *_args: Reader(raw))
+    monkeypatch.setattr(
+        os,
+        "fstat",
+        lambda _fd: SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o600, st_uid=0, st_nlink=1, st_size=len(raw)
+        ),
+    )
+    exec(  # noqa: S102 - repository-owned probe with mocked protected report
+        compile(smoke.native_result_probe_source(), "<fixed-native-result-probe>", "exec"), {}
+    )
+    output = capsys.readouterr().out
+    assert "PRIVATE_FIXTURE" not in output
+    lines = output.splitlines()
+    if failure:
+        assert lines == ["native_result_header" if failure == "header" else "native_result_media"]
+    else:
+        assert lines[0] == "NATIVE_SELF_TEST_RESULT_OK"
+        assert json.loads(lines[1]) == {
+            "strict_sink_reader_timings": safe_strict_sink_reader_timings(strict_reader_timings())
+        }
+        assert len(lines) == 2
+
+
+@pytest.mark.parametrize(
+    "change",
+    [None, "unknown-envelope", "unknown-row", "bad-count", "extra-line", "raw-line", "bad-json"],
+)
+def test_host_lifecycle_revalidates_timing_projection_before_logging(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    change: str | None,
+) -> None:
+    payload = {"strict_sink_reader_timings": strict_reader_timings()}
+    if change == "unknown-envelope":
+        payload["raw_stderr"] = "PRIVATE_FIXTURE"
+    elif change == "unknown-row":
+        payload["strict_sink_reader_timings"][-1]["raw_stderr"] = "PRIVATE_FIXTURE"
+    elif change == "bad-count":
+        payload["strict_sink_reader_timings"].pop()
+    lines = ["NATIVE_SELF_TEST_RESULT_OK", json.dumps(payload)]
+    if change == "extra-line":
+        lines.append("PRIVATE_FIXTURE")
+    elif change == "raw-line":
+        lines[1] = "PRIVATE_FIXTURE"
+    elif change == "bad-json":
+        lines[1] = '{"strict_sink_reader_timings": '
+    stages = []
+
+    def fake_compose(*args, **kwargs):
+        if "python3" in args:
+            assert kwargs["max_capture_bytes"] == 64 * 1024
+            output = ("\n".join(lines) + "\n").encode()
+        elif "REMOTE_NATIVE_LIFECYCLE_OK" in args[-1]:
+            output = b"REMOTE_NATIVE_LIFECYCLE_OK\n"
+        else:
+            output = b""
+        return subprocess.CompletedProcess(args, 0, output, b"")
+
+    monkeypatch.setattr(smoke, "compose", fake_compose)
+    monkeypatch.setattr(smoke, "set_smoke_stage", stages.append)
+    if change:
+        with pytest.raises(SmokeFailure, match="^native self-test reader timings are invalid$"):
+            smoke.verify_remote_lifecycle()
+        assert stages[-1] == "native_result_media"
+        assert capsys.readouterr().out == ""
+    else:
+        smoke.verify_remote_lifecycle()
+        output = capsys.readouterr().out.splitlines()
+        prefix = "Native strict sink reader diagnostic: "
+        assert all(line.startswith(prefix) for line in output)
+        assert [
+            json.loads(line[len(prefix) :]) for line in output
+        ] == safe_strict_sink_reader_timings(strict_reader_timings())
 
 
 @pytest.mark.parametrize(

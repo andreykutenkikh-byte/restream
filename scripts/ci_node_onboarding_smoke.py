@@ -148,6 +148,7 @@ SAFE_BOOTSTRAP_DIAGNOSTIC_CODES = frozenset(
         "relay_self_test_reset_precondition_failed",
         "relay_self_test_reset_injection_failed",
         "relay_self_test_reset_slate_failed",
+        "relay_self_test_reset_live_failed",
         "relay_self_test_reset_circuit_failed",
         "relay_self_test_reset_kick_failed",
         "relay_self_test_reset_reconnect_failed",
@@ -363,6 +364,12 @@ def _safe_failure_media(value: Any) -> dict[str, Any] | None:
     required = {"scope", "elapsed_seconds", "log_ok", "markers", "first_seen"}
     optional = {"supervisor_count", "child_count", "supervisor_seen_seconds", "child_seen_seconds"}
     reader = {"reader_input", "reader_output", "reader_frames"}
+    reader_timings = {
+        "reader_input_seconds": "reader_input",
+        "reader_output_seconds": "reader_output",
+        "reader_first_frame_seconds": "reader_frames",
+        "reader_last_frame_seconds": "reader_frames",
+    }
     if not isinstance(value, dict) or not required <= value.keys():
         return None
     scope = value.get("scope")
@@ -370,6 +377,7 @@ def _safe_failure_media(value: Any) -> dict[str, Any] | None:
         return None
     if scope == "capture":
         required |= reader
+        optional |= reader_timings.keys() | {"reader_media_seconds"}
     if not required <= value.keys() or not value.keys() <= required | optional:
         return None
     elapsed = value["elapsed_seconds"]
@@ -398,13 +406,55 @@ def _safe_failure_media(value: Any) -> dict[str, Any] | None:
         or not 0 <= value["reader_frames"] <= 10000
     ):
         return None
+    if scope == "capture":
+        for name, evidence in reader_timings.items():
+            if name in value and (
+                not value[evidence] or not _diagnostic_seconds(value[name], elapsed)
+            ):
+                return None
+        if (
+            "reader_first_frame_seconds" in value
+            and "reader_last_frame_seconds" in value
+            and value["reader_first_frame_seconds"] > value["reader_last_frame_seconds"]
+        ):
+            return None
+        # Buffered media can advance faster than the reader's wall clock.
+        if "reader_media_seconds" in value and not _diagnostic_seconds(
+            value["reader_media_seconds"]
+        ):
+            return None
     result = dict(value)
     result["elapsed_seconds"] = round(elapsed, 3)
     result["markers"] = dict(markers)
     result["first_seen"] = {name: round(seconds, 3) for name, seconds in first_seen.items()}
-    for name in ("supervisor_seen_seconds", "child_seen_seconds"):
+    for name in (
+        "supervisor_seen_seconds",
+        "child_seen_seconds",
+        *reader_timings,
+        "reader_media_seconds",
+    ):
         if name in result:
             result[name] = round(result[name], 3)
+    return result
+
+
+def safe_strict_sink_reader_timings(value: Any) -> list[dict[str, Any]] | None:
+    """Project only bounded per-capture evidence, never arbitrary report fields."""
+    if not isinstance(value, list) or not 1 <= len(value) <= 32:
+        return None
+    result = []
+    seen: set[int] = set()
+    for row in value:
+        if not isinstance(row, dict) or row.keys() != {"segment", "diagnostic"}:
+            return None
+        segment = row["segment"]
+        if type(segment) is not int or not 1 <= segment <= 32 or segment in seen:
+            return None
+        diagnostic = _safe_failure_media(row["diagnostic"])
+        if diagnostic is None or diagnostic["scope"] != "capture":
+            return None
+        seen.add(segment)
+        result.append({"segment": segment, "diagnostic": diagnostic})
     return result
 
 
@@ -878,9 +928,10 @@ def ready_relay(client: APIClient) -> tuple[Mapping[str, Any], Mapping[str, Any]
 def native_self_test_result_failure(result: Any) -> str | None:
     """Validate the current quick-test contract without returning report values.
 
-    This same pure function executes in the disposable target; only its fixed
-    failure code leaves the target. Aggregate RTSP recorder artifacts are not
-    the corruption oracle: strict final-RTMP segments and delivery evidence are.
+    This same pure function executes in the disposable target. Only its fixed
+    status and separately projected capture diagnostics leave the target.
+    Aggregate RTSP recorder artifacts are not the corruption oracle: strict
+    final-RTMP segments and delivery evidence are.
     """
 
     def section(name: str) -> dict[str, Any]:
@@ -1095,6 +1146,10 @@ def native_self_test_result_failure(result: Any) -> str | None:
         and result.get("legacy_portrait_720x1280_regression_absent") is True
     ):
         return "native_result_media"
+    if "strict_sink_reader_timings" in result:
+        timings = safe_strict_sink_reader_timings(result["strict_sink_reader_timings"])
+        if timings is None or len(timings) != capture["segments"]:
+            return "native_result_media"
     for name in ("secret_scan_while_live", "secret_scan"):
         scan = section(name)
         if not (
@@ -1119,9 +1174,15 @@ def native_result_probe_source() -> str:
     """Send repository code, not secret report contents, across the CI boundary."""
     return (
         "from __future__ import annotations\nimport json, math, os, stat\n"
+        + f"_MEDIA_DIAGNOSTIC_MARKERS = frozenset({sorted(_MEDIA_DIAGNOSTIC_MARKERS)!r})\n"
+        + f"_MEDIA_FIRST_SEEN_MARKERS = frozenset({sorted(_MEDIA_FIRST_SEEN_MARKERS)!r})\n"
+        + inspect.getsource(_diagnostic_seconds)
+        + inspect.getsource(_safe_failure_media)
+        + inspect.getsource(safe_strict_sink_reader_timings)
         + inspect.getsource(native_self_test_result_failure)
         + """
 failure = 'native_result_unreadable'
+timings = None
 try:
     descriptor = os.open('/var/lib/moblin-relay/tests/last-quick-result.json',
                          os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -1132,10 +1193,15 @@ try:
                 and metadata.st_nlink == 1 and 0 < metadata.st_size <= 1048576):
             raw = handle.read(1048577)
             if len(raw) <= 1048576:
-                failure = native_self_test_result_failure(json.loads(raw))
+                result = json.loads(raw)
+                failure = native_self_test_result_failure(result)
+                if failure is None and 'strict_sink_reader_timings' in result:
+                    timings = safe_strict_sink_reader_timings(result['strict_sink_reader_timings'])
 except (OSError, ValueError, TypeError, OverflowError):
-    pass
+    failure = 'native_result_unreadable'
 print(failure or 'NATIVE_SELF_TEST_RESULT_OK')
+if failure is None and timings is not None:
+    print(json.dumps({'strict_sink_reader_timings': timings}, sort_keys=True))
 """
     )
 
@@ -1199,12 +1265,27 @@ PY
         "python3",
         "-c",
         native_result_probe_source(),
-        max_capture_bytes=256,
+        max_capture_bytes=64 * 1024,
     )
-    failure = probe.stdout.decode("ascii", errors="replace").strip()
+    lines = probe.stdout.decode("ascii", errors="replace").strip().splitlines()
+    failure = lines[0] if lines else ""
     if failure in NATIVE_RESULT_FAILURES:
         set_smoke_stage(failure)
     require(failure == "NATIVE_SELF_TEST_RESULT_OK", "native self-test result is invalid")
+    if len(lines) != 1:
+        timings = None
+        if len(lines) == 2:
+            try:
+                payload = json.loads(lines[1])
+                if isinstance(payload, dict) and payload.keys() == {"strict_sink_reader_timings"}:
+                    timings = safe_strict_sink_reader_timings(payload["strict_sink_reader_timings"])
+            except (ValueError, TypeError, OverflowError):
+                pass
+        if timings is None or len(timings) != 13:
+            set_smoke_stage("native_result_media")
+            raise SmokeFailure("native self-test reader timings are invalid")
+        for row in timings:
+            print("Native strict sink reader diagnostic: " + json.dumps(row, sort_keys=True))
     set_smoke_stage("remote_lifecycle_accounts")
     lifecycle = compose(
         "exec",

@@ -123,6 +123,7 @@ def test_native_relay_failures_have_stable_localized_messages() -> None:
         "relay_self_test_reset_precondition_failed",
         "relay_self_test_reset_injection_failed",
         "relay_self_test_reset_slate_failed",
+        "relay_self_test_reset_live_failed",
         "relay_self_test_reset_circuit_failed",
         "relay_self_test_reset_kick_failed",
         "relay_self_test_reset_reconnect_failed",

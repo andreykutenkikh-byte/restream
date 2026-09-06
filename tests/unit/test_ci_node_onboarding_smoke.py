@@ -149,6 +149,7 @@ def test_native_safe_failure_code_is_allowlisted() -> None:
         "relay_self_test_reset_precondition_failed",
         "relay_self_test_reset_injection_failed",
         "relay_self_test_reset_slate_failed",
+        "relay_self_test_reset_live_failed",
         "relay_self_test_reset_circuit_failed",
         "relay_self_test_reset_kick_failed",
         "relay_self_test_reset_reconnect_failed",

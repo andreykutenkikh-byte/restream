@@ -142,6 +142,7 @@ SELF_TEST_STAGES = frozenset(
         "reset-start",
         "reset-kill",
         "reset-slate",
+        "reset-live",
         "reset-open",
         "reset-kicked",
         "reset-session",
@@ -3542,9 +3543,20 @@ def output_format_failure_stage(
 class CaptureReaderProgress:
     """Discard reader output after recognizing only fixed milestones/counts."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, started: float | None = None) -> None:
         self.lock = threading.Lock()
+        self.started = started
         self.values = {"reader_input": False, "reader_output": False, "reader_frames": 0}
+
+    def mark_time(self, name: str, *, latest: bool = False) -> None:
+        if self.started is None:
+            return
+        elapsed = time.monotonic() - self.started
+        if math.isfinite(elapsed) and 0 <= elapsed <= 660:
+            if latest:
+                self.values[name] = round(elapsed, 3)
+            else:
+                self.values.setdefault(name, round(elapsed, 3))
 
     def drain(self, pipe, *, progress: bool) -> None:
         pending = b""
@@ -3580,13 +3592,21 @@ class CaptureReaderProgress:
             if progress:
                 match = re.fullmatch(rb"frame=\s*([0-9]{1,5})", line)
                 if match:
-                    self.values["reader_frames"] = max(
-                        self.values["reader_frames"], min(int(match[1]), 10000)
-                    )
+                    frames = min(int(match[1]), 10000)
+                    if frames > self.values["reader_frames"]:
+                        self.mark_time("reader_first_frame_seconds")
+                        self.mark_time("reader_last_frame_seconds", latest=True)
+                    self.values["reader_frames"] = max(self.values["reader_frames"], frames)
+                if self.started is not None:
+                    media_time = re.fullmatch(rb"out_time_us=([0-9]{1,9})", line)
+                    if media_time and int(media_time[1]) <= 660_000_000:
+                        self.values["reader_media_seconds"] = round(int(media_time[1]) / 1e6, 3)
             elif line.startswith(b"Input #0, flv, from "):
                 self.values["reader_input"] = True
+                self.mark_time("reader_input_seconds")
             elif line.startswith(b"Output #0, flv, to "):
                 self.values["reader_output"] = True
+                self.mark_time("reader_output_seconds")
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -3652,7 +3672,7 @@ class MediaFailureDiagnostics:
         self.offset = 0
         self.uid = os.geteuid()
         self.values = {"scope": scope, "log_ok": False, "markers": {}, "first_seen": {}}
-        self.reader = CaptureReaderProgress()
+        self.reader = CaptureReaderProgress(started=self.started)
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self.observe, daemon=True)
         with contextlib.suppress(OSError, TestFailure):
@@ -4485,6 +4505,21 @@ def main() -> int:
                     "path": sink_capture,
                     "capture_bytes": capture_bytes,
                     "result_key": result_key,
+                }
+            )
+            reader_timings = result.setdefault("strict_sink_reader_timings", [])
+            if len(reader_timings) >= 32:
+                raise TestFailure("strict RTMP reader timing count exceeded its bound")
+            reader_timings.append(
+                {
+                    "segment": strict_sink_segment_sequence,
+                    "diagnostic": {
+                        **diagnostic.values,
+                        "markers": dict(diagnostic.values.get("markers", {})),
+                        "first_seen": dict(diagnostic.values.get("first_seen", {})),
+                        **diagnostic.reader.snapshot(),
+                        "elapsed_seconds": round(time.monotonic() - diagnostic.started, 3),
+                    },
                 }
             )
             result["strict_sink_segment_capture"] = {
@@ -5896,6 +5931,7 @@ def main() -> int:
                     f"repeated-failure {failure_index} SLATE transition",
                     failure_started,
                 )
+                mark_self_test_stage("reset-live")
                 final_replacement = wait_healthy_live(
                     f"LIVE after forced bridge failure {failure_index}",
                     SUPERVISOR_RESTART_TIMEOUT_SECONDS,

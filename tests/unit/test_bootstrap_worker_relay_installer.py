@@ -672,6 +672,7 @@ def test_installer_maps_every_declared_self_test_stage_exactly() -> None:
         ("reset-start", "relay_self_test_reset_precondition_failed"),
         ("reset-kill", "relay_self_test_reset_injection_failed"),
         ("reset-slate", "relay_self_test_reset_slate_failed"),
+        ("reset-live", "relay_self_test_reset_live_failed"),
         ("reset-open", "relay_self_test_reset_circuit_failed"),
         ("reset-kicked", "relay_self_test_reset_kick_failed"),
         ("reset-session", "relay_self_test_reset_reconnect_failed"),
