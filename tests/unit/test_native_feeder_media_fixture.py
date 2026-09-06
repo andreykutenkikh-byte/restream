@@ -3,7 +3,7 @@ from __future__ import annotations
 import runpy
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import yaml
@@ -61,6 +61,41 @@ def test_finite_clock_source_keeps_media_copy_and_places_sps_before_buffering_se
     assert "-bsf:v" not in original
 
 
+def test_four_second_source_diagnostic_reports_bytes_pts_and_nominal_send_time(
+    monkeypatch, tmp_path, capsys
+):
+    helper = runpy.run_path(str(HELPER), run_name="_clock_fixture_test")
+    make = helper["make_transport"]
+    payload = (b"\x47" + b"\xff" * 187) * 112
+
+    def generate(directory):
+        return directory / "live.mp4"
+
+    def remux(command, **_kwargs):
+        Path(command[-1]).write_bytes(payload)
+        return SimpleNamespace(returncode=0, stderr=b"")
+
+    monkeypatch.setitem(generate.__globals__, "run", lambda *_args, **_kwargs: None)
+    monkeypatch.setitem(generate.__globals__, "LIVE_FIXTURE_DURATION_SECONDS", 8)
+    namespace = {
+        "generate_live": generate,
+        "local_mpegts_remux_command": lambda _path: ["ffmpeg", "-stream_loop", "-1", "pipe:1"],
+        "LIVE_FEED_CHUNK_BYTES": 10528,
+        "LIVE_TRANSPORT_MUX_RATE_BITS_PER_SECOND": 9_000_000,
+    }
+    monkeypatch.setitem(make.__globals__, "load_feeder", lambda _case: namespace)
+    monkeypatch.setattr(helper["subprocess"], "run", remux)
+    monkeypatch.setitem(
+        make.__globals__, "probe_packets", lambda *_args: [1.4 + index / 30 for index in range(120)]
+    )
+    _path, actual = make(tmp_path, 4)
+    assert actual == payload
+    assert capsys.readouterr().out.strip() == (
+        "Synthetic source clock: duration_seconds=4 source_bytes=21056 padding_bytes=0 "
+        "video_packets=120 pts_span_seconds=3.966667 nominal_send_seconds=0.009358"
+    )
+
+
 @pytest.mark.parametrize("case", ["old", "single", "fixed"])
 @pytest.mark.parametrize("jitter", [0.003, 0.010])
 def test_real_media_helper_replays_exact_removed_clock_policies(monkeypatch, case, jitter):
@@ -109,10 +144,11 @@ def test_phase_debt_without_explicit_send_accounting_reproduces_four_packet_burs
         ([0.738, 0.94, 0.481, 0.984], "fixed fixture media clock does not follow wall time"),
         ([0.738, 0.991, 0.8, 0.984], "single-interval fixture scheduling cliff was not reproduced"),
         ([0.738, 0.991, 0.481, 0.94], "bounded catch-up fixture clock does not follow wall time"),
+        ([0.738, 0.991, 0.481, 1.06], "bounded catch-up fixture clock does not follow wall time"),
     ],
 )
 def test_media_gate_preserves_original_cases_and_adds_bounded_cliff_cases(
-    monkeypatch, rates, error
+    monkeypatch, capsys, rates, error
 ):
     helper = runpy.run_path(str(HELPER), run_name="_clock_fixture_test")
     main = helper["main"]
@@ -146,3 +182,10 @@ def test_media_gate_preserves_original_cases_and_adds_bounded_cliff_cases(
     ]
     assert helper["CAPTURE_TIMEOUT_SECONDS"] == 20.0
     assert helper["MAX_CAPTURE_BYTES"] == 12 * 1024 * 1024
+    first_line = capsys.readouterr().out.splitlines()[0]
+    assert first_line == (
+        "Real media clock rates before assertions: "
+        f"old_3ms={rates[0]:.6f} bounded_3ms={rates[1]:.6f} "
+        f"single_10ms={rates[2]:.6f} bounded_10ms={rates[3]:.6f}"
+    )
+    assert "complete fixed media" not in first_line

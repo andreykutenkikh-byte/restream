@@ -98,7 +98,18 @@ def make_transport(directory, duration=SOURCE_DURATION_SECONDS):
     padding = (-len(payload)) % namespace["LIVE_FEED_CHUNK_BYTES"]
     payload += (b"\x47\x1f\xff\x10" + b"\xff" * 184) * (padding // 188)
     transport.write_bytes(payload)
-    probe_packets(transport, "source")
+    timestamps = probe_packets(transport, "source")
+    chunk = namespace["LIVE_FEED_CHUNK_BYTES"]
+    nominal_seconds = (len(payload) - chunk) / (
+        namespace["LIVE_TRANSPORT_MUX_RATE_BITS_PER_SECOND"] / 8
+    )
+    print(
+        "Synthetic source clock: "
+        f"duration_seconds={duration} source_bytes={len(payload)} padding_bytes={padding} "
+        f"video_packets={len(timestamps)} pts_span_seconds={max(timestamps) - min(timestamps):.6f} "
+        f"nominal_send_seconds={nominal_seconds:.6f}",
+        flush=True,
+    )
     return transport, payload
 
 
@@ -113,7 +124,8 @@ def media_clock_rate(
 ):
     namespace = load_feeder(case)
     cls = namespace["PacedMPEGTSFeeder"]
-    sent = SimpleNamespace(digest=hashlib.sha256(), size=0, first=None, last=None)
+    sent = SimpleNamespace(digest=hashlib.sha256(), size=0, first=None, last=None, max_gap=0.0)
+    waits = SimpleNamespace(count=0, max_overrun=0.0, beyond_credit=0)
     received = hashlib.sha256()
     received_size = 0
     original_socket = socket.socket
@@ -124,6 +136,8 @@ def media_clock_rate(
             observed = time.monotonic()
             if sent.first is None:
                 sent.first = observed
+            if sent.last is not None:
+                sent.max_gap = max(sent.max_gap, observed - sent.last)
             sent.last = observed
             sent.digest.update(data[:size])
             sent.size += size
@@ -131,10 +145,18 @@ def media_clock_rate(
 
     class DelayedCondition(threading.Condition):
         def wait(self, timeout=None):
+            started = time.monotonic()
             result = super().wait(timeout)
             if timeout is not None and timeout > 0:
                 # Inject bounded scheduler lateness into this feeder only.
                 time.sleep(jitter)
+                overrun = max(0.0, time.monotonic() - started - timeout)
+                waits.count += 1
+                waits.max_overrun = max(waits.max_overrun, overrun)
+                if overrun >= feeder._catchup_chunks * namespace["LIVE_FEED_CHUNK_BYTES"] / (
+                    namespace["LIVE_TRANSPORT_MUX_RATE_BITS_PER_SECOND"] / 8
+                ):
+                    waits.beyond_credit += 1
             return result
 
     capture = directory / f"{case}.ts"
@@ -198,7 +220,20 @@ def media_clock_rate(
     ):
         raise ProbeFailure("real media transport was incomplete or reordered")
     timestamps = probe_packets(capture, case)
-    return (max(timestamps) - min(timestamps)) / (sent.last - sent.first)
+    pts_span = max(timestamps) - min(timestamps)
+    sent_seconds = sent.last - sent.first
+    rate = pts_span / sent_seconds
+    print(
+        "Real media clock measurement: "
+        f"case={case} duration_seconds={duration} jitter_seconds={jitter:.6f} "
+        f"source_bytes={len(source_payload)} sent_bytes={sent.size} received_bytes={received_size} "
+        f"video_packets={len(timestamps)} pts_span_seconds={pts_span:.6f} "
+        f"send_seconds={sent_seconds:.6f} rate={rate:.6f} max_send_gap_seconds={sent.max_gap:.6f} "
+        f"wait_count={waits.count} max_wait_overrun_seconds={waits.max_overrun:.6f} "
+        f"waits_beyond_frame_credit={waits.beyond_credit}",
+        flush=True,
+    )
+    return rate
 
 
 def probe_packets(capture, case):
@@ -294,6 +329,14 @@ def main():
             )
             for case in ("single", "fixed")
         ]
+    # These are derived only from generated fixtures. Report every measured
+    # comparison before its unchanged threshold can fail, without paths/data.
+    print(
+        "Real media clock rates before assertions: "
+        f"old_3ms={old_rate:.6f} bounded_3ms={fixed_rate:.6f} "
+        f"single_10ms={cliff_rates[0]:.6f} bounded_10ms={cliff_rates[1]:.6f}",
+        flush=True,
+    )
     if not 0 < old_rate < 0.90:
         raise ProbeFailure("old fixture media clock slowdown was not reproduced")
     if not 0.95 <= fixed_rate <= 1.05:
