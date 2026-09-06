@@ -196,7 +196,9 @@ iOS requires a user gesture before Web Audio can play. **Включить зву
 предупреждения** unlocks an in-memory oscillator and plays a short test tone. Alerts
 then sound on any worsening transition to yellow/red/black, including green→red,
 green→black and yellow→black. A more serious escalation is not suppressed by a recent
-weaker warning's cooldown. The first render, unknown→green, unchanged severity and
+weaker warning's cooldown. A confirmed yellow/red/black alarm after an already rendered
+unknown/warm-up state also sounds: losing LIVE before three good heartbeats must not
+silence the alert. The first render, unknown→green, unchanged severity and
 recovery remain silent. **Заглушить на 60 секунд** and enabled/muted state are memory-only.
 iOS may throttle or suspend a background WebView, so background audio and polling are
 not guaranteed.
