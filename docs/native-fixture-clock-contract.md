@@ -49,6 +49,17 @@ There are no reader retries or reduced probe settings. Observation after reader
 completion never extends the reader's deadline. Work and owned cleanup are
 bounded; only fixed reasons and numeric diagnostics reach CI logs.
 
+The paired source is eight seconds: 240 video frames and 375 AAC frames share
+that boundary. The earlier four-second source has half an AAC frame at its end.
+FFmpeg 5.1's copied-loop offset uses the longest track endpoint, so padding can
+disturb video timestamps at the seam. Before the reader cases, a fast actual
+continuous-copy remux checks both clips: the original four-second clip must
+exhibit the seam-only discrepancy, and the eight-second clip must pass the same
+frame-spacing and GOP checks through its first loop. This does not loosen the
+observer's two-millisecond tolerance, reset timestamps or discard bad frames.
+Observer failure diagnostics identify only a fixed reason and bounded numeric
+frame/PTS deltas, never the underlying log text.
+
 This establishes a controlled failure class. It cannot prove that scheduler
 delay was the exclusive cause of each historical run whose artifacts are gone.
 

@@ -59,29 +59,51 @@ class PhaseObserver(threading.Thread):
         super().__init__(daemon=True)
         self.pipe, self.lock = pipe, threading.Lock()
         self.frames = deque(maxlen=512)
-        self.failure = False
+        self.failure = None
 
     def run(self):
+        reason, line_bytes, frame_delta, pts_delta = "eof", 0, None, None
         try:
             while line := self.pipe.readline(2049):
+                line_bytes = len(line)
                 if len(line) > 2048 or not line.endswith(b"\n"):
-                    raise ProbeFailure("observer line bound failed")
+                    reason = "line_bound"
+                    raise ProbeFailure(reason)
+                reason = "frame_parse"
                 frame = parse_frame(line, time.monotonic())
                 if frame is not None:
                     with self.lock:
                         if self.frames:
                             previous = self.frames[-1]
+                            frame_delta, pts_delta = frame[0] - previous[0], frame[1] - previous[1]
+                            reason = "frame_continuity"
                             require(
-                                frame[0] == previous[0] + 1
-                                and abs(frame[1] - previous[1] - 1 / 30) < 0.002,
+                                frame_delta == 1 and abs(pts_delta - 1 / 30) < 0.002,
                                 "observer frame continuity failed",
                             )
                         self.frames.append(frame)
-        except (OSError, ValueError, ProbeFailure):
-            self.failure = True
+                reason = "eof"
+        except OSError:
+            reason = "pipe_io"
+        except (ValueError, ProbeFailure):
+            pass
+        finally:
+            with self.lock:
+                last = self.frames[-1] if self.frames else None
+                self.failure = {
+                    "reason": reason,
+                    "line_bytes": line_bytes,
+                    "frame_count": len(self.frames),
+                    "last_frame": last[0] if last else None,
+                    "last_pts": round(last[1], 6) if last else None,
+                    "frame_delta": frame_delta,
+                    "pts_delta": round(pts_delta, 6) if pts_delta is not None else None,
+                }
 
     def snapshot(self):
         with self.lock:
+            if self.failure:
+                print(json.dumps({"observer_failure": self.failure}), flush=True)
             require(not self.failure and self.is_alive(), "observer failed or stopped")
             return list(self.frames)
 
@@ -203,13 +225,122 @@ def free_port(kind):
         return reservation.getsockname()[1]
 
 
+def validate_loop_packets(payload, duration):
+    require(len(payload) <= 131072, "source seam probe output bound failed")
+    data = json.loads(payload)
+    streams, packets = data["streams"], data["packets"]
+    require(
+        len(streams) == 1
+        and all(
+            streams[0].get(key) == value
+            for key, value in {
+                "codec_name": "h264",
+                "profile": "Main",
+                "level": 40,
+                "width": 1080,
+                "height": 1920,
+                "r_frame_rate": "30/1",
+            }.items()
+        ),
+        "source seam video contract changed",
+    )
+    seam = duration * 30
+    require(
+        duration in (4, 8) and seam < len(packets) <= seam + 8, "source seam packet count failed"
+    )
+    pts = [float(packet["pts_time"]) for packet in packets]
+    require(
+        all(math.isfinite(value) and 0 <= value <= 20 for value in pts),
+        "source seam PTS bounds failed",
+    )
+    require(
+        all(packet["flags"] in ("K_", "__") for packet in packets),
+        "source seam packet flags changed",
+    )
+    keys = [index for index, packet in enumerate(packets) if packet["flags"] == "K_"]
+    require(keys == list(range(0, len(packets), 60)), "source seam GOP length changed")
+    deltas = [right - left for left, right in pairwise(pts)]
+    require(
+        all(abs(delta - 1 / 30) < 0.002 for index, delta in enumerate(deltas, 1) if index != seam),
+        "source continuity failed outside loop seam",
+    )
+    seam_delta = deltas[seam - 1]
+    evidence = {
+        "duration_seconds": duration,
+        "video_packets": len(packets),
+        "seam_frame": seam,
+        "seam_delta_seconds": round(seam_delta, 6),
+        "seam_error_seconds": round(seam_delta - 1 / 30, 6),
+    }
+    print(json.dumps({"source_loop": evidence}), flush=True)
+    # The negative case must exhibit only the AAC-padding seam defect; an
+    # arbitrary probe/decode/continuity failure is never accepted as evidence.
+    require(
+        0.002 < seam_delta - 1 / 30 < 0.022 if duration == 4 else abs(seam_delta - 1 / 30) < 0.002,
+        "source seam counterfactual not established",
+    )
+    return evidence
+
+
+def verify_source_loop(namespace, live, work, duration):
+    globals_ = namespace["capture_final_sink_media_segment"].__globals__
+    require(0 < live.stat().st_size <= 12 * 1024**2, "source clip size bound failed")
+    output = work / "loop-seam.ts"
+    remux = media_commands(namespace, live, 1, 1)[0]
+    remux[-1:] = ["-t", str(duration + 0.2), "-fs", str(11 * 1024**2), str(output)]
+    completed = globals_["run"](
+        remux,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=10,
+    )
+    require(
+        completed.returncode == 0
+        and output.is_file()
+        and 0 < output.stat().st_size <= 12 * 1024**2,
+        "source seam remux failed",
+    )
+    output.chmod(0o600)
+    stdout, stderr = work / "loop-seam-probe.json", work / "loop-seam-probe.stderr"
+    with stdout.open("xb") as out, stderr.open("xb") as err:
+        stdout.chmod(0o600)
+        stderr.chmod(0o600)
+        probe = globals_["run"](
+            [
+                str(globals_["FFPROBE"]),
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_packets",
+                "-show_streams",
+                "-show_entries",
+                "stream=codec_name,profile,level,width,height,r_frame_rate:packet=pts_time,flags",
+                "-of",
+                "json",
+                str(output),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=out,
+            stderr=err,
+            timeout=10,
+        )
+    require(probe.returncode == 0 and stderr.stat().st_size == 0, "source seam probe failed")
+    require(stdout.stat().st_size <= 131072, "source seam probe output bound failed")
+    return validate_loop_packets(stdout.read_text(encoding="utf-8"), duration)
+
+
 def configure(namespace, work, sink_port, deadline):
     globals_ = namespace["capture_final_sink_media_segment"].__globals__
     globals_.update(
         SELF_TEST_STAGE_FILE="",
         SELF_TEST_PROGRESS_FILE=work / "progress.json",
         SINK_RTMP_PORT=sink_port,
-        LIVE_FIXTURE_DURATION_SECONDS=4,
+        # Eight seconds aligns 240 video frames / 375 complete AAC frames.
+        # Four seconds contains a half AAC frame; FFmpeg 5.1 stream_loop uses
+        # its padded audio endpoint for every stream, disturbing video PTS.
+        LIVE_FIXTURE_DURATION_SECONDS=8,
     )
     original_run, original_probe = globals_["run"], globals_["run_probe"]
 
@@ -443,8 +574,15 @@ def main():
     with TemporaryDirectory(prefix="native-reader-clock-") as temporary:
         work = Path(temporary)
         namespace = loader("fixed")
-        configure(namespace, work, 1, deadline)
+        globals_ = configure(namespace, work, 1, deadline)
+        original = work / "original-four-second-source"
+        original.mkdir(mode=0o700)
+        globals_["LIVE_FIXTURE_DURATION_SECONDS"] = 4
+        old_live = namespace["generate_live"](original)
+        verify_source_loop(namespace, old_live, original, 4)
+        globals_["LIVE_FIXTURE_DURATION_SECONDS"] = 8
         live = namespace["generate_live"](work)
+        verify_source_loop(namespace, live, work, 8)
         for case in ("single", "fixed"):
             directory = work / case
             directory.mkdir(mode=0o700)

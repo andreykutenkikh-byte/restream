@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import json
 import runpy
 import subprocess
 import sys
@@ -41,6 +43,204 @@ def test_showinfo_parser_rejects_unbounded_pts_and_fake_keyframe(helper):
     line = line.replace(b"601", b"1").replace(b"type:I", b"type:P")
     with pytest.raises(helper["ProbeFailure"], match="keyframe type"):
         helper["parse_frame"](line, 1)
+
+
+@pytest.mark.parametrize(
+    "duration,offset,reason",
+    [
+        (4, 4.0106875, "frame_continuity"),
+        (8, 8.000020833, "eof"),
+    ],
+)
+def test_actual_observer_rejects_padding_seam_but_accepts_aligned_codec_period(
+    helper, capsys, duration, offset, reason
+):
+    # FFmpeg5.1 seek_to_start uses the largest max_pts-min_pts+final-unit
+    # across copied streams. These codec-grid endpoints model that formula;
+    # the CI remux/ffprobe proves the actual generated files independently.
+    seam = duration * 30
+    pts = [
+        index / 30 if index < seam else offset + (index - seam) / 30 for index in range(seam + 3)
+    ]
+    lines = [b"rtmp://secret.invalid/key ignored stderr\n"]
+    for index, value in enumerate(pts):
+        key = index % 60 == 0
+        lines.append(
+            (
+                f"[Parsed_showinfo_0 @ 0x1] n: {index} pts: {index} pts_time:{value:.6f} "
+                f"pos: 1 iskey:{int(key)} type:{'I' if key else 'P'} checksum:1\n"
+            ).encode()
+        )
+    observer = helper["PhaseObserver"](io.BytesIO(b"".join(lines)))
+    observer.run()
+    assert observer.failure["reason"] == reason
+    assert len(observer.frames) == (seam if duration == 4 else seam + 3)
+    if duration == 4:
+        assert observer.failure["frame_delta"] == 1
+        assert observer.failure["pts_delta"] == pytest.approx(0.044021, abs=1e-6)
+    with pytest.raises(helper["ProbeFailure"], match="observer failed"):
+        observer.snapshot()
+    evidence = capsys.readouterr().out
+    assert "secret" not in evidence and "rtmp" not in evidence
+    assert json.loads(evidence)["observer_failure"]["reason"] == reason
+
+
+@pytest.mark.parametrize(
+    "payload,reason", [(b"x" * 2049, "line_bound"), (b"partial", "line_bound")]
+)
+def test_observer_line_failure_is_bounded_and_does_not_print_payload(helper, payload, reason):
+    observer = helper["PhaseObserver"](io.BytesIO(payload))
+    observer.run()
+    assert observer.failure == {
+        "reason": reason,
+        "line_bytes": len(payload),
+        "frame_count": 0,
+        "last_frame": None,
+        "last_pts": None,
+        "frame_delta": None,
+        "pts_delta": None,
+    }
+
+
+def test_observer_io_failure_never_carries_exception_text(helper):
+    def fail(_limit):
+        raise OSError("rtmp://secret.invalid/key")
+
+    observer = helper["PhaseObserver"](SimpleNamespace(readline=fail))
+    observer.run()
+    assert observer.failure["reason"] == "pipe_io"
+    assert "secret" not in json.dumps(observer.failure)
+
+
+def loop_probe_payload(duration, seam_error=0):
+    seam = duration * 30
+    return json.dumps(
+        {
+            "streams": [
+                {
+                    "codec_name": "h264",
+                    "profile": "Main",
+                    "level": 40,
+                    "width": 1080,
+                    "height": 1920,
+                    "r_frame_rate": "30/1",
+                }
+            ],
+            "packets": [
+                {
+                    "pts_time": 1.4 + index / 30 + (seam_error if index >= seam else 0),
+                    "flags": "K_" if index % 60 == 0 else "__",
+                }
+                for index in range(seam + 6)
+            ],
+        }
+    )
+
+
+@pytest.mark.parametrize("duration,seam_error", [(4, 0.0106875), (8, 0.000020833)])
+def test_source_seam_accepts_only_original_negative_and_aligned_positive(
+    helper, duration, seam_error
+):
+    evidence = helper["validate_loop_packets"](loop_probe_payload(duration, seam_error), duration)
+    assert evidence["seam_frame"] == duration * 30
+    assert evidence["seam_error_seconds"] == pytest.approx(seam_error, abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["no_old_seam", "bad_new_seam", "extra_gap", "gop", "profile", "count", "bounds", "size"],
+)
+def test_source_seam_negative_cannot_hide_unrelated_failure(helper, change):
+    duration = 8 if change == "bad_new_seam" else 4
+    data = json.loads(loop_probe_payload(duration, 0 if change == "no_old_seam" else 0.0106875))
+    if change == "extra_gap":
+        data["packets"][20]["pts_time"] += 0.01
+    elif change == "gop":
+        data["packets"][60]["flags"] = "__"
+    elif change == "profile":
+        data["streams"][0]["profile"] = "High"
+    elif change == "count":
+        data["packets"] = data["packets"][:120]
+    elif change == "bounds":
+        data["packets"][1]["pts_time"] = float("inf")
+    payload = " " * 131073 if change == "size" else json.dumps(data)
+    with pytest.raises(helper["ProbeFailure"]):
+        helper["validate_loop_packets"](payload, duration)
+
+
+@pytest.mark.parametrize("mode", ["valid", "oversize", "stderr"])
+def test_source_seam_runs_bounded_copy_and_checks_output_before_reading(
+    helper, tmp_path, monkeypatch, mode
+):
+    live = tmp_path / "live.mp4"
+    live.write_bytes(b"fixture")
+    calls, reads = [], []
+    read_text = Path.read_text
+
+    def read(path, **kwargs):
+        reads.append(path)
+        return read_text(path, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        if command[0] == "ffmpeg":
+            (tmp_path / "loop-seam.ts").write_bytes(b"transport")
+        else:
+            payload = b"x" * 131073 if mode == "oversize" else loop_probe_payload(8).encode()
+            kwargs["stdout"].write(payload)
+            if mode == "stderr":
+                kwargs["stderr"].write(b"rtmp://secret.invalid/key")
+        return SimpleNamespace(returncode=0)
+
+    def capture():
+        pass
+
+    globals_ = capture.__globals__.copy() | {
+        "run": run,
+        "FFPROBE": "/usr/bin/ffprobe",
+    }
+    namespace = {
+        "capture_final_sink_media_segment": SimpleNamespace(__globals__=globals_),
+        "local_mpegts_remux_command": lambda _path: [
+            "ffmpeg",
+            "-stream_loop",
+            "-1",
+            "-i",
+            str(live),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0",
+            "-c",
+            "copy",
+            "-f",
+            "mpegts",
+            "pipe:1",
+        ],
+        "LIVE_FEED_FIFO_UNITS": 4096,
+        "LIVE_FEED_SOCKET_BUFFER_BYTES": 262144,
+    }
+    if mode == "valid":
+        helper["verify_source_loop"](namespace, live, tmp_path, 8)
+        assert reads == [tmp_path / "loop-seam-probe.json"]
+    else:
+        message = "output bound" if mode == "oversize" else "probe failed"
+        with pytest.raises(helper["ProbeFailure"], match=message):
+            helper["verify_source_loop"](namespace, live, tmp_path, 8)
+        assert reads == []
+    command, options = calls[0]
+    assert "0:v:0" in command and "0:a:0" in command
+    assert command[command.index("-c") + 1] == "copy"
+    assert command[command.index("-t") + 1] == "8.2"
+    assert command[command.index("-stream_loop") + 1] == "-1"
+    assert command[command.index("-fs") + 1] == str(11 * 1024**2)
+    assert options["timeout"] == 10
+    command, options = calls[1]
+    assert command[command.index("-select_streams") + 1] == "v:0"
+    assert "-show_packets" in command and options["timeout"] == 10
+    assert helper["WORK_SECONDS"] == 110
 
 
 @pytest.mark.parametrize("case,rate", [("single", 0.298), ("fixed", 0.991)])
@@ -204,7 +404,7 @@ def test_reused_functions_redirect_globals_without_modifying_strict_reader(
     assert globals_["SINK_RTMP_PORT"] == 30101
     assert globals_["SELF_TEST_STAGE_FILE"] == ""
     assert globals_["SELF_TEST_PROGRESS_FILE"] == tmp_path / "progress.json"
-    assert globals_["LIVE_FIXTURE_DURATION_SECONDS"] == 4
+    assert globals_["LIVE_FIXTURE_DURATION_SECONDS"] == 8
     # The unchanged capture's actual argv and deadline remain 90 frames / 15s.
     calls = []
 
