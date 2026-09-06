@@ -1,10 +1,13 @@
-# Read-only production comparison — 2026-09-05
+# Recovery stack verification — 2026-09-05/06
 
-This is evidence for code review, **not deployment approval**. No merge,
-deployment, service lifecycle operation, package installation, key rotation,
-connection reset, fault injection or agent publication was performed.
+This is evidence for code review, **not deployment approval**. September 5
+observations are historical; September 6 updates are identified separately.
+The current completion pass performs no PR merge, production deployment,
+service lifecycle operation, production package installation, key rotation,
+connection reset, production fault injection or agent publication. Earlier
+separately authorized runtime work is not attributed to this completion pass.
 
-## Git starting state
+## September 5 Git starting state
 
 Discovery used refreshed remote refs, PR metadata, CI runs and review comments.
 The known starting refs were still current:
@@ -22,7 +25,7 @@ It was integrated by fast-forward, preserving its SHA and branch; subsequent
 PR #15 fixes use ordinary commits and pushes. No duplicate cherry-pick or
 force push was used for PR #15.
 
-## Control plane: verified subset
+## September 5 control plane: verified subset
 
 Existing operator-configured SSH-key access reached proxy `147.45.231.225`.
 Checkout `/opt/adojapan-restream` was clean at the main SHA above. Both public
@@ -40,7 +43,7 @@ cryptography 46.0.7; control-plane MediaMTX image reference 1.19.2.
 Revision labels were absent, so image IDs were not treated as commit attestations.
 
 Read-only SQLite access (`mode=ro`, `query_only`) showed schema version 5 and
-one stopped, disabled control-plane destination. The HK relay's current agent
+one stopped, disabled control-plane destination. The HK relay's agent then
 reported version 1.2.5, protocol 1, node ready. The other registered node had
 failed installation and no heartbeat. No credential-bearing columns were read.
 
@@ -54,7 +57,7 @@ Git history and differs only by omission of `relay_agent*` from setuptools
 package discovery. It was recorded, not overwritten. This is a selected-file
 comparison, not full image or native runtime attestation.
 
-## Operator stop is not an incident
+## September 5 operator stop is not an incident
 
 At 04:00:17 UTC and 04:04:03 UTC fresh HK telemetry reported active service,
 running main process, listening SRT, SLATE source and active forward. At
@@ -63,25 +66,46 @@ The operator explicitly confirmed manually stopping relay. No restart was
 attempted and the transition was not attributed to a recovery failure.
 Forward telemetry alone does not independently prove a public YouTube broadcast.
 
-## Native relay: RUNTIME_AUDIT_UNVERIFIED
+## September 5 native relay audit: RUNTIME_AUDIT_UNVERIFIED
 
 Existing key-based SSH to HK `176.98.181.225` failed directly and via the proxy.
 No password was searched for or requested. Installed native paths, release or
 manifest, hashes of relayctl/normalizer/renderer/unit files, and native incidents
 could not be directly verified. Control-plane telemetry is not a substitute for
 those hashes. The checkout SHA does not establish which copied native runtime
-files are installed. Future rollout remains unapproved pending that comparison.
+files are installed. Rollout was not approved by this incomplete comparison.
 
 No production configuration, secrets, Amnezia, Docker lifecycle, firewall,
 network routes or interfaces were changed. All fault-injection/media tests run
 only in local tests or disposable GitHub CI fixtures.
 
+## September 6 read-only runtime comparison
+
+Existing key-only access directly reached HK. Eight selected nonsensitive
+installed files—relayctl, normalizer, renderer, relay unit, broker, history module,
+broker unit and tmpfiles definition—matched deployed `5669278` and merged PR15
+`243d8418` exactly. [The runtime inventory](runtime-audit-20260906.json) records
+their paths, SHA256/Git-blob hashes and ownership. MediaMTX was v1.20.1, FFmpeg
+4.4.2 and Python 3.10.12. At 04:04 UTC the relay was active/enabled, on SLATE,
+with active forward and health PASS. This is server-side state, not proof of
+viewer delivery or of why Moblin input was absent.
+
+The release marker was unavailable; the existing manifest returned no selected
+public version field. File hashes provide the selected runtime comparison;
+they are not a complete filesystem attestation. Current control-plane internal
+inventory remains unverified because the explicitly designated SSH key was
+rejected. Public live/ready health both returned HTTP 200. The September 5
+checkout/image inventory and known bootstrap pyproject packaging drift remain
+historical evidence only. No production file, service, stream or credentials
+were changed by this audit, and it does not authorize deployment.
+
 ## Recovery integration and validation history
 
 The recovery branch was a direct continuation of the original PR #15 head, so
 integration preserved commit `2b3474862766b3b5e3949f0a8857dd71f18cbfd9` by
-fast-forward. Its normalizer, renderer, relayctl and service-unit content remains
-unchanged in the current PR #15 checkout. No runtime behavior was reverted.
+fast-forward. At the September 5 PR15 head `bf6f021`, its normalizer, renderer,
+relayctl and service-unit content still matched the original recovery commit.
+The September 6 integration below preserves the later deployed runtime fixes.
 
 The follow-up changes repair test execution and the CI oracle:
 
@@ -111,7 +135,7 @@ the actual native media self-test and fresh heartbeat readiness. The self-test
 reached final cleanup at 376.871 seconds. The run then failed its separate
 lifecycle oracle: the first shell comparison expected release `2026.09.04.1`
 instead of the installer's `2026.09.05.1`. Further stale assertions in that
-oracle also contradicted the current recovery report. Overall CI was **failure**,
+oracle also contradicted that head's recovery report. Overall CI was **failure**,
 not success; post-onboarding runtime-limit checks did not run, while cleanup did.
 
 The corrected lifecycle oracle is in
@@ -128,13 +152,15 @@ credential isolation, password non-persistence, revoke, post-onboarding runtime 
 and cleanup all passed. PR #15 stays Draft. This was the first recorded green base,
 not approval to merge or deploy.
 
-Two later PR #16 runs, on unchanged native runtime, exposed intermittent media
+Two later September 5 PR #16 runs, on unchanged native runtime, exposed intermittent media
 failures: run 33952161676 timed out while reading a strict 90-frame final RTMP
 segment after LIVE delivery was confirmed; run 33952428440 did not regain the
 normalized LIVE publisher within the existing supervisor-crash recovery deadline,
-although input and downstream SLATE media still grew. Their underlying causes
-remain unproven. No assertion, recovery deadline or security check was relaxed
-to turn these failures into passes.
+while an SRT publisher remained present and downstream SLATE media grew. Publisher
+presence does not establish growth of input media bytes. The surviving logs do
+not determine the exclusive cause of either failure, and the original media
+artifacts are unavailable. No assertion, recovery deadline or security check was
+relaxed to turn these failures into passes.
 
 PR #15 follow-up `bf6f0216c10784f2c9073bff7d563bf002fc215b` adds diagnostic evidence
 only: event-scoped fixed normalizer markers, bounded process counts/first-seen
@@ -147,9 +173,62 @@ This exact head's [CI run 33953963213](https://github.com/andreykutenkikh-byte/r
 completed **SUCCESS**, including native self-test cleanup at 389.476 seconds,
 post-onboarding limits and CI fixture cleanup. Its local full suite passed 1370
 tests with 19 Windows/POSIX skips; dependency, format/lint/type, frontend, syntax
-and Compose policy gates also passed. It is the new `PR15_GREEN_HEAD` / run.
+and Compose policy gates also passed. This was the last recorded September 5
+`PR15_GREEN_HEAD` / run.
 A successful diagnostic run does **not** establish that the preceding
 intermittency is fixed; this remains an explicit final-review limitation.
+
+## September 6 integration, fixture repairs and remaining blocker
+
+Merge `243d8418fe0969f0f27b5ed0270731d6f45ad65d` integrates the deployed
+recovery/observability history while preserving PR15's CI fixes. The new native
+bundle includes `history.py`, required by the broker import; an internal dependency
+closure check prevents another incomplete fresh installation. The runtime keeps
+the 2/2.5/2-second watchdog thresholds, carried-forward six-second exact-source
+stall proof, protected recovery credentials and bounded local history.
+
+A separate reproducible defect was found in the synthetic MPEG-TS feeder clock:
+it rebased on every late scheduler wakeup and accumulated sub-packet lateness.
+The corrected loop preserves that phase and reanchors after a complete packet
+interval is missed or after an intentional pause, without a catch-up burst.
+Four deterministic tests exercise the real feeder loop. This proves the fixture
+defect and repair, not exclusive causality of the historical native failures.
+The old strict reader discarded both pipes, so its timeout did not demonstrate
+pipe backpressure. Supervisor, output/reader deadlines and strict assertions
+were not relaxed.
+
+The separate real-media clock check captures complete finite MPEG-TS and verifies
+byte identity, ordering, portrait-video PTS and cleanup. Complete capture avoided
+terminal-PES truncation but did not alone fix the source-baseline failure.
+Diagnostic `68a1514` exposed `non-existing SPS 0 referenced in buffering period`:
+FFmpeg 5.1's automatic Annex-B conversion placed SPS/PPS at IDR after the SEI that
+referenced SPS. The helper-only `h264_mp4toannexb,dump_extra=freq=keyframe` filter
+puts key-packet extradata before that SEI without reencoding, dropping NALs or
+suppressing errors. Docker live-tmpfs staging uses exec stdin and verifies the
+written bytes. These changes are isolated fixture corrections. See the upstream
+[FFmpeg filter documentation](https://ffmpeg.org/ffmpeg-bitstream-filters.html#dump_005fextra)
+and [Docker copy limitations](https://docs.docker.com/reference/cli/docker/container/cp/#corner-cases).
+
+Despite those repairs, PR15 `71c78132553b5bb6ff64e9c8187f565e5e6a6eae`
+[run 34012815959](https://github.com/andreykutenkikh-byte/restream/actions/runs/34012815959)
+failed native E2E after 173.598 seconds: the strict recovered-LIVE RTMP reader
+last reported 71 frames against a 90-frame target before its 15-second timeout following a
+forced bridge kill. The source/output health predicates passed. The recorded
+`reset-slate` stage was stale: SLATE and subsequent LIVE recovery had already
+passed. Periodic progress is not an exact count of frames in the deleted partial
+capture. This is a newly observed unresolved capture failure, not only an old-log
+limitation, and the pacing repair cannot be claimed to have fixed it.
+
+Follow-up `df9307f9bd07ac69e67e2f79822bf70d512d4e97` adds typed numeric reader
+startup/progress evidence and the accurate `reset-live` stage. Its full
+[CI run 34013753666](https://github.com/andreykutenkikh-byte/restream/actions/runs/34013753666)
+passed: 1556 Python tests, 44 frontend tests, real media/security/native checks
+and cleanup. The real clock comparison measured old/fixed rates 0.739/0.991;
+all thirteen strict captures reached 90 frames in 3.477–5.081 seconds. This is
+the current verified `PR15_GREEN_HEAD` / run. The follow-up is diagnostic;
+its successful run does not establish the cause or resolution of the preceding
+71-frame timeout. That failure remains a blocker to an unconditional
+`PR15_AND_PR16_READY_FOR_FINAL_REVIEW` declaration.
 
 ## HUD baseline, before corrections
 
@@ -180,7 +259,18 @@ eight own HUD commits from base `f83ba125b570e34d362ee184ddc550ef77fa784c` onto
 `bf6f0216c10784f2c9073bff7d563bf002fc215b`. All eight range-diff entries were equal;
 the restacked head before this evidence update was
 `439c523b736fbad68544d313672ed32e9e1050c4`. The expected remote lease was the full
-`9e00cae...` SHA above. Final exact-head CI must validate this new stack separately.
+`9e00cae...` SHA above. The final September 5 head `5fb7b584ed17f03e352e8352137010f638e5b679`
+then passed [CI run 33954755755](https://github.com/andreykutenkikh-byte/restream/actions/runs/33954755755),
+including both browser engines and native E2E. That run is historical evidence.
+
+After the full September 6 PR15 success above, nine own HUD commits were rebased
+from saved base `bf6f0216c10784f2c9073bff7d563bf002fc215b` onto
+`df9307f9bd07ac69e67e2f79822bf70d512d4e97`. All nine range-diff entries were equal;
+the rebased head before this documentation update was
+`7f291bd0662552726977be9057aa9f0d0bc69b76`. The saved local and remote HUD head,
+and required explicit push lease, are `5fb7b584ed17f03e352e8352137010f638e5b679`.
+The final new HUD exact HEAD must pass its own full CI; earlier green runs do
+not validate this new stack. The PR description records its final SHA and run.
 
 ## HUD corrections and regression coverage
 
@@ -189,6 +279,17 @@ prevents duplicate initialization across repeated script evaluations. An authent
 HUD page exposes only a boolean and can reopen an already-consumed pairing link without
 replaying its one-time token. Page suspension is separate from terminal revoke/logout;
 polling resumes on pageshow and retains the request slot until aborted work settles.
+
+The September 6 review also reproduced false logout success when its HTTP request
+failed. The corrected page hides local metrics and pauses polling immediately,
+but enters terminal revoked state only after server success or HTTP 401. Failed
+requests remain visibly unconfirmed and retryable with one in-flight request and
+the existing request deadline. Frontend regressions cover HTTP/network failures,
+confirmation, duplicate clicks, timeout and a pending pairing response that must
+not overtake logout. A new actual-browser case checks an
+aborted logout leaves the server session valid, then confirms successful retry,
+cookie removal and subsequent HTTP 401. Its two-engine result must come from the
+final exact-head CI, not the earlier browser run.
 
 The evaluator retains the last confirmed active route across source loss. It distinguishes
 initial SLATE (waiting), LIVE, source loss with running relay, coherent native stop,
@@ -237,9 +338,9 @@ column/value, sequence and old migration marker survived; new classifications,
 empty HUD tables, foreign keys and integrity all passed. Its temporary database
 was removed; no production database was opened for migration.
 
-## Actual browser evidence and final gate
+## September 5 browser evidence and final gate requirements
 
-Local validation includes locked dependency synchronization and installed-package
+September 5 local validation included locked dependency synchronization and installed-package
 compatibility, Ruff format/lint, mypy, the complete Python suite, repository safety,
 81 frontend tests, syntax checks for six JavaScript and fifteen shell files, and four
 Compose configuration variants plus the production-model policy with synthetic values.
@@ -288,6 +389,7 @@ not substituted for the required final restacked-head CI.
 
 The PR descriptions record the final exact HEADs, CI run URLs and results. A final-review
 declaration requires both complete exact-head runs to succeed, including native media
-and both browser engines. Both PRs stay Draft, and even full code CI does not remove the
-native runtime audit limitation or authorize deployment. No merge, deployment, agent
-publication or production/runtime mutation is part of this work.
+and both browser engines, and the documented native capture blocker to be resolved.
+Both PRs stay Draft. Full code CI does not remove the current runtime-audit scope
+and limitations or authorize deployment. No PR merge, deployment, agent publication
+or production/runtime mutation is part of this completion pass.

@@ -120,6 +120,14 @@ states. Its missing input is therefore not treated as proof of manual stop; only
 available telemetry is used. Native relay coherent-stop checks use the real reported
 states shown above.
 
+The merged runtime allows 2 seconds of jointly stalled input/output, 2.5 seconds
+of output-only inactivity, and 2 seconds without usable metrics before its
+corresponding watchdog action. Its continuously verified no-growth interval
+carries into the existing 6-second exact-publisher stall proof; the watchdog's
+2 seconds are not followed by a new 6-second interval. Media growth, failed
+measurements or a changed publisher identity invalidate that proof. Retry
+cooldowns and attempt limits are unchanged, so the HUD grace remains 120 seconds.
+
 The value comes from the existing native recovery constants, not an assumed recovery
 phase exposed by the agent:
 
@@ -128,15 +136,22 @@ phase exposed by the agent:
 + 2 × 30s retry cooldown
 + 3 × (0.1s confirmation + 2 × 0.2s metric reads + 1s polling + 0.5s API request)
 + 15s downstream recovery window + 5s agent heartbeat + 2s visible HUD poll
-= 94s; round upward by one 30s native retry period → 120s
+= 94s; round up to the next 30s retry-period boundary → 120s
 ```
 
 Some operations overlap; this conservative observation window is a HUD policy, not a
 guarantee about network recovery. Sources are the constants in
 `deploy/moblin-relay/moblin-relay-normalize`, the output gate in its `self-test`, and the
-existing five-second heartbeat contract in `relay_agent/client.py`. No agent protocol
-or release is changed. The current API does not carry recovery phase/exhaustion, so the
-HUD never invents «reset succeeded» or claims that retries are exhausted.
+existing five-second heartbeat contract in `relay_agent/client.py`. The HUD requires
+no agent protocol change or agent release. The current API does not carry recovery
+phase/exhaustion, so the HUD never invents «reset succeeded» or claims that retries
+are exhausted.
+
+Broker history stays in a separate root-only local database; the HUD does not
+consume it as new heartbeat samples or recovery-phase telemetry. Credential
+preflight failures use existing failed service/process states, which the HUD
+already treats as a confirmed process error without recovery grace. These runtime
+changes add no HUD API field or control-plane schema version.
 
 If fresh active-route telemetry disappears entirely, retain its context for at most
 120 seconds after the last actual fresh observation, then show unknown monitoring state,
@@ -169,7 +184,13 @@ ten-second cadence; pagehide pauses polling until pageshow, including the BFCach
 path. Visibility changes reschedule the appropriate cadence. Requests
 have a timeout and retain their ownership until they settle, so pause/resume cannot
 create overlapping requests. Network failures use bounded backoff up to 15 seconds.
-Revoke/logout is terminal; a temporary network error is not a media-loss recommendation.
+Confirmed revoke/logout is terminal; a temporary network error is not a media-loss
+recommendation. Logout immediately hides local metrics and pauses polling, but only
+a successful server response or HTTP 401 confirms that access ended. A failed or
+timed-out request shows an explicit unconfirmed state and permits manual retry;
+it never claims the HttpOnly session was revoked. Only one logout request may run,
+using the existing seven-second request deadline. A new pairing exchange must
+settle before logout is enabled, so its delayed cookie cannot overtake logout.
 
 iOS requires a user gesture before Web Audio can play. **Включить звуковые
 предупреждения** unlocks an in-memory oscillator and plays a short test tone. Alerts
