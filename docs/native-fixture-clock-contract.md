@@ -56,16 +56,62 @@ bounded; only fixed reasons and numeric diagnostics reach CI logs.
 The paired source is eight seconds: 240 video frames and 375 AAC frames share
 that boundary. The earlier four-second source has half an AAC frame at its end.
 FFmpeg 5.1's copied-loop offset uses the longest track endpoint, so padding can
-disturb video timestamps at the seam. Before the reader cases, a fast actual
-continuous-copy remux checks both clips: the original four-second clip must
-exhibit the seam-only discrepancy, and the eight-second clip must pass the same
-frame-spacing and GOP checks through its first loop. This does not loosen the
-observer's two-millisecond tolerance, reset timestamps or discard bad frames.
+disturb video timestamps at the seam. The helper first converts each finite MP4
+to Annex-B MPEG-TS with both SPS/PPS filters, then continuously remuxes that TS
+without an explicit bitstream filter. This is not raw TS concatenation: FFmpeg
+still advances the loop timestamps. Both positive conversion/remux commands
+use error-level logging and `-xerror`; their bounded private stderr must be empty.
+
+The earlier helper applied its explicit filter chain to a looping input. In
+FFmpeg 5.1.9, the CLI sends EOF to that output filter at the first input loop,
+then seeks back without resetting the filter. Subsequent video packets are
+rejected, while unfiltered audio continues. The chain has a reset callback;
+the CLI loop does not call it. This mechanism concerns the explicit CLI output
+filter, not the MPEG-TS muxer's separately owned automatic converter.
+([CLI loop and stream-copy output](https://github.com/FFmpeg/FFmpeg/blob/n5.1.9/fftools/ffmpeg.c),
+[filter EOF/reset lifecycle](https://github.com/FFmpeg/FFmpeg/blob/n5.1.9/libavcodec/bsf.c))
+
+Before reader cases, a bounded original-command regression requires exactly
+120 complete video packets and only the specific paired filter-after-EOF
+errors; generic errors do not count. Prepared four/eight-second loop probes
+then require video beyond the first cycle, unchanged codec/profile and GOPs,
+and the respective seam-only discrepancy / continuous frame spacing. The
+original MP4s must report 30 fps. Only the deliberately discontinuous four-second
+loop may have a different guessed frame rate; its packet timestamps remain the
+oracle. The valid eight-second loop must still report 30 fps. Portable FFmpeg
+5.1.2 reproduced 126/246 packets and seam errors of 10.678 ms / 11 microseconds;
+the pinned CI binary must establish those properties independently.
+This does not loosen the observer's two-millisecond tolerance, reset timestamps
+or discard bad frames. The paired reader uses the same prepared eight-second TS
+for both clocks and the original MP4 for its unchanged expected video signature.
 Observer failure diagnostics identify only a fixed reason and bounded numeric
 frame/PTS deltas, never the underlying log text.
 
-This establishes a controlled failure class. It cannot prove that scheduler
+A passing paired gate establishes a controlled failure class. It cannot prove that scheduler
 delay was the exclusive cause of each historical run whose artifacts are gone.
+
+## Native long-source header and clock correction
+
+The main native fixture uses muxer-owned automatic conversion, not the explicit
+filter chain above; the explicit-BSF EOF defect does **not** explain its reader
+timeouts. A separate actual FFmpeg 5.1.2 probe did expose a source-header defect:
+automatic MP4-to-TS conversion reported `non-existing SPS 0 referenced in
+buffering period`. The synthetic encoder now repeats SPS/PPS before each IDR's
+CBR SEI using `repeat-headers=1`; CBR, GOP, profile and encoded-picture settings
+remain unchanged. This changes only generated test media, not relay encoding.
+
+The long LIVE source is now 72 seconds, the next multiple of 24 after the old 60:
+24 is the common period of 12-second SLATE cycles and 8-second AAC/video alignment.
+This retains the existing long-window intent and avoids a half-AAC-frame loop
+tail. It is an asset duration, not an increased recovery or capture deadline.
+
+Actual local FFmpeg 5.1.2 generation, automatic remux through 72.2 seconds and full
+video/audio decode passed: 2166 video packets, 60-frame GOP, 1080x1920 Main/level 4.0,
+yuv420p, 30/1, all video PTS steps within 2 ms of 1/30, seam step 0.033356 seconds,
+empty remux/probe/decode stderr. No input/clock assertion was removed. This proves
+the corrected synthetic source; it is not exclusive attribution of historical
+15-second reader failures. Exact-head pinned-Linux recovery/media CI remains
+required before acceptance.
 
 ## Source-cut time is not last-media time
 

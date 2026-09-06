@@ -25,6 +25,14 @@ JITTER_SECONDS = 0.022
 WORK_SECONDS = 110.0  # At most ten further seconds for owned-process cleanup.
 PHASE_AGE_SECONDS = 0.2
 RATE_BOUNDS = {"single": (0.25, 0.31), "fixed": (0.95, 1.05)}
+ANNEX_B_FILTERS = "h264_mp4toannexb,dump_extra=freq=keyframe"
+VIDEO_CONTRACT = {
+    "codec_name": "h264",
+    "profile": "Main",
+    "level": 40,
+    "width": 1080,
+    "height": 1920,
+}
 FRAME = re.compile(
     rb"^\[Parsed_showinfo_[0-9]+ @ 0x[0-9a-fA-F]+\] n:\s*([0-9]+) "
     rb"pts:\s*-?[0-9]+ pts_time:([0-9]+(?:\.[0-9]+)?) .* "
@@ -198,9 +206,11 @@ def sink_config(port, metrics_port):
 
 
 def media_commands(namespace, live, udp_port, sink_port):
+    # The input is already Annex-B. FFmpeg 5.1 drains an explicit output BSF
+    # at each input EOF but does not reset it when -stream_loop seeks back.
     remux = namespace["local_mpegts_remux_command"](live)
-    # Same helper-only SPS-before-buffering-SEI conversion as the clock gate.
-    remux[-1:] = ["-bsf:v", "h264_mp4toannexb,dump_extra=freq=keyframe", "pipe:1"]
+    remux[remux.index("-loglevel") + 1] = "error"
+    remux.insert(1, "-xerror")
     source = (
         f"udp://127.0.0.1:{udp_port}?fifo_size={namespace['LIVE_FEED_FIFO_UNITS']}"
         f"&buffer_size={namespace['LIVE_FEED_SOCKET_BUFFER_BYTES']}"
@@ -225,24 +235,22 @@ def free_port(kind):
         return reservation.getsockname()[1]
 
 
-def validate_loop_packets(payload, duration):
+def validate_loop_packets(payload, duration, *, bsf_eof=False):
     require(len(payload) <= 131072, "source seam probe output bound failed")
     data = json.loads(payload)
     streams, packets = data["streams"], data["packets"]
     require(
         len(streams) == 1
-        and all(
-            streams[0].get(key) == value
-            for key, value in {
-                "codec_name": "h264",
-                "profile": "Main",
-                "level": 40,
-                "width": 1080,
-                "height": 1920,
-                "r_frame_rate": "30/1",
-            }.items()
-        ),
+        and all(streams[0].get(key) == value for key, value in VIDEO_CONTRACT.items()),
         "source seam video contract changed",
+    )
+    # The deliberately discontinuous four-second loop can make ffprobe guess
+    # 120/1. Its original MP4 is checked at 30/1 before conversion; packet PTS
+    # below remain the actual clock oracle. The valid eight-second loop and
+    # the original single-cycle EOF counterexample must still report 30/1.
+    require(
+        duration == 4 and not bsf_eof or streams[0].get("r_frame_rate") == "30/1",
+        "source seam nominal frame rate changed",
     )
     require(duration in (4, 8) and isinstance(packets, list), "source seam input bounds failed")
     pts = [float(packet["pts_time"]) for packet in packets]
@@ -265,7 +273,8 @@ def validate_loop_packets(payload, duration):
     )
     seam = duration * 30
     require(
-        duration in (4, 8) and seam < len(packets) <= seam + 8, "source seam packet count failed"
+        duration == 4 and len(packets) == seam if bsf_eof else seam < len(packets) <= seam + 8,
+        "source seam packet count failed",
     )
     require(
         all(packet["flags"] in ("K_", "__") for packet in packets),
@@ -278,6 +287,8 @@ def validate_loop_packets(payload, duration):
         all(abs(delta - 1 / 30) < 0.002 for index, delta in enumerate(deltas, 1) if index != seam),
         "source continuity failed outside loop seam",
     )
+    if bsf_eof:
+        return {"video_packets": len(packets), "reason": "explicit_bsf_after_eof"}
     seam_delta = deltas[seam - 1]
     evidence = {
         "duration_seconds": duration,
@@ -296,27 +307,50 @@ def validate_loop_packets(payload, duration):
     return evidence
 
 
-def verify_source_loop(namespace, live, work, duration):
+def run_transport(namespace, command, output, *, bsf_eof=False):
     globals_ = namespace["capture_final_sink_media_segment"].__globals__
-    require(0 < live.stat().st_size <= 12 * 1024**2, "source clip size bound failed")
-    output = work / "loop-seam.ts"
-    remux = media_commands(namespace, live, 1, 1)[0]
-    remux[-1:] = ["-t", str(duration + 0.2), "-fs", str(11 * 1024**2), str(output)]
-    completed = globals_["run"](
-        remux,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=10,
-    )
+    command = list(command)
+    command[command.index("-loglevel") + 1] = "error"
+    if not bsf_eof and "-xerror" not in command:
+        command.insert(1, "-xerror")
+    command[-1:] = ["-fs", str(11 * 1024**2), str(output)]
+    stderr = output.with_suffix(".stderr")
+    with stderr.open("xb") as err:
+        stderr.chmod(0o600)
+        completed = globals_["run"](
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=err,
+            timeout=10,
+        )
     require(
         completed.returncode == 0
         and output.is_file()
         and 0 < output.stat().st_size <= 12 * 1024**2,
-        "source seam remux failed",
+        "source transport remux failed",
     )
     output.chmod(0o600)
-    stdout, stderr = work / "loop-seam-probe.json", work / "loop-seam-probe.stderr"
+    require(stderr.stat().st_size <= 65536, "source transport stderr bound failed")
+    errors = stderr.read_bytes()
+    if bsf_eof:
+        # Exact FFmpeg 5.1 error pair, never a generic failed-command oracle.
+        pair = (
+            rb"\[bsf_list @ (?:0x)?[0-9a-fA-F]{6,32}\] A non-NULL packet sent after an EOF\.\r?\n"
+            rb"Error applying bitstream filters to an output packet for stream #0:0\.\r?\n"
+        )
+        require(
+            re.fullmatch(rb"(?:" + pair + rb"){1,8}", errors) is not None,
+            "original explicit BSF EOF failure not established",
+        )
+    else:
+        require(not errors, "source transport remux emitted an error")
+
+
+def probe_transport(namespace, output):
+    globals_ = namespace["capture_final_sink_media_segment"].__globals__
+    stdout = output.with_suffix(".probe.json")
+    stderr = output.with_suffix(".probe.stderr")
     with stdout.open("xb") as out, stderr.open("xb") as err:
         stdout.chmod(0o600)
         stderr.chmod(0o600)
@@ -342,7 +376,43 @@ def verify_source_loop(namespace, live, work, duration):
         )
     require(probe.returncode == 0 and stderr.stat().st_size == 0, "source seam probe failed")
     require(stdout.stat().st_size <= 131072, "source seam probe output bound failed")
-    return validate_loop_packets(stdout.read_text(encoding="utf-8"), duration)
+    return stdout.read_text(encoding="utf-8")
+
+
+def prepare_loop_source(namespace, live, work):
+    require(0 < live.stat().st_size <= 12 * 1024**2, "source clip size bound failed")
+    signature = namespace["stream_signature"](live, include_gop=False)
+    video = signature["streams"][0]
+    require(
+        all(video.get(key) == value for key, value in VIDEO_CONTRACT.items())
+        and video.get("r_frame_rate") == "30/1",
+        "original source video contract changed",
+    )
+    command = namespace["local_mpegts_remux_command"](live)
+    loop = command.index("-stream_loop")
+    del command[loop : loop + 2]
+    command[-1:] = ["-bsf:v", ANNEX_B_FILTERS, "pipe:1"]
+    output = work / "prepared-source.ts"
+    # Apply SPS/PPS-before-SEI conversion exactly once, keeping encoded media.
+    run_transport(namespace, command, output)
+    return output
+
+
+def verify_original_bsf_loop(namespace, live, work):
+    command = namespace["local_mpegts_remux_command"](live)
+    command[-1:] = ["-bsf:v", ANNEX_B_FILTERS, "-t", "4.2", "pipe:1"]
+    output = work / "original-bsf-loop.ts"
+    run_transport(namespace, command, output, bsf_eof=True)
+    evidence = validate_loop_packets(probe_transport(namespace, output), 4, bsf_eof=True)
+    print(json.dumps({"source_bsf_eof": evidence}), flush=True)
+
+
+def verify_source_loop(namespace, prepared, work, duration):
+    command = media_commands(namespace, prepared, 1, 1)[0]
+    command[-1:] = ["-t", str(duration + 0.2), "pipe:1"]
+    output = work / "loop-seam.ts"
+    run_transport(namespace, command, output)
+    return validate_loop_packets(probe_transport(namespace, output), duration)
 
 
 def configure(namespace, work, sink_port, deadline):
@@ -375,12 +445,12 @@ def configure(namespace, work, sink_port, deadline):
     return globals_
 
 
-def run_case(case, namespace, live, work, deadline):
+def run_case(case, namespace, live, prepared, work, deadline):
     port, metrics_port = free_port(socket.SOCK_STREAM), free_port(socket.SOCK_STREAM)
     udp = free_port(socket.SOCK_DGRAM)
     require(port != metrics_port, "fixture ports collided")
     globals_ = configure(namespace, work, port, deadline)
-    remux, publisher_command, observer_command = media_commands(namespace, live, udp, port)
+    remux, publisher_command, observer_command = media_commands(namespace, prepared, udp, port)
     byte_rate = namespace["LIVE_TRANSPORT_MUX_RATE_BITS_PER_SECOND"] / 8
     measure = {
         "bytes": 0,
@@ -593,14 +663,17 @@ def main():
         original.mkdir(mode=0o700)
         globals_["LIVE_FIXTURE_DURATION_SECONDS"] = 4
         old_live = namespace["generate_live"](original)
-        verify_source_loop(namespace, old_live, original, 4)
+        verify_original_bsf_loop(namespace, old_live, original)
+        old_prepared = prepare_loop_source(namespace, old_live, original)
+        verify_source_loop(namespace, old_prepared, original, 4)
         globals_["LIVE_FIXTURE_DURATION_SECONDS"] = 8
         live = namespace["generate_live"](work)
-        verify_source_loop(namespace, live, work, 8)
+        prepared = prepare_loop_source(namespace, live, work)
+        verify_source_loop(namespace, prepared, work, 8)
         for case in ("single", "fixed"):
             directory = work / case
             directory.mkdir(mode=0o700)
-            run_case(case, loader(case), live, directory, deadline)
+            run_case(case, loader(case), live, prepared, directory, deadline)
     print(
         "Strict RTMP reader clock counterfactual verified; owned-process cleanup passed", flush=True
     )

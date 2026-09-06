@@ -205,6 +205,144 @@ def test_source_seam_negative_cannot_hide_unrelated_failure(helper, change):
         helper["validate_loop_packets"](payload, duration)
 
 
+@pytest.mark.parametrize("duration,guessed_rate", [(4, "120/1"), (8, "30/1")])
+def test_prepared_source_uses_packet_clock_across_only_the_designed_negative_seam(
+    helper, duration, guessed_rate
+):
+    # Actual FFmpeg 5.1.2 prepared-TS loops: 4s has a 10.678ms seam error;
+    # 8s has an 11us rounding error. Only the invalid loop confuses its guess.
+    data = json.loads(loop_probe_payload(duration, 0.010678 if duration == 4 else 0.000011))
+    data["streams"][0]["r_frame_rate"] = guessed_rate
+    helper["validate_loop_packets"](json.dumps(data), duration)
+    if duration == 8:
+        data["streams"][0]["r_frame_rate"] = "120/1"
+        with pytest.raises(helper["ProbeFailure"], match="nominal frame rate"):
+            helper["validate_loop_packets"](json.dumps(data), duration)
+
+
+def transport_namespace(run):
+    return {
+        "capture_final_sink_media_segment": SimpleNamespace(
+            __globals__={"run": run, "FFPROBE": "ffprobe"}
+        ),
+        "local_mpegts_remux_command": lambda path: [
+            "ffmpeg",
+            "-loglevel",
+            "quiet",
+            "-stream_loop",
+            "-1",
+            "-i",
+            str(path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0",
+            "-c",
+            "copy",
+            "-f",
+            "mpegts",
+            "pipe:1",
+        ],
+    }
+
+
+@pytest.mark.parametrize("change", ["valid", "rate", "profile", "stderr", "oversize"])
+def test_preconversion_applies_both_filters_once_and_retains_original_video_contract(
+    helper, tmp_path, change
+):
+    live = tmp_path / "live.mp4"
+    live.write_bytes(b"fixture")
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        Path(command[-1]).write_bytes(b"transport")
+        if change in {"stderr", "oversize"}:
+            kwargs["stderr"].write(b"x" * (65537 if change == "oversize" else 1))
+        return SimpleNamespace(returncode=0)
+
+    namespace = transport_namespace(run)
+    video = helper["VIDEO_CONTRACT"] | {"r_frame_rate": "30/1"}
+    if change == "rate":
+        video["r_frame_rate"] = "120/1"
+    elif change == "profile":
+        video["profile"] = "High"
+    namespace["stream_signature"] = lambda path, **kwargs: {"streams": [video]}
+    if change == "valid":
+        assert helper["prepare_loop_source"](namespace, live, tmp_path) == (
+            tmp_path / "prepared-source.ts"
+        )
+    else:
+        with pytest.raises(helper["ProbeFailure"]):
+            helper["prepare_loop_source"](namespace, live, tmp_path)
+    if change in {"rate", "profile"}:
+        assert calls == []
+        return
+    command, options = calls[0]
+    assert "-stream_loop" not in command and "-xerror" in command
+    assert command[command.index("-bsf:v") + 1] == "h264_mp4toannexb,dump_extra=freq=keyframe"
+    assert command[command.index("-c") + 1] == "copy"
+    assert command[command.index("-loglevel") + 1] == "error"
+    assert command[command.index("-fs") + 1] == str(11 * 1024**2)
+    assert options["timeout"] == 10
+
+
+@pytest.mark.parametrize(
+    "change", ["linux", "windows", "generic", "extra", "lookalike", "empty", "count", "pts", "rate"]
+)
+def test_original_loop_requires_exact_bsf_eof_pairs_and_complete_first_cycle(
+    helper, tmp_path, capsys, change
+):
+    address = "00000145d4757340" if change == "windows" else "0xabc123"
+    newline = "\r\n" if change == "windows" else "\n"
+    pair = (
+        f"[bsf_list @ {address}] A non-NULL packet sent after an EOF.{newline}"
+        f"Error applying bitstream filters to an output packet for stream #0:0.{newline}"
+    ).encode()
+    errors = pair * 6
+    if change == "generic":
+        errors = b"Input/output error\n"
+    elif change == "extra":
+        errors += b"rtmp://secret.invalid/key\n"
+    elif change == "lookalike":
+        errors = errors.replace(b"stream #0:0", b"stream #0:1")
+    elif change == "empty":
+        errors = b""
+    data = json.loads(loop_probe_payload(4))
+    data["packets"] = data["packets"][: 119 if change == "count" else 120]
+    if change == "pts":
+        data["packets"][20]["pts_time"] += 0.01
+    elif change == "rate":
+        data["streams"][0]["r_frame_rate"] = "120/1"
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        if command[0] == "ffmpeg":
+            Path(command[-1]).write_bytes(b"transport")
+            kwargs["stderr"].write(errors)
+        else:
+            kwargs["stdout"].write(json.dumps(data).encode())
+        return SimpleNamespace(returncode=0)
+
+    namespace = transport_namespace(run)
+    if change in {"linux", "windows"}:
+        helper["verify_original_bsf_loop"](namespace, tmp_path / "live.mp4", tmp_path)
+        evidence = json.loads(capsys.readouterr().out.splitlines()[-1])
+        assert evidence == {
+            "source_bsf_eof": {"video_packets": 120, "reason": "explicit_bsf_after_eof"}
+        }
+    else:
+        with pytest.raises(helper["ProbeFailure"]):
+            helper["verify_original_bsf_loop"](namespace, tmp_path / "live.mp4", tmp_path)
+        assert "secret" not in capsys.readouterr().out
+    command = calls[0]
+    assert command[command.index("-stream_loop") + 1] == "-1"
+    assert command[command.index("-bsf:v") + 1] == helper["ANNEX_B_FILTERS"]
+    assert command[command.index("-t") + 1] == "4.2"
+    assert "-xerror" not in command  # Finish the known first cycle for its strict packet probe.
+
+
 @pytest.mark.parametrize("mode", ["valid", "oversize", "stderr"])
 def test_source_seam_runs_bounded_copy_and_checks_output_before_reading(
     helper, tmp_path, monkeypatch, mode
@@ -242,6 +380,8 @@ def test_source_seam_runs_bounded_copy_and_checks_output_before_reading(
         "capture_final_sink_media_segment": SimpleNamespace(__globals__=globals_),
         "local_mpegts_remux_command": lambda _path: [
             "ffmpeg",
+            "-loglevel",
+            "quiet",
             "-stream_loop",
             "-1",
             "-i",
@@ -261,7 +401,7 @@ def test_source_seam_runs_bounded_copy_and_checks_output_before_reading(
     }
     if mode == "valid":
         helper["verify_source_loop"](namespace, live, tmp_path, 8)
-        assert reads == [tmp_path / "loop-seam-probe.json"]
+        assert reads == [tmp_path / "loop-seam.probe.json"]
     else:
         message = "output bound" if mode == "oversize" else "probe failed"
         with pytest.raises(helper["ProbeFailure"], match=message):
@@ -273,6 +413,8 @@ def test_source_seam_runs_bounded_copy_and_checks_output_before_reading(
     assert command[command.index("-t") + 1] == "8.2"
     assert command[command.index("-stream_loop") + 1] == "-1"
     assert command[command.index("-fs") + 1] == str(11 * 1024**2)
+    assert "-bsf:v" not in command and "-xerror" in command
+    assert command[command.index("-loglevel") + 1] == "error"
     assert options["timeout"] == 10
     command, options = calls[1]
     assert command[command.index("-select_streams") + 1] == "v:0"
@@ -389,12 +531,14 @@ def test_only_exact_old_15_second_timeout_with_growing_frames_is_expected(helper
 
 def test_media_invocations_are_continuous_loopback_copy_and_native_audio_contract(helper):
     namespace = {
-        "local_mpegts_remux_command": lambda _path: [
+        "local_mpegts_remux_command": lambda path: [
             "ffmpeg",
+            "-loglevel",
+            "quiet",
             "-stream_loop",
             "-1",
             "-i",
-            "live.mp4",
+            str(path),
             "-c",
             "copy",
             "pipe:1",
@@ -402,9 +546,13 @@ def test_media_invocations_are_continuous_loopback_copy_and_native_audio_contrac
         "LIVE_FEED_FIFO_UNITS": 4096,
         "LIVE_FEED_SOCKET_BUFFER_BYTES": 262144,
     }
-    remux, publisher, observer = helper["media_commands"](namespace, Path("live.mp4"), 30100, 30101)
+    remux, publisher, observer = helper["media_commands"](
+        namespace, Path("prepared-source.ts"), 30100, 30101
+    )
     assert remux[remux.index("-stream_loop") + 1] == "-1"
-    assert remux[-3:] == ["-bsf:v", "h264_mp4toannexb,dump_extra=freq=keyframe", "pipe:1"]
+    assert remux[remux.index("-i") + 1] == "prepared-source.ts"
+    assert "-bsf:v" not in remux and "-xerror" in remux
+    assert remux[remux.index("-loglevel") + 1] == "error"
     assert publisher[publisher.index("-c:v") + 1] == "copy"
     assert publisher[publisher.index("-c:a") + 1] == "aac"
     assert publisher[publisher.index("-af") + 1] == "aresample=48000:async=1:first_pts=0"
@@ -465,6 +613,57 @@ def test_main_is_explicitly_ci_gated_before_any_process(helper, monkeypatch):
     )
     with pytest.raises(helper["ProbeFailure"], match="CI-only"):
         helper["main"]()
+
+
+def test_main_proves_old_bsf_then_loops_prepared_source_but_validates_original(helper, monkeypatch):
+    globals_ = helper["main"].__globals__
+    monkeypatch.setenv("CI_NATIVE_READER_CLOCK", "isolated-fixture")
+    monkeypatch.setattr(Path, "is_file", lambda _path: True)
+    monkeypatch.setattr(
+        helper["subprocess"],
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=b"v1.20.1"),
+    )
+    events, source_globals = [], {}
+    namespace = {"generate_live": lambda work: work / "live.mp4"}
+    monkeypatch.setattr(
+        helper["runpy"], "run_path", lambda *_args, **_kwargs: {"load_feeder": lambda _: namespace}
+    )
+    monkeypatch.setitem(globals_, "configure", lambda *_args: source_globals)
+    monkeypatch.setitem(
+        globals_, "verify_original_bsf_loop", lambda _, live, work: events.append(("old", live))
+    )
+
+    def prepare(_, live, work):
+        events.append(("prepare", live, source_globals["LIVE_FIXTURE_DURATION_SECONDS"]))
+        return work / "prepared-source.ts"
+
+    monkeypatch.setitem(globals_, "prepare_loop_source", prepare)
+    monkeypatch.setitem(
+        globals_,
+        "verify_source_loop",
+        lambda _, source, work, duration: events.append(("seam", source, duration)),
+    )
+    monkeypatch.setitem(
+        globals_,
+        "run_case",
+        lambda case, _, live, prepared, work, deadline: events.append((case, live, prepared)),
+    )
+    assert helper["main"]() == 0
+    assert [event[0] for event in events] == [
+        "old",
+        "prepare",
+        "seam",
+        "prepare",
+        "seam",
+        "single",
+        "fixed",
+    ]
+    assert events[1][2] == 4 and events[3][2] == 8
+    assert events[2][1].name == events[4][1].name == "prepared-source.ts"
+    assert events[-2][1:] == events[-1][1:]
+    assert events[-1][1] == events[3][1] and events[-1][2] == events[4][1]
+    assert helper["WORK_SECONDS"] == 110 and helper["JITTER_SECONDS"] == 0.022
 
 
 def test_validation_probe_timeout_is_capped_by_remaining_outer_budget(

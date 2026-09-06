@@ -2427,12 +2427,16 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     assert loaded["ASSET_DURATION_SECONDS"] == 12
     assert loaded["LIVE_FIXTURE_DURATION_SECONDS"] >= 5 * loaded["ASSET_DURATION_SECONDS"]
     assert loaded["LIVE_FIXTURE_DURATION_SECONDS"] % loaded["ASSET_DURATION_SECONDS"] == 0
+    # A complete AAC frame is 1024 samples; half-frame tail padding changes
+    # the copied-loop video clock even though every encoded picture is valid.
+    assert (loaded["LIVE_FIXTURE_DURATION_SECONDS"] * 48000) % 1024 == 0
     assert (loaded["LIVE_FIXTURE_DURATION_SECONDS"] * loaded["VIDEO_FPS"]) % loaded[
         "VIDEO_GOP_FRAMES"
     ] == 0
     live_generator = source.split("def generate_live", 1)[1].split("def video_gop_signature", 1)[0]
     assert live_generator.count("LIVE_FIXTURE_DURATION_SECONDS") == 3
     assert "ASSET_DURATION_SECONDS" not in live_generator
+    assert ":repeat-headers=1" in live_generator
 
     assert 'os.environ.pop("MOBLIN_RELAY_SELF_TEST_STAGE_FILE", "")' in source
     assert 'r"/run/moblin-relay-self-test\\.' in source
