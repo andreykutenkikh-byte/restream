@@ -315,7 +315,11 @@ def test_history_export_is_bounded_readonly_with_missing_and_invalid_results(
 ) -> None:
     path = tmp_path / "history" / "history.sqlite3"
     monkeypatch.setattr("relay_agent.history.time.time", lambda: 2000)
-    assert read_history(path=path)["error_code"] == "history_missing"
+    # GitHub's unit runner owns the temporary ancestors, not root. Production
+    # correctly refuses that ancestry before checking whether the leaf exists.
+    if os.name == "posix" and effective_uid() != 0:
+        assert read_history(path=path)["error_code"] == "history_unavailable"
+    assert read_history(path=path, expected_uid=effective_uid())["error_code"] == "history_missing"
     assert not path.parent.exists()
     store = HistoryStore(path, expected_uid=effective_uid())
     sampler = HistorySampler()
