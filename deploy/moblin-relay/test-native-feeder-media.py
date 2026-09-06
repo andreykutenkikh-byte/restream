@@ -9,18 +9,20 @@ import os
 import runpy
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
-SELF_TEST = Path("/opt/moblin-relay/libexec/self-test")
-SLATE = Path("/var/lib/moblin-relay/slate.mp4")
+SELF_TEST = Path("/tmp/adojapan-ci-clock-self-test.py")  # noqa: S108 - explicit disposable CI stage
 FFPROBE = "/usr/bin/ffprobe"
 FIXED_CONDITION = "if now >= deadline + len(pending) / self._bytes_per_second:"
 PREVIOUS_CONDITION = "if now > deadline:"
-WINDOW_SECONDS = 6.0
+SOURCE_DURATION_SECONDS = 8
+CAPTURE_TIMEOUT_SECONDS = 20.0
+MAX_CAPTURE_BYTES = 12 * 1024 * 1024
 WAKEUP_JITTER_SECONDS = 0.003
 
 
@@ -33,17 +35,52 @@ def load_feeder(case):
         raise ProbeFailure("invalid feeder case")
     source = SELF_TEST.read_text(encoding="utf-8")
     if source.count(FIXED_CONDITION) != 1:
-        raise ProbeFailure("installed feeder does not contain the tested clock repair")
+        raise ProbeFailure("staged feeder does not contain the tested clock repair")
     if case == "fixed":
         return runpy.run_path(str(SELF_TEST), run_name="_native_feeder_media")
     # Replay exactly the removed comparison, changing no other source behavior.
     source = source.replace(FIXED_CONDITION, PREVIOUS_CONDITION)
     namespace = {"__name__": "_native_feeder_media", "__file__": str(SELF_TEST)}
-    exec(compile(source, str(SELF_TEST), "exec"), namespace)  # noqa: S102 - installed test code
+    exec(compile(source, str(SELF_TEST), "exec"), namespace)  # noqa: S102 - staged test code
     return namespace
 
 
-def media_clock_rate(case, directory):
+def make_transport(directory):
+    namespace = load_feeder("fixed")
+    generate = namespace["generate_live"]
+    generate.__globals__["LIVE_FIXTURE_DURATION_SECONDS"] = SOURCE_DURATION_SECONDS
+    original_run = generate.__globals__["run"]
+
+    def bounded_generate(command, **kwargs):
+        return original_run(command, timeout=30, **kwargs)
+
+    generate.__globals__["run"] = bounded_generate
+    live = generate(directory)
+    transport = directory / "source.ts"
+    command = namespace["local_mpegts_remux_command"](live)
+    loop_index = command.index("-stream_loop")
+    del command[loop_index : loop_index + 2]
+    command[-1] = str(transport)
+    result = subprocess.run(  # noqa: S603 - fixed ffmpeg with generated local portrait media
+        command, stdin=subprocess.DEVNULL, capture_output=True, timeout=10, check=False
+    )
+    if result.returncode or result.stderr or not transport.is_file():
+        raise ProbeFailure("finite portrait transport generation failed")
+    payload = transport.read_bytes()
+    if not payload or len(payload) > MAX_CAPTURE_BYTES or len(payload) % 188:
+        raise ProbeFailure("finite portrait transport has an invalid size")
+    # Complete MPEG-TS files can end partway through a feeder datagram. Null
+    # packets add no media and allow the real feeder to send the entire final
+    # video/audio PES. A wall-time cutoff can manufacture a truncated terminal
+    # PES that ffprobe's strict stderr gate correctly rejects.
+    padding = (-len(payload)) % namespace["LIVE_FEED_CHUNK_BYTES"]
+    payload += (b"\x47\x1f\xff\x10" + b"\xff" * 184) * (padding // 188)
+    transport.write_bytes(payload)
+    probe_packets(transport, "source")
+    return transport, payload
+
+
+def media_clock_rate(case, directory, transport, source_payload):
     namespace = load_feeder(case)
     cls = namespace["PacedMPEGTSFeeder"]
     sent = SimpleNamespace(digest=hashlib.sha256(), size=0, first=None, last=None)
@@ -75,35 +112,48 @@ def media_clock_rate(case, directory):
         receiver.bind(("127.0.0.1", 0))
         receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
         receiver.settimeout(0.25)
-        feeder = cls(namespace["local_mpegts_remux_command"](SLATE), receiver.getsockname()[1])
+        # FFmpeg finalized source.ts before this process starts. Retain its
+        # bytes exactly, with pipe backpressure and no producer-side pacing.
+        # Keep the producer alive until finish() so expected finite EOF cannot
+        # become the live feeder's remux-failure signal.
+        producer = [
+            sys.executable,
+            "-c",
+            "import pathlib,sys,time; "
+            "sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes()); "
+            "sys.stdout.buffer.flush(); time.sleep(60)",
+            str(transport),
+        ]
+        feeder = cls(producer, receiver.getsockname()[1])
         feeder._condition = DelayedCondition()
         feeder.run.__globals__["socket"] = SimpleNamespace(
             AF_INET=socket.AF_INET, SOCK_DGRAM=socket.SOCK_DGRAM, socket=MeasuredSender
         )
         started = time.monotonic()
-        deadline = started + WINDOW_SECONDS
+        deadline = started + CAPTURE_TIMEOUT_SECONDS
         stopped = False
         feeder.start()
         try:
             with capture.open("xb") as output:
                 while True:
-                    if time.monotonic() >= deadline and not stopped:
-                        if not feeder.finish():
-                            raise ProbeFailure("real media feeder did not stop")
-                        stopped = True
+                    if time.monotonic() >= deadline:
+                        raise ProbeFailure("complete real media capture exceeded its deadline")
                     try:
                         datagram = receiver.recv(65535)
                     except TimeoutError:
-                        if stopped:
-                            break
                         if time.monotonic() - started > 1 and not feeder.healthy():
                             raise ProbeFailure("real media feeder did not become healthy") from None
                         continue
                     output.write(datagram)
                     received.update(datagram)
                     received_size += len(datagram)
-                    if received_size > 12 * 1024 * 1024:
-                        raise ProbeFailure("real media capture exceeded its byte bound")
+                    if received_size > len(source_payload):
+                        raise ProbeFailure("real media capture exceeded its source byte bound")
+                    if received_size == len(source_payload):
+                        if not feeder.finish():
+                            raise ProbeFailure("real media feeder did not stop")
+                        stopped = True
+                        break
         finally:
             if not stopped and not feeder.finish():
                 raise ProbeFailure("real media feeder cleanup failed")
@@ -111,11 +161,17 @@ def media_clock_rate(case, directory):
         feeder.failure_kind is not None
         or received_size != sent.size
         or received.digest() != sent.digest.digest()
+        or received.digest() != hashlib.sha256(source_payload).digest()
         or sent.first is None
         or sent.last is None
-        or sent.last - sent.first < WINDOW_SECONDS - 1
+        or sent.last - sent.first < SOURCE_DURATION_SECONDS - 1
     ):
         raise ProbeFailure("real media transport was incomplete or reordered")
+    timestamps = probe_packets(capture, case)
+    return (max(timestamps) - min(timestamps)) / (sent.last - sent.first)
+
+
+def probe_packets(capture, case):
     result = subprocess.run(  # noqa: S603 - fixed ffprobe and generated local capture
         [
             FFPROBE,
@@ -136,6 +192,23 @@ def media_clock_rate(case, directory):
         check=False,
     )
     if result.returncode or result.stderr or len(result.stdout) > 512 * 1024:
+        lowered = result.stderr.lower()
+        kind = "other" if lowered else "none"
+        for marker, category in (
+            (b"pes packet size mismatch", "pes-size"),
+            (b"packet corrupt", "packet-corrupt"),
+            (b"error while decoding", "decode"),
+            (b"invalid", "invalid-data"),
+        ):
+            if marker in lowered:
+                kind = category
+                break
+        print(
+            f"Packet probe diagnostic: case={case} exit={result.returncode} "
+            f"stdout_bytes={len(result.stdout)} stderr_bytes={len(result.stderr)} "
+            f"stderr_kind={kind}",
+            flush=True,
+        )
         raise ProbeFailure("real media packet probe failed")
     payload = json.loads(result.stdout)
     streams = payload.get("streams", [])
@@ -152,7 +225,7 @@ def media_clock_rate(case, directory):
     timestamps = [float(packet["pts_time"]) for packet in payload["packets"]]
     if len(timestamps) < 60:
         raise ProbeFailure("real media capture had too few video packets")
-    return (max(timestamps) - min(timestamps)) / (sent.last - sent.first)
+    return timestamps
 
 
 def main():
@@ -160,8 +233,9 @@ def main():
         raise ProbeFailure("real media clock probe requires the isolated CI fixture")
     with tempfile.TemporaryDirectory(prefix="native-feeder-clock-") as temporary:
         directory = Path(temporary)
-        old_rate = media_clock_rate("old", directory)
-        fixed_rate = media_clock_rate("fixed", directory)
+        transport, payload = make_transport(directory)
+        old_rate = media_clock_rate("old", directory, transport, payload)
+        fixed_rate = media_clock_rate("fixed", directory, transport, payload)
     if not 0 < old_rate < 0.90:
         raise ProbeFailure("old fixture media clock slowdown was not reproduced")
     if not 0.95 <= fixed_rate <= 1.05:

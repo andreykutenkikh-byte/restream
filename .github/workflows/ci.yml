@@ -132,6 +132,15 @@ jobs:
       - name: Effective runtime limits
         run: sh scripts/check_runtime_limits.sh
 
+      - name: Native fixture media clock under scheduler jitter
+        shell: bash
+        run: |
+          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml \
+            cp deploy/moblin-relay/self-test ci-ssh-target:/tmp/adojapan-ci-clock-self-test.py
+          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml \
+            exec -T -e CI_NATIVE_FEEDER_CLOCK=isolated-fixture ci-ssh-target \
+            python3 - < deploy/moblin-relay/test-native-feeder-media.py
+
       - name: Real RTMP rotation and output end-to-end smoke
         run: uv run --locked python scripts/ci_output_smoke.py
 
@@ -140,13 +149,6 @@ jobs:
 
       - name: SSH bootstrap and native Moblin Relay end-to-end smoke
         run: uv run --locked python scripts/ci_node_onboarding_smoke.py
-
-      - name: Native fixture media clock under scheduler jitter
-        shell: bash
-        run: |
-          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml \
-            exec -T -e CI_NATIVE_FEEDER_CLOCK=isolated-fixture ci-ssh-target \
-            python3 - < deploy/moblin-relay/test-native-feeder-media.py
 
       - name: Post-onboarding runtime limits
         run: sh scripts/check_runtime_limits.sh
