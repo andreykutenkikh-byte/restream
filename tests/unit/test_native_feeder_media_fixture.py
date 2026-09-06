@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import runpy
+import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 import yaml
@@ -39,3 +41,21 @@ def test_clock_probe_reports_missing_prerequisite_without_media_work(monkeypatch
         namespace["ProbeFailure"], match=f"^isolated fixture prerequisite missing: {missing}$"
     ):
         namespace["main"]()
+
+
+def test_finite_clock_source_keeps_media_copy_and_places_sps_before_buffering_sei(monkeypatch):
+    monkeypatch.setitem(sys.modules, "fcntl", ModuleType("fcntl"))
+    monkeypatch.setitem(sys.modules, "resource", ModuleType("resource"))
+    helper = runpy.run_path(str(HELPER), run_name="_clock_fixture_test")
+    source = runpy.run_path(str(ROOT / "deploy/moblin-relay/self-test"), run_name="_feeder")
+    live, transport = Path("live.mp4"), Path("source.ts")
+    original = source["local_mpegts_remux_command"](live)
+    command = helper["finite_transport_command"](source, live, transport)
+    expected = list(original)
+    index = expected.index("-stream_loop")
+    del expected[index : index + 2]
+    expected[-1:] = ["-bsf:v", "h264_mp4toannexb,dump_extra=freq=keyframe", str(transport)]
+    assert command == expected
+    assert command[command.index("-c") + 1] == "copy"
+    assert original[-1] == "pipe:1"
+    assert "-bsf:v" not in original

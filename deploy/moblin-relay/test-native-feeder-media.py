@@ -46,6 +46,23 @@ def load_feeder(case):
     return namespace
 
 
+def finite_transport_command(namespace, live, transport):
+    command = namespace["local_mpegts_remux_command"](live)
+    loop_index = command.index("-stream_loop")
+    del command[loop_index : loop_index + 2]
+    # FFmpeg 5.1's automatic MP4 conversion inserts SPS/PPS only at the IDR,
+    # after the CBR buffering-period SEI that already references that SPS.
+    # Prepend converted Annex-B extradata to key packets before their SEI.
+    # This preserves encoded pictures and timing; neither errors nor NAL units
+    # are discarded. See ffmpeg-bitstream-filters.html#dump_005fextra.
+    command[-1:] = [
+        "-bsf:v",
+        "h264_mp4toannexb,dump_extra=freq=keyframe",
+        str(transport),
+    ]
+    return command
+
+
 def make_transport(directory):
     namespace = load_feeder("fixed")
     generate = namespace["generate_live"]
@@ -58,10 +75,7 @@ def make_transport(directory):
     generate.__globals__["run"] = bounded_generate
     live = generate(directory)
     transport = directory / "source.ts"
-    command = namespace["local_mpegts_remux_command"](live)
-    loop_index = command.index("-stream_loop")
-    del command[loop_index : loop_index + 2]
-    command[-1] = str(transport)
+    command = finite_transport_command(namespace, live, transport)
     result = subprocess.run(  # noqa: S603 - fixed ffmpeg with generated local portrait media
         command, stdin=subprocess.DEVNULL, capture_output=True, timeout=10, check=False
     )
