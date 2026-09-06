@@ -1425,6 +1425,7 @@ def native_result_probe_source() -> str:
         + f"_MEDIA_DIAGNOSTIC_MARKERS = frozenset({sorted(_MEDIA_DIAGNOSTIC_MARKERS)!r})\n"
         + f"_MEDIA_FIRST_SEEN_MARKERS = frozenset({sorted(_MEDIA_FIRST_SEEN_MARKERS)!r})\n"
         + inspect.getsource(_diagnostic_seconds)
+        + inspect.getsource(_safe_source_clock)
         + inspect.getsource(_safe_failure_media)
         + inspect.getsource(safe_strict_sink_reader_timings)
         + inspect.getsource(native_self_test_result_failure)

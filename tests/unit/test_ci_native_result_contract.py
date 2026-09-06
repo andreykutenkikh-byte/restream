@@ -1,6 +1,7 @@
 """Current native media result gates, executed without a server or credentials."""
 
 import copy
+import inspect
 import io
 import json
 import os
@@ -332,6 +333,87 @@ def test_remote_probe_executes_same_validator_and_never_prints_report(
     raw = json.dumps(payload).encode()
     exec(compile(source, "<fixed-native-result-probe>", "exec"), {})  # noqa: S102
     assert capsys.readouterr().out == "native_result_header\n"
+
+
+@pytest.mark.parametrize("case", ["known", "unknown", "injected", "nonfinite", "boolean"])
+def test_generated_probe_source_clock_dependency_is_closed_and_rejects_unsafe_data(
+    native_result: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case: str,
+) -> None:
+    clock: dict[str, Any] = {
+        "state": "known",
+        "packets": 1280,
+        "seconds": 12.0,
+        "ratio": 0.999,
+        "last_age": 0.003,
+        "max_gap": 0.015,
+        "discarded": 0.0,
+        "rebases": 0,
+    }
+    if case == "unknown":
+        clock = {"state": "unknown"}
+    elif case == "injected":
+        clock["url"] = "rtmp://PRIVATE_TEST_SOURCE/key"
+    elif case == "nonfinite":
+        clock["ratio"] = float("nan")
+    elif case == "boolean":
+        clock["packets"] = True
+    native_result["strict_sink_reader_timings"] = [
+        {
+            "segment": index,
+            "diagnostic": {
+                "scope": "capture",
+                "elapsed_seconds": 3.5,
+                "log_ok": True,
+                "markers": {},
+                "first_seen": {},
+                "reader_input": True,
+                "reader_output": True,
+                "reader_frames": 90,
+                "source_clock": dict(clock),
+            },
+        }
+        for index in range(1, 14)
+    ]
+    native_result["raw_report"] = "PRIVATE_TEST_REPORT_CONTENT"
+    raw = json.dumps(native_result).encode()
+
+    class Reader(io.BytesIO):
+        def fileno(self) -> int:
+            return 17
+
+    monkeypatch.setattr(os, "open", lambda *_args: 17)
+    monkeypatch.setattr(os, "O_NOFOLLOW", 0x20000, raising=False)
+    monkeypatch.setattr(os, "O_NONBLOCK", 0x800, raising=False)
+    monkeypatch.setattr(os, "fdopen", lambda *_args: Reader(raw))
+    monkeypatch.setattr(
+        os,
+        "fstat",
+        lambda _fd: SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o600, st_uid=0, st_nlink=1, st_size=len(raw)
+        ),
+    )
+    source = smoke.native_result_probe_source()
+    dependency = inspect.getsource(smoke._safe_source_clock)
+    assert source.count(dependency) == 1
+    # Reproduce 81e300's exact missing-definition failure in fresh globals.
+    previous_source = source.replace(dependency, "", 1)
+    with pytest.raises(NameError, match="_safe_source_clock"):
+        exec(compile(previous_source, "<previous-native-probe>", "exec"), {})  # noqa: S102
+    assert capsys.readouterr().out == ""
+    exec(compile(source, "<fixed-native-probe>", "exec"), {})  # noqa: S102
+    output = capsys.readouterr().out
+    assert "PRIVATE_TEST" not in output
+    if case in {"known", "unknown"}:
+        lines = output.splitlines()
+        assert lines[0] == "NATIVE_SELF_TEST_RESULT_OK"
+        assert json.loads(lines[1])[
+            "strict_sink_reader_timings"
+        ] == smoke.safe_strict_sink_reader_timings(native_result["strict_sink_reader_timings"])
+    else:
+        assert output == "native_result_media\n"
 
 
 @pytest.mark.parametrize(
