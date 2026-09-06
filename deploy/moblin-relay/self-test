@@ -249,6 +249,11 @@ LIVE_FEED_START_TIMEOUT_SECONDS = 5.0
 LIVE_FEED_CONTROL_TIMEOUT_SECONDS = 1.0
 LIVE_FEED_STOP_TIMEOUT_SECONDS = 2.0
 LIVE_TRANSPORT_MUX_RATE_BITS_PER_SECOND = 9_000_000
+# Catch-up is bounded by one encoded video frame of transport, not by an
+# unbounded backlog. Three unchanged datagrams fit within that byte budget.
+LIVE_FEED_CATCHUP_CHUNKS = int(
+    LIVE_TRANSPORT_MUX_RATE_BITS_PER_SECOND / 8 / VIDEO_FPS / LIVE_FEED_CHUNK_BYTES
+)
 SRT_IDLE_LOWER_BOUND_SECONDS = 8.0
 SRT_IDLE_UPPER_BOUND_SECONDS = 13.0
 LIVE_TO_SLATE_DEADLINE_SECONDS = 4.5
@@ -2496,6 +2501,7 @@ class PacedMPEGTSFeeder(threading.Thread):
         super().__init__(name="moblin-relay-test-live-feeder", daemon=True)
         if (
             not remux_command
+            or not math.isfinite(bytes_per_second)
             or bytes_per_second <= 0
             or LIVE_FEED_CHUNK_BYTES % MPEGTS_PACKET_SIZE_BYTES != 0
             or LIVE_FEED_CHUNK_BYTES > MAX_UDP_DATAGRAM_BYTES
@@ -2503,6 +2509,13 @@ class PacedMPEGTSFeeder(threading.Thread):
             raise TestFailure("synthetic LIVE transport has invalid pacing metadata")
         self._remux_command = tuple(remux_command)
         self._bytes_per_second = bytes_per_second
+        self._catchup_chunks = max(
+            1,
+            min(
+                LIVE_FEED_CATCHUP_CHUNKS,
+                int(bytes_per_second / VIDEO_FPS / LIVE_FEED_CHUNK_BYTES),
+            ),
+        )
         self._destination = ("127.0.0.1", udp_port)
         self._condition = threading.Condition()
         self._remux: subprocess.Popen | None = None
@@ -2645,6 +2658,7 @@ class PacedMPEGTSFeeder(threading.Thread):
                     self._condition.notify_all()
                 pacing_anchor = time.monotonic()
                 paced_bytes = 0
+                burst_count = 0
                 while True:
                     with self._condition:
                         while self._pause_requested and not self._stop_requested:
@@ -2657,6 +2671,7 @@ class PacedMPEGTSFeeder(threading.Thread):
                             self._paused = False
                             pacing_anchor = time.monotonic()
                             paced_bytes = 0
+                            burst_count = 0
                             self._condition.notify_all()
 
                     while len(pending) < LIVE_FEED_CHUNK_BYTES:
@@ -2681,14 +2696,25 @@ class PacedMPEGTSFeeder(threading.Thread):
                         deadline = pacing_anchor + paced_bytes / self._bytes_per_second
                         now = time.monotonic()
                         if now < deadline:
+                            burst_count = 0
                             self._condition.wait(deadline - now)
                             continue
-                        if now >= deadline + len(pending) / self._bytes_per_second:
+                        if burst_count >= self._catchup_chunks:
+                            # Work between sends can consume further deadlines.
+                            # Force a real wait before a fourth datagram even
+                            # then; phase debt alone is not a hard burst bound.
+                            interval = len(pending) / self._bytes_per_second
+                            pacing_anchor += now - deadline + interval
+                            burst_count = 0
+                            self._condition.wait(interval)
+                            continue
+                        catchup_window = self._catchup_chunks * len(pending) / self._bytes_per_second
+                        if now >= deadline + catchup_window:
                             # Preserve the media clock through ordinary wakeup jitter.
-                            # Rebasing every late wakeup would add that lateness to
-                            # every packet interval and continuously slow the source.
-                            # Once a complete interval is missed, discard the lag so
-                            # a delayed sender cannot flush a catch-up packet burst.
+                            # The previous zero-catch-up policy halved the source
+                            # rate under repeated 10 ms scheduling delays. Allow
+                            # at most one video frame's transport credit instead;
+                            # discard larger lag, never flush a long-stall backlog.
                             pacing_anchor += now - deadline
                     try:
                         sent = sender.sendto(pending, self._destination)
@@ -2703,6 +2729,7 @@ class PacedMPEGTSFeeder(threading.Thread):
                             self._ready = True
                             self._condition.notify_all()
                     paced_bytes += len(pending)
+                    burst_count += 1
                     pending.clear()
         except OSError:
             self._fail("remux")

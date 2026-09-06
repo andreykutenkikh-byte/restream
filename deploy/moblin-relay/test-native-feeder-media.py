@@ -19,12 +19,16 @@ from types import SimpleNamespace
 
 SELF_TEST = Path("/tmp/adojapan-ci-clock-self-test.py")  # noqa: S108 - explicit disposable CI stage
 FFPROBE = "/usr/bin/ffprobe"
-FIXED_CONDITION = "if now >= deadline + len(pending) / self._bytes_per_second:"
+FIXED_CONDITION = "if now >= deadline + catchup_window:"
+SINGLE_INTERVAL_CONDITION = "if now >= deadline + len(pending) / self._bytes_per_second:"
 PREVIOUS_CONDITION = "if now > deadline:"
+CATCHUP_GUARD = "if burst_count >= self._catchup_chunks:"
 SOURCE_DURATION_SECONDS = 8
+CLIFF_DURATION_SECONDS = 4
 CAPTURE_TIMEOUT_SECONDS = 20.0
 MAX_CAPTURE_BYTES = 12 * 1024 * 1024
 WAKEUP_JITTER_SECONDS = 0.003
+CLIFF_JITTER_SECONDS = 0.010
 
 
 class ProbeFailure(Exception):
@@ -32,15 +36,18 @@ class ProbeFailure(Exception):
 
 
 def load_feeder(case):
-    if case not in {"old", "fixed"}:
+    if case not in {"old", "single", "fixed"}:
         raise ProbeFailure("invalid feeder case")
     source = SELF_TEST.read_text(encoding="utf-8")
-    if source.count(FIXED_CONDITION) != 1:
+    if source.count(FIXED_CONDITION) != 1 or source.count(CATCHUP_GUARD) != 1:
         raise ProbeFailure("staged feeder does not contain the tested clock repair")
     if case == "fixed":
         return runpy.run_path(str(SELF_TEST), run_name="_native_feeder_media")
-    # Replay exactly the removed comparison, changing no other source behavior.
-    source = source.replace(FIXED_CONDITION, PREVIOUS_CONDITION)
+    # Replay each removed comparison without the new burst guard. The private
+    # accounting counters do not affect either historical pacing policy.
+    comparison = PREVIOUS_CONDITION if case == "old" else SINGLE_INTERVAL_CONDITION
+    source = source.replace(FIXED_CONDITION, comparison)
+    source = source.replace(CATCHUP_GUARD, "if False:")
     namespace = {"__name__": "_native_feeder_media", "__file__": str(SELF_TEST)}
     exec(compile(source, str(SELF_TEST), "exec"), namespace)  # noqa: S102 - staged test code
     return namespace
@@ -63,10 +70,10 @@ def finite_transport_command(namespace, live, transport):
     return command
 
 
-def make_transport(directory):
+def make_transport(directory, duration=SOURCE_DURATION_SECONDS):
     namespace = load_feeder("fixed")
     generate = namespace["generate_live"]
-    generate.__globals__["LIVE_FIXTURE_DURATION_SECONDS"] = SOURCE_DURATION_SECONDS
+    generate.__globals__["LIVE_FIXTURE_DURATION_SECONDS"] = duration
     original_run = generate.__globals__["run"]
 
     def bounded_generate(command, **kwargs):
@@ -95,7 +102,15 @@ def make_transport(directory):
     return transport, payload
 
 
-def media_clock_rate(case, directory, transport, source_payload):
+def media_clock_rate(
+    case,
+    directory,
+    transport,
+    source_payload,
+    *,
+    jitter=WAKEUP_JITTER_SECONDS,
+    duration=SOURCE_DURATION_SECONDS,
+):
     namespace = load_feeder(case)
     cls = namespace["PacedMPEGTSFeeder"]
     sent = SimpleNamespace(digest=hashlib.sha256(), size=0, first=None, last=None)
@@ -119,7 +134,7 @@ def media_clock_rate(case, directory, transport, source_payload):
             result = super().wait(timeout)
             if timeout is not None and timeout > 0:
                 # Inject bounded scheduler lateness into this feeder only.
-                time.sleep(WAKEUP_JITTER_SECONDS)
+                time.sleep(jitter)
             return result
 
     capture = directory / f"{case}.ts"
@@ -179,7 +194,7 @@ def media_clock_rate(case, directory, transport, source_payload):
         or received.digest() != hashlib.sha256(source_payload).digest()
         or sent.first is None
         or sent.last is None
-        or sent.last - sent.first < SOURCE_DURATION_SECONDS - 1
+        or sent.last - sent.first < duration - 1
     ):
         raise ProbeFailure("real media transport was incomplete or reordered")
     timestamps = probe_packets(capture, case)
@@ -265,13 +280,37 @@ def main():
         transport, payload = make_transport(directory)
         old_rate = media_clock_rate("old", directory, transport, payload)
         fixed_rate = media_clock_rate("fixed", directory, transport, payload)
+        cliff_directory = directory / "cliff"
+        cliff_directory.mkdir()
+        transport, payload = make_transport(cliff_directory, CLIFF_DURATION_SECONDS)
+        cliff_rates = [
+            media_clock_rate(
+                case,
+                cliff_directory,
+                transport,
+                payload,
+                jitter=CLIFF_JITTER_SECONDS,
+                duration=CLIFF_DURATION_SECONDS,
+            )
+            for case in ("single", "fixed")
+        ]
     if not 0 < old_rate < 0.90:
         raise ProbeFailure("old fixture media clock slowdown was not reproduced")
     if not 0.95 <= fixed_rate <= 1.05:
         raise ProbeFailure("fixed fixture media clock does not follow wall time")
+    if not 0 < cliff_rates[0] < 0.60:
+        raise ProbeFailure("single-interval fixture scheduling cliff was not reproduced")
+    if not 0.95 <= cliff_rates[1] <= 1.05:
+        raise ProbeFailure("bounded catch-up fixture clock does not follow wall time")
     print(
         "Real portrait media clock verified: "
         f"old_rate={old_rate:.3f} fixed_rate={fixed_rate:.3f}; ordered delivery and cleanup passed",
+        flush=True,
+    )
+    print(
+        "One-frame catch-up media clock verified: "
+        f"single_interval_rate={cliff_rates[0]:.3f} bounded_rate={cliff_rates[1]:.3f}; "
+        "ordered delivery and cleanup passed",
         flush=True,
     )
     return 0
