@@ -9,6 +9,7 @@ const vm = require("node:vm");
 const {
   ALERT_COOLDOWN_MS,
   MUTE_DURATION_MS,
+  REQUEST_TIMEOUT_MS,
   AlertAudio,
   HudPoller,
   confidenceLabel,
@@ -560,6 +561,140 @@ test("pagehide/pageshow resumes the same initialized page and logout stays termi
   harness.window.document.dispatch("visibilitychange");
   assert.equal(harness.timers.size, 0);
   assert.equal(harness.window.document.body.dataset.hudState, "revoked");
+});
+
+for (const failure of ["http-500", "network-rejection"]) {
+  test(`logout ${failure} remains unconfirmed and allows a successful retry`, async () => {
+    const harness = ordinaryScriptWindow({ paired: true });
+    const initialFetch = harness.window.fetch;
+    let attempts = 0;
+    harness.window.fetch = async (url, options) => {
+      if (!url.endsWith("/logout")) return initialFetch(url, options);
+      attempts += 1;
+      assert.equal(options.credentials, "same-origin");
+      assert.equal(options.cache, "no-store");
+      assert.ok(options.signal);
+      if (attempts > 1) return response({ logged_out: true });
+      if (failure === "network-rejection") throw new Error("synthetic offline");
+      return response({}, { status: 500 });
+    };
+    vm.runInNewContext(javascript, { window: harness.window });
+    await runImmediatePoll(harness);
+    const logout = harness.elements.get("[data-hud-logout]");
+    harness.elements.get("[data-hud-details-open]").dispatch("click");
+    logout.dispatch("click");
+    await flushMicrotasks();
+    assert.equal(harness.window.document.body.dataset.hudState, "logout-error");
+    assert.equal(harness.elements.get("[data-hud-title]").textContent, "Не удалось отключить HUD");
+    assert.equal(harness.elements.get("[data-hud-updated]").textContent, "Отключение не подтверждено");
+    assert.equal(harness.elements.get("[data-hud-bitrate]").textContent, "—");
+    assert.equal(harness.elements.get("[data-hud-cpu]").textContent, "—");
+    assert.equal(harness.elements.get("[data-hud-details]").hidden, false);
+    assert.equal(logout.disabled, false);
+    harness.window.dispatch("pagehide");
+    harness.window.dispatch("pageshow");
+    harness.window.document.dispatch("visibilitychange");
+    harness.window.location.hash = `#pair=${validToken}`;
+    harness.window.dispatch("hashchange");
+    assert.equal(harness.window.location.hash, "");
+    assert.equal(harness.timers.size, 0);
+    assert.deepEqual(harness.requests, ["/moblin-hud/api/status"]);
+    logout.dispatch("click");
+    await flushMicrotasks();
+    assert.equal(attempts, 2);
+    assert.equal(harness.window.document.body.dataset.hudState, "revoked");
+    assert.equal(logout.disabled, true);
+  });
+}
+
+for (const status of [200, 401]) {
+  test(`logout becomes terminal only after confirmed HTTP ${status}`, async () => {
+    const harness = ordinaryScriptWindow({ paired: true });
+    let completeLogout;
+    let attempts = 0;
+    harness.window.fetch = async (url) => {
+      assert.equal(url, "/moblin-hud/api/logout");
+      attempts += 1;
+      return new Promise((resolve) => { completeLogout = resolve; });
+    };
+    vm.runInNewContext(javascript, { window: harness.window });
+    // Logout may start before the initial pairing promise settles.
+    const logout = harness.elements.get("[data-hud-logout]");
+    logout.dispatch("click");
+    logout.dispatch("click");
+    await flushMicrotasks();
+    assert.equal(attempts, 1);
+    assert.equal(logout.disabled, true);
+    assert.equal(harness.window.document.body.dataset.hudState, "logout-pending");
+    harness.window.dispatch("pageshow");
+    harness.window.document.dispatch("visibilitychange");
+    assert.ok([...harness.timers.values()].every((timer) => timer.delay === REQUEST_TIMEOUT_MS));
+    completeLogout(response({}, { status }));
+    await flushMicrotasks();
+    assert.equal(harness.window.document.body.dataset.hudState, "revoked");
+    assert.equal(logout.disabled, true);
+    harness.window.dispatch("pagehide");
+    harness.window.dispatch("pageshow");
+    harness.window.document.dispatch("visibilitychange");
+    logout.dispatch("click");
+    assert.equal(attempts, 1);
+    assert.equal(harness.timers.size, 0);
+  });
+}
+
+test("a pending logout has a bounded deadline and timeout remains retryable", async () => {
+  const harness = ordinaryScriptWindow({ paired: true });
+  harness.window.AbortController = AbortController;
+  harness.window.fetch = (_url, { signal }) => new Promise((_resolve, reject) => {
+    signal.addEventListener("abort", () => reject(new Error("synthetic timeout")), { once: true });
+  });
+  vm.runInNewContext(javascript, { window: harness.window });
+  await flushMicrotasks();
+  const logout = harness.elements.get("[data-hud-logout]");
+  logout.dispatch("click");
+  assert.equal(harness.timers.size, 1);
+  const timeout = [...harness.timers.values()][0];
+  assert.equal(timeout.delay, REQUEST_TIMEOUT_MS);
+  timeout.callback();
+  await flushMicrotasks();
+  assert.equal(harness.window.document.body.dataset.hudState, "logout-error");
+  assert.equal(logout.disabled, false);
+  assert.equal(harness.timers.size, 0);
+});
+
+test("logout cannot overtake a pending pairing exchange that will set a session cookie", async () => {
+  const harness = ordinaryScriptWindow({ hash: `#pair=${validToken}` });
+  let completePairing;
+  let sessionCookie = false;
+  const requests = [];
+  harness.window.fetch = async (url) => {
+    requests.push(url);
+    if (url.endsWith("/pair")) {
+      await new Promise((resolve) => { completePairing = resolve; });
+      sessionCookie = true;
+      return response({ paired: true });
+    }
+    assert.equal(url, "/moblin-hud/api/logout");
+    sessionCookie = false;
+    return response({ logged_out: true });
+  };
+  vm.runInNewContext(javascript, { window: harness.window });
+  const logout = harness.elements.get("[data-hud-logout]");
+  assert.equal(logout.disabled, true);
+  logout.dispatch("click");
+  await flushMicrotasks();
+  assert.deepEqual(requests, ["/moblin-hud/api/pair"]);
+  assert.notEqual(harness.window.document.body.dataset.hudState, "revoked");
+  completePairing();
+  await flushMicrotasks();
+  assert.equal(sessionCookie, true);
+  assert.equal(logout.disabled, false);
+  logout.dispatch("click");
+  await flushMicrotasks();
+  assert.deepEqual(requests, ["/moblin-hud/api/pair", "/moblin-hud/api/logout"]);
+  assert.equal(sessionCookie, false);
+  assert.equal(harness.window.document.body.dataset.hudState, "revoked");
+  assert.equal(harness.timers.size, 0);
 });
 
 test("same-document pairing-link reopen clears its fragment and reuses the confirmed session", async () => {

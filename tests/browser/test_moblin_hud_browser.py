@@ -488,3 +488,56 @@ def test_ordinary_hud_browser_contract(
         )
         assert not leaked, "Synthetic HUD credential appeared in a request URL or captured log"
         assert all(not urlsplit(url).query for url in request_urls if "/moblin-hud/api/" in url)
+
+
+def test_failed_logout_requires_confirmation_before_session_revocation(
+    browser: Any, hud_server: HudServer, admin_password: str
+) -> None:
+    fixture = hud_server
+    login = fixture.client.post(
+        "/api/auth/login",
+        json={"login": fixture.app.state.settings.admin_login, "password": admin_password},
+    )
+    assert login.status_code == 200
+    pairing_response = fixture.client.post(
+        "/api/moblin-hud/pairings",
+        json={},
+        headers={"Origin": fixture.origin, "X-CSRF-Token": login.json()["csrf_token"]},
+    )
+    assert pairing_response.status_code == 200
+    page_errors: list[str] = []
+    with browser.new_context(ignore_https_errors=True) as context:
+        page = context.new_page()
+        page.set_default_timeout(10_000)
+        page.on("pageerror", lambda error: page_errors.append(error.message))
+        with page.expect_response(
+            lambda response: urlsplit(response.url).path == "/moblin-hud/api/status"
+        ) as first:
+            page.goto(pairing_response.json()["pairing_url"], wait_until="load")
+        assert first.value.status == 200
+
+        # Abort the actual browser request before the server can revoke anything.
+        # A transport failure must not fabricate server-side session invalidation.
+        page.route("**/moblin-hud/api/logout", lambda route: route.abort("failed"), times=1)
+        page.locator("[data-hud-details-open]").click()
+        page.locator("[data-hud-logout]").click()
+        page.wait_for_function("() => document.body.dataset.hudState === 'logout-error'")
+        assert page.locator("[data-hud-title]").inner_text() == "Не удалось отключить HUD"
+        assert page.locator("[data-hud-updated]").inner_text() == "Отключение не подтверждено"
+        assert page.locator("[data-hud-bitrate]").inner_text() == "—"
+        assert page.locator("[data-hud-cpu]").inner_text() == "—"
+        assert page.locator("[data-hud-logout]").is_enabled()
+        assert context.request.get(fixture.origin + "/moblin-hud/api/status").status == 200
+
+        # Retry reaches the real endpoint: both its response and the subsequent
+        # authentication check must confirm revocation before reporting success.
+        with page.expect_response(
+            lambda response: urlsplit(response.url).path == "/moblin-hud/api/logout"
+        ) as logged_out:
+            page.locator("[data-hud-logout]").click()
+        assert logged_out.value.status == 200
+        page.wait_for_function("() => document.body.dataset.hudState === 'revoked'")
+        assert page.locator("[data-hud-title]").inner_text() == "Доступ HUD отключён"
+        assert context.request.get(fixture.origin + "/moblin-hud/api/status").status == 401
+        assert not any(cookie["name"] == HUD_SESSION_COOKIE for cookie in context.cookies())
+        assert not page_errors

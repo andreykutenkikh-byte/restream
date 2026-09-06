@@ -510,6 +510,19 @@
         setText(elements.recommendation, mode === "revoked" ? "Требуется новая привязка" : "Не переключайте сервер по этому экрану");
         setText(elements.reason, mode === "revoked" ? "Сессия устройства отозвана или истекла." : "Достоверная оценка временно невозможна.");
         setText(elements.updated, mode === "revoked" ? "Сессия завершена" : "Ожидаем восстановление");
+        if (mode === "logout-pending" || mode === "logout-error") {
+          const pending = mode === "logout-pending";
+          for (const name of ["cpu", "memory", "rawState", "confidence", "reasonCodes", "serverTime"]) {
+            setText(elements[name], "—");
+          }
+          setText(elements.title, pending ? "Отключаем HUD…" : "Не удалось отключить HUD");
+          setText(elements.message, pending
+            ? "Ожидаем подтверждение сервера. Данные мониторинга скрыты."
+            : "Сервер не подтвердил отключение. Повторите попытку в подробностях.");
+          setText(elements.recommendation, pending ? "Дождитесь подтверждения" : "Повторите отключение устройства");
+          setText(elements.reason, "Сессия может оставаться действующей до подтверждения сервера.");
+          setText(elements.updated, "Отключение не подтверждено");
+        }
       },
     };
   }
@@ -536,10 +549,13 @@
         },
       });
       let previousLevel = null;
+      const alreadyPaired = documentObject.body?.dataset.hudPaired === "true";
       let terminalSession = false;
       let pageSuspended = false;
       let pairingFinished = false;
       let sessionConfirmed = false;
+      let logoutPaused = false;
+      let logoutPending = false;
       const poller = new HudPoller({
         fetchFn: windowObject.fetch.bind(windowObject),
         isHidden: () => documentObject.hidden,
@@ -578,27 +594,46 @@
       select(documentObject, "details-close")?.addEventListener("click", () => {
         if (details) details.hidden = true;
       });
-      select(documentObject, "logout")?.addEventListener("click", async () => {
-        terminalSession = true;
-        sessionConfirmed = false;
+      const logoutButton = select(documentObject, "logout");
+      if (logoutButton) logoutButton.disabled = !alreadyPaired;
+      logoutButton?.addEventListener("click", async () => {
+        // A pending exchange may still set a new cookie. Do not let logout
+        // overtake it and then falsely claim that the new session was revoked.
+        if ((!pairingFinished && !alreadyPaired) || logoutPending || terminalSession) return;
+        logoutPending = true;
+        logoutPaused = true;
+        logoutButton.disabled = true;
         poller.stop();
         audio.destroy();
+        renderer.offline("logout-pending");
+        const controller = new windowObject.AbortController();
+        const timeout = windowObject.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
         try {
-          await windowObject.fetch("/moblin-hud/api/logout", {
+          const response = await windowObject.fetch("/moblin-hud/api/logout", {
             method: "POST",
             credentials: "same-origin",
             cache: "no-store",
             headers: { Accept: "application/json" },
+            signal: controller.signal,
           });
+          if (!response.ok && response.status !== 401) throw new Error("logout_not_confirmed");
+          terminalSession = true;
+          sessionConfirmed = false;
+          if (details) details.hidden = true;
+          renderer.offline("revoked");
         } catch (_error) {
-          // The local session is still hidden and polling remains stopped.
+          // Only the server can revoke the HttpOnly session. Keep local data
+          // hidden without claiming that revocation succeeded; permit retry.
+          renderer.offline("logout-error");
+        } finally {
+          windowObject.clearTimeout(timeout);
+          logoutPending = false;
+          logoutButton.disabled = terminalSession;
         }
-        if (details) details.hidden = true;
-        renderer.offline("revoked");
       });
 
       documentObject.addEventListener("visibilitychange", () => {
-        if (!terminalSession && !pageSuspended && pairingFinished) {
+        if (!terminalSession && !logoutPaused && !pageSuspended && pairingFinished) {
           poller.restart(documentObject.hidden ? 10_000 : 0);
         }
       });
@@ -611,7 +646,7 @@
       });
       windowObject.addEventListener("pageshow", () => {
         pageSuspended = false;
-        if (!terminalSession && pairingFinished) poller.start();
+        if (!terminalSession && !logoutPaused && pairingFinished) poller.start();
       });
       windowObject.addEventListener("hashchange", () => {
         if (!windowObject.location.hash) return;
@@ -620,7 +655,7 @@
         );
         // Reopening a saved link may be a same-document navigation. Reuse only
         // an already confirmed session; a new pairing requires a fresh page.
-        if (sessionConfirmed && pairingFinished && !terminalSession && !pageSuspended) {
+        if (sessionConfirmed && pairingFinished && !terminalSession && !logoutPaused && !pageSuspended) {
           poller.restart(0);
         }
       });
@@ -630,7 +665,7 @@
       const pairing = pairFromFragment({
         location: windowObject.location,
         history: windowObject.history,
-        alreadyPaired: documentObject.body?.dataset.hudPaired === "true",
+        alreadyPaired,
         fetchFn: (url, options) => windowObject.fetch(url, { ...options, signal: pairController.signal }),
       });
       void pairing
@@ -638,7 +673,8 @@
         .finally(() => {
           windowObject.clearTimeout(pairTimeout);
           pairingFinished = true;
-          if (!terminalSession && !pageSuspended) poller.start();
+          if (logoutButton) logoutButton.disabled = terminalSession || logoutPending;
+          if (!terminalSession && !logoutPaused && !pageSuspended) poller.start();
         });
     };
 
