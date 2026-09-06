@@ -7,6 +7,65 @@ service lifecycle operation, production package installation, key rotation,
 connection reset, production fault injection or agent publication. Earlier
 separately authorized runtime work is not attributed to this completion pass.
 
+## Current candidate — September 7 restack
+
+This section supersedes status language in the dated chronology below. Statements
+such as "latest base" or "remaining blocker" there describe that historical
+checkpoint, not acceptance of the current candidate.
+
+The pre-restack HUD code head is `6638f808b5c924bf4c464bffb06f00984699a836`,
+with thirteen own commits above `ce7f33598c9d6b5129a4a15d2b8e885559ab72bf`.
+This evidence update is the fourteenth own commit. The expected remote head is
+`c77faf6e88cc5f8416f776470bc221536df5b943`; a restack push must use that exact
+lease after checking it has not changed.
+
+The new PR15 base `a4feee1dc64c9e0917f91145db4111020b113c5c` passed complete
+[CI 34053170259](https://github.com/andreykutenkikh-byte/restream/actions/runs/34053170259):
+1977 Linux Python tests, 44 frontend tests, native onboarding/recovery, all
+13 strict 90-frame sink readers (3.327–5.231 seconds), media/format/timestamp/
+decode checks, independent old-versus-fixed reader-clock proof, post-onboarding
+resource limits and cleanup. The native scenario completed in 379.065 seconds.
+That exact base is now eligible for the own-commit-only restack; the rebased HUD
+head must still pass its own complete CI and actual browser tests. No future HUD
+head or successful run is asserted here; the stack is not yet ready for final
+review, merge or deployment.
+
+Earlier Linux native failures remain in the audit chronology and PR15 fixture
+diagnosis. The latest commits add bounded packet/probe observations, not a
+claimed exclusive explanation of every prior failure. The successful run is
+exact-head acceptance evidence, not a promise of failure-free production or
+permission to deploy; this pass has made no production changes.
+
+The latest HUD correction treats an observed warm-up `unknown` state as the
+non-alert severity baseline: a subsequent yellow/red/black deterioration can
+sound after opt-in. An absent first state, unknown-to-green, unchanged severity,
+recovery and mute remain silent; escalation and cooldown rules are preserved.
+All 41 HUD frontend tests passed locally. The ordinary browser test now observes
+calls to `OscillatorNode.start` and delegates to the native method, without
+replacing the sound decision or playback. It checks silence before opt-in, the
+gesture test tone, then a warm-up LIVE → SLATE alarm without a duplicate alarm.
+
+The current browser suite still comprises four cases: ordinary HUD and failed
+logout/retry, each in Chromium and WebKit. Its updated alarm observation has
+**not yet passed an actual browser run**. The older remote head
+`c77faf6e88cc5f8416f776470bc221536df5b943` passed four browser tests in Chromium
+151.0.7922.34 and WebKit 26.5 in
+[run 34016372265](https://github.com/andreykutenkikh-byte/restream/actions/runs/34016372265),
+but that complete run failed native media. Those browser results do not approve
+the current local changes or the future restack.
+
+A bounded local attempt resolved the locked browser group, but Playwright 1.62.0
+had not finished downloading after approximately five minutes. Only the owned
+installer was stopped; no engine was installed and no browser test executed.
+User browsers/settings and production were untouched. The existing Linux CI
+browser job remains responsible for running both required engines on the final
+exact head; local setup failure is neither a HUD test failure nor a pass.
+
+The twenty-case regression matrix, real API → evaluator heartbeat flows, 120-second
+recovery grace, and v5→v6/v6→v7 migration preservation/integrity coverage below
+remain intact. This audio/browser amendment changes none of those API, evaluator,
+migration or security contracts; their final acceptance still requires exact-head CI.
+
 ## September 5 Git starting state
 
 Discovery used refreshed remote refs, PR metadata, CI runs and review comments.
