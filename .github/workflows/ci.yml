@@ -144,8 +144,7 @@ jobs:
       - name: Native fixture media clock under scheduler jitter
         shell: bash
         run: |
-          docker compose -p adojapan-restream --env-file .env.ci \
-            -f compose.yml -f compose.production.yml -f compose.ci.yml \
+          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml \
             exec -T -e CI_NATIVE_FEEDER_CLOCK=isolated-fixture ci-ssh-target \
             python3 - < deploy/moblin-relay/test-native-feeder-media.py
 

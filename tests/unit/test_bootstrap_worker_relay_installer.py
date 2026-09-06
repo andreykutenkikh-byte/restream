@@ -188,6 +188,7 @@ def test_bundle_loader_has_a_fixed_reviewed_allowlist() -> None:
     assert "deploy/moblin-relay/README.md" not in names
     assert "deploy/moblin-relay/node.json.example" not in names
     assert "deploy/moblin-relay/test-render-config.py" not in names
+    assert "deploy/moblin-relay/test-native-feeder-media.py" not in names
     assert all(payload for payload in bundle.values())
 
 

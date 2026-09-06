@@ -2221,6 +2221,7 @@ def test_bundle_contains_only_portable_sources_and_no_instance_manifest() -> Non
         "self-test",
         "slate.txt",
         "test-render-config.py",
+        "test-native-feeder-media.py",
     }
     assert {path.name for path in BUNDLE.iterdir() if path.is_file()} == expected
     combined = "\n".join(
