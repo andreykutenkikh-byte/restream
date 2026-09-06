@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import runpy
 import socket
 import subprocess
@@ -209,6 +210,13 @@ def probe_packets(capture, case):
             f"stderr_kind={kind}",
             flush=True,
         )
+        # This subprocess reads only our newly generated finite test fixture,
+        # never runtime media, configuration, URLs or credentials. Expose its
+        # bounded diagnostic so source errors cannot hide behind 'other'.
+        diagnostic = result.stderr[:512].decode("ascii", errors="replace")
+        diagnostic = diagnostic.replace(str(capture.parent), "<fixture>")
+        diagnostic = re.sub(r"0x[0-9a-fA-F]+", "<address>", diagnostic)
+        print(f"Synthetic fixture probe stderr: {diagnostic!r}", flush=True)
         raise ProbeFailure("real media packet probe failed")
     payload = json.loads(result.stdout)
     streams = payload.get("streams", [])
