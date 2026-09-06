@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import re
 import runpy
 import socket
+import stat
 import subprocess
 import threading
 import time
@@ -19,7 +21,8 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 CLOCK_HELPER = Path("/tmp/adojapan-ci-clock-helper.py")  # noqa: S108 - verified CI stage
-MEDIAMTX = Path("/opt/moblin-relay/bin/mediamtx")
+MEDIAMTX = Path("/usr/local/lib/adojapan-ci/reader/mediamtx")
+MEDIAMTX_VERSION = "v1.20.1"
 FFMPEG = "/usr/bin/ffmpeg"
 JITTER_SECONDS = 0.022
 # Two extra GOP intervals per gate add <=4/.25 + 4/.95 =20.211s
@@ -51,6 +54,56 @@ class ProbeFailure(Exception):
 def require(condition, reason):
     if not condition:
         raise ProbeFailure(reason)
+
+
+def verify_reader_binary():
+    """Trust only the fixed, root-owned CI-image artifact, never install state."""
+    directory = MEDIAMTX.parent.lstat()
+    require(
+        stat.S_ISDIR(directory.st_mode)
+        and directory.st_uid == directory.st_gid == 0
+        and stat.S_IMODE(directory.st_mode) == 0o555,
+        "reader artifact directory invalid",
+    )
+    manifest = None
+    digest = hashlib.sha256()
+    for path, mode, limit in (
+        (MEDIAMTX.parent / "manifest.json", 0o444, 1024),
+        (MEDIAMTX, 0o555, 128 * 1024**2),
+    ):
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as source:
+            metadata = os.fstat(source.fileno())
+            require(
+                stat.S_ISREG(metadata.st_mode)
+                and metadata.st_uid == metadata.st_gid == 0
+                and stat.S_IMODE(metadata.st_mode) == mode
+                and metadata.st_nlink == 1
+                and 0 < metadata.st_size <= limit,
+                "reader artifact file invalid",
+            )
+            if path == MEDIAMTX:
+                remaining = metadata.st_size
+                while remaining:
+                    chunk = source.read(min(remaining, 1024 * 1024))
+                    require(bool(chunk), "reader artifact changed while hashing")
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+                require(not source.read(1), "reader artifact changed while hashing")
+            else:
+                manifest = json.loads(source.read(limit + 1))
+    require(
+        isinstance(manifest, dict)
+        and manifest.keys() == {"version", "archive", "archive_sha256", "binary_sha256"}
+        and manifest["version"] == MEDIAMTX_VERSION
+        and manifest["archive"] == f"mediamtx_{MEDIAMTX_VERSION}_linux_amd64.tar.gz"
+        and all(
+            isinstance(manifest[key], str) and re.fullmatch("[0-9a-f]{64}", manifest[key])
+            for key in ("archive_sha256", "binary_sha256")
+        )
+        and manifest["binary_sha256"] == digest.hexdigest(),
+        "reader artifact manifest or digest invalid",
+    )
 
 
 def parse_frame(line, observed):
@@ -736,12 +789,16 @@ def run_case(case, namespace, live, prepared, work, deadline):
 def main():
     require(os.environ.get("CI_NATIVE_READER_CLOCK") == "isolated-fixture", "CI-only reader gate")
     deadline = time.monotonic() + WORK_SECONDS
-    require(CLOCK_HELPER.is_file() and MEDIAMTX.is_file(), "reader fixture prerequisites missing")
-    version = subprocess.run(  # noqa: S603 - fixed installed CI binary
+    require(CLOCK_HELPER.is_file(), "reader fixture prerequisites missing")
+    verify_reader_binary()
+    version = subprocess.run(  # noqa: S603 - fixed verified CI-image binary
         [str(MEDIAMTX), "--version"], capture_output=True, timeout=5, check=False
     )
     require(
-        version.returncode == 0 and version.stdout.strip() == b"v1.20.1", "MediaMTX pin mismatch"
+        version.returncode == 0
+        and version.stdout.strip() == MEDIAMTX_VERSION.encode("ascii")
+        and not version.stderr,
+        "MediaMTX pin mismatch",
     )
     os.environ.pop("MOBLIN_RELAY_SELF_TEST_STAGE_FILE", None)
     loader = runpy.run_path(str(CLOCK_HELPER), run_name="_reader_clock_loader")["load_feeder"]

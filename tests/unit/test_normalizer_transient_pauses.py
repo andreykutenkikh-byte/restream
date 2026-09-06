@@ -118,7 +118,8 @@ def test_watchdog_carries_continuous_input_proof_without_shortening_six_second_g
 def test_other_failure_reasons_cannot_carry_proof_into_srt_reset():
     ns = load()
     source = "11111111-2222-4333-8444-555555555555"
-    for reason in ("metrics-blind", "output-fallback", "output-regression", "child-exit"):
+    excluded_reasons = set(ns["RESTART_LOG_TOKENS"]) - {"verified-stall", "output-fallback"}
+    for reason in excluded_reasons | {"missing-pts"}:
         watchdog = ns["MediaWatchdog"](("output", 100), 0.0)
         watchdog.ingest_connection_id = source
         watchdog.ingest_counter = 100

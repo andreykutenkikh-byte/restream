@@ -1,14 +1,25 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import os
+import re
 import runpy
+import stat
 import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+
+from bootstrap_worker.relay_installer import (
+    MEDIA_MTX_ARCHIVE,
+    MEDIA_MTX_ARCHIVE_SHA256,
+    MEDIA_MTX_URL,
+    MEDIA_MTX_VERSION,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / "deploy/moblin-relay/test-native-reader-clock.py"
@@ -38,6 +49,148 @@ def test_ci_runs_independent_counterfactual_after_native_failure_without_masking
 @pytest.fixture
 def helper():
     return runpy.run_path(str(HELPER), run_name="_reader_clock_test")
+
+
+def test_ci_reader_artifact_pins_match_installer_and_are_outside_rollback_scope(helper):
+    dockerfile = (ROOT / "ci/ssh-target/Dockerfile").read_text(encoding="utf-8")
+    pins = dict(re.findall(r"reader_(version|archive|url|archive_sha256)='([^']+)'", dockerfile))
+    assert pins == {
+        "version": MEDIA_MTX_VERSION,
+        "archive": MEDIA_MTX_ARCHIVE,
+        "url": MEDIA_MTX_URL,
+        "archive_sha256": MEDIA_MTX_ARCHIVE_SHA256,
+    }
+    assert helper["MEDIAMTX_VERSION"] == MEDIA_MTX_VERSION
+    assert helper["MEDIAMTX"].as_posix() == "/usr/local/lib/adojapan-ci/reader/mediamtx"
+    section = dockerfile.split("# Independent media evidence", 1)[1].split(
+        "COPY ci/ssh-target/sshd_config", 1
+    )[0]
+    assert section.index("sha256sum --check --status") < section.index("tar -xzf")
+    assert "-C /tmp/adojapan-ci-reader-download mediamtx LICENSE" in section
+    assert "--max-time 180 --max-filesize 67108864" in section
+    assert "sha256sum /usr/local/lib/adojapan-ci/reader/mediamtx" in section
+    assert '"archive_sha256":"%s","binary_sha256":"%s"' in section
+    assert "chmod 0555 /usr/local/lib/adojapan-ci/reader" in section
+    assert "/opt/moblin-relay" not in section and "systemctl" not in section
+
+
+@pytest.fixture
+def reader_artifact(helper, monkeypatch, tmp_path):
+    directory = tmp_path / "reader"
+    directory.mkdir()
+    binary = directory / "mediamtx"
+    payload = b"isolated pinned binary fixture"
+    binary.write_bytes(payload)
+    manifest = {
+        "version": MEDIA_MTX_VERSION,
+        "archive": MEDIA_MTX_ARCHIVE,
+        "archive_sha256": MEDIA_MTX_ARCHIVE_SHA256,
+        "binary_sha256": hashlib.sha256(payload).hexdigest(),
+    }
+    (directory / "manifest.json").write_text(json.dumps(manifest), encoding="ascii")
+    overrides, opened = {}, {}
+    original_lstat = Path.lstat
+
+    def metadata(path, mode, size=0):
+        return SimpleNamespace(
+            **(
+                {
+                    "st_mode": mode,
+                    "st_uid": 0,
+                    "st_gid": 0,
+                    "st_nlink": 1,
+                    "st_size": size,
+                }
+                | overrides.get(path.name, {})
+            )
+        )
+
+    def lstat(path):
+        if path == directory:
+            return metadata(path, stat.S_IFDIR | 0o555)
+        return original_lstat(path)
+
+    def open_artifact(path, flags):
+        descriptor = os.open(path, flags)
+        opened[descriptor] = path
+        return descriptor
+
+    def fstat(descriptor):
+        path = opened[descriptor]
+        return metadata(
+            path, stat.S_IFREG | (0o555 if path == binary else 0o444), os.fstat(descriptor).st_size
+        )
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+    monkeypatch.setitem(helper["verify_reader_binary"].__globals__, "MEDIAMTX", binary)
+    monkeypatch.setitem(
+        helper["verify_reader_binary"].__globals__,
+        "os",
+        SimpleNamespace(
+            O_RDONLY=os.O_RDONLY,
+            O_NOFOLLOW=getattr(os, "O_NOFOLLOW", 0),
+            O_NONBLOCK=getattr(os, "O_NONBLOCK", 0),
+            open=open_artifact,
+            fdopen=os.fdopen,
+            fstat=fstat,
+        ),
+    )
+    return directory, manifest, overrides
+
+
+def test_ci_reader_binary_digest_is_verified_without_native_install(helper, reader_artifact):
+    directory, _manifest, _overrides = reader_artifact
+    assert not (directory / "opt/moblin-relay").exists()
+    assert helper["verify_reader_binary"]() is None
+    (directory / "mediamtx").write_bytes(b"changed but still named mediamtx")
+    with pytest.raises(helper["ProbeFailure"], match="manifest or digest"):
+        helper["verify_reader_binary"]()
+
+
+@pytest.mark.parametrize(
+    "name,changes",
+    [
+        ("reader", {"st_mode": stat.S_IFLNK | 0o555}),
+        ("reader", {"st_uid": 10002}),
+        ("mediamtx", {"st_uid": 10002}),
+        ("mediamtx", {"st_mode": stat.S_IFREG | 0o777}),
+        ("mediamtx", {"st_mode": stat.S_IFIFO | 0o555}),
+        ("mediamtx", {"st_nlink": 2}),
+        ("mediamtx", {"st_size": 128 * 1024**2 + 1}),
+        ("manifest.json", {"st_mode": stat.S_IFREG | 0o644}),
+        ("manifest.json", {"st_gid": 10002}),
+        ("manifest.json", {"st_size": 1025}),
+    ],
+)
+def test_ci_reader_rejects_untrusted_artifact_metadata(helper, reader_artifact, name, changes):
+    _directory, _manifest, overrides = reader_artifact
+    overrides[name] = changes
+    with pytest.raises(helper["ProbeFailure"], match="artifact (directory|file) invalid"):
+        helper["verify_reader_binary"]()
+
+
+@pytest.mark.parametrize("field", ["version", "archive", "archive_sha256", "binary_sha256", "url"])
+def test_ci_reader_manifest_rejects_pin_or_shape_changes(helper, reader_artifact, field):
+    directory, manifest, _overrides = reader_artifact
+    manifest[field] = "https://secret.invalid/not-a-pinned-artifact"
+    (directory / "manifest.json").write_text(json.dumps(manifest), encoding="ascii")
+    with pytest.raises(helper["ProbeFailure"], match="artifact manifest or digest invalid"):
+        helper["verify_reader_binary"]()
+
+
+def test_main_checks_artifact_before_executing_its_version(helper, monkeypatch):
+    monkeypatch.setenv("CI_NATIVE_READER_CLOCK", "isolated-fixture")
+    monkeypatch.setattr(Path, "is_file", lambda _path: True)
+
+    def invalid():
+        raise helper["ProbeFailure"]("reader artifact file invalid")
+
+    monkeypatch.setitem(helper["main"].__globals__, "verify_reader_binary", invalid)
+    monkeypatch.setattr(
+        helper["subprocess"], "run", lambda *_args, **_kwargs: pytest.fail("executed")
+    )
+    with pytest.raises(helper["ProbeFailure"], match="artifact file invalid"):
+        helper["main"]()
 
 
 def frames(rate=1.0, start=0, count=241):
@@ -797,10 +950,11 @@ def test_main_proves_old_bsf_then_loops_prepared_source_but_validates_original(h
     globals_ = helper["main"].__globals__
     monkeypatch.setenv("CI_NATIVE_READER_CLOCK", "isolated-fixture")
     monkeypatch.setattr(Path, "is_file", lambda _path: True)
+    monkeypatch.setitem(globals_, "verify_reader_binary", lambda: None)
     monkeypatch.setattr(
         helper["subprocess"],
         "run",
-        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=b"v1.20.1"),
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=b"v1.20.1", stderr=b""),
     )
     events, source_globals = [], {}
     namespace = {"generate_live": lambda work: work / "live.mp4"}
@@ -873,10 +1027,11 @@ def test_validation_probe_timeout_is_capped_by_remaining_outer_budget(
 def test_wrong_installed_mediamtx_version_stops_before_loading_fixture(helper, monkeypatch):
     monkeypatch.setenv("CI_NATIVE_READER_CLOCK", "isolated-fixture")
     monkeypatch.setattr(Path, "is_file", lambda _path: True)
+    monkeypatch.setitem(helper["main"].__globals__, "verify_reader_binary", lambda: None)
     monkeypatch.setattr(
         helper["subprocess"],
         "run",
-        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=b"v1.20.0"),
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=b"v1.20.0", stderr=b""),
     )
     monkeypatch.setattr(
         helper["runpy"], "run_path", lambda *_args, **_kwargs: pytest.fail("loaded")

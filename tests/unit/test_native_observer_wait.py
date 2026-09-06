@@ -357,6 +357,27 @@ def test_outage_flow_projection_rejects_lookalikes_and_inconsistent_evidence(mon
     assert safe_self_test_progress(payload, job_id="test-job") == {"progress": "unavailable"}
 
 
+@pytest.mark.parametrize("stage", ["outage-normal", "stall-switch", "stuck-slate"])
+def test_flow_projection_accepts_only_supported_source_loss_stages(monkeypatch, stage):
+    state, _failure, _requests = record_flow(monkeypatch, [flow_sample(100.1), flow_sample(101.0)])
+    flow = state["SELF_TEST_FLOW_FAILURE"][1]
+    payload = {"job_id": "test-job", "stage": stage, "elapsed_seconds": 5, "failure_flow": flow}
+    assert safe_self_test_progress(payload, job_id="test-job")["failure_flow"] == flow
+    assert safe_self_test_progress(payload, job_id="different-job") == {"progress": "unavailable"}
+
+
+@pytest.mark.parametrize("stage", ["live-normalize", "stall-pause", "stuck-live", "cleanup"])
+def test_flow_projection_rejects_unrelated_stages(monkeypatch, stage):
+    state, _failure, _requests = record_flow(monkeypatch, [flow_sample(100.1), flow_sample(101.0)])
+    payload = {
+        "job_id": "test-job",
+        "stage": stage,
+        "elapsed_seconds": 5,
+        "failure_flow": state["SELF_TEST_FLOW_FAILURE"][1],
+    }
+    assert safe_self_test_progress(payload, job_id="test-job") == {"progress": "unavailable"}
+
+
 def test_outage_flow_checkpoint_keeps_fixed_two_kib_limit_and_exception_identity(monkeypatch):
     samples = [
         flow_sample(100.1),

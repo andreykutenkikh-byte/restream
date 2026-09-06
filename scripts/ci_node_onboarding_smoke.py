@@ -617,7 +617,11 @@ def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
         or (failure_media is not None and safe_media is None)
         or (
             failure_flow is not None
-            and (safe_flow is None or stage != "outage-normal" or failure_media is not None)
+            and (
+                safe_flow is None
+                or stage not in {"outage-normal", "stall-switch", "stuck-slate"}
+                or failure_media is not None
+            )
         )
         or (
             initial_live_reason is not None

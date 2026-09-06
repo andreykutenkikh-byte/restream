@@ -1,7 +1,8 @@
 # Native media fixture clock and outage checks
 
-These are isolated test-fixture corrections, not a production deployment or
-permission to alter an active relay. Final exact-head CI results belong in the
+This records isolated test-fixture corrections and the narrowly scoped runtime
+proof-carry correction below. It is not a production deployment or permission
+to alter an active relay. Final exact-head CI results belong in the
 PR description; an earlier green run is not acceptance of a later commit.
 
 ## Source pacing
@@ -36,9 +37,13 @@ transport acceptance remains 0.95–1.05, with byte integrity checked separately
 `test-native-reader-clock.py` runs only in the disposable CI SSH fixture after
 the native onboarding attempt, including a failed attempt. The original native
 failure stays fatal; this independent check neither retries nor replaces it.
-It requires the already-installed pinned MediaMTX binary and fails explicitly
-if that prerequisite is missing. Earlier setup failures and cancellation do
-not trigger this check. It creates its own
+The disposable SSH image separately verifies the canonical v1.20.1 archive SHA
+and retains only its executable, license and digest manifest under the fixed
+root-owned, read-only `/usr/local/lib/adojapan-ci/reader` directory. It installs
+no service. Before execution the helper validates the bounded regular files,
+ownership, permissions, binary SHA and exact version. There is no `/opt` fallback:
+native install rollback cannot remove this independent prerequisite. Earlier
+setup failures and cancellation do not trigger this check. It creates its own
 loopback listeners, temporary configuration and owned media processes. It does
 not invoke service lifecycle, self-test main or credential-writing routines.
 
@@ -163,8 +168,8 @@ threshold change or a promise that total pipeline drain is capped at two seconds
 Only hard sender shutdown uses the existing eight-second lower natural-SRT-expiry
 boundary: a fully completed fresh sample must show SLATE while the same SRT
 publisher is still attached, strictly before cut + 8 seconds. This absolute
-deadline never slides when more bytes arrive. Other fault tests retain their
-4.5-second transition deadline. Natural expiry still requires its separate
+deadline never slides when more bytes arrive. Direct normalizer/child fault tests
+retain their 4.5-second transition deadline. Natural expiry still requires its separate
 8–13-second assertion or the existing exact-source confirmed-reset proof.
 The three-second capture-growth/gap checks and all 12/15-second recovery and
 90-frame media checks remain in force.
@@ -175,3 +180,35 @@ A last unchanged sample pair is not described as a whole outage without media.
 Missing/regressed counters, changed identities and invalid timing yield unknown
 evidence. Raw counters, identities, URLs, secrets and exception text are excluded;
 the existing 2 KiB checkpoint and 64 KiB result limits remain unchanged.
+
+## Paused sender and corroborated fallback
+
+A feeder pause acknowledges the end of new sends, not the disappearance of
+already-buffered output. Exactly two pause cases now require both bounds: SLATE
+within 4.5 seconds of the last observed normalized-output byte growth, and a
+fixed absolute cutoff from the acknowledged pause. The same-session case keeps
+its eight-second resume boundary; the persistent-stall case keeps its nine-second
+completed-reset deadline. No new growth can extend either absolute cutoff.
+Completed, ordered metrics observations and the same attached SRT publisher are
+mandatory. Missing metrics, changed normalized identity or regressed counters
+fail closed. Byte growth is transport evidence, not a decoded-video assertion;
+the separate unchanged capture, decode, six-second no-early-reset and fresh
+pre-reset checks remain mandatory. Failure-only flow diagnostics cover both
+pause stages with the existing allowlist, correlation and size bounds.
+
+An independent actual-watchdog regression also exposed a runtime proof-loss
+case: a legal 190 ms successful output scrape can reach the output-fallback
+branch before the next ingest corroboration. The old reason-only guard then
+discarded an already-observed continuous joint-stall interval and restarted the
+six-second confirmation. In this deterministic model the old confirmation was
+at 11.085 seconds; carrying the corroborated interval allows confirmation and
+both fresh pre-reset checks by 8.925 seconds. This is a reproduced failure class,
+not proof that it exclusively caused the earlier CI failure.
+
+The normalizer now preserves that proof for output-fallback only when the
+existing exact-source, joint counters, idle interval and three-observation guards
+all hold. Six-second confirmation, fresh pre-reset checks, cancellation on growth,
+identity change or metrics failure, attempt limits and cooldown are unchanged.
+Output-fallback without corroboration and FFmpeg/PTS errors alone still cannot
+authorize a reset. This candidate normalizer intentionally differs from the
+previously audited deployed file; it has not been deployed to production.

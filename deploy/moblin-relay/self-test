@@ -1579,6 +1579,54 @@ def record_outage_flow_failure(
     SELF_TEST_FLOW_FAILURE = (failure, value)
 
 
+class PauseSLATEEvidence:
+    """Bound fallback after observed output growth and by the fixed pause cutoff."""
+
+    def __init__(self, started: float, deadline: float, baseline: dict) -> None:
+        ids, counter = baseline.get("normalized_ids"), baseline.get("normalized_bytes")
+        if (
+            type(started) not in {int, float} or type(deadline) not in {int, float}
+            or not math.isfinite(started) or not math.isfinite(deadline)
+            or not started < deadline <= started + PERSISTENT_INPUT_STALL_RESET_TIMEOUT_SECONDS
+            or not complete_metrics_sample(baseline) or baseline.get("normalized") is not True
+            or not isinstance(ids, list) or len(ids) != 1 or not isinstance(ids[0], str)
+            or not ids[0] or ids[0] == "missing-id"
+            or type(counter) is not int or not 0 <= counter <= 2**63 - 1
+        ):
+            raise TestFailure("pause SLATE proof lacks a valid output baseline")
+        self.started, self.deadline = started, deadline
+        self.ids, self.counter = tuple(ids), counter
+        self.last_growth = started
+        self.last_sample_start, self.last_sample_finish = started, started
+
+    def observe(self, sample: dict) -> None:
+        first, last = sample.get("t"), sample.get("finished")
+        if (
+            not complete_metrics_sample(sample)
+            or type(sample.get("normalized")) is not bool
+            or type(first) not in {int, float} or type(last) not in {int, float}
+            or not math.isfinite(first) or not math.isfinite(last)
+            or not self.started <= first <= last < self.deadline
+            or first < self.last_sample_start
+            or (first != self.last_sample_start and first < self.last_sample_finish)
+            or (first == self.last_sample_start and last != self.last_sample_finish
+                and self.last_sample_finish != self.started)
+        ):
+            raise TestFailure("pause SLATE proof has invalid or expired observation timing")
+        self.last_sample_start, self.last_sample_finish = first, last
+        if sample.get("normalized"):
+            ids, counter = sample.get("normalized_ids"), sample.get("normalized_bytes")
+            if (
+                not isinstance(ids, list) or tuple(ids) != self.ids
+                or type(counter) is not int or not self.counter <= counter <= 2**63 - 1
+            ):
+                raise TestFailure("pause SLATE proof lost its output identity or counter")
+            if counter > self.counter:
+                self.counter, self.last_growth = counter, last
+        if last - self.last_growth > LIVE_TO_SLATE_DEADLINE_SECONDS:
+            raise TestFailure("pause SLATE exceeded the post-growth deadline")
+
+
 class SinkDeliveryGrowthGate:
     """Require two increasing byte observations from one RTMP publisher."""
 
@@ -5022,25 +5070,43 @@ def main() -> int:
             expected_ingest_ids: list[str] | None,
             *,
             hard_source_cut: bool = False,
+            pause_deadline: float | None = None,
+            pause_baseline: dict | None = None,
         ) -> dict:
             # A hard network cut can leave buffered media draining before the
             # unchanged 2s/2.5s watchdog idle proof even begins. Its contract is
             # detach before the earliest natural SRT expiry, not 4.5s from cut.
-            # Keep the shorter bound for pauses and normalizer/child failures.
+            # Pauses also leave buffered media. Their fixed 8s resume / 9s reset
+            # cutoffs remain, plus the original 4.5s bound after output growth.
+            # Direct normalizer/child failures keep the shorter cut-based bound.
             limit = (
                 SRT_IDLE_LOWER_BOUND_SECONDS if hard_source_cut else LIVE_TO_SLATE_DEADLINE_SECONDS
             )
             deadline = transition_started + limit
+            pause_proof = None
+            if pause_deadline is not None:
+                if hard_source_cut or pause_baseline is None:
+                    raise TestFailure("pause SLATE proof has conflicting or missing inputs")
+                pause_proof = PauseSLATEEvidence(transition_started, pause_deadline, pause_baseline)
+                deadline = pause_deadline
+                limit = deadline - transition_started
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TestFailure(f"{description} exceeded the SLATE deadline")
-            if hard_source_cut and (
+            if (hard_source_cut or pause_proof is not None) and (
                 not isinstance(expected_ingest_ids, list) or len(expected_ingest_ids) != 1
                 or not isinstance(expected_ingest_ids[0], str) or not expected_ingest_ids[0]
             ):
                 raise TestFailure("hard-cut SLATE proof requires the original SRT connection")
 
             def slate_state(item: dict) -> bool:
+                if pause_proof is not None:
+                    pause_proof.observe(item)
+                    if (
+                        item.get("ingest_live") is not True
+                        or item.get("ingest_ids") != expected_ingest_ids
+                    ):
+                        raise TestFailure("paused SRT connection disappeared before SLATE proof")
                 if hard_source_cut:
                     first, last = item.get("t"), item.get("finished")
                     if (
@@ -5641,6 +5707,9 @@ def main() -> int:
         if len(previous_normalizer_ids) != 1:
             raise TestFailure("same-session stall precondition lacks one normalizer")
         mark_self_test_stage("stall-pause")
+        if transition_log_descriptor is None:
+            raise TestFailure("same-session stall lacks its diagnostic descriptor")
+        pause_log_offset = os.fstat(transition_log_descriptor).st_size
         time.sleep(0.35)
         if not feeder.pause():
             raise TestFailure("live feeder did not pause for the same-session stall")
@@ -5648,11 +5717,21 @@ def main() -> int:
         feeder_paused = True
         try:
             mark_self_test_stage("stall-switch")
-            same_session_slate = wait_slate_with_live_srt(
-                "same-session SLATE transition",
-                same_session_started,
-                initial_ingest_ids,
-            )
+            try:
+                same_session_slate = wait_slate_with_live_srt(
+                    "same-session SLATE transition",
+                    same_session_started,
+                    initial_ingest_ids,
+                    pause_deadline=same_session_started + SRT_IDLE_LOWER_BOUND_SECONDS,
+                    pause_baseline=before_pause,
+                )
+            except TestFailure as exc:
+                with contextlib.suppress(Exception):
+                    record_outage_flow_failure(
+                        exc, observer, same_session_started, time.monotonic(),
+                        transition_log_descriptor, pause_log_offset,
+                    )
+                raise
             mark_self_test_stage("stall-capture")
             wait_slate_capture_growth(
                 "same-session SLATE capture growth",
@@ -5816,11 +5895,21 @@ def main() -> int:
             stuck_started = time.monotonic()
             recovery_deadline = stuck_started + PERSISTENT_INPUT_STALL_RESET_TIMEOUT_SECONDS
             mark_self_test_stage("stuck-slate")
-            stuck_slate = wait_slate_with_live_srt(
-                "persistent-stall SLATE transition",
-                stuck_started,
-                stuck_ingest_ids,
-            )
+            try:
+                stuck_slate = wait_slate_with_live_srt(
+                    "persistent-stall SLATE transition",
+                    stuck_started,
+                    stuck_ingest_ids,
+                    pause_deadline=recovery_deadline,
+                    pause_baseline=stuck_baseline,
+                )
+            except TestFailure as exc:
+                with contextlib.suppress(Exception):
+                    record_outage_flow_failure(
+                        exc, observer, stuck_started, time.monotonic(),
+                        stuck_log_descriptor, stuck_log_offset,
+                    )
+                raise
             pre_reset = observer.checked_snapshot("persistent-stall pre-reset proof")
             if (
                 not pre_reset.get("ingest_live")

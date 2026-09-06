@@ -161,7 +161,7 @@ jobs:
         if: ${{ !cancelled() && (success() || steps.native_onboarding.outcome == 'failure') }}
         shell: bash
         run: |
-          # Reuse the installed pinned binary only inside the CI SSH fixture.
+          # Use the verified CI-image artifact, independent of install rollback.
           # Stage source through stdin because /tmp is a live tmpfs mount.
           docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml \
             exec -T ci-ssh-target python3 -c \

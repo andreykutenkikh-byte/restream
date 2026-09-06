@@ -20,6 +20,40 @@ RUN apt-get update \
     && chmod 0440 /etc/sudoers.d/ci-node \
     && mkdir -p /run/sshd
 
+# Independent media evidence must survive native install rollback. These pins
+# are checked against RelayInstaller by unit tests; no service is installed.
+RUN set -eu; \
+    reader_version='v1.20.1'; \
+    reader_archive='mediamtx_v1.20.1_linux_amd64.tar.gz'; \
+    reader_url='https://github.com/bluenviron/mediamtx/releases/download/v1.20.1/mediamtx_v1.20.1_linux_amd64.tar.gz'; \
+    reader_archive_sha256='81b143f55a5d23d4a8c028d52869c14ea4a59919900528698fcc97a747fd69c6'; \
+    install -d -m 0700 /tmp/adojapan-ci-reader-download /usr/local/lib/adojapan-ci/reader; \
+    curl --fail --location --silent --show-error --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --connect-timeout 15 --max-time 180 --max-filesize 67108864 \
+        "$reader_url" --output /tmp/adojapan-ci-reader-download/archive.tar.gz; \
+    printf '%s  %s\n' "$reader_archive_sha256" /tmp/adojapan-ci-reader-download/archive.tar.gz \
+        | sha256sum --check --status; \
+    tar -xzf /tmp/adojapan-ci-reader-download/archive.tar.gz \
+        -C /tmp/adojapan-ci-reader-download mediamtx LICENSE; \
+    test -f /tmp/adojapan-ci-reader-download/mediamtx; \
+    test ! -L /tmp/adojapan-ci-reader-download/mediamtx; \
+    test -f /tmp/adojapan-ci-reader-download/LICENSE; \
+    test ! -L /tmp/adojapan-ci-reader-download/LICENSE; \
+    test "$(stat -c '%s' /tmp/adojapan-ci-reader-download/mediamtx)" -le 134217728; \
+    install -o root -g root -m 0555 /tmp/adojapan-ci-reader-download/mediamtx \
+        /usr/local/lib/adojapan-ci/reader/mediamtx; \
+    install -o root -g root -m 0444 /tmp/adojapan-ci-reader-download/LICENSE \
+        /usr/local/lib/adojapan-ci/reader/LICENSE; \
+    reader_binary_sha256="$(sha256sum /usr/local/lib/adojapan-ci/reader/mediamtx | cut -d ' ' -f 1)"; \
+    printf '{"version":"%s","archive":"%s","archive_sha256":"%s","binary_sha256":"%s"}\n' \
+        "$reader_version" "$reader_archive" "$reader_archive_sha256" "$reader_binary_sha256" \
+        > /usr/local/lib/adojapan-ci/reader/manifest.json; \
+    chmod 0444 /usr/local/lib/adojapan-ci/reader/manifest.json; \
+    reader_actual_version="$(/usr/local/lib/adojapan-ci/reader/mediamtx --version)"; \
+    test "$reader_actual_version" = "$reader_version"; \
+    chmod 0555 /usr/local/lib/adojapan-ci/reader; \
+    rm -rf /tmp/adojapan-ci-reader-download
+
 COPY ci/ssh-target/sshd_config /etc/ssh/sshd_config
 COPY ci/ssh-target/fake-docker /usr/local/bin/docker
 COPY ci/ssh-target/fake-apt-get /usr/local/bin/apt-get
