@@ -145,6 +145,15 @@ jobs:
             exec -T -e CI_NATIVE_FEEDER_CLOCK=isolated-fixture ci-ssh-target \
             python3 - < deploy/moblin-relay/test-native-feeder-media.py
 
+      - name: Strict sink decoded-frame minimum
+        shell: bash
+        run: |
+          # Use the exact self-test staged by the preceding clock gate.
+          # Finite local media proves clean EOF cannot satisfy a short capture.
+          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml \
+            exec -T -e CI_NATIVE_SHORT_EOF=isolated-fixture ci-ssh-target \
+            python3 - < deploy/moblin-relay/test-native-short-eof.py
+
       - name: Real RTMP rotation and output end-to-end smoke
         run: uv run --locked python scripts/ci_output_smoke.py
 

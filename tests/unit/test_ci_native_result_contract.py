@@ -131,6 +131,8 @@ def native_result() -> dict[str, Any]:
         },
         "strict_sink_segment_validation": {
             "segments": 13,
+            "required_video_frames": 90,
+            "segment_video_frames": [90] * 13,
             "capture_bytes": 100000,
             "video_frames": 1170,
             "audio_frames": 1800,
@@ -162,6 +164,33 @@ def test_current_native_report_and_diagnostic_only_local_pauses_pass(
 ) -> None:
     assert smoke.native_self_test_result_failure(native_result) is None
     assert "circuit_breaker_opened" not in native_result["repeated_bridge_failure_recovery"]
+
+
+@pytest.mark.parametrize("segment", range(13))
+def test_decoded_minimum_applies_to_every_segment_not_only_the_total(native_result, segment):
+    strict = native_result["strict_sink_segment_validation"]
+    strict["segment_video_frames"] = [120] * 13
+    strict["segment_video_frames"][segment] = 89
+    strict["video_frames"] = sum(strict["segment_video_frames"])
+    assert strict["video_frames"] > 13 * 90
+    assert smoke.native_self_test_result_failure(native_result) == "native_result_media"
+
+
+@pytest.mark.parametrize("counts", [None, [], [90] * 12, [90] * 14, [True] * 13, [10001] * 13])
+def test_decoded_segment_evidence_is_mandatory_complete_and_bounded(native_result, counts):
+    native_result["strict_sink_segment_validation"]["segment_video_frames"] = counts
+    assert smoke.native_self_test_result_failure(native_result) == "native_result_media"
+
+
+@pytest.mark.parametrize("minimum", [True, 60, 89, 90.0, "90", None])
+def test_result_cannot_lower_or_misstate_required_decoded_minimum(native_result, minimum):
+    native_result["strict_sink_segment_validation"]["required_video_frames"] = minimum
+    assert smoke.native_self_test_result_failure(native_result) == "native_result_media"
+
+
+def test_decoded_segment_total_must_match_individual_evidence(native_result):
+    native_result["strict_sink_segment_validation"]["video_frames"] += 1
+    assert smoke.native_self_test_result_failure(native_result) == "native_result_media"
 
 
 @pytest.mark.parametrize("value", [6.0, 6.2, 7.999, 8.0])
@@ -329,6 +358,12 @@ def test_remote_probe_executes_same_validator_and_never_prints_report(
     source = smoke.native_result_probe_source()
     exec(compile(source, "<fixed-native-result-probe>", "exec"), {})  # noqa: S102
     assert capsys.readouterr().out == "NATIVE_SELF_TEST_RESULT_OK\n"
+    strict = payload["strict_sink_segment_validation"]
+    strict["segment_video_frames"] = [61] + [120] * 12
+    strict["video_frames"] = sum(strict["segment_video_frames"])
+    raw = json.dumps(payload).encode()
+    exec(compile(source, "<fixed-native-result-probe>", "exec"), {})  # noqa: S102
+    assert capsys.readouterr().out == "native_result_media\n"
     payload["status"] = marker
     raw = json.dumps(payload).encode()
     exec(compile(source, "<fixed-native-result-probe>", "exec"), {})  # noqa: S102

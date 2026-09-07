@@ -921,6 +921,8 @@ def test_reused_functions_redirect_globals_without_modifying_strict_reader(
     assert globals_["SELF_TEST_STAGE_FILE"] == ""
     assert globals_["SELF_TEST_PROGRESS_FILE"] == tmp_path / "progress.json"
     assert globals_["LIVE_FIXTURE_DURATION_SECONDS"] == 8
+    assert globals_["STRICT_SINK_REQUIRED_VIDEO_FRAMES"] == 90
+    assert namespace["validate_final_sink_media_segment"].__globals__ is globals_
     # The unchanged capture's actual argv and deadline remain 90 frames / 15s.
     calls = []
 

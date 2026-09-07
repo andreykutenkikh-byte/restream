@@ -214,6 +214,7 @@ PORTRAIT_WIDTH = 1080
 PORTRAIT_HEIGHT = 1920
 VIDEO_FPS = 30
 VIDEO_GOP_FRAMES = 60
+STRICT_SINK_REQUIRED_VIDEO_FRAMES = VIDEO_GOP_FRAMES + VIDEO_FPS
 ASSET_DURATION_SECONDS = 12
 VIDEO_FRAME_INTERVAL_TOLERANCE_SECONDS = 0.002
 # The synthetic LIVE input must not wrap while publisher exclusivity is observed.
@@ -4329,7 +4330,7 @@ def capture_final_sink_media_segment(
             # plus one second proves that the recovered encoded epoch is usable
             # without turning this into another long-lived observer.
             "-frames:v",
-            str(VIDEO_GOP_FRAMES + VIDEO_FPS),
+            str(STRICT_SINK_REQUIRED_VIDEO_FRAMES),
             "-map",
             "0:v:0",
             "-map",
@@ -4434,7 +4435,7 @@ def validate_final_sink_media_segment(
         decoded_frames = analyze_decoded_video_frames(sink_capture)
         if (
             decoded_frames["ffprobe_exit"] != 0
-            or decoded_frames["frame_count"] < VIDEO_GOP_FRAMES
+            or decoded_frames["frame_count"] < STRICT_SINK_REQUIRED_VIDEO_FRAMES
             or decoded_frames["unexpected_dimension_frames"] != 0
             or decoded_frames["unexpected_pixel_format_frames"] != 0
             or decoded_frames["decode_error_flags"]
@@ -7047,6 +7048,8 @@ def main() -> int:
         result["strict_sink_segment_capture"]["pending_validation"] = 0
         result["strict_sink_segment_validation"] = {
             "segments": len(strict_sink_segment_counts),
+            "required_video_frames": STRICT_SINK_REQUIRED_VIDEO_FRAMES,
+            "segment_video_frames": [item["video_frames"] for item in strict_sink_segment_counts],
             "capture_bytes": sum(
                 item["capture_bytes"] for item in strict_sink_segment_counts
             ),

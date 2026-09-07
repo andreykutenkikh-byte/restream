@@ -5,6 +5,52 @@ proof-carry correction below. It is not a production deployment or permission
 to alter an active relay. Final exact-head CI results belong in the
 PR description; an earlier green run is not acceptance of a later commit.
 
+## Strict decoded-frame minimum after independent review
+
+The independent review reproduced a clean-EOF false PASS: the reader requested
+90 frames, but the validator required only 60 decoded frames. A correct
+61-frame H.264/AAC FLV with IDRs at frames 0 and 60 passed every other format,
+GOP, decode and timestamp check. An FFmpeg frame limit is an upper bound;
+successful EOF and capture size do not prove that the requested count arrived.
+
+`STRICT_SINK_REQUIRED_VIDEO_FRAMES` now supplies both the capture target and
+the minimum decoded count, currently 60 + 30 = 90. Each of the 13 retained
+segments passes the real validator independently. The final report also retains
+all 13 decoded counts; both local and generated CI result validators reject a
+short individual segment even if the total exceeds 13 × 90. These bounded
+numeric fields do not change the existing 64 KiB result limit. The independent
+reader and finite-media helpers load the complete self-test namespace, including
+the shared constant; the generated result validator adds no global dependency.
+
+`test-native-short-eof.py` is a mandatory Linux CI step before native onboarding.
+It uses the exact staged self-test and real FFmpeg/ffprobe, with no server or
+network listener. The finite local input replaces only the reader input URL;
+the 90-frame target, 15-second reader deadline and stream-copy arguments remain.
+For each of 61, 89 and 90 frames, the same correct finite portrait H.264/AAC file
+is checked twice. The old comparison is replayed in the repository validator by
+restoring only its former decoded-count guard. Both validators retain the full
+format/GOP/PTS/DTS/A/V/decode checks, bounded subprocesses and capture cleanup.
+The helper is CI-only and is excluded from the production installer bundle.
+
+The existing portable FFmpeg 5.1.2 passed that actual-media regression locally:
+old 61/89/90 all PASS; repaired 61/89 FAIL at the decoded-frame minimum; repaired
+90 PASS. Every capture ended cleanly with exit code zero. This proves a stricter
+acceptance oracle, not a cause or remedy for network reader timeouts, incomplete
+probing or the cut+8 failure. The independent review's historical statuses remain:
+
+| Run | Status |
+| --- | --- |
+| 33952161676 | INCONCLUSIVE |
+| 33952428440 | INCONCLUSIVE |
+| 3987e8f / 34049534760 | OPEN_BLOCKER |
+| 71dfb24 / 34051598056 | OPEN_BLOCKER |
+| c5a35439 / 34054147945 | OPEN_BLOCKER |
+
+These open entries are acceptance-test failures with unresolved attribution,
+not established production runtime causes. Owner media-risk acceptance remains
+NOT_GRANTED. This correction does not alter the normalizer, watchdog, recovery
+bounds, bitrate, codecs or FPS and does not authorize merge or deployment.
+
 ## Source pacing
 
 The synthetic MPEG-TS feeder sends 10,528-byte datagrams at 9 Mbit/s. Its nominal

@@ -2357,6 +2357,7 @@ def test_bundle_contains_only_portable_sources_and_no_instance_manifest() -> Non
         "test-render-config.py",
         "test-native-feeder-media.py",
         "test-native-reader-clock.py",
+        "test-native-short-eof.py",
     }
     assert {path.name for path in BUNDLE.iterdir() if path.is_file()} == expected
     combined = "\n".join(
@@ -2768,7 +2769,7 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     )
     assert "check_b_frames=False" not in sink_validation_helper
     assert 'f"sink-proof-{segment_index:03d}.flv"' in sink_capture_helper
-    assert "str(VIDEO_GOP_FRAMES + VIDEO_FPS)" in sink_capture_helper
+    assert "str(STRICT_SINK_REQUIRED_VIDEO_FRAMES)" in sink_capture_helper
     assert '"-c",\n            "copy"' in sink_capture_helper
     assert "stream_signature(" not in sink_capture_helper
     assert "video_gop_signature(" not in sink_capture_helper

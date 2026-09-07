@@ -1381,8 +1381,15 @@ def native_self_test_result_failure(result: Any) -> str | None:
 
     strict = section("strict_sink_segment_validation")
     capture = section("strict_sink_segment_capture")
+    segment_frames = strict.get("segment_video_frames")
     if not (
         strict.get("segments") == capture.get("segments") == 13
+        and type(strict.get("required_video_frames")) is int
+        and strict["required_video_frames"] == 90
+        and isinstance(segment_frames, list)
+        and len(segment_frames) == 13
+        and all(type(frames) is int and 90 <= frames <= 10000 for frames in segment_frames)
+        and strict.get("video_frames") == sum(segment_frames)
         and strict.get("capture_bytes") == capture.get("capture_bytes")
         and all(
             number(strict.get(key), 1, 10**12)
