@@ -3,6 +3,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tarfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -265,6 +266,7 @@ def test_private_repository_guard_accepts_clean_ciphertext_only_repo(tmp_path: P
     )
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Production repository flock requires Linux")
 def test_repository_lock_refuses_an_overlapping_backup(tmp_path: Path) -> None:
     repository = tmp_path / "dr"
     initialise_repository(repository, "git@github.com:example/dr.git")
@@ -276,7 +278,18 @@ def test_repository_lock_refuses_an_overlapping_backup(tmp_path: Path) -> None:
     ):
         pass
 
-    assert not (repository / ".git" / "adojapan-restream-dr.lock").exists()
+    assert (repository / ".git" / "adojapan-restream-dr.lock").is_file()
+    with exclusive_repository_lock(repository):
+        pass
+
+
+@pytest.mark.skipif(sys.platform == "linux", reason="Non-Linux compatibility contract")
+def test_repository_lock_is_explicitly_unsupported_off_linux(tmp_path: Path) -> None:
+    with (
+        pytest.raises(RuntimeError, match="requires Linux flock"),
+        exclusive_repository_lock(tmp_path),
+    ):
+        pytest.fail("An unsupported platform entered the critical section")
 
 
 def test_release_commit_rejects_tracked_source_changes(tmp_path: Path) -> None:

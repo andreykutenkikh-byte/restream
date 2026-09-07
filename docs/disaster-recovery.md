@@ -54,7 +54,9 @@ boundary for a Git transport. It:
 - refuses an encrypted artifact above 95 MiB so GitHub's per-file limit cannot turn an otherwise
   normal commit into a predictably rejected push;
 - refuses the source repository, HTTPS credentials, an unconfirmed DR repository, a dirty
-  worktree, or a repository that tracks anything other than the expected `.age` artifacts; and
+  worktree, or a repository that tracks anything other than the expected `.age` artifacts;
+- holds a nonblocking Linux `flock` on the persistent private
+  `.git/adojapan-restream-dr.lock` file for the complete publisher operation; and
 - stages exactly one ciphertext file, commits it, and pushes it with non-interactive SSH.
 
 The local safety attestation does not query GitHub and is not evidence that a remote is private.
@@ -123,6 +125,54 @@ The command prints no values or manifest; success is exactly
 `Encrypted disaster-recovery snapshot pushed successfully`. A failed push leaves the encrypted
 commit locally for diagnosis, but recovery from VPS loss is not established until the commit is
 visible from another machine.
+
+### Publisher lock and interrupted runs
+
+The Linux publisher opens the lock relative to a pinned `.git` directory, with
+`O_NOFOLLOW` and descriptor/namespace identity checks before entering the critical
+section. The repository and `.git` must belong to the invoking user (root for the
+production entrypoint) and must not be writable by group/others. The lock must be
+a regular, single-link file belonging to that user with mode `0600`. Unsafe files,
+changed identities and filesystem/permission errors fail closed; only a conflicting
+`flock` is reported as another running backup. Existing objects are never chmodded
+or chowned to make validation pass. The file contains no credentials or PID metadata.
+
+Normal release closes the descriptor and retains the same file/inode. File existence
+does not mean that the lock is busy. Do not unlink or replace it while publishers
+can run: that would create a second locking namespace. The kernel releases the lock
+when its last owning descriptor closes, including after process death or reboot.
+
+Only the publisher's `age` process and mutating Git commands (`add`, `commit`, `push`)
+explicitly inherit the locked descriptor. If the parent dies while one still runs,
+the child retains the lock until it exits; another publisher is rejected meanwhile.
+Other subprocesses do not inherit it. Read-only Git inspections disable optional
+index writes using `GIT_OPTIONAL_LOCKS=0`. Release uses close, not an explicit unlock,
+so a surviving child cannot be unlocked by its parent's context cleanup.
+
+This protects concurrent publication; it does not make the entire backup transaction
+crash-consistent. Interrupted encryption may leave a temporary ciphertext file; a
+commit/push may complete only partly or reach the remote before the parent records
+success. An operator must inspect local/remote encrypted state after such an error.
+Git hooks, the Git executable and SSH transport must be trusted and keep their work
+within their normal synchronous lifetime. Arbitrary detached hook/transport descendants
+that close the inherited descriptor are outside this lock contract. No real DR remote,
+restore drill or production migration is performed by these tests.
+
+The old version uses a directory at exactly the same lock path. The new version
+reports a distinct legacy-lock error if that directory exists, even when empty;
+it never treats age, emptiness or a PID as proof of abandonment. Before a one-time
+operator migration, disable scheduled invocations, verify that no old publisher or
+its children remain, and remove only that confirmed unused empty directory with
+`rmdir`. Do not use recursive removal. Then run the new publisher to create its
+permanent file. The old publisher also refuses that existing file, preventing silent
+parallel use of the two lock versions. Do not perform this migration during an
+active backup.
+
+The archive/Git helpers remain importable for Windows development. Acquiring a
+repository lock explicitly requires Linux; there is no emulated in-memory lock.
+Real process contention, normal release, SIGKILL/reacquisition, inode preservation,
+unsafe/legacy objects and critical-child lifetime tests run in the existing Linux CI
+pytest gate. Windows skips those Linux tests and is not evidence that flock passed.
 
 Schedule this exact two-stage operation with a root-owned systemd service and timer only after all
 paths have been resolved on production. Use a non-overlapping lock, a daily schedule with

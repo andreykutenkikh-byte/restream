@@ -8,6 +8,7 @@ No plaintext tar archive is ever written: tar/gzip output is streamed directly t
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import io
 import json
@@ -16,6 +17,7 @@ import re
 import sqlite3
 import stat
 import subprocess
+import sys
 import tarfile
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -33,6 +35,7 @@ SNAPSHOT_SUFFIX = ".tar.gz.age"
 MAX_GIT_SNAPSHOT_BYTES = 95 * 1024 * 1024
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40,64}")
 SSH_REMOTE_PATTERN = re.compile(r"(?:git@[^:]+:[^\s]+|ssh://git@[^/\s]+/[^\s]+)")
+REPOSITORY_LOCK_NAME = "adojapan-restream-dr.lock"
 
 
 @dataclass(frozen=True)
@@ -161,6 +164,7 @@ def _safe_process_environment() -> dict[str, str]:
     allowed = ("HOME", "LANG", "LC_ALL", "PATH", "SSH_AUTH_SOCK", "TZ")
     environment = {name: os.environ[name] for name in allowed if name in os.environ}
     environment["GIT_TERMINAL_PROMPT"] = "0"
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
     return environment
 
 
@@ -172,6 +176,7 @@ def create_encrypted_snapshot(
     snapshot_directory: Path,
     created_at: datetime | None = None,
     age_binary: str = "age",
+    repository_lock: RepositoryLock | None = None,
 ) -> Path:
     """Atomically create an age-encrypted tar/gzip snapshot."""
     recipient = _resolved_regular_file(recipient_file, private=False, maximum_size=64 * 1024)
@@ -193,6 +198,7 @@ def create_encrypted_snapshot(
                 stdout=encrypted_output,
                 stderr=subprocess.PIPE,
                 env=_safe_process_environment(),
+                **_critical_child_options(repository_lock),
             )
             if process.stdin is None:
                 raise RuntimeError("age stdin was not created")
@@ -236,21 +242,134 @@ def create_encrypted_snapshot(
 RunCommand = Callable[..., subprocess.CompletedProcess[str]]
 
 
+def _same_file(first: os.stat_result, second: os.stat_result) -> bool:
+    return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+
+
+def _check_lock_directory(details: os.stat_result) -> None:
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != os.geteuid()
+        or stat.S_IMODE(details.st_mode) & 0o022
+    ):
+        raise ValueError("Disaster-recovery repository directory is unsafe")
+
+
+def _check_lock_file(details: os.stat_result) -> None:
+    if stat.S_ISDIR(details.st_mode):
+        raise ValueError(
+            "Legacy disaster-recovery directory lock requires an operator migration; "
+            "first verify that no older backup publisher is running"
+        )
+    if (
+        not stat.S_ISREG(details.st_mode)
+        or details.st_uid != os.geteuid()
+        or stat.S_IMODE(details.st_mode) != 0o600
+        or details.st_nlink != 1
+    ):
+        raise ValueError("Disaster-recovery lock file is unsafe")
+
+
+@dataclass
+class RepositoryLock:
+    """Explicit inheritance authority for this publisher's critical children only."""
+
+    repository: Path
+    repository_fd: int
+    git_fd: int
+    descriptor: int
+    owner_pid: int
+    active: bool = True
+
+    def check_identity(self) -> None:
+        if not self.active or os.getpid() != self.owner_pid:
+            raise RuntimeError("Disaster-recovery repository lock is not owned by this publisher")
+        repository = os.fstat(self.repository_fd)
+        git_directory = os.fstat(self.git_fd)
+        file = os.fstat(self.descriptor)
+        for details in (repository, git_directory):
+            _check_lock_directory(details)
+        _check_lock_file(file)
+        if (
+            not _same_file(repository, self.repository.lstat())
+            or not _same_file(
+                git_directory, os.stat(".git", dir_fd=self.repository_fd, follow_symlinks=False)
+            )
+            or not _same_file(
+                file, os.stat(REPOSITORY_LOCK_NAME, dir_fd=self.git_fd, follow_symlinks=False)
+            )
+        ):
+            raise ValueError("Disaster-recovery lock namespace changed while acquiring ownership")
+
+    def child_options(self) -> dict[str, Any]:
+        self.check_identity()
+        # pass_fds intentionally shares the flock's open file description. The
+        # descriptor remains non-inheritable for every other subprocess.
+        return {"pass_fds": (self.descriptor,), "close_fds": True}
+
+
+def _critical_child_options(repository_lock: RepositoryLock | None) -> dict[str, Any]:
+    return repository_lock.child_options() if repository_lock is not None else {}
+
+
 @contextmanager
-def exclusive_repository_lock(repository: Path) -> Iterator[None]:
-    """Refuse overlapping publishers without placing a lock in the tracked worktree."""
-    git_directory = repository.resolve(strict=True) / ".git"
-    if not git_directory.is_dir():
-        raise ValueError("Disaster-recovery destination requires a standard Git worktree")
-    lock_directory = git_directory / "adojapan-restream-dr.lock"
+def exclusive_repository_lock(repository: Path) -> Iterator[RepositoryLock]:
+    """Hold a persistent Linux flock; closing the last inherited fd releases it."""
+    if sys.platform != "linux":
+        raise RuntimeError("Disaster-recovery repository locking requires Linux flock")
+    # Keep portable archive/Git helpers importable without pretending to lock on Windows.
+    import fcntl
+
+    repository_fd = git_fd = descriptor = None
+    ownership: RepositoryLock | None = None
+    entered = False
     try:
-        lock_directory.mkdir(mode=0o700)
-    except FileExistsError as error:
-        raise RuntimeError("Another disaster-recovery backup is already running") from error
-    try:
-        yield
+        target = repository.resolve(strict=True)
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        repository_fd = os.open(target, directory_flags)
+        _check_lock_directory(os.fstat(repository_fd))
+        git_fd = os.open(".git", directory_flags, dir_fd=repository_fd)
+        _check_lock_directory(os.fstat(git_fd))
+        try:
+            before = os.stat(REPOSITORY_LOCK_NAME, dir_fd=git_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            before = None
+        if before is not None:
+            _check_lock_file(before)
+        descriptor = os.open(
+            REPOSITORY_LOCK_NAME,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+            0o600,
+            dir_fd=git_fd,
+        )
+        opened = os.fstat(descriptor)
+        _check_lock_file(opened)
+        if before is not None and not _same_file(before, opened):
+            raise ValueError("Disaster-recovery lock file changed while opening")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN}:
+                raise RuntimeError("Another disaster-recovery backup is already running") from error
+            raise RuntimeError("Unable to acquire disaster-recovery repository flock") from error
+        ownership = RepositoryLock(target, repository_fd, git_fd, descriptor, os.getpid())
+        ownership.check_identity()
+        entered = True
+        yield ownership
+    except OSError as error:
+        if entered:
+            raise
+        raise RuntimeError(
+            "Unable to open or validate disaster-recovery repository lock"
+        ) from error
     finally:
-        lock_directory.rmdir()
+        if ownership is not None:
+            ownership.active = False
+        # Do not LOCK_UN: an owned age/Git child may still hold this same open
+        # file description after an exception or parent death. Never unlink it.
+        for opened_fd in (descriptor, git_fd, repository_fd):
+            if opened_fd is not None:
+                os.close(opened_fd)
 
 
 def _git(
@@ -259,6 +378,7 @@ def _git(
     *,
     check: bool = True,
     run: RunCommand = subprocess.run,
+    repository_lock: RepositoryLock | None = None,
 ) -> str:
     result = run(
         ["git", "-C", str(repository), *arguments],
@@ -266,6 +386,7 @@ def _git(
         capture_output=True,
         text=True,
         env=_safe_process_environment(),
+        **_critical_child_options(repository_lock),
     )
     if check and result.returncode != 0:
         diagnostic = (result.stderr or result.stdout).strip()[:2048]
@@ -325,6 +446,7 @@ def publish_snapshot(
     branch: str,
     remote: str,
     run: RunCommand = subprocess.run,
+    repository_lock: RepositoryLock | None = None,
 ) -> None:
     target = repository.resolve(strict=True)
     artifact = snapshot.resolve(strict=True)
@@ -334,13 +456,23 @@ def publish_snapshot(
         raise ValueError("Encrypted snapshot must be inside the DR repository") from error
     if not relative.as_posix().endswith(SNAPSHOT_SUFFIX):
         raise ValueError("Unexpected encrypted snapshot filename")
-    _git(target, ["add", "--", relative.as_posix()], run=run)
+    _git(target, ["add", "--", relative.as_posix()], run=run, repository_lock=repository_lock)
     staged = _git(target, ["diff", "--cached", "--name-only", "-z"], run=run)
     if [name for name in staged.split("\0") if name] != [relative.as_posix()]:
         raise RuntimeError("Refusing to commit anything except the new encrypted snapshot")
     timestamp = artifact.name.removeprefix(SNAPSHOT_PREFIX).removesuffix(SNAPSHOT_SUFFIX)
-    _git(target, ["commit", "-m", f"Encrypted recovery snapshot {timestamp}"], run=run)
-    _git(target, ["push", "--porcelain", remote, f"HEAD:refs/heads/{branch}"], run=run)
+    _git(
+        target,
+        ["commit", "-m", f"Encrypted recovery snapshot {timestamp}"],
+        run=run,
+        repository_lock=repository_lock,
+    )
+    _git(
+        target,
+        ["push", "--porcelain", remote, f"HEAD:refs/heads/{branch}"],
+        run=run,
+        repository_lock=repository_lock,
+    )
 
 
 def _is_tmpfs(path: Path) -> bool:
@@ -418,7 +550,7 @@ def main() -> None:
     get_effective_user_id = getattr(os, "geteuid", None)
     if os.name != "posix" or get_effective_user_id is None or get_effective_user_id() != 0:
         raise SystemExit("Run the disaster-recovery backup as root on Linux")
-    with exclusive_repository_lock(args.repository):
+    with exclusive_repository_lock(args.repository) as repository_lock:
         repository = validate_private_git_repository(
             args.repository,
             args.source_repository,
@@ -434,6 +566,7 @@ def main() -> None:
                 release_commit=_release_commit(args.source_repository),
                 recipient_file=args.recipient_file,
                 snapshot_directory=snapshot_directory,
+                repository_lock=repository_lock,
             )
         finally:
             if args.consume_database_backup:
@@ -443,6 +576,7 @@ def main() -> None:
             snapshot,
             branch=args.branch,
             remote=args.remote,
+            repository_lock=repository_lock,
         )
     print("Encrypted disaster-recovery snapshot pushed successfully")
 
