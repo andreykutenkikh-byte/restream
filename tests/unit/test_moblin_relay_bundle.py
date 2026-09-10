@@ -3527,7 +3527,10 @@ def test_self_test_initial_live_log_interval_brackets_source_and_closes_fd() -> 
     healthy_live = "initial_live = wait_healthy_live("
     bridge_gate = "wait_initial_live_bridge_active("
     clean_gate = "require_initial_live_log_clean("
-    close = "finally:\n            os.close(initial_live_log_descriptor)"
+    close = (
+        "finally:\n            observer.startup_input_observer = None\n"
+        "            os.close(initial_live_log_descriptor)"
+    )
     assert (
         block.index(opened)
         < block.index(source_start)
