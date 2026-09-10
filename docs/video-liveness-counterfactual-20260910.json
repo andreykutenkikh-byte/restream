@@ -1,0 +1,185 @@
+{
+  "baseline_sha": "655d536e6a7f6e463a04e7cb0ef2cacbba1b7987",
+  "cases": [
+    {
+      "file": "local-audio-tail-repro-result-20260910.json",
+      "sha256": "d9006e7ef64f020059428a7f38fe4fde9d3f18c7b41ecf89bed54ad11f7439fe",
+      "status": "COMPLETED",
+      "scope": "LOOPBACK_SYNTHETIC_DIAGNOSTIC_NOT_ACCEPTANCE",
+      "scenario": "WHOLE_SOURCE_PAUSE",
+      "tracks": {
+        "video": {
+          "packets": 236,
+          "last_observed_seconds": 16.265999999995984,
+          "last_pts_seconds": 7.856433
+        },
+        "audio": {
+          "packets": 372,
+          "last_observed_seconds": 16.281999999999243,
+          "last_pts_seconds": 7.915
+        }
+      },
+      "audio_after_video_seconds": 0.01600000000325963,
+      "normalized_growth_after_last_video": {
+        "count": 1,
+        "first_seconds": 16.375,
+        "last_seconds": 16.375,
+        "total_bytes": 14829
+      },
+      "copied_video_progress": {
+        "max_frame": 0,
+        "first_max_at_seconds": null,
+        "last_sample_seconds": null
+      },
+      "exact_baseline_watchdog_replay_first_rejection": {
+        "at_seconds": 18.93800000000192,
+        "reason": "output-fallback"
+      },
+      "proposed_video_progress_staleness_replay": null,
+      "scope_warning": "Recorded sampled observations replay only, not a full supervisor process or CI root-cause reproduction; copied frames are not decoded frames.",
+      "cleanup": {
+        "all_owned_processes_stopped": true,
+        "temporary_directory_removed": true
+      }
+    },
+    {
+      "file": "local-video-end-repro-result-20260910.json",
+      "sha256": "12487e5599bef03ac66b97c015b216510a05d96003bc2a5f62bb24aed6553995",
+      "status": "COMPLETED",
+      "scope": "LOOPBACK_SYNTHETIC_DIAGNOSTIC_NOT_ACCEPTANCE",
+      "scenario": "VIDEO_STOPS_AUDIO_CONTINUES",
+      "tracks": {
+        "video": {
+          "packets": 359,
+          "last_observed_seconds": 20.31300000000192,
+          "last_pts_seconds": 11.954
+        },
+        "audio": {
+          "packets": 563,
+          "last_observed_seconds": 20.343999999997322,
+          "last_pts_seconds": 11.988021
+        }
+      },
+      "audio_after_video_seconds": 0.030999999995401595,
+      "normalized_growth_after_last_video": {
+        "count": 1,
+        "first_seconds": 20.42199999999866,
+        "last_seconds": 20.42199999999866,
+        "total_bytes": 28525
+      },
+      "copied_video_progress": {
+        "max_frame": 475,
+        "first_max_at_seconds": 20.20300000000134,
+        "last_sample_seconds": 20.20300000000134
+      },
+      "exact_baseline_watchdog_replay_first_rejection": {
+        "at_seconds": 22.92199999999866,
+        "reason": "output-fallback"
+      },
+      "proposed_video_progress_staleness_replay": {
+        "at_seconds": 22.79699999999866,
+        "frame": 475,
+        "last_progress_growth_seconds": 20.20300000000134,
+        "video_progress_age_seconds": 2.5939999999973224
+      },
+      "scope_warning": "Recorded sampled observations replay only, not a full supervisor process or CI root-cause reproduction; copied frames are not decoded frames.",
+      "cleanup": {
+        "all_owned_processes_stopped": true,
+        "temporary_directory_removed": true
+      }
+    },
+    {
+      "file": "local-video-eof-repro-result-20260910.json",
+      "sha256": "2008a8282657589c0809a65024668e3af0afd40af7354bc8530576ec8777d3a1",
+      "status": "COMPLETED",
+      "scope": "LOOPBACK_SYNTHETIC_DIAGNOSTIC_NOT_ACCEPTANCE",
+      "scenario": "VIDEO_STOPS_AUDIO_CONTINUES",
+      "tracks": {
+        "video": {
+          "packets": 361,
+          "last_observed_seconds": 20.468999999997322,
+          "last_pts_seconds": 11.986033
+        },
+        "audio": {
+          "packets": 1072,
+          "last_observed_seconds": 41.28199999999924,
+          "last_pts_seconds": 32.956938
+        }
+      },
+      "audio_after_video_seconds": 20.81300000000192,
+      "normalized_growth_after_last_video": {
+        "count": 96,
+        "first_seconds": 20.57800000000134,
+        "last_seconds": 41.29699999999866,
+        "total_bytes": 154520
+      },
+      "copied_video_progress": {
+        "max_frame": 479,
+        "first_max_at_seconds": 20.70300000000134,
+        "last_sample_seconds": 41.18800000000192
+      },
+      "exact_baseline_watchdog_replay_first_rejection": {
+        "at_seconds": 23.110000000000582,
+        "reason": "output-fallback"
+      },
+      "proposed_video_progress_staleness_replay": {
+        "at_seconds": 23.218999999997322,
+        "frame": 479,
+        "last_progress_growth_seconds": 20.70300000000134,
+        "video_progress_age_seconds": 2.5159999999959837
+      },
+      "scope_warning": "Recorded sampled observations replay only, not a full supervisor process or CI root-cause reproduction; copied frames are not decoded frames.",
+      "cleanup": {
+        "all_owned_processes_stopped": true,
+        "temporary_directory_removed": true
+      }
+    },
+    {
+      "file": "local-video-eof-audio-jump-repro-result-20260910.json",
+      "sha256": "60083465c7295511238d497a968661f378d0ea52185a19350c5ff92d09dca355",
+      "status": "COMPLETED",
+      "scope": "LOOPBACK_SYNTHETIC_DIAGNOSTIC_NOT_ACCEPTANCE",
+      "scenario": "VIDEO_STOPS_AUDIO_CONTINUES_WITH_12S_TIMESTAMP_JUMP",
+      "tracks": {
+        "video": {
+          "packets": 360,
+          "last_observed_seconds": 20.375,
+          "last_pts_seconds": 11.987167
+        },
+        "audio": {
+          "packets": 1076,
+          "last_observed_seconds": 41.28100000000268,
+          "last_pts_seconds": 32.957479
+        }
+      },
+      "audio_after_video_seconds": 20.906000000002678,
+      "normalized_growth_after_last_video": {
+        "count": 66,
+        "first_seconds": 20.437000000005355,
+        "last_seconds": 41.2190000000046,
+        "total_bytes": 6918
+      },
+      "copied_video_progress": {
+        "max_frame": 479,
+        "first_max_at_seconds": 20.734000000004016,
+        "last_sample_seconds": 41.28100000000268
+      },
+      "exact_baseline_watchdog_replay_first_rejection": {
+        "at_seconds": 25.89100000000326,
+        "reason": "output-fallback"
+      },
+      "proposed_video_progress_staleness_replay": {
+        "at_seconds": 23.26600000000326,
+        "frame": 479,
+        "last_progress_growth_seconds": 20.734000000004016,
+        "video_progress_age_seconds": 2.5319999999992433
+      },
+      "scope_warning": "Recorded sampled observations replay only, not a full supervisor process or CI root-cause reproduction; copied frames are not decoded frames.",
+      "cleanup": {
+        "all_owned_processes_stopped": true,
+        "temporary_directory_removed": true
+      }
+    }
+  ],
+  "scope": "Synthetic Windows loopback sampled counterfactual, not full supervisor/HK/YouTube acceptance. Raw receipts identified by SHA256. Negative cases retained."
+}

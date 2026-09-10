@@ -495,6 +495,9 @@ def test_recovered_source_at_retry_boundary_defers_reset_and_reopens_bridge() ->
     class FakeChild:
         def __init__(self) -> None:
             self.running = True
+            read_fd, write_fd = os.pipe()
+            os.close(write_fd)
+            self.stdout = os.fdopen(read_fd, "rb", buffering=0)
 
         def poll(self):
             return None if self.running else 0
@@ -564,6 +567,7 @@ def test_recovered_source_at_retry_boundary_defers_reset_and_reopens_bridge() ->
     assert breaker.opened is False
     assert breaker.attempts == 0
     assert launched_children
+    assert all(child.stdout.closed for child in launched_children)
     assert loaded["STATE_EVENT_SOURCE_ATTACHED"] in state_events
     assert loaded["STATE_EVENT_SOURCE_DETACHED"] in state_events
 
@@ -598,6 +602,9 @@ def test_growth_at_initial_reset_boundary_cancels_post_and_reopens_bridge() -> N
     class FakeChild:
         def __init__(self) -> None:
             self.running = True
+            read_fd, write_fd = os.pipe()
+            os.close(write_fd)
+            self.stdout = os.fdopen(read_fd, "rb", buffering=0)
 
         def poll(self):
             return None if self.running else 0
@@ -657,6 +664,7 @@ def test_growth_at_initial_reset_boundary_cancels_post_and_reopens_bridge() -> N
     assert breaker.opened is False
     assert breaker.attempts == 0
     assert launched_children
+    assert all(child.stdout.closed for child in launched_children)
 
 
 def test_metrics_failure_before_post_requires_a_new_full_six_second_proof() -> None:
@@ -751,6 +759,7 @@ def test_three_child_exits_with_growing_input_never_authorize_srt_post() -> None
     launch_count = 0
     exit_count = 0
     ingest_counter = 0
+    exited_children = []
 
     class FakeMetricsReader:
         def __init__(self, *_args: object) -> None:
@@ -767,6 +776,12 @@ def test_three_child_exits_with_growing_input_never_authorize_srt_post() -> None
             return None
 
     class ExitedChild:
+        def __init__(self) -> None:
+            read_fd, write_fd = os.pipe()
+            os.close(write_fd)
+            self.stdout = os.fdopen(read_fd, "rb", buffering=0)
+            exited_children.append(self)
+
         def poll(self) -> int:
             nonlocal exit_count
             exit_count += 1
@@ -815,6 +830,7 @@ def test_three_child_exits_with_growing_input_never_authorize_srt_post() -> None
 
     assert result == 0
     assert launch_count == exit_count == 3
+    assert all(child.stdout.closed for child in exited_children)
     assert restart_events == [loaded["RESTART_REASON_CHILD_EXIT"]] * 3
     assert recovery_events == []
     assert breaker.opened is False

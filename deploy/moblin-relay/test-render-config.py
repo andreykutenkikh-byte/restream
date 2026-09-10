@@ -298,6 +298,7 @@ def assert_normalizer_contract(normalizer) -> None:
     assert watchdog.observe_ingest(True, ("ingest-a", 500), 1.20, 1.19) is False
     assert hasattr(normalizer, "make_parent_death_setup")
     assert set(normalizer.RESTART_LOG_TOKENS) == {
+        "video-stalled",
         "child-exit",
         "output-start-timeout",
         "metrics-blind",

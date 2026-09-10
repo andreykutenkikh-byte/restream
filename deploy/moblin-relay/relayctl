@@ -67,6 +67,10 @@ NORMALIZER_RESTART_INCIDENTS = {
         "NORMALIZER_OUTPUT_STALLED",
         "relay-output stopped advancing",
     ),
+    "video-stalled": (
+        "NORMALIZER_VIDEO_STALLED",
+        "Video stopped advancing; audio or transport bytes alone are not a healthy video stream",
+    ),
     "ingest-timing": (
         "SRT_INPUT_CHECK_TIMEOUT",
         "The watchdog could not verify SRT input in time",

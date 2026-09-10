@@ -64,6 +64,7 @@ SELF_TEST_WAIT_FAILURE: tuple[BaseException, dict, float] | None = None
 SELF_TEST_MEDIA_FAILURE: tuple[BaseException, dict] | None = None
 SELF_TEST_FLOW_FAILURE: tuple[BaseException, dict] | None = None
 SELF_TEST_INITIAL_LIVE_FAILURE: tuple[BaseException, str] | None = None
+SELF_TEST_STARTUP_FAILURE: tuple[BaseException, dict] | None = None
 SELF_TEST_STAGES = frozenset(
     {
         "startup",
@@ -442,6 +443,14 @@ def persist_self_test_failure_progress(exc: BaseException) -> None:
         and SELF_TEST_INITIAL_LIVE_FAILURE[1] in INITIAL_LIVE_FAILURE_REASONS
     ):
         progress["failure_initial_live_reason"] = SELF_TEST_INITIAL_LIVE_FAILURE[1]
+        if (
+            SELF_TEST_INITIAL_LIVE_FAILURE[1] == "output-start-timeout"
+            and SELF_TEST_STARTUP_FAILURE is not None
+            and SELF_TEST_STARTUP_FAILURE[0] is exc
+        ):
+            startup = safe_startup_failure(SELF_TEST_STARTUP_FAILURE[1])
+            if startup is not None:
+                progress["failure_startup"] = startup
     # Preserve the existing 2 KiB checkpoint limit with structured failure
     # evidence, not indentation. Normal progress/results remain human-readable.
     atomic_json(SELF_TEST_PROGRESS_FILE, progress, compact=True)
@@ -3482,13 +3491,94 @@ def known_forward_dts_marker_count(tail: bytes) -> int:
     )
 
 
-def initial_live_gate_failure(reason: str) -> TestFailure:
+def safe_startup_failure(value: object) -> dict[str, object] | None:
+    """Project the fixed normalizer schema, never arbitrary log values."""
+    counts = {"reads", "failed", "absent", "present", "identities", "regressions", "growth"}
+    durations = {
+        "spawn_ms",
+        "elapsed_ms",
+        "post_spawn_ms",
+        "first_output_ms",
+        "last_output_age_ms",
+        "first_growth_ms",
+        "last_growth_age_ms",
+        "max_read_ms",
+        "video_age_ms",
+    }
+    if (
+        not isinstance(value, dict)
+        or value.keys()
+        != counts | durations | {"version", "clock_valid", "overflow", "video_frames"}
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or any(type(value[name]) is not bool for name in ("clock_valid", "overflow"))
+        or any(type(value[name]) is not int or not 0 <= value[name] <= 1024 for name in counts)
+        or any(
+            value[name] is not None
+            and (type(value[name]) is not int or not 0 <= value[name] <= 600_000)
+            for name in durations
+        )
+        or (
+            value["video_frames"] is not None
+            and (type(value["video_frames"]) is not int or not 0 <= value["video_frames"] <= 1024)
+        )
+        or (not value["clock_valid"] and any(value[name] is not None for name in durations))
+    ):
+        return None
+    projected = dict(value)
+    if len(json.dumps(projected, separators=(",", ":"), allow_nan=False).encode("ascii")) > 768:
+        return None
+    return projected
+
+
+def initial_live_startup_diagnostic(tail: bytes) -> dict | None:
+    """Read the last complete record before the first exact startup-timeout token."""
+    if type(tail) is not bytes or len(tail) > MAX_REJECTION_LOG_TAIL_BYTES:
+        return None
+    marker = b"moblin-relay-normalize:restart:output-start-timeout"
+    prefix = b"moblin-relay-normalize:startup:"
+    position = tail.find(marker)
+    if position < 0 or position != tail.rfind(b"\n", 0, position) + 1:
+        return None
+    line_end = tail.find(b"\n", position)
+    if line_end < 0 or tail[position:line_end].rstrip(b"\r") != marker:
+        return None
+    candidate = None
+    for line in tail[:position].splitlines():
+        if not line.startswith(prefix):
+            continue
+        candidate = None
+        payload = line[len(prefix) :]
+        if not 0 < len(payload) <= 768:
+            continue
+        try:
+            pairs = json.loads(payload, object_pairs_hook=list)
+            if not isinstance(pairs, list) or any(
+                not isinstance(pair, tuple) or len(pair) != 2 for pair in pairs
+            ):
+                continue
+            value = dict(pairs)
+            if len(value) != len(pairs):
+                continue
+            candidate = safe_startup_failure(value)
+        except (TypeError, ValueError, UnicodeError):
+            continue
+    return candidate
+
+
+def initial_live_gate_failure(reason: str, *, tail: bytes | None = None) -> TestFailure:
     """Bind one allowlisted reason to its exact exception, never child output."""
-    global SELF_TEST_INITIAL_LIVE_FAILURE
+    global SELF_TEST_INITIAL_LIVE_FAILURE, SELF_TEST_STARTUP_FAILURE
     if reason not in INITIAL_LIVE_FAILURE_REASONS:
         return TestFailure("invalid internal initial LIVE diagnostic reason")
     failure = TestFailure(f"initial LIVE log gate failed: {reason}")
     SELF_TEST_INITIAL_LIVE_FAILURE = (failure, reason)
+    if reason == "output-start-timeout" and tail is not None:
+        # Diagnostics are optional; parsing cannot replace the original fatal gate.
+        with contextlib.suppress(Exception):
+            startup = initial_live_startup_diagnostic(tail)
+            if startup is not None:
+                SELF_TEST_STARTUP_FAILURE = (failure, startup)
     return failure
 
 
@@ -3497,9 +3587,10 @@ def require_initial_live_log_clean(
     offset: int,
     expected_uid: int,
 ) -> None:
-    reason = initial_live_log_failure(read_validated_log_tail(descriptor, offset, expected_uid))
+    tail = read_validated_log_tail(descriptor, offset, expected_uid)
+    reason = initial_live_log_failure(tail)
     if reason is not None:
-        raise initial_live_gate_failure(reason)
+        raise initial_live_gate_failure(reason, tail=tail)
 
 
 def wait_initial_live_bridge_active(
@@ -3516,7 +3607,7 @@ def wait_initial_live_bridge_active(
         tail = read_validated_log_tail(descriptor, offset, expected_uid)
         reason = initial_live_log_failure(tail)
         if reason is not None:
-            raise initial_live_gate_failure(reason)
+            raise initial_live_gate_failure(reason, tail=tail)
         if NORMALIZER_BRIDGE_ACTIVE_MARKER in tail:
             return
         if time.monotonic() >= deadline:
@@ -6144,10 +6235,20 @@ def main() -> int:
         )
         same_session_no_growth = maximum_capture_no_growth_seconds(same_session_samples)
         if same_session_no_growth > CAPTURE_NO_GROWTH_LIMIT_SECONDS:
-            raise TestFailure(
+            failure = TestFailure(
                 "downstream media stalled during same-session recovery: "
                 f"{same_session_no_growth:.3f}s"
             )
+            # Inspect the existing RTSP capture before failure cleanup removes
+            # it. Packet append observations are not network emission times;
+            # keep them separate from the RTMP sink's aggregate byte growth.
+            with contextlib.suppress(Exception):
+                record_outage_flow_failure(
+                    failure, observer, same_session_started, time.monotonic(),
+                    transition_log_descriptor, pause_log_offset,
+                    capture_observer=capture_observer,
+                )
+            raise failure
         result["same_session_stall"] = {
             "srt_connection_preserved": True,
             "upstream_processes_preserved": True,

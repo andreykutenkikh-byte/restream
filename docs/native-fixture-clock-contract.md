@@ -554,3 +554,32 @@ gate, startup/recovery policies, media arguments and all validity assertions are
 unchanged. A process timeout still kills/reaps the probe and fails the test; no
 partial output or negative result is converted into a PASS. A complete target
 run with the changed candidate is required before accepting this correction.
+
+## Video liveness is separate from RTMP byte growth
+
+The normalizer now reads FFmpeg's machine-readable progress through one private,
+nonblocking stdout pipe. Startup requires both the existing RTMP growth gate and
+fresh copied-video frame progress. After startup, a video plateau uses the existing
+2.5-second output fallback threshold even if AAC or transport bytes still grow.
+`video-stalled` is a video-liveness failure, never proof authorizing an SRT reset. Video
+remains stream-copy; resolution, encoding, audio filters and transport parameters
+are unchanged. Pipe reads and line storage are bounded and closed with each child.
+
+A loopback FFmpeg 5.1.2 / MediaMTX 1.20.1 discriminator ended synthetic video while
+audio continued with a deliberate timestamp jump. Replaying the unchanged old
+watchdog against its real measured counters rejected output 5.516 seconds after
+the last observed video packet; the additional progress gate rejected at 2.891
+seconds. This is sampled counterfactual evidence, not a full supervisor test or
+proof of the historical CI/HK failure's cause. An aligned whole-source pause did
+not reproduce the audio tail. Therefore the audio filter has not been removed.
+
+Progress frames are FFmpeg copied-video accounting, not decoded frames or proof
+of delivery to YouTube. The existing RTMP checks, 13 strict decoded captures,
+15-second reader deadline and three-second continuity gate remain mandatory.
+Progress age is measured when the supervisor drains its pipe, not at packet
+emission, and does not bound arbitrary operating-system scheduling delays.
+
+Startup timeout emits one bounded, fixed-schema diagnostic without credentials
+or publisher identities. Same-session continuity failures retain the existing
+safe per-track RTSP capture observations before cleanup; those observations must
+not be relabeled as actual RTMP emission or decoded playback timing.

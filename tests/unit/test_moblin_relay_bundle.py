@@ -4336,7 +4336,7 @@ def test_normalizer_restart_diagnostics_are_fixed_and_secret_free(capsys) -> Non
     tokens = loaded["RESTART_LOG_TOKENS"]
     emit = loaded["emit_restart_reason"]
 
-    assert len(tokens) == 13
+    assert len(tokens) == 14
     assert tokens["ingest-confirmed-stall"] == (
         "moblin-relay-normalize:restart:ingest-confirmed-stall"
     )

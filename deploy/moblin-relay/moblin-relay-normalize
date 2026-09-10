@@ -7,6 +7,7 @@ import base64
 import ctypes
 import http.client
 import io
+import json
 import math
 import os
 import re
@@ -110,6 +111,7 @@ RESTART_REASON_METRICS_BLIND = "metrics-blind"
 RESTART_REASON_OUTPUT_IDENTITY = "output-identity"
 RESTART_REASON_OUTPUT_REGRESSION = "output-regression"
 RESTART_REASON_OUTPUT_FALLBACK = "output-fallback"
+RESTART_REASON_VIDEO_STALLED = "video-stalled"
 RESTART_REASON_INGEST_TIMING = "ingest-timing"
 RESTART_REASON_INGEST_MISSING = "ingest-missing"
 RESTART_REASON_INGEST_IDENTITY = "ingest-identity"
@@ -124,6 +126,7 @@ RESTART_LOG_TOKENS = {
     RESTART_REASON_OUTPUT_IDENTITY: "moblin-relay-normalize:restart:output-identity",
     RESTART_REASON_OUTPUT_REGRESSION: ("moblin-relay-normalize:restart:output-regression"),
     RESTART_REASON_OUTPUT_FALLBACK: "moblin-relay-normalize:restart:output-fallback",
+    RESTART_REASON_VIDEO_STALLED: "moblin-relay-normalize:restart:video-stalled",
     RESTART_REASON_INGEST_TIMING: "moblin-relay-normalize:restart:ingest-timing",
     RESTART_REASON_INGEST_MISSING: "moblin-relay-normalize:restart:ingest-missing",
     RESTART_REASON_INGEST_IDENTITY: "moblin-relay-normalize:restart:ingest-identity",
@@ -205,6 +208,173 @@ def emit_state_event(event: str) -> None:
     if token is None:
         raise ValueError("invalid normalizer state event")
     print(token, file=sys.stderr, flush=True)
+
+
+class StartupDiagnostics:
+    """One bounded timeout record; transport observations are not video proof."""
+
+    MAX_COUNT = 1024
+    MAX_DURATION_MS = 600_000
+    MAX_PAYLOAD_BYTES = 768
+    PREFIX = "moblin-relay-normalize:startup:"
+
+    def __init__(self, started_at: float) -> None:
+        self._valid = self._clock_value(started_at)
+        self._start = float(started_at) if self._valid else 0.0
+        self._last_event = self._start
+        self._spawn_end: float | None = None
+        self._first_output: float | None = None
+        self._last_output: float | None = None
+        self._first_growth: float | None = None
+        self._last_growth: float | None = None
+        self._max_read_ms = 0
+        self._previous: CounterSample | None = None
+        self._counts = dict.fromkeys(
+            ("reads", "failed", "absent", "present", "identities", "regressions", "growth"),
+            0,
+        )
+        self._overflow = False
+        self._emitted = False
+
+    @staticmethod
+    def _clock_value(value: object) -> bool:
+        return type(value) in (int, float) and -1e12 <= value <= 1e12 and math.isfinite(value)
+
+    def _event_time(self, value: float) -> float | None:
+        if (
+            not self._clock_value(value)
+            or value < self._last_event
+            or not 0 <= (value - self._start) * 1000 <= self.MAX_DURATION_MS
+        ):
+            self._valid = False
+            return None
+        self._last_event = float(value)
+        return self._last_event
+
+    def _increment(self, name: str) -> None:
+        if self._counts[name] < self.MAX_COUNT:
+            self._counts[name] += 1
+        else:
+            self._overflow = True
+
+    def spawn_finished(self, finished_at: float) -> None:
+        """Observe Popen return without redefining the supervisor's timer."""
+        if self._spawn_end is not None:
+            self._valid = False
+            return
+        self._spawn_end = self._event_time(finished_at)
+
+    def observe_output(
+        self,
+        successful: bool,
+        sample: CounterSample | None,
+        started_at: float,
+        finished_at: float,
+    ) -> None:
+        """Record completed read intervals without logging counters or identities."""
+        self._increment("reads")
+        read_start = self._event_time(started_at)
+        read_end = self._event_time(finished_at)
+        if self._spawn_end is None:
+            self._valid = False
+        if read_start is not None and read_end is not None and read_end >= read_start:
+            self._max_read_ms = max(self._max_read_ms, round((read_end - read_start) * 1000))
+        if successful is not True:
+            self._increment("failed")
+            self._previous = None
+            return
+        if sample is None:
+            self._increment("absent")
+            self._previous = None
+            return
+        if (
+            type(sample) is not tuple
+            or len(sample) != 2
+            or type(sample[0]) is not str
+            or not sample[0]
+            or len(sample[0]) > 128
+            or type(sample[1]) is not int
+            or not 0 <= sample[1] <= 2**63 - 1
+        ):
+            self._valid = False
+            self._previous = None
+            return
+        self._increment("present")
+        if read_end is not None:
+            if self._first_output is None:
+                self._first_output = read_end
+            self._last_output = read_end
+        if self._previous is None or sample[0] != self._previous[0]:
+            self._increment("identities")
+        elif sample[1] < self._previous[1]:
+            self._increment("regressions")
+        elif sample[1] > self._previous[1]:
+            self._increment("growth")
+            if read_end is not None:
+                if self._first_growth is None:
+                    self._first_growth = read_end
+                self._last_growth = read_end
+        self._previous = sample
+
+    def emit_timeout(
+        self,
+        finished_at: float,
+        *,
+        video_frames: int = 0,
+        video_last_growth: float | None = None,
+    ) -> None:
+        """Emit once per child attempt, solely with fixed keys and bounded values."""
+        if self._emitted:
+            return
+        self._emitted = True
+        end = self._event_time(finished_at)
+        bounded_video_frames: int | None = None
+        video_growth_time: float | None = None
+        if type(video_frames) is not int or video_frames < 0:
+            self._valid = False
+        else:
+            bounded_video_frames = min(video_frames, self.MAX_COUNT)
+            self._overflow |= video_frames > self.MAX_COUNT
+        if video_last_growth is not None:
+            if (
+                not self._clock_value(video_last_growth)
+                or end is None
+                or not self._start <= video_last_growth <= end
+                or not bounded_video_frames
+            ):
+                self._valid = False
+            else:
+                video_growth_time = float(video_last_growth)
+        elif bounded_video_frames:
+            self._valid = False
+
+        def duration(first: float | None, last: float | None) -> int | None:
+            if not self._valid or first is None or last is None:
+                return None
+            return round((last - first) * 1000)
+
+        payload = {
+            "version": 1,
+            "clock_valid": self._valid,
+            "overflow": self._overflow,
+            **self._counts,
+            "spawn_ms": duration(self._start, self._spawn_end),
+            "elapsed_ms": duration(self._start, end),
+            "post_spawn_ms": duration(self._spawn_end, end),
+            "first_output_ms": duration(self._start, self._first_output),
+            "last_output_age_ms": duration(self._last_output, end),
+            "first_growth_ms": duration(self._start, self._first_growth),
+            "last_growth_age_ms": duration(self._last_growth, end),
+            "max_read_ms": self._max_read_ms if self._valid else None,
+            "video_frames": bounded_video_frames,
+            "video_age_ms": duration(video_growth_time, end),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        if len(encoded.encode("ascii")) > self.MAX_PAYLOAD_BYTES:
+            # The fixed schema is smaller than this bound even at every cap.
+            # Never fall back to arbitrary object/error serialization.
+            encoded = '{"clock_valid":false,"overflow":true,"version":1}'
+        print(self.PREFIX + encoded, file=sys.stderr, flush=True)
 
 
 def validated_port(raw_value: str) -> int:
@@ -578,6 +748,10 @@ def build_ffmpeg_argv(rtsp_port: int, rtmp_port: int) -> list[str]:
         "-nostats",
         "-loglevel",
         "error",
+        # A private pipe exposes only machine-readable progress to the supervisor.
+        # RTMP byte growth alone can be audio; it must not keep video marked LIVE.
+        "-progress",
+        "pipe:1",
         # The FLV muxer hard-fails an H.264 stream-copy packet without PTS.
         # Repair only missing input PTS from an available DTS, preserving the
         # encoded video and its native timeline instead of using wall-clock
@@ -797,6 +971,76 @@ class MetricsReader(Generic[T]):
             if response is not None:
                 response.close()
             self.deadline.end()
+
+
+class VideoProgress:
+    """Bounded, nonblocking FFmpeg copied-video progress; never decoded proof.
+
+    Only complete progress blocks with a nondecreasing numeric frame count are
+    accepted. Raw lines are never logged or retained beyond a small line buffer.
+    Each instance belongs to one child and is closed before that child is replaced.
+    """
+
+    READ_LIMIT = 16_384
+    LINE_LIMIT = 256
+
+    def __init__(self, pipe, now: float) -> None:
+        self.pipe = pipe
+        os.set_blocking(pipe.fileno(), False)
+        self.pending = bytearray()
+        self.discarding = False
+        self.frame: int | None = None
+        self.frames = 0
+        self.last_growth = now
+        self.ended = False
+
+    def close(self) -> None:
+        self.pipe.close()
+
+    def observe_line(self, line: bytes, now: float) -> None:
+        if line.startswith(b"frame="):
+            value = line[6:].strip()
+            self.frame = int(value) if value.isdigit() and len(value) <= 12 else None
+        elif line in (b"progress=continue", b"progress=end"):
+            if self.frame is not None and self.frame >= self.frames:
+                if self.frame > self.frames:
+                    self.last_growth = now
+                self.frames = self.frame
+            self.frame = None
+
+    def sample(self, now: float) -> None:
+        remaining = self.READ_LIMIT
+        while remaining and not self.ended:
+            try:
+                chunk = os.read(self.pipe.fileno(), min(4096, remaining))
+            except BlockingIOError:
+                break
+            except OSError:
+                self.ended = True
+                break
+            if not chunk:
+                self.ended = True
+                break
+            remaining -= len(chunk)
+            for value in chunk:
+                if value == 10:
+                    if not self.discarding:
+                        self.observe_line(bytes(self.pending).rstrip(b"\r"), now)
+                    self.pending.clear()
+                    self.discarding = False
+                elif not self.discarding:
+                    if len(self.pending) >= self.LINE_LIMIT:
+                        self.pending.clear()
+                        self.frame = None
+                        self.discarding = True
+                    else:
+                        self.pending.append(value)
+
+    def has_video(self) -> bool:
+        return self.frames > 0
+
+    def stalled(self, now: float) -> bool:
+        return now - self.last_growth >= OUTPUT_IDLE_FALLBACK_SECONDS
 
 
 class GrowthGate:
@@ -1137,6 +1381,8 @@ def run_supervisor(
     ingest_gate = ConnectionGrowthGate()
     output_gate = ConnectionGrowthGate()
     child: subprocess.Popen | None = None
+    video_progress: VideoProgress | None = None
+    startup_diagnostics: StartupDiagnostics | None = None
     watchdog: MediaWatchdog | None = None
     child_started = 0.0
     restart_not_before = 0.0
@@ -1148,6 +1394,9 @@ def run_supervisor(
         while not stop_requested:
             now = time.monotonic()
             if child is not None and child.poll() is not None:
+                if video_progress is not None:
+                    video_progress.close()
+                    video_progress = None
                 emit_restart_reason(RESTART_REASON_CHILD_EXIT)
                 recovery.record_failure(RESTART_REASON_CHILD_EXIT, now)
                 child = None
@@ -1159,6 +1408,9 @@ def run_supervisor(
                 if child is not None:
                     stop_child(child, force=True)
                     child = None
+                if video_progress is not None:
+                    video_progress.close()
+                    video_progress = None
                 watchdog = None
                 ingest_gate.reset()
                 output_gate.reset()
@@ -1276,17 +1528,21 @@ def run_supervisor(
                     if ingest_sample is not None and growth_confirmed and now >= restart_not_before:
                         supervisor_pid = os.getpid()
                         parent_death_setup = make_parent_death_setup(supervisor_pid)
+                        startup_diagnostics = StartupDiagnostics(now)
                         try:
                             child = subprocess.Popen(
                                 argv,
                                 stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE,
                                 env=child_environment,
                                 close_fds=True,
                                 preexec_fn=parent_death_setup,
                             )
                         except (OSError, subprocess.SubprocessError):
                             return 1
+                        startup_diagnostics.spawn_finished(time.monotonic())
                         child_started = now
+                        video_progress = VideoProgress(child.stdout, time.monotonic())
                         watchdog = None
                         confirmed_input_stall = None
                         output_gate.reset()
@@ -1295,24 +1551,50 @@ def run_supervisor(
                 time.sleep(MEDIA_POLL_INTERVAL_SECONDS)
                 continue
 
+            output_read_started = time.monotonic()
             successful, counter = output_reader.sample()
             now = time.monotonic()
+            if video_progress is not None:
+                video_progress.sample(now)
             if watchdog is None:
-                if successful and counter is not None and output_gate.observe(counter):
+                if startup_diagnostics is not None:
+                    startup_diagnostics.observe_output(
+                        successful, counter, output_read_started, now
+                    )
+                if (
+                    successful and counter is not None and output_gate.observe(counter)
+                    and video_progress is not None and video_progress.has_video()
+                    and not video_progress.stalled(now)
+                ):
                     watchdog = MediaWatchdog(counter, now)
                     emit_state_event(STATE_EVENT_BRIDGE_ACTIVE)
                     ingest_reader.close()
                 elif now - child_started >= OUTPUT_START_TIMEOUT_SECONDS:
+                    if startup_diagnostics is not None:
+                        startup_diagnostics.emit_timeout(
+                            now,
+                            video_frames=video_progress.frames if video_progress is not None else 0,
+                            video_last_growth=(
+                                video_progress.last_growth
+                                if video_progress is not None and video_progress.has_video()
+                                else None
+                            ),
+                        )
                     emit_restart_reason(RESTART_REASON_OUTPUT_START_TIMEOUT)
                     recovery.record_failure(RESTART_REASON_OUTPUT_START_TIMEOUT, now)
                     stop_child(child, force=True)
                     child = None
+                    if video_progress is not None:
+                        video_progress.close()
+                        video_progress = None
                     ingest_gate.reset()
                     restart_not_before = now + CHILD_RESTART_FLOOR_SECONDS
                 time.sleep(MEDIA_POLL_INTERVAL_SECONDS)
                 continue
 
             keep_child, probe_ingest = watchdog.observe_output(successful, counter, now)
+            if keep_child and video_progress is not None and video_progress.stalled(now):
+                keep_child = watchdog.reject(RESTART_REASON_VIDEO_STALLED)
             if not probe_ingest:
                 ingest_reader.close()
             if keep_child and probe_ingest:
@@ -1333,6 +1615,9 @@ def run_supervisor(
                 ingest_reader.close()
                 stop_child(child, force=True)
                 child = None
+                if video_progress is not None:
+                    video_progress.close()
+                    video_progress = None
                 watchdog = None
                 ingest_gate.reset()
                 restart_not_before = time.monotonic() + CHILD_RESTART_FLOOR_SECONDS
@@ -1343,6 +1628,8 @@ def run_supervisor(
         output_reader.close()
         if child is not None:
             stop_child(child)
+        if video_progress is not None:
+            video_progress.close()
         if stop_requested and source_attached_emitted:
             emit_state_event(STATE_EVENT_SOURCE_DETACHED)
 

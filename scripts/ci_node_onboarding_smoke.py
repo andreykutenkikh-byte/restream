@@ -674,6 +674,46 @@ def _safe_failure_flow(value: Any) -> dict[str, Any] | None:
     return result
 
 
+def safe_startup_failure(value: object) -> dict[str, object] | None:
+    """Project the fixed normalizer schema, never arbitrary log values."""
+    counts = {"reads", "failed", "absent", "present", "identities", "regressions", "growth"}
+    durations = {
+        "spawn_ms",
+        "elapsed_ms",
+        "post_spawn_ms",
+        "first_output_ms",
+        "last_output_age_ms",
+        "first_growth_ms",
+        "last_growth_age_ms",
+        "max_read_ms",
+        "video_age_ms",
+    }
+    if (
+        not isinstance(value, dict)
+        or value.keys()
+        != counts | durations | {"version", "clock_valid", "overflow", "video_frames"}
+        or type(value["version"]) is not int
+        or value["version"] != 1
+        or any(type(value[name]) is not bool for name in ("clock_valid", "overflow"))
+        or any(type(value[name]) is not int or not 0 <= value[name] <= 1024 for name in counts)
+        or any(
+            value[name] is not None
+            and (type(value[name]) is not int or not 0 <= value[name] <= 600_000)
+            for name in durations
+        )
+        or (
+            value["video_frames"] is not None
+            and (type(value["video_frames"]) is not int or not 0 <= value["video_frames"] <= 1024)
+        )
+        or (not value["clock_valid"] and any(value[name] is not None for name in durations))
+    ):
+        return None
+    projected = dict(value)
+    if len(json.dumps(projected, separators=(",", ":"), allow_nan=False).encode("ascii")) > 768:
+        return None
+    return projected
+
+
 def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
     """Only fixed stage names and bounded numbers may reach the CI log."""
     unavailable = {"progress": "unavailable"}
@@ -690,6 +730,8 @@ def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
     failure_flow = payload.get("failure_flow")
     safe_flow = _safe_failure_flow(failure_flow) if failure_flow is not None else None
     initial_live_reason = payload.get("failure_initial_live_reason")
+    failure_startup = payload.get("failure_startup")
+    safe_startup = safe_startup_failure(failure_startup) if failure_startup is not None else None
     allowed_flags = {
         "live",
         "normalized",
@@ -739,10 +781,18 @@ def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
         )
         or (failure_media is not None and safe_media is None)
         or (
+            failure_startup is not None
+            and (
+                safe_startup is None
+                or stage != "live-normalize"
+                or initial_live_reason != "output-start-timeout"
+            )
+        )
+        or (
             failure_flow is not None
             and (
                 safe_flow is None
-                or stage not in {"outage-normal", "stall-switch", "stuck-slate"}
+                or stage not in {"outage-normal", "stall-switch", "stall-cont", "stuck-slate"}
                 or failure_media is not None
             )
         )
@@ -779,6 +829,8 @@ def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
         result["failure_flow"] = safe_flow
     if initial_live_reason is not None:
         result["failure_initial_live_reason"] = initial_live_reason
+    if safe_startup is not None:
+        result["failure_startup"] = safe_startup
     return result
 
 
@@ -823,7 +875,7 @@ try:
     print(json.dumps({key: value.get(key) for key in
         ('job_id', 'stage', 'elapsed_seconds', 'strict_segment_index', 'failure_lines',
          'failure_flags', 'failure_wait_seconds', 'failure_media', 'failure_flow',
-         'failure_initial_live_reason')}))
+         'failure_initial_live_reason', 'failure_startup')}))
 except (OSError, ValueError):
     print('{}')
 """,
