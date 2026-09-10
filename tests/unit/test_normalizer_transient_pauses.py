@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import runpy
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
@@ -86,6 +89,110 @@ def test_long_metrics_gap_is_observability_failure_not_proof_to_reset_srt():
     assert watchdog.failure_reason == "metrics-blind"
     assert watchdog.ingest_counter is None
     assert not ns["SOURCE_RESET_ELIGIBLE_REASONS"]
+
+
+def test_trickled_metrics_cannot_block_watchdog_past_three_seconds_or_authorize_srt_reset():
+    """Exercise real serial HTTP reads, not zero-duration virtual observations.
+
+    A per-read socket timeout accepts this complete valid metric only after more
+    than three seconds, preventing the watchdog from running in the meantime.
+    The total request deadline must return invalid samples promptly enough for
+    the unchanged metrics-blind policy. This is not full media-fallback proof.
+    """
+    ns = load()
+    metric = (
+        'rtmp_conns_inbound_bytes{remoteAddr="127.0.0.1:54321",id="normalizer-a",'
+        'state="publish",path="relay-output"} 500\n'
+    ).encode("ascii")
+    source_id = "11111111-2222-4333-8444-555555555555"
+    trickle_enabled = threading.Event()
+    stopping = threading.Event()
+    handlers: list[threading.Thread] = []
+    handlers_lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, _format, *_args):
+            pass
+
+        def do_GET(self):
+            with handlers_lock:
+                handler = threading.current_thread()
+                if handler not in handlers:
+                    handlers.append(handler)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(metric)))
+                self.end_headers()
+                if not trickle_enabled.is_set():
+                    self.wfile.write(metric)
+                    self.wfile.flush()
+                    return
+                self.wfile.write(metric[:-32])
+                self.wfile.flush()
+                for byte in metric[-32:]:
+                    if stopping.wait(0.12):
+                        break
+                    self.wfile.write(bytes([byte]))
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                # Do not ask the HTTP keep-alive loop to read a closed peer.
+                self.close_connection = True
+            finally:
+                if stopping.is_set():
+                    self.close_connection = True
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True
+    )
+    reader = ns["MetricsReader"](
+        server.server_port, ns["OUTPUT_METRICS_PATH"], ns["parse_output_sample"]
+    )
+    try:
+        server_thread.start()
+        successful, initial = reader.sample()
+        assert successful and initial == ("normalizer-a", 500)
+        started = time.monotonic()
+        watchdog = ns["MediaWatchdog"](initial, started)
+        trickle_enabled.set()
+        decisions = []
+        for _ in range(20):
+            successful, sample = reader.sample()
+            observed = time.monotonic()
+            keep, probe_ingest = watchdog.observe_output(successful, sample, observed)
+            decisions.append((successful, sample, probe_ingest, observed - started))
+            if not keep or observed - started >= 3.0:
+                break
+            time.sleep(ns["MEDIA_POLL_INTERVAL_SECONDS"])
+        elapsed = decisions[-1][3]
+        assert elapsed < 3.0, f"metrics blocked the watchdog for {elapsed:.3f}s"
+        assert all(item[:3] == (False, None, False) for item in decisions)
+        assert watchdog.failure_reason == ns["RESTART_REASON_METRICS_BLIND"]
+        assert ns["METRICS_BLIND_TIMEOUT_SECONDS"] <= elapsed
+        assert watchdog.ingest_counter is None
+        assert watchdog.confirmed_stall_gate(source_id) is None
+        recovery = ns["RecoveryCircuitBreaker"](source_id)
+        assert not recovery.record_failure(watchdog.failure_reason, observed)
+        assert not recovery.opened and recovery.attempts == 0
+        assert not ns["SOURCE_RESET_ELIGIBLE_REASONS"]
+        assert ns["METRICS_REQUEST_TIMEOUT_SECONDS"] == 0.2
+        assert ns["VERIFIED_STALL_TIMEOUT_SECONDS"] == 2.0
+        assert ns["OUTPUT_IDLE_FALLBACK_SECONDS"] == 2.5
+    finally:
+        reader.close()
+        stopping.set()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=1)
+        with handlers_lock:
+            request_threads = list(handlers)
+        for thread in request_threads:
+            thread.join(timeout=1)
+        assert not server_thread.is_alive()
+        assert all(not thread.is_alive() for thread in request_threads)
 
 
 def test_watchdog_carries_continuous_input_proof_without_shortening_six_second_grace():

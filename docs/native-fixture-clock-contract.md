@@ -468,3 +468,40 @@ monotonic observation follows each successful send, under the existing locking
 discipline; no new thread, history buffer, pacing decision, reader argument,
 deadline or runtime behavior is introduced. Both successful and failed strict
 capture diagnostics can retain this bounded summary for comparison.
+
+## HK continuity follow-up: bound the complete metrics request
+
+The owner-authorized temporary HK test on 10 September, using FFmpeg 4.4.2
+and MediaMTX 1.20.1, failed the unchanged three-second capture-growth gate at
+3.221 seconds. A single observation-only repeat measured 2.207 seconds and
+stopped deliberately after that gate; it was not a full native PASS. In the
+repeat, input, normalized output and final RTMP sink counters were flat before
+SLATE resumed, with the original SRT and sink connections retained. Source
+resume occurred after the measured plateau. This localizes the repeat to
+LIVE-to-SLATE, but does not retrospectively establish the first failure's cause.
+
+A separate actual-loopback HTTP regression exposed a concrete watchdog defect:
+`HTTPConnection(timeout=0.2)` limited individual blocking socket operations,
+not the whole metrics request. A five-byte response delivered one byte every
+120 ms was accepted after approximately 484 ms. A trickling response could
+therefore keep the synchronous watchdog inside a successful read instead of
+letting it evaluate stale output or missing observability.
+
+MetricsReader now uses one monotonic deadline for connect, request, headers,
+body and the final parser result. The remaining budget is applied underneath
+HTTPResponse buffering, before every socket read/write. A slow partial response
+is discarded and its connection closed; a later sample starts a fresh budget.
+Healthy complete responses still reuse the existing connection. Socket file
+reference ownership is retained for both keep-alive and Connection: close.
+No background worker, retry, process, signal timer or additional metrics request
+is introduced. This bounds I/O waiting, not operating-system scheduling latency;
+a late result is invalid even if its bytes are otherwise correct.
+
+The existing 2.0/2.5-second watchdog policy, six-second exact-source reset proof,
+fresh pre-reset checks, 3-second continuity gate, 15-second strict reader and
+90-decoded-frame minimum remain unchanged. Metrics timeout is observability
+failure, not evidence authorizing an SRT reset. Actual-socket and actual-watchdog
+regressions exercise the total-deadline failure class independently of media.
+This fix is not yet proof that the earlier HK 3.221-second failure, or any of
+the historical native cases above, is resolved. Exact-head CI and actual HK
+media acceptance results must be reported separately, including any failure.
