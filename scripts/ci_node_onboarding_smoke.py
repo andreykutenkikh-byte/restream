@@ -714,6 +714,100 @@ def safe_startup_failure(value: object) -> dict[str, object] | None:
     return projected
 
 
+def safe_startup_input_failure(value: object) -> dict[str, object] | None:
+    """Strict fixed projection; exported intervals are observations, never packet times."""
+
+    def integer(item: object, maximum: int) -> bool:
+        return type(item) is int and 0 <= item <= maximum
+
+    def interval(item: object, maximum: int = 20000) -> bool:
+        return item is None or (
+            isinstance(item, list)
+            and len(item) == 2
+            and all(integer(part, maximum) for part in item)
+            and item[0] <= item[1]
+        )
+
+    if (
+        not isinstance(value, dict)
+        or value.keys()
+        != {
+            "scope",
+            "complete",
+            "window_clipped",
+            "samples",
+            "end_ms",
+            "first_rtmp_ms",
+            "channels",
+            "clock",
+        }
+        or value["scope"] != "first-ingest-to-first-rtmp"
+        or any(type(value[key]) is not bool for key in ("complete", "window_clipped"))
+        or not integer(value["samples"], 128)
+        or not all(interval(value[key]) for key in ("end_ms", "first_rtmp_ms"))
+    ):
+        return None
+    if value["complete"] and (
+        value["window_clipped"] or value["samples"] < 2 or value["first_rtmp_ms"] is None
+    ):
+        return None
+    channels = value["channels"]
+    if not isinstance(channels, dict) or channels.keys() != {
+        "srt",
+        "path",
+        "rtsp_bytes",
+        "rtsp_rtp",
+    }:
+        return None
+    for channel in channels.values():
+        if (
+            not isinstance(channel, dict)
+            or channel.keys() != {"state", "first_growth_ms", "last_growth_ms"}
+            or not isinstance(channel["state"], str)
+            or channel["state"] not in {"unknown", "absent", "unchanged", "growth", "changed"}
+            or not all(interval(channel[key]) for key in ("first_growth_ms", "last_growth_ms"))
+        ):
+            return None
+        first, last = channel["first_growth_ms"], channel["last_growth_ms"]
+        if (
+            (first is None) != (last is None)
+            or (channel["state"] in {"unknown", "absent", "unchanged"} and first is not None)
+            or (channel["state"] == "growth" and first is None)
+        ):
+            return None
+    clock = value["clock"]
+    if not isinstance(clock, dict):
+        return None
+    if clock != {"state": "unknown"}:  # noqa: SIM102 - keep this optional schema readable
+        if clock.keys() != {
+            "state",
+            "samples",
+            "adjacent_metrics_ms",
+            "ratio",
+            "max_gap_ms",
+            "last_age_ms",
+        } or (
+            clock["state"] != "observed-before-first-rtmp"
+            or not integer(clock["samples"], 128)
+            or clock["samples"] < 1
+            or clock["adjacent_metrics_ms"] is None
+            or not interval(clock["adjacent_metrics_ms"])
+            or not integer(clock["max_gap_ms"], 20000)
+            or not integer(clock["last_age_ms"], 20000)
+            or not isinstance(clock["ratio"], list)
+            or len(clock["ratio"]) != 2
+            or any(
+                type(item) not in (int, float) or not 0 <= item <= 4 or not math.isfinite(item)
+                for item in clock["ratio"]
+            )
+            or clock["ratio"][0] > clock["ratio"][1]
+        ):
+            return None
+    # Copy only validated fixed fields. A payload-size cap leaves room for the existing failure.
+    serialized = json.dumps(value, separators=(",", ":"), allow_nan=False)
+    return dict(json.loads(serialized)) if len(serialized.encode("ascii")) <= 1100 else None
+
+
 def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
     """Only fixed stage names and bounded numbers may reach the CI log."""
     unavailable = {"progress": "unavailable"}
@@ -831,6 +925,12 @@ def safe_self_test_progress(payload: Any, *, job_id: str) -> dict[str, Any]:
         result["failure_initial_live_reason"] = initial_live_reason
     if safe_startup is not None:
         result["failure_startup"] = safe_startup
+    if stage in {"live-normalize", "norm-flap", "norm-hook", "norm-child", "norm-publish"}:
+        optional = safe_startup_input_failure(payload.get("failure_startup_input"))
+        if optional is not None:
+            candidate = {**result, "failure_startup_input": optional}
+            if len(json.dumps(candidate, separators=(",", ":"), allow_nan=False).encode()) < 2048:
+                result = candidate
     return result
 
 
@@ -854,6 +954,12 @@ import time
 from pathlib import Path
 
 path = Path('/run/moblin-relay-self-test.progress.json')
+def unique_pairs(pairs):
+    value = dict(pairs)
+    if len(value) != len(pairs):
+        raise ValueError('unavailable')
+    return value
+
 try:
     before = path.lstat()
     if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0
@@ -869,13 +975,13 @@ try:
         raw = handle.read(2049)
     if len(raw) > 2048:
         raise ValueError('unavailable')
-    value = json.loads(raw)
+    value = json.loads(raw, object_pairs_hook=unique_pairs)
     if not isinstance(value, dict):
         raise ValueError('unavailable')
     print(json.dumps({key: value.get(key) for key in
         ('job_id', 'stage', 'elapsed_seconds', 'strict_segment_index', 'failure_lines',
          'failure_flags', 'failure_wait_seconds', 'failure_media', 'failure_flow',
-         'failure_initial_live_reason', 'failure_startup')}))
+         'failure_initial_live_reason', 'failure_startup', 'failure_startup_input')}))
 except (OSError, ValueError):
     print('{}')
 """,

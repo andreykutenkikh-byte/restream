@@ -65,6 +65,7 @@ SELF_TEST_MEDIA_FAILURE: tuple[BaseException, dict] | None = None
 SELF_TEST_FLOW_FAILURE: tuple[BaseException, dict] | None = None
 SELF_TEST_INITIAL_LIVE_FAILURE: tuple[BaseException, str] | None = None
 SELF_TEST_STARTUP_FAILURE: tuple[BaseException, dict] | None = None
+SELF_TEST_STARTUP_INPUT_FAILURE: tuple[BaseException, dict] | None = None
 SELF_TEST_STAGES = frozenset(
     {
         "startup",
@@ -451,6 +452,21 @@ def persist_self_test_failure_progress(exc: BaseException) -> None:
             startup = safe_startup_failure(SELF_TEST_STARTUP_FAILURE[1])
             if startup is not None:
                 progress["failure_startup"] = startup
+    if (
+        SELF_TEST_STARTUP_INPUT_FAILURE is not None
+        and SELF_TEST_STARTUP_INPUT_FAILURE[0] is exc
+        and progress["stage"]
+        in {"live-normalize", "norm-flap", "norm-hook", "norm-child", "norm-publish"}
+    ):
+        with contextlib.suppress(Exception):
+            optional = safe_startup_input_failure(SELF_TEST_STARTUP_INPUT_FAILURE[1])
+            if optional is not None:
+                candidate = {**progress, "failure_startup_input": optional}
+                if (
+                    len(json.dumps(candidate, separators=(",", ":"), allow_nan=False).encode())
+                    < 2048
+                ):
+                    progress = candidate
     # Preserve the existing 2 KiB checkpoint limit with structured failure
     # evidence, not indentation. Normal progress/results remain human-readable.
     atomic_json(SELF_TEST_PROGRESS_FILE, progress, compact=True)
@@ -996,6 +1012,290 @@ def fetch_metrics(port: int) -> str:
         return response.read(2_000_000).decode("utf-8", errors="replace")
 
 
+def startup_rtsp_sample(payload: str) -> tuple[str, int, int] | None:
+    """Optional aggregate read-session data, never usable-H264/FFmpeg-read proof."""
+    sessions = parse_metrics(payload, "rtsp_sessions")
+    declared = re.findall(r"^rtsp_sessions(?:\{|\s)", payload, re.MULTILINE)
+    if len(sessions) != len(declared) or any(value not in (0, 1) for _, value in sessions):
+        raise ValueError("invalid optional RTSP session metric")
+    rows = [
+        labels
+        for labels, value in sessions
+        if labels.get("path") == INGEST_PATH
+        and labels.get("state") == "read"
+        and value == 1
+        and re.fullmatch(r"127\.0\.0\.1:[0-9]{1,5}", labels.get("remoteAddr", ""))
+    ]
+    if not rows:
+        return None
+    if len(rows) != 1 or not re.fullmatch(
+        r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}", rows[0].get("id", "")
+    ):
+        raise ValueError("ambiguous optional RTSP session")
+    values = []
+    for name in ("rtsp_sessions_outbound_bytes", "rtsp_sessions_outbound_rtp_packets"):
+        counters = [value for labels, value in parse_metrics(payload, name) if labels == rows[0]]
+        if (
+            len(counters) != 1
+            or not math.isfinite(counters[0])
+            or not (counters[0].is_integer() and 0 <= counters[0] <= 2**53 - 1)
+        ):
+            raise ValueError("invalid optional RTSP counter")
+        values.append(int(counters[0]))
+    return rows[0]["id"], values[0], values[1]
+
+
+class StartupInputEvidence:
+    """Bounded first-ingest→first-RTMP observation window, NOT a child interval."""
+
+    def __init__(self, started: float, clock) -> None:
+        self.started, self.clock = started, clock
+        self.lock = threading.Lock()
+        self.rows: list[dict] = []
+        self.clipped = self.done = self.unknown = False
+
+    def observe(self, sample: dict, payload: str | None) -> None:
+        # Called only by the existing Observer thread, with no extra network I/O.
+        with self.lock:
+            if self.done:
+                return
+            try:
+                first, last = sample["t"], sample["finished"]
+                if not all(type(v) in (int, float) and math.isfinite(v) for v in (first, last)):
+                    raise ValueError("invalid observation clock")
+                if first < self.started:
+                    return
+                if not first <= last <= self.started + 20 or len(self.rows) >= 128:
+                    self.clipped = self.done = True
+                    return
+                if self.rows and first < self.rows[-1]["last"]:
+                    raise ValueError("regressed observation clock")
+                if not self.rows and not (
+                    sample.get("ingest_live") is True and len(sample.get("ingest_ids", [])) == 1
+                ):
+                    return
+                row = {"first": first, "last": last, "ok": sample.get("dut_metrics_ok") is True}
+                for role, counter in (("srt", "ingest_transport_bytes"), ("path", "ingest_bytes")):
+                    ids, value = sample.get("ingest_ids"), sample.get(counter)
+                    row[role] = (
+                        (tuple(ids), value)
+                        if isinstance(ids, list)
+                        and len(ids) == 1
+                        and isinstance(ids[0], str)
+                        and ids[0] != "missing-id"
+                        and type(value) is int
+                        and 0 <= value <= 2**53 - 1
+                        else None
+                    )
+                    row["ok"] &= row[role] is not None
+                try:
+                    if payload is None:
+                        raise ValueError("missing optional metrics response")
+                    rtsp = startup_rtsp_sample(payload)
+                    row["rtsp_bytes"] = ((rtsp[0],), rtsp[1]) if rtsp else None
+                    row["rtsp_rtp"] = ((rtsp[0],), rtsp[2]) if rtsp else None
+                except Exception:
+                    row["rtsp_bytes"] = row["rtsp_rtp"] = None
+                    row["ok"] = False
+                row["output"] = (
+                    sample.get("normalized") is True and len(sample.get("normalized_ids", [])) == 1
+                )
+                row["clock"] = None
+                if not row["output"]:  # Never replace early evidence with a later recovered clock.
+                    with contextlib.suppress(Exception):
+                        value = self.clock()
+                        if (
+                            isinstance(value, dict)
+                            and value.get("state") == "known"
+                            and all(
+                                type(value.get(key)) in (int, float)
+                                and math.isfinite(value[key])
+                                and 0 <= value[key] <= bound
+                                for key, bound in (("ratio", 4), ("max_gap", 20), ("last_age", 20))
+                            )
+                        ):
+                            row["clock"] = [value["ratio"], value["max_gap"], value["last_age"]]
+                self.rows.append(row)
+                self.done = row["output"]
+            except Exception:
+                self.unknown = True
+
+    def summary(self) -> dict:
+        with self.lock:
+            self.done = True
+            rows = [dict(row) for row in self.rows]
+            clipped, unknown = self.clipped, self.unknown
+        origin = rows[0]["first"] if rows else self.started
+
+        def span(row):
+            return [round((row["first"] - origin) * 1000), round((row["last"] - origin) * 1000)]
+
+        complete = bool(
+            len(rows) >= 2
+            and rows[-1]["output"]
+            and not clipped
+            and not unknown
+            and all(row["ok"] for row in rows)
+            and all(
+                right["last"] - left["first"] <= 3
+                for left, right in zip(rows, rows[1:], strict=False)
+            )
+        )
+        value = {
+            "scope": "first-ingest-to-first-rtmp",
+            "complete": complete,
+            "window_clipped": clipped,
+            "samples": len(rows),
+            "end_ms": span(rows[-1]) if rows else None,
+            "first_rtmp_ms": span(rows[-1]) if rows and rows[-1]["output"] else None,
+            "channels": {},
+            "clock": {"state": "unknown"},
+        }
+        for role in ("srt", "path", "rtsp_bytes", "rtsp_rtp"):
+            channel = {"state": "unknown", "first_growth_ms": None, "last_growth_ms": None}
+            value["channels"][role] = channel
+            if not rows or unknown or any(not row["ok"] for row in rows):
+                continue
+            previous = None
+            channel["state"] = "absent"
+            for row in rows:
+                current = row[role]
+                if previous is not None and (current is None or current[0] != previous[role][0]):
+                    channel["state"] = "changed"
+                    break  # Never merge a later successful FFmpeg retry with the first epoch.
+                if current is not None:
+                    if previous is None:
+                        channel["state"] = "unchanged"
+                    elif current[1] < previous[role][1]:
+                        channel["state"] = "unknown"
+                        channel["first_growth_ms"] = channel["last_growth_ms"] = None
+                        break
+                    elif current[1] > previous[role][1]:
+                        interval = [span(previous)[0], span(row)[1]]
+                        channel["state"] = "growth"
+                        if channel["first_growth_ms"] is None:
+                            channel["first_growth_ms"] = interval
+                        channel["last_growth_ms"] = interval
+                    previous = row
+        clocks = [(row, row["clock"]) for row in rows if row["clock"] is not None]
+        if clocks:
+            value["clock"] = {
+                "state": "observed-before-first-rtmp",
+                "samples": len(clocks),
+                "adjacent_metrics_ms": span(clocks[-1][0]),
+                "ratio": [
+                    round(min(item[1][0] for item in clocks), 6),
+                    round(max(item[1][0] for item in clocks), 6),
+                ],
+                "max_gap_ms": round(max(item[1][1] for item in clocks) * 1000),
+                "last_age_ms": round(clocks[-1][1][2] * 1000),
+            }
+        return value
+
+
+def safe_startup_input_failure(value: object) -> dict[str, object] | None:
+    """Strict fixed projection; exported intervals are observations, never packet times."""
+
+    def integer(item: object, maximum: int) -> bool:
+        return type(item) is int and 0 <= item <= maximum
+
+    def interval(item: object, maximum: int = 20000) -> bool:
+        return item is None or (
+            isinstance(item, list)
+            and len(item) == 2
+            and all(integer(part, maximum) for part in item)
+            and item[0] <= item[1]
+        )
+
+    if (
+        not isinstance(value, dict)
+        or value.keys()
+        != {
+            "scope",
+            "complete",
+            "window_clipped",
+            "samples",
+            "end_ms",
+            "first_rtmp_ms",
+            "channels",
+            "clock",
+        }
+        or value["scope"] != "first-ingest-to-first-rtmp"
+        or any(type(value[key]) is not bool for key in ("complete", "window_clipped"))
+        or not integer(value["samples"], 128)
+        or not all(interval(value[key]) for key in ("end_ms", "first_rtmp_ms"))
+    ):
+        return None
+    if value["complete"] and (
+        value["window_clipped"] or value["samples"] < 2 or value["first_rtmp_ms"] is None
+    ):
+        return None
+    channels = value["channels"]
+    if not isinstance(channels, dict) or channels.keys() != {
+        "srt",
+        "path",
+        "rtsp_bytes",
+        "rtsp_rtp",
+    }:
+        return None
+    for channel in channels.values():
+        if (
+            not isinstance(channel, dict)
+            or channel.keys() != {"state", "first_growth_ms", "last_growth_ms"}
+            or not isinstance(channel["state"], str)
+            or channel["state"] not in {"unknown", "absent", "unchanged", "growth", "changed"}
+            or not all(interval(channel[key]) for key in ("first_growth_ms", "last_growth_ms"))
+        ):
+            return None
+        first, last = channel["first_growth_ms"], channel["last_growth_ms"]
+        if (
+            (first is None) != (last is None)
+            or (channel["state"] in {"unknown", "absent", "unchanged"} and first is not None)
+            or (channel["state"] == "growth" and first is None)
+        ):
+            return None
+    clock = value["clock"]
+    if not isinstance(clock, dict):
+        return None
+    if clock != {"state": "unknown"}:  # noqa: SIM102 - keep this optional schema readable
+        if clock.keys() != {
+            "state",
+            "samples",
+            "adjacent_metrics_ms",
+            "ratio",
+            "max_gap_ms",
+            "last_age_ms",
+        } or (
+            clock["state"] != "observed-before-first-rtmp"
+            or not integer(clock["samples"], 128)
+            or clock["samples"] < 1
+            or clock["adjacent_metrics_ms"] is None
+            or not interval(clock["adjacent_metrics_ms"])
+            or not integer(clock["max_gap_ms"], 20000)
+            or not integer(clock["last_age_ms"], 20000)
+            or not isinstance(clock["ratio"], list)
+            or len(clock["ratio"]) != 2
+            or any(
+                type(item) not in (int, float) or not 0 <= item <= 4 or not math.isfinite(item)
+                for item in clock["ratio"]
+            )
+            or clock["ratio"][0] > clock["ratio"][1]
+        ):
+            return None
+    # Copy only validated fixed fields. A payload-size cap leaves room for the existing failure.
+    serialized = json.dumps(value, separators=(",", ":"), allow_nan=False)
+    return dict(json.loads(serialized)) if len(serialized.encode("ascii")) <= 1100 else None
+
+
+def bind_startup_input_failure(exc: BaseException, evidence: StartupInputEvidence | None) -> None:
+    """Optional evidence must never replace, wrap, or alter the original fatal exception."""
+    global SELF_TEST_STARTUP_INPUT_FAILURE
+    with contextlib.suppress(Exception):
+        value = safe_startup_input_failure(evidence.summary()) if evidence is not None else None
+        if value is not None:
+            SELF_TEST_STARTUP_INPUT_FAILURE = (exc, value)
+
+
 def kick_test_sink_rtmp_connection(connection_id: str) -> None:
     """Kick one exact loopback test-sink publisher without logging its ID."""
     if re.fullmatch(r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}", connection_id) is None:
@@ -1136,6 +1436,7 @@ class Observer(threading.Thread):
         self.cpu_first: dict[str, tuple[float, int]] = {}
         self.clock_ticks = os.sysconf("SC_CLK_TCK")
         self.monitoring_started = time.monotonic()
+        self.startup_input_observer = None
 
     def run(self) -> None:
         while not self.stop_event.is_set():
@@ -1162,6 +1463,7 @@ class Observer(threading.Thread):
                 "sink_bytes": None,
                 "capture_size": self.capture.stat().st_size if self.capture.exists() else 0,
             }
+            dut_metrics = None
             try:
                 dut_metrics = fetch_metrics(DUT_METRICS_PORT)
                 sample["dut_metrics_ok"] = True
@@ -1279,6 +1581,10 @@ class Observer(threading.Thread):
             with self.lock:
                 sample["finished"] = time.monotonic()
                 self.samples.append(sample)
+            optional_observer = self.startup_input_observer
+            if optional_observer is not None:
+                with contextlib.suppress(Exception):
+                    optional_observer(sample, dut_metrics)
             self.stop_event.wait(0.2)
 
     def snapshot(self) -> dict:
@@ -5773,6 +6079,7 @@ def main() -> int:
             work,
             os.geteuid(),
         )
+        startup_input_evidence = None
         try:
             mark_self_test_stage("auth-src-help")
             primary_helper = start_source_helper(
@@ -5783,6 +6090,11 @@ def main() -> int:
             mark_self_test_stage("auth-src-feed")
             initial_live_started = time.monotonic()
             initial_live_deadline = initial_live_started + 20
+            startup_input_evidence = StartupInputEvidence(
+                initial_live_started,
+                lambda: feeder.clock_snapshot() if feeder is not None else {"state": "unknown"},
+            )
+            observer.startup_input_observer = startup_input_evidence.observe
             feeder = start_live_feeder()
             mark_self_test_stage("auth-src-path")
             wait_helper_path(
@@ -5867,7 +6179,15 @@ def main() -> int:
                 or not feeder.healthy()
             ):
                 raise TestFailure("primary source path exited unexpectedly")
+            with contextlib.suppress(Exception):
+                optional = safe_startup_input_failure(startup_input_evidence.summary())
+                if optional is not None:
+                    result["initial_startup_input"] = optional
+        except Exception as exc:
+            bind_startup_input_failure(exc, startup_input_evidence)
+            raise
         finally:
+            observer.startup_input_observer = None
             os.close(initial_live_log_descriptor)
 
         mark_self_test_stage("auth-scan")

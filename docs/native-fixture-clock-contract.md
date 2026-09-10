@@ -609,3 +609,40 @@ fresh pre-reset checks at 8.845 s. Fourteen focused regressions cover this hando
 and rejection of incomplete, growing, missing or changed-source proof. These
 virtual timings demonstrate the code regression, not measured HK media timing;
 the corrected candidate still requires a new exact-head target acceptance run.
+
+### Retain the input side of the first startup failure
+
+The proof-carry candidate passed its PR15 CI and a separate full private HK test,
+including all 13 strict RTMP segments. Its own-HUD-only restack then failed the
+initial cumulative log gate in CI run `34487667604`: the first child spent 6.029 s
+after a 2 ms spawn without an RTMP publisher or copied-video progress. All 119
+metrics requests succeeded. A later attempt reached healthy LIVE before the
+earlier failure was reported. These observations do not identify input starvation,
+FFmpeg stream discovery, or another pre-output wait as the cause.
+
+The self-test now optionally records the first authenticated-ingest-to-first-RTMP
+window, at most 20 seconds and 128 observations, using its existing Observer and
+already-fetched DUT metrics body. It projects only fixed states and relative
+observation intervals for SRT unique bytes, parsed ingest-path bytes and the
+loopback RTSP reader's aggregate outbound bytes/RTP packets. Identity changes
+terminate the corresponding counter epoch; missing or malformed evidence is not
+turned into growth. Identities, destinations and raw counters are never exported.
+
+An optional callback also retains the feeder's transport-clock observations
+before the first RTMP publisher is observed. `adjacent_metrics_ms` identifies the
+preceding metrics interval, not the later callback's sampling time or a claim
+that RTMP had not already appeared between observations. This is a sending-clock ratio, not
+encoded-video bitrate, receiver consumption or a measurement limited to the first
+failed child. The window may contain more than one child attempt. Aggregate RTP
+growth does not prove usable H.264, successful decoding or FFmpeg consumption.
+`complete=true` means observation coverage only; it can coexist with a changed
+counter epoch and never means that the first child was healthy.
+
+The initial failure is retained by exact exception identity and stage. The new
+fixed-schema field is capped at 1100 bytes and omitted if it would exceed the
+existing 2 KiB checkpoint. Invalid optional data cannot replace the original
+fatal result. The CI projection preserves the same schema; duplicate JSON keys
+are rejected. Successful results can retain the same optional diagnostic for
+comparison, but it is not a pass/fail predicate. No runtime file, media argument,
+probe setting, recovery threshold or acceptance deadline is changed by this
+diagnostic addition. The startup cause remains unresolved pending actual evidence.
