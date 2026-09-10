@@ -505,3 +505,52 @@ regressions exercise the total-deadline failure class independently of media.
 This fix is not yet proof that the earlier HK 3.221-second failure, or any of
 the historical native cases above, is resolved. Exact-head CI and actual HK
 media acceptance results must be reported separately, including any failure.
+
+## Full HK recording: bounded offline processing budget
+
+The next full HK test completed all 13 strict RTMP segments, including at least
+90 decoded frames and the existing format/GOP/PTS/DTS/A/V checks, but its whole
+auxiliary recording's GOP scan exceeded the separate 60-second process deadline.
+The failed 854,729,003-byte recording was not retained by that failure's cleanup
+path. Its exact cause cannot be replayed or inferred from a different file.
+
+A bounded file-only experiment used the unchanged 72-second LIVE generator from
+self-test SHA `29f4df2d4ef998c2846df35adb63170e05c571b236c97f783c0aa98fcf4b069b`.
+Stream-copy looping produced a 936.021-second, 953,757,832-byte synthetic FLV:
+1080x1920 H.264 Main Level 4.0, yuv420p, 30 FPS, GOP 60, AAC-LC mono 48 kHz.
+On the pinned HK FFmpeg/ffprobe 4.4.2 under a 180% CPU / 2 GiB cgroup, the original
+60-second GOP probe timed out after emitting only 7,812 of 28,080 frame records.
+Explicit decoder-thread controls also timed out; no thread setting was changed.
+Partial records were not accepted as complete validation.
+
+One separate, finite calibration kept the original commands and parsers but
+gave each measured offline process a diagnostic 300-second deadline:
+
+| Complete scan | Actual elapsed seconds | Result |
+| --- | ---: | --- |
+| Original GOP helper | 212.701 | 28,080 frames, 468 keyframes, every interval 60 |
+| Original decoded-video helper | 210.888 | Every frame 1080x1920/yuv420p, complete monotonic PTS |
+| Original FFmpeg A/V decoder | 236.126 | Exit 0, no warnings or decode errors |
+
+Both frame scans had empty stderr; the decoded-video scan found no resolution
+regression. All processes were reaped and the two generated media files removed;
+the installed runtime and production credentials were unchanged. The numerical calibration result has
+SHA256 `4eac48b29e230e9ecb32b95c9c71d54bfdff01c8cbb02da9bdf46eb73c284c60`.
+This proves that 60 seconds is insufficient for a valid long synthetic recording
+on this target. It does not prove the deleted original recording was clean or
+explain an earlier CI startup timeout. The calibration is not full acceptance.
+
+Only the full self-test's three aggregate video-processing calls now receive
+`min(300, max(60, ceil(recording_duration_seconds / 3)))` seconds. Duration must
+be finite and positive; invalid metadata fails closed. The cap is applied before
+division as well, avoiding overflow from oversized metadata. The full result
+records the selected budget. For this fixture it is 300 seconds, about 27% above
+the slowest measured scan; this is a bounded allowance, not a load guarantee.
+
+Helper defaults and quick aggregate probes remain 60 seconds. The installer
+quick-test limit remains 660 seconds. Audio-only and packet scans remain 60 and
+30 seconds; the 15-second strict reader, 90-frame minimum, three-second continuity
+gate, startup/recovery policies, media arguments and all validity assertions are
+unchanged. A process timeout still kills/reaps the probe and fails the test; no
+partial output or negative result is converted into a PASS. A complete target
+run with the changed candidate is required before accepting this correction.

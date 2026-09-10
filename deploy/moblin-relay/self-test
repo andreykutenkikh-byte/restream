@@ -2462,7 +2462,7 @@ def generate_live(work: Path) -> Path:
     return output
 
 
-def video_gop_signature(path: Path) -> dict:
+def video_gop_signature(path: Path, *, timeout: float = 60) -> dict:
     completed = run_probe(
         [
             str(FFPROBE),
@@ -2477,7 +2477,7 @@ def video_gop_signature(path: Path) -> dict:
             "json",
             str(path),
         ],
-        timeout=60,
+        timeout=timeout,
     )
     if completed.returncode != 0:
         raise TestFailure(f"ffprobe frame scan failed for {path.name}")
@@ -2537,6 +2537,20 @@ def stream_signature(path: Path, *, include_gop: bool = True) -> dict:
     if include_gop:
         result["video_gop"] = video_gop_signature(path)
     return result
+
+
+def aggregate_probe_timeout_seconds(duration: float | None, *, quick: bool) -> int:
+    """Budget only the full test's three long, offline video scans."""
+    if quick:
+        return 60
+    if (
+        type(duration) not in (int, float)
+        or duration <= 0
+        or (type(duration) is float and not math.isfinite(duration))
+    ):
+        raise TestFailure("invalid aggregate capture duration for offline probe budget")
+    # Cap before division as well, so even very large finite metadata is safe.
+    return min(300, max(60, math.ceil(min(duration, 900) / 3)))
 
 
 def validate_portrait_asset(
@@ -3801,7 +3815,7 @@ def analyze_timestamps(capture: Path) -> dict:
     }
 
 
-def analyze_decoded_video_frames(capture: Path) -> dict:
+def analyze_decoded_video_frames(capture: Path, *, timeout: float = 60) -> dict:
     command = [
         str(FFPROBE),
         "-v",
@@ -3816,7 +3830,7 @@ def analyze_decoded_video_frames(capture: Path) -> dict:
         "compact=p=0:nk=0",
         str(capture),
     ]
-    completed = run_probe(command, timeout=60)
+    completed = run_probe(command, timeout=timeout)
     frame_count = 0
     dimensions: dict[str, int] = {}
     pixel_formats: dict[str, int] = {}
@@ -7067,6 +7081,11 @@ def main() -> int:
         result["aggregate_rtsp_capture_corruption_oracle"] = False
         mark_self_test_stage("streams")
         normalized_signature = stream_signature(capture, include_gop=False)
+        aggregate_probe_timeout = aggregate_probe_timeout_seconds(
+            normalized_signature.get("duration_seconds"), quick=args.quick
+        )
+        if not args.quick:
+            result["aggregate_probe_timeout_seconds"] = aggregate_probe_timeout
         normalized_streams = normalized_signature.get("streams", [])
         if len(normalized_streams) != 2:
             raise TestFailure("normalized capture does not contain exactly video and audio")
@@ -7080,7 +7099,9 @@ def main() -> int:
         )
         result["aggregate_format_diagnostic_passed"] = format_failure is None
         mark_self_test_stage("gop")
-        normalized_signature["video_gop"] = video_gop_signature(capture)
+        normalized_signature["video_gop"] = video_gop_signature(
+            capture, timeout=aggregate_probe_timeout
+        )
         normalized_gop_intervals = normalized_signature["video_gop"].get("interval_frames", [])
         aggregate_gop_diagnostic_passed = not (
             not normalized_gop_intervals
@@ -7112,7 +7133,7 @@ def main() -> int:
                 "null",
                 "-",
             ],
-            timeout=60,
+            timeout=aggregate_probe_timeout,
         )
         decode_text = decode.stderr
         # A single long-lived RTSP-to-FLV recorder observes several independent
@@ -7131,7 +7152,9 @@ def main() -> int:
         result["decode_error_pattern_found"] = bool(media_corruption.search(decode_text))
 
         mark_self_test_stage("frames")
-        result["decoded_video_frames"] = analyze_decoded_video_frames(capture)
+        result["decoded_video_frames"] = analyze_decoded_video_frames(
+            capture, timeout=aggregate_probe_timeout
+        )
         decoded_frames = result["decoded_video_frames"]
         landscape_regression_absent = decoded_frames["landscape_1280x720_frames"] == 0
         legacy_portrait_regression_absent = decoded_frames["legacy_portrait_720x1280_frames"] == 0

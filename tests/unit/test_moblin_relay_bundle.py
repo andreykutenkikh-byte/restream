@@ -706,7 +706,8 @@ def test_self_test_classifies_first_absence_before_natural_idle_window() -> None
     assert "final_reset_log_offset = os.fstat(transition_log_descriptor).st_size" in source
 
 
-def test_self_test_aggregate_decoder_uses_full_process_deadline() -> None:
+@pytest.mark.parametrize("timeout", [60, 300])
+def test_self_test_aggregate_decoder_uses_full_process_deadline(timeout: int) -> None:
     namespace = load_self_test()
     tree = ast.parse(SELF_TEST.read_text(encoding="utf-8"))
     assignments = {
@@ -722,16 +723,19 @@ def test_self_test_aggregate_decoder_uses_full_process_deadline() -> None:
         "exec",
     )
     namespace["capture"] = Path("isolated-aggregate.flv")
+    namespace["aggregate_probe_timeout"] = timeout
     with patch("subprocess.run", return_value=SimpleNamespace(stderr="decode warning")) as run:
         exec(block, namespace)  # noqa: S102 - fixed, repository-owned decoder AST
-    assert run.call_args.kwargs["timeout"] == 60
+    assert run.call_args.kwargs["timeout"] == timeout
     assert run.call_args.kwargs["stdout"] == subprocess.PIPE
     assert run.call_args.kwargs["stderr"] == subprocess.PIPE
     assert run.call_args.kwargs["text"] is True
     assert namespace["decode_text"] == "decode warning"
     assert "explode" in run.call_args.args[0]
     with (
-        patch("subprocess.run", side_effect=subprocess.TimeoutExpired(["private-fixture"], 60)),
+        patch(
+            "subprocess.run", side_effect=subprocess.TimeoutExpired(["private-fixture"], timeout)
+        ),
         pytest.raises(namespace["TestFailure"], match="^local media probe timed out$"),
     ):
         exec(block, namespace)  # noqa: S102 - fixed, repository-owned decoder AST
@@ -2813,7 +2817,7 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
         main_after_continuity.index("safe_stop(dut, process_group=True)")
     )
     assert decode_block.index('mark_self_test_stage("gop")') < decode_block.index(
-        'normalized_signature["video_gop"] = video_gop_signature(capture)'
+        'normalized_signature["video_gop"] = video_gop_signature('
     )
     assert decode_block.index('mark_self_test_stage("decoder")') < decode_block.index(
         "decode = run_probe("
@@ -2834,7 +2838,7 @@ def test_self_test_emits_only_root_run_scoped_allowlisted_stages() -> None:
     assert 'raise TestFailure("capture frame validation failed")' not in decode_block
     assert 'raise TestFailure("capture timestamp validation failed")' not in decode_block
     assert decode_block.index('mark_self_test_stage("frames")') < decode_block.index(
-        'result["decoded_video_frames"] = analyze_decoded_video_frames(capture)'
+        'result["decoded_video_frames"] = analyze_decoded_video_frames('
     )
     assert decode_block.index('mark_self_test_stage("timestamps")') < decode_block.index(
         'result["decoded_audio_timestamps"] = analyze_decoded_audio_timestamps(capture)'
