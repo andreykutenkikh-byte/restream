@@ -583,3 +583,29 @@ Startup timeout emits one bounded, fixed-schema diagnostic without credentials
 or publisher identities. Same-session continuity failures retain the existing
 safe per-track RTSP capture observations before cleanup; those observations must
 not be relabeled as actual RTMP emission or decoded playback timing.
+
+### Preserve independently verified input-idle proof at a video stop
+
+Candidate `6802d58` passed initial LIVE and same-session recovery on HK but failed
+the subsequent persistent-input-stall confirmation deadline. Its exact-tree CI
+run `34483509175` failed at the same `stuck-open` checkpoint. The HK log showed
+`video-stalled` before the missing confirmation; neither run is full acceptance.
+
+The video-stop path discarded the watchdog's existing joint input/output idle
+proof, restarting the six-second grace after stopping FFmpeg. It now carries
+that proof under the same conditions as the existing output-fallback path:
+the same source identity and counter, an uninterrupted idle interval and at least
+three corroborating observations. Video failure alone cannot create this proof.
+Byte growth, missing metrics, identity changes and counter regressions invalidate
+it as before. The six-second grace, subsequent exact-source observations and
+fresh pre-reset checks remain mandatory; reset-eligible failure reasons remain
+empty. No recovery deadline or media acceptance assertion has been relaxed.
+
+A deterministic test runs the actual supervisor with real OS progress pipes,
+virtual 190 ms successful metrics reads and a mocked reset API. With identical
+inputs, discarding the existing proof misses the original nine-second budget;
+carrying it confirms the full six-second interval at 8.365 s and completes both
+fresh pre-reset checks at 8.845 s. Fourteen focused regressions cover this handoff
+and rejection of incomplete, growing, missing or changed-source proof. These
+virtual timings demonstrate the code regression, not measured HK media timing;
+the corrected candidate still requires a new exact-head target acceptance run.

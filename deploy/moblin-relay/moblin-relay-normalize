@@ -1191,13 +1191,15 @@ class MediaWatchdog:
         # interval. Restarting the six-second timer after a two-second watchdog
         # delay would needlessly delay recovery beyond the transport idle gate.
         # Missing metrics, byte growth and identity changes discard this proof.
-        # A slow successful output scrape can reach its fallback before the
-        # next ingest corroboration. Keep the same already-observed joint proof
-        # in that case; the full grace and fresh pre-reset checks still apply.
+        # A slow output scrape or the independent video deadline can stop the
+        # child before the next ingest corroboration. Neither stop reason is
+        # source-stall evidence: carry only existing joint-counter proof, with
+        # the full six-second grace and fresh pre-reset checks still required.
         if (
             self.failure_reason not in {
                 RESTART_REASON_VERIFIED_STALL,
                 RESTART_REASON_OUTPUT_FALLBACK,
+                RESTART_REASON_VIDEO_STALLED,
             }
             or self.ingest_connection_id != source_id
             or self.ingest_counter is None
