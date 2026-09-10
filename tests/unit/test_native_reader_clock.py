@@ -997,6 +997,7 @@ def test_main_proves_old_bsf_then_loops_prepared_source_but_validates_original(h
     assert events[2][1].name == events[4][1].name == "prepared-source.ts"
     assert events[-2][1:] == events[-1][1:]
     assert events[-1][1] == events[3][1] and events[-1][2] == events[4][1]
+    assert not events[-1][1].parent.exists()  # The complete paired work tree was removed.
     assert helper["WORK_SECONDS"] == 132 and helper["JITTER_SECONDS"] == 0.022
 
 

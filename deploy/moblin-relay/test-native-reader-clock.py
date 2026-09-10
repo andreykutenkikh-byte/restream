@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""CI-only counterfactual: old pacing times out the unchanged strict RTMP reader."""
+"""CI-only source-clock regression and unchanged strict-reader media acceptance."""
 
 from __future__ import annotations
 
@@ -49,6 +49,13 @@ FRAME = re.compile(
 
 class ProbeFailure(Exception):
     """Only fixed reasons and bounded numeric evidence leave this fixture."""
+
+
+class CaseFailure(ProbeFailure):
+    def __init__(self, outcome, reason, evidence=None):
+        super().__init__(reason)
+        self.outcome = outcome
+        self.evidence = evidence or {}
 
 
 def require(condition, reason):
@@ -290,14 +297,166 @@ def expected_old_timeout(error, failure_class, progress):
     cause = error.__cause__
     return (
         type(error) is failure_class
+        and str(error) == "strict RTMP sink media read timed out"
         and isinstance(cause, subprocess.TimeoutExpired)
         and cause.timeout == 15
         and progress.get("reader_input") is True
         and progress.get("reader_output") is True
-        and 0 < progress.get("reader_frames", 0) < 90
-        and progress.get("reader_last_frame_seconds", 0)
-        > progress.get("reader_first_frame_seconds", 0)
+        and type(progress.get("reader_frames")) is int
+        and 0 < progress["reader_frames"] < 90
+        and all(
+            type(progress.get(key)) in (int, float)
+            and math.isfinite(progress[key])
+            # Pipe-observer timestamps can be recorded while reaping/draining
+            # the timed-out reader. Its actual deadline is cause.timeout above.
+            and 0 <= progress[key] <= WORK_SECONDS
+            for key in ("reader_first_frame_seconds", "reader_last_frame_seconds")
+        )
+        and progress["reader_last_frame_seconds"] > progress["reader_first_frame_seconds"]
     )
+
+
+def source_clock_passes(rate):
+    """The same wall-time predicate for both historical and fixed pacing."""
+    return (
+        type(rate) in (int, float)
+        and math.isfinite(rate)
+        and RATE_BOUNDS["fixed"][0] <= rate <= RATE_BOUNDS["fixed"][1]
+    )
+
+
+def validate_clock_evidence(case, measure, byte_rate, chunk_bytes):
+    """Use every successful send from first to last, not one buffered burst."""
+    valid = (
+        case in RATE_BOUNDS
+        and isinstance(measure, dict)
+        and type(byte_rate) in (int, float)
+        and math.isfinite(byte_rate)
+        and 0 < byte_rate <= 10**7
+        and type(chunk_bytes) is int
+        and 0 < chunk_bytes <= 65535
+        and type(measure.get("bytes")) is int
+        and chunk_bytes < measure["bytes"] <= 2**31
+        and type(measure.get("waits")) is int
+        and 0 < measure["waits"] <= 10**6
+        and all(
+            type(measure.get(key)) in (int, float)
+            and math.isfinite(measure[key])
+            and measure[key] >= 0
+            for key in ("first", "last")
+        )
+    )
+    if not valid:
+        raise CaseFailure("FIXTURE_PRECONDITION_FAILURE", "source clock evidence is invalid")
+    elapsed = measure["last"] - measure["first"]
+    media_seconds = (measure["bytes"] - chunk_bytes) / byte_rate
+    if not (0 < elapsed <= WORK_SECONDS and 2 * PHASE_GOPS <= media_seconds <= WORK_SECONDS):
+        raise CaseFailure("FIXTURE_PRECONDITION_FAILURE", "source clock interval is incomplete")
+    rate = media_seconds / elapsed
+    passed = source_clock_passes(rate)
+    evidence = {
+        "clock_result": "PASS" if passed else "FAIL",
+        "transport_rate": round(rate, 6),
+        "transport_seconds": round(elapsed, 6),
+        "media_seconds": round(media_seconds, 6),
+        "predicate_low": RATE_BOUNDS["fixed"][0],
+        "predicate_high": RATE_BOUNDS["fixed"][1],
+    }
+    if passed != (case == "fixed") or not RATE_BOUNDS[case][0] <= rate <= RATE_BOUNDS[case][1]:
+        raise CaseFailure(
+            "FIXTURE_PRECONDITION_FAILURE", "source clock regression failed", evidence
+        )
+    return evidence
+
+
+def classify_capture_failure(case, error, failure_class, progress):
+    if case == "single" and expected_old_timeout(error, failure_class, progress):
+        return {
+            "reader_outcome": "EXPECTED_READER_TIMEOUT",
+            "decoded_frames": None,
+            "full_validation": False,
+        }
+    if isinstance(error.__cause__, subprocess.TimeoutExpired):
+        reason = (
+            "fixed strict reader deadline failed"
+            if case == "fixed"
+            else "reader timeout preconditions failed"
+        )
+        raise CaseFailure("FIXTURE_PRECONDITION_FAILURE", reason) from error
+    raise CaseFailure("DECODE_OR_FORMAT_FAILURE", "strict reader capture failed") from error
+
+
+def validate_reader_segment(
+    namespace, capture, size, expected_video, *, process_metadata_guard=lambda _command: None
+):
+    """Observe the real validator's decoded count; never replace its checks."""
+    validator = namespace["validate_final_sink_media_segment"]
+    globals_ = validator.__globals__
+    original_analyze = globals_.get("analyze_decoded_video_frames")
+    if not callable(original_analyze) or globals_.get("STRICT_SINK_REQUIRED_VIDEO_FRAMES") != 90:
+        raise CaseFailure(
+            "FIXTURE_PRECONDITION_FAILURE", "production decoded validator is unavailable"
+        )
+    observed = []
+
+    def observe(path):
+        result = original_analyze(path)
+        observed.append(result)
+        return result
+
+    globals_["analyze_decoded_video_frames"] = observe
+    try:
+        result = validator(capture, size, expected_video, process_metadata_guard, segment_index=1)
+    except namespace["TestFailure"] as error:
+        decoded = observed[0] if len(observed) == 1 and isinstance(observed[0], dict) else {}
+        count = decoded.get("frame_count")
+        evidence = {
+            "decoded_frames": count if type(count) is int and 0 <= count <= 10000 else None,
+            "full_validation": False,
+        }
+        reason = str(error)
+        outcome = "DECODE_OR_FORMAT_FAILURE"
+        if reason == "strict RTMP sink media cleanup failed":
+            outcome = "CLEANUP_FAILURE"
+        elif reason.startswith("strict RTMP sink timestamp validation failed ("):
+            outcome = "TIMESTAMP_OR_AV_SYNC_FAILURE"
+        elif (
+            reason == "strict RTMP sink video frame validation failed"
+            and type(count) is int
+            and 0 <= count < globals_["STRICT_SINK_REQUIRED_VIDEO_FRAMES"]
+            and decoded.get("ffprobe_exit") == 0
+            and decoded.get("unexpected_dimension_frames") == 0
+            and decoded.get("unexpected_pixel_format_frames") == 0
+            and (
+                decoded.get("decode_error_flags") == {}
+                or decoded.get("decode_error_flags") is False
+            )
+            and decoded.get("stderr_empty") is True
+        ):
+            outcome = "SHORT_EOF"
+        raise CaseFailure(
+            outcome, "strict reader full media validation failed", evidence
+        ) from error
+    finally:
+        globals_["analyze_decoded_video_frames"] = original_analyze
+    count = result.get("video_frames") if isinstance(result, dict) else None
+    # Even an accidentally bypassed validator must not invent decoded evidence.
+    if not (
+        len(observed) == 1
+        and isinstance(observed[0], dict)
+        and type(count) is int
+        and globals_["STRICT_SINK_REQUIRED_VIDEO_FRAMES"] <= count <= 10000
+        and type(observed[0].get("frame_count")) is int
+        and observed[0].get("frame_count") == count
+    ):
+        raise CaseFailure(
+            "FIXTURE_PRECONDITION_FAILURE", "full decoded validation evidence missing"
+        )
+    return {
+        "reader_outcome": "VALID_SEGMENT_COMPLETED",
+        "decoded_frames": count,
+        "full_validation": True,
+    }
 
 
 def sink_config(port, metrics_port):
@@ -571,6 +730,53 @@ def configure(namespace, work, sink_port, deadline):
     return globals_
 
 
+def cleanup_case(feeder, feeder_started, processes, observer, port, metrics_port, udp):
+    errors = []
+
+    def attempt(operation):
+        try:
+            operation()
+        except Exception as error:
+            errors.append(error)
+
+    if feeder_started:
+        attempt(lambda: require(feeder.finish(timeout=2), "feeder cleanup failed"))
+
+    def stop(process):
+        try:
+            process.terminate()
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1)
+        except ProcessLookupError:
+            # Reap even when a process exited immediately before termination.
+            process.wait(timeout=1)
+
+    for process in reversed(processes):
+        attempt(lambda process=process: stop(process))
+    if observer is not None:
+        attempt(lambda: observer.join(timeout=1))
+        attempt(lambda: require(not observer.is_alive(), "observer cleanup failed"))
+        attempt(observer.pipe.close)
+
+    def check_tcp(tcp_port):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as check:
+            check.settimeout(0.25)
+            require(check.connect_ex(("127.0.0.1", tcp_port)) != 0, "TCP port cleanup failed")
+
+    for tcp_port in (port, metrics_port):
+        attempt(lambda tcp_port=tcp_port: check_tcp(tcp_port))
+
+    def check_udp():
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as check:
+            check.bind(("127.0.0.1", udp))
+
+    attempt(check_udp)
+    if errors:
+        raise CaseFailure("CLEANUP_FAILURE", "reader clock fixture cleanup failed") from errors[0]
+
+
 def run_case(case, namespace, live, prepared, work, deadline):
     port, metrics_port = free_port(socket.SOCK_STREAM), free_port(socket.SOCK_STREAM)
     udp = free_port(socket.SOCK_DGRAM)
@@ -632,6 +838,7 @@ def run_case(case, namespace, live, prepared, work, deadline):
         require(all(process.poll() is None for process in processes), "fixture process exited")
         require(feeder.healthy(), "fixture feeder stopped")
 
+    result = {"case": case, "decoded_frames": None, "full_validation": False}
     try:
         start([str(MEDIAMTX), str(config)])
         namespace["wait_tcp"](port, timeout=5)
@@ -706,19 +913,13 @@ def run_case(case, namespace, live, prepared, work, deadline):
 
         original_subprocess = globals_["subprocess"]
         globals_["subprocess"] = SimpleNamespace(**(vars(subprocess) | {"Popen": reader_popen}))
-        expected_failure = False
+        capture_error = None
         try:
             capture, size = namespace["capture_final_sink_media_segment"](
                 work, 1, lambda _command: None, reader_diagnostic=diagnostic
             )
         except namespace["TestFailure"] as error:
-            print(json.dumps({"case": case, "reader_failure": diagnostic.snapshot()}), flush=True)
-            require(
-                case == "single"
-                and expected_old_timeout(error, namespace["TestFailure"], diagnostic.snapshot()),
-                "strict reader failed outside expected old-clock timeout",
-            )
-            expected_failure = True
+            capture_error = error
         finally:
             # Later signature/validation probes must not mutate reader timing.
             globals_["subprocess"] = original_subprocess
@@ -726,64 +927,87 @@ def run_case(case, namespace, live, prepared, work, deadline):
         require(len(spawned) == 1, "strict reader was not launched exactly once")
         with lock:
             after = dict(measure)
+        result["reader"] = diagnostic.snapshot()
+        result["clock"] = validate_clock_evidence(
+            case, after, byte_rate, namespace["LIVE_FEED_CHUNK_BYTES"]
+        )
         frames = finish_phase(observer, gate, case, deadline, healthy)
         next_idr = validate_phase(frames, gate, spawned[0], case, prior_frames)
         rate = (after["bytes"] - before["bytes"]) / (after["last"] - before["last"]) / byte_rate
         require(RATE_BOUNDS[case][0] <= rate <= RATE_BOUNDS[case][1], "feeder rate changed")
         require(after["waits"] > before["waits"], "scheduler injection was not exercised")
+        result.update(
+            transport_rate=round(rate, 6),
+            launch_age_seconds=round(spawned[0] - gate[2], 6),
+            next_idr_seconds=next_idr,
+            max_send_gap=round(after["max_gap"], 6),
+            max_wait_overrun=round(after["max_overrun"], 6),
+        )
+        if capture_error is not None:
+            result.update(
+                classify_capture_failure(
+                    case, capture_error, namespace["TestFailure"], diagnostic.snapshot()
+                )
+            )
+        else:
+            expected = namespace["stream_signature"](live, include_gop=False)["streams"][0]
+            result.update(validate_reader_segment(namespace, capture, size, expected))
+    except Exception as error:
+        failure = (
+            error
+            if isinstance(error, CaseFailure)
+            else CaseFailure("FIXTURE_PRECONDITION_FAILURE", "reader fixture precondition failed")
+        )
         print(
             json.dumps(
-                {
-                    "case": case,
-                    "transport_rate": round(rate, 6),
-                    "launch_age_seconds": round(spawned[0] - gate[2], 6),
-                    "next_idr_seconds": next_idr,
-                    "max_send_gap": round(after["max_gap"], 6),
-                    "max_wait_overrun": round(after["max_overrun"], 6),
-                    "reader": diagnostic.snapshot(),
-                    "expected_timeout": expected_failure,
-                }
+                {"case_result": result | failure.evidence | {"reader_outcome": failure.outcome}}
             ),
             flush=True,
         )
-        require(expected_failure == (case == "single"), "old strict reader timeout not reproduced")
-        if case == "fixed":
-            expected = namespace["stream_signature"](live, include_gop=False)["streams"][0]
-            namespace["validate_final_sink_media_segment"](
-                capture, size, expected, lambda _command: None, segment_index=1
-            )
+        if failure is error:
+            raise
+        raise failure from error
     finally:
-        errors = []
-        if feeder_started and not feeder.finish(timeout=2):
-            errors.append("feeder")
-        for process in reversed(processes):
-            try:
-                process.terminate()
-                process.wait(timeout=1)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                try:
-                    process.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    errors.append("process")
-            except ProcessLookupError:
-                pass
-        if observer is not None:
-            observer.join(timeout=1)
-            if observer.is_alive():
-                errors.append("observer")
-            observer.pipe.close()
-        for tcp_port in (port, metrics_port):
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as check:
-                check.settimeout(0.25)
-                if check.connect_ex(("127.0.0.1", tcp_port)) == 0:
-                    errors.append("tcp")
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as check:
-            try:
-                check.bind(("127.0.0.1", udp))
-            except OSError:
-                errors.append("udp")
-        require(not errors, "reader clock fixture cleanup failed")
+        try:
+            cleanup_case(feeder, feeder_started, processes, observer, port, metrics_port, udp)
+        except CaseFailure:
+            print(
+                json.dumps({"case_result": result | {"reader_outcome": "CLEANUP_FAILURE"}}),
+                flush=True,
+            )
+            raise
+    print(json.dumps({"case_result": result}), flush=True)
+    return result
+
+
+def run_pair(loader, live, prepared, work, deadline):
+    failures = []
+    results = []
+    for case in ("single", "fixed"):
+        directory = work / case
+        directory.mkdir(mode=0o700)
+        try:
+            require(deadline - time.monotonic() >= 18, "insufficient paired reader budget")
+            results.append(run_case(case, loader(case), live, prepared, directory, deadline))
+        except ProbeFailure as error:
+            # A second independent case is evidence, never a fallback/retry.
+            failures.append(error)
+            print(
+                json.dumps(
+                    {
+                        "paired_case_failure": {
+                            "case": case,
+                            "reader_outcome": error.outcome
+                            if isinstance(error, CaseFailure)
+                            else "FIXTURE_PRECONDITION_FAILURE",
+                        }
+                    }
+                ),
+                flush=True,
+            )
+    if failures:
+        raise ProbeFailure("reader clock paired acceptance failed") from failures[0]
+    return results
 
 
 def main():
@@ -802,8 +1026,9 @@ def main():
     )
     os.environ.pop("MOBLIN_RELAY_SELF_TEST_STAGE_FILE", None)
     loader = runpy.run_path(str(CLOCK_HELPER), run_name="_reader_clock_loader")["load_feeder"]
-    with TemporaryDirectory(prefix="native-reader-clock-") as temporary:
-        work = Path(temporary)
+    temporary = TemporaryDirectory(prefix="native-reader-clock-")
+    try:
+        work = Path(temporary.name)
         namespace = loader("fixed")
         globals_ = configure(namespace, work, 1, deadline)
         original = work / "original-four-second-source"
@@ -817,10 +1042,13 @@ def main():
         live = namespace["generate_live"](work)
         prepared = prepare_loop_source(namespace, live, work)
         verify_source_loop(namespace, prepared, work, 8)
-        for case in ("single", "fixed"):
-            directory = work / case
-            directory.mkdir(mode=0o700)
-            run_case(case, loader(case), live, prepared, directory, deadline)
+        run_pair(loader, live, prepared, work, deadline)
+    finally:
+        try:
+            temporary.cleanup()
+        except Exception as error:
+            print(json.dumps({"reader_outcome": "CLEANUP_FAILURE"}), flush=True)
+            raise CaseFailure("CLEANUP_FAILURE", "reader temporary-file cleanup failed") from error
     print(
         "Strict RTMP reader clock counterfactual verified; owned-process cleanup passed", flush=True
     )
