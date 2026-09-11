@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 import runpy
@@ -16,6 +17,7 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
+from typing import Any
 
 STAGED = {
     "self-test": Path("/tmp/adojapan-ci-clock-self-test.py"),  # noqa: S108
@@ -324,12 +326,245 @@ def prefix_summary(result, progress, state, code):
     }
 
 
+# Compatibility duplicate of the three pure CI projection helpers below.
+# The isolated runner cannot import control-plane dependencies. AST-parity
+# tests pin these bodies and marker sets to ci_node_onboarding_smoke.py.
+_MEDIA_DIAGNOSTIC_MARKERS = frozenset(
+    {
+        "attached",
+        "active",
+        "detached",
+        "child-exit",
+        "start-timeout",
+        "metrics-blind",
+        "output-identity",
+        "output-regression",
+        "output-fallback",
+        "ingest-timing",
+        "ingest-missing",
+        "ingest-identity",
+        "ingest-regression",
+        "verified-stall",
+        "ingest-confirmed-stall",
+        "watchdog-unknown",
+        "reset-requested",
+        "reset-succeeded",
+    }
+)
+_MEDIA_FIRST_SEEN_MARKERS = frozenset({"attached", "active", "start-timeout", "child-exit"})
+
+
+def _diagnostic_seconds(value: Any, maximum: float = 660) -> bool:
+    # Compare the bound before isfinite so enormous JSON integers cannot overflow.
+    return type(value) in {int, float} and 0 <= value <= maximum and math.isfinite(value)
+
+
+def _safe_source_clock(value: Any) -> dict[str, Any] | None:
+    """Project only one fixture sending episode, never transport identities."""
+    if not isinstance(value, dict):
+        return None
+    if value == {"state": "unknown"}:
+        return {"state": "unknown"}
+    seconds = {"seconds", "last_age", "max_gap", "discarded"}
+    if (
+        value.keys() != {"state", "packets", "ratio", "rebases"} | seconds
+        or value["state"] != "known"
+        or type(value["packets"]) is not int
+        or not 2 <= value["packets"] <= 1_000_000
+        or type(value["rebases"]) is not int
+        or not 0 <= value["rebases"] <= 1_000_000
+        or any(not _diagnostic_seconds(value[name]) for name in seconds)
+        or value["seconds"] < 1
+        or value["max_gap"] > value["seconds"]
+        or not _diagnostic_seconds(value["ratio"], 4)
+    ):
+        return None
+    return {
+        **{name: value[name] for name in ("state", "packets", "rebases")},
+        **{name: round(value[name], 6) for name in (*sorted(seconds), "ratio")},
+    }
+
+
+def _safe_failure_media(value: Any) -> dict[str, Any] | None:
+    """Reject the entire nested diagnostic on any non-schema value; never reflect text."""
+    required = {"scope", "elapsed_seconds", "log_ok", "markers", "first_seen"}
+    optional = {"supervisor_count", "child_count", "supervisor_seen_seconds", "child_seen_seconds"}
+    reader = {"reader_input", "reader_output", "reader_frames"}
+    reader_timings = {
+        "reader_input_seconds": "reader_input",
+        "reader_output_seconds": "reader_output",
+        "reader_first_frame_seconds": "reader_frames",
+        "reader_last_frame_seconds": "reader_frames",
+    }
+    probe_timings = ("reader_probe_start_seconds", "reader_probe_end_seconds")
+    if not isinstance(value, dict) or not required <= value.keys():
+        return None
+    scope = value.get("scope")
+    if not isinstance(scope, str) or scope not in {"crash", "capture"}:
+        return None
+    if scope == "capture":
+        required |= reader
+        optional |= (
+            reader_timings.keys()
+            | set(probe_timings)
+            | {
+                "reader_media_seconds",
+                "reader_nal_events",
+                "reader_inspection_limited",
+                "source_clock",
+            }
+        )
+    if not required <= value.keys() or not value.keys() <= required | optional:
+        return None
+    elapsed = value["elapsed_seconds"]
+    if not _diagnostic_seconds(elapsed) or type(value["log_ok"]) is not bool:
+        return None
+    markers, first_seen = value["markers"], value["first_seen"]
+    if (
+        not isinstance(markers, dict)
+        or not markers.keys() <= _MEDIA_DIAGNOSTIC_MARKERS
+        or any(type(count) is not int or not 1 <= count <= 255 for count in markers.values())
+        or not isinstance(first_seen, dict)
+        or not first_seen.keys() <= _MEDIA_FIRST_SEEN_MARKERS & markers.keys()
+        or any(not _diagnostic_seconds(seconds, elapsed) for seconds in first_seen.values())
+    ):
+        return None
+    for name in ("supervisor_count", "child_count"):
+        if name in value and (type(value[name]) is not int or not 0 <= value[name] <= 32):
+            return None
+    for name in ("supervisor_seen_seconds", "child_seen_seconds"):
+        if name in value and not _diagnostic_seconds(value[name], elapsed):
+            return None
+    if scope == "capture" and (
+        type(value["reader_input"]) is not bool
+        or type(value["reader_output"]) is not bool
+        or type(value["reader_frames"]) is not int
+        or not 0 <= value["reader_frames"] <= 10000
+    ):
+        return None
+    if scope == "capture":
+        if "source_clock" in value and _safe_source_clock(value["source_clock"]) is None:
+            return None
+        if "reader_inspection_limited" in value and value["reader_inspection_limited"] is not True:
+            return None
+        if "reader_nal_events" in value:
+            events = value["reader_nal_events"]
+            if (
+                not isinstance(events, dict)
+                or not events
+                or not events.keys() <= {"sps", "pps", "idr", "non_idr"}
+            ):
+                return None
+            for event in events.values():
+                if (
+                    not isinstance(event, dict)
+                    or event.keys() != {"count", "first_seconds", "last_seconds"}
+                    or type(event["count"]) is not int
+                    or not 1 <= event["count"] <= 255
+                    or not _diagnostic_seconds(event["first_seconds"], elapsed)
+                    or not _diagnostic_seconds(event["last_seconds"], elapsed)
+                    or event["first_seconds"] > event["last_seconds"]
+                    or (
+                        "reader_input_seconds" in value
+                        and _diagnostic_seconds(value["reader_input_seconds"], elapsed)
+                        and event["last_seconds"] > value["reader_input_seconds"]
+                    )
+                ):
+                    return None
+        for name in probe_timings:
+            if name in value and not _diagnostic_seconds(value[name], elapsed):
+                return None
+        if "reader_probe_end_seconds" in value and (
+            "reader_probe_start_seconds" not in value
+            or value["reader_probe_end_seconds"] < value["reader_probe_start_seconds"]
+        ):
+            return None
+        for name, evidence in reader_timings.items():
+            if name in value and (
+                not value[evidence] or not _diagnostic_seconds(value[name], elapsed)
+            ):
+                return None
+        if "reader_input_seconds" in value and any(
+            value[name] > value["reader_input_seconds"] for name in probe_timings if name in value
+        ):
+            return None
+        if (
+            "reader_first_frame_seconds" in value
+            and "reader_last_frame_seconds" in value
+            and value["reader_first_frame_seconds"] > value["reader_last_frame_seconds"]
+        ):
+            return None
+        # Buffered media can advance faster than the reader's wall clock.
+        if "reader_media_seconds" in value and not _diagnostic_seconds(
+            value["reader_media_seconds"]
+        ):
+            return None
+    result = dict(value)
+    result["elapsed_seconds"] = round(elapsed, 3)
+    result["markers"] = dict(markers)
+    result["first_seen"] = {name: round(seconds, 3) for name, seconds in first_seen.items()}
+    if "source_clock" in value:
+        result["source_clock"] = _safe_source_clock(value["source_clock"])
+    if "reader_nal_events" in value:
+        result["reader_nal_events"] = {
+            name: {
+                "count": event["count"],
+                "first_seconds": round(event["first_seconds"], 3),
+                "last_seconds": round(event["last_seconds"], 3),
+            }
+            for name, event in value["reader_nal_events"].items()
+        }
+    for name in (
+        "supervisor_seen_seconds",
+        "child_seen_seconds",
+        *reader_timings,
+        *probe_timings,
+        "reader_media_seconds",
+    ):
+        if name in result:
+            result[name] = round(result[name], 3)
+    return result
+
+
+def failure_evidence(progress):
+    """Preserve already-collected fixed evidence, never diagnostic log strings."""
+    result = {}
+    media = _safe_failure_media(progress.get("failure_media"))
+    if media is not None:
+        result["failure_media"] = media
+    flags = progress.get("failure_flags")
+    allowed_flags = {
+        "live",
+        "normalized",
+        "path_ready",
+        "ingest_live",
+        "metrics_ok",
+        "core_alive",
+        "ingest_one",
+        "sink_one",
+        "sink_growth",
+        "state_ok",
+        "ingest_match",
+    }
+    if (
+        type(flags) is dict
+        and flags
+        and flags.keys() <= allowed_flags
+        and all(type(value) is bool for value in flags.values())
+    ):
+        result["failure_flags"] = dict(flags)
+    wait = progress.get("failure_wait_seconds")
+    if _diagnostic_seconds(wait):
+        result["failure_wait_seconds"] = round(wait, 3)
+    return result
+
+
 def failure_location(progress, allowed_stages):
     """Keep the original fixed checkpoint and source lines, never exception text."""
     source = progress if type(progress) is dict else {}
     stage = source.get("stage")
     lines = source.get("failure_lines")
-    return {
+    location = {
         "stage": stage if type(stage) is str and stage in allowed_stages else None,
         "failure_lines": lines
         if type(lines) is list
@@ -337,6 +572,9 @@ def failure_location(progress, allowed_stages):
         and all(type(line) is int and 1 <= line <= 20000 for line in lines)
         else [],
     }
+    if location["stage"] is not None:
+        location.update(failure_evidence(source))
+    return location
 
 
 def main():
