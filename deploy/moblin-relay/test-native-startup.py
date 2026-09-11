@@ -15,6 +15,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,22 @@ PURPOSE = "adojapan-ci-native-startup-diagnostic"
 TARGET = "crash-first-child"
 STOP = "CI_DIAGNOSTIC_CRASH_PREFIX_FINISHED"
 WORK_SECONDS = 480
+PACKET_TRACE_BYTES = 32 * 1024
+PACKET_TRACE_INSPECTION_BYTES = 512 * 1024
+PACKET_PHASES = ("demux_receive", "parser_output")
+PACKET_FLAGS = (
+    "sampled",
+    "streams_limited",
+    "inspection_limited",
+    "window_limited",
+    "clock_invalid",
+)
+PACKET_PATTERN = re.compile(
+    rb"\[flv @ (?:0x)?[0-9a-fA-F]{1,16}\] "
+    rb"(ff_read_packet|read_frame_internal) stream=([0-9]{1,3}), "
+    rb"pts=(NOPTS|-?[0-9]{1,19}), dts=(NOPTS|-?[0-9]{1,19}), "
+    rb"size=([0-9]{1,10}), duration=(-?[0-9]{1,19}), flags=([0-9]{1,10})"
+)
 
 
 class DiagnosticFailure(Exception):
@@ -178,6 +196,271 @@ def slate_command(stage):
     ]
 
 
+def safe_reader_packet_trace(value):
+    """Strict numeric-only projection; collector observations are not wire arrival."""
+
+    def integer(item, lower, upper):
+        return type(item) is int and lower <= item <= upper
+
+    if not isinstance(value, dict) or set(value) != {
+        "version",
+        "scope",
+        "timebase",
+        "flags",
+        "groups",
+    }:
+        return None
+    if (
+        type(value["version"]) is not int
+        or value["version"] != 1
+        or value["scope"] != "strict-reader-collector-not-network-or-decode"
+        or value["timebase"] != "flv-milliseconds"
+    ):
+        return None
+    flags, groups = value["flags"], value["groups"]
+    if (
+        not isinstance(flags, dict)
+        or set(flags) != set(PACKET_FLAGS)
+        or any(type(item) is not bool for item in flags.values())
+        or not isinstance(groups, list)
+        or len(groups) > 8
+    ):
+        return None
+    seen, streams, total_rows = set(), set(), 0
+    for group in groups:
+        if not isinstance(group, dict) or set(group) != {
+            "phase",
+            "stream",
+            "count",
+            "first_ms",
+            "last_ms",
+            "rows",
+        }:
+            return None
+        phase, stream, rows = group["phase"], group["stream"], group["rows"]
+        if (
+            not isinstance(phase, str)
+            or phase not in PACKET_PHASES
+            or not integer(stream, 0, 255)
+            or (phase, stream) in seen
+            or not integer(group["count"], 1, 65535)
+            or not integer(group["first_ms"], 0, 20000)
+            or not integer(group["last_ms"], group["first_ms"], 20000)
+            or not isinstance(rows, list)
+            or not 1 <= len(rows) <= 16
+            or len(rows) != min(group["count"], 16)
+        ):
+            return None
+        seen.add((phase, stream))
+        streams.add(stream)
+        total_rows += len(rows)
+        previous = group["first_ms"]
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != {
+                "wall_ms",
+                "pts",
+                "dts",
+                "duration",
+                "size",
+                "flags",
+            }:
+                return None
+            if (
+                not integer(row["wall_ms"], previous, group["last_ms"])
+                or any(
+                    item is not None and not integer(item, -(2**63), 2**63 - 1)
+                    for item in (row["pts"], row["dts"])
+                )
+                or not integer(row["duration"], -(2**63), 2**63 - 1)
+                or not integer(row["size"], 1, 2**31 - 1)
+                or not integer(row["flags"], 0, 2**31 - 1)
+            ):
+                return None
+            previous = row["wall_ms"]
+        if rows[0]["wall_ms"] != group["first_ms"] or rows[-1]["wall_ms"] != group["last_ms"]:
+            return None
+        if group["count"] > 16 and not flags["sampled"]:
+            return None
+    if len(streams) > 4 or total_rows > 128:
+        return None
+    encoded = json.dumps(value, allow_nan=False, separators=(",", ":"))
+    return json.loads(encoded) if len(encoded.encode("ascii")) <= PACKET_TRACE_BYTES else None
+
+
+class ReaderPacketTrace:
+    """First eight + last eight observations per phase/anonymous stream, no raw lines."""
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.started = clock()
+        self.previous = self.started
+        self.lock = threading.Lock()
+        self.closed = False
+        self.inspected = 0
+        self.groups = {}
+        self.streams = set()
+        self.flags = dict.fromkeys(PACKET_FLAGS, False)
+
+    def observe_line(self, line, *, progress):
+        if progress:
+            return
+        with self.lock:
+            if (
+                self.closed
+                or self.flags["inspection_limited"]
+                or self.flags["window_limited"]
+                or self.flags["clock_invalid"]
+            ):
+                return
+            self.inspected += len(line) + 1
+            if self.inspected > PACKET_TRACE_INSPECTION_BYTES:
+                self.flags["inspection_limited"] = True
+                return
+            now = self.clock()
+            if (
+                any(
+                    type(item) not in (int, float) or not -(10**12) <= item <= 10**12
+                    for item in (now, self.started)
+                )
+                or not math.isfinite(now)
+                or not math.isfinite(self.started)
+                or now < self.previous
+            ):
+                self.flags["clock_invalid"] = True
+                return
+            self.previous = now
+            elapsed = now - self.started
+            if elapsed > 20:
+                self.flags["window_limited"] = True
+                return
+            match = PACKET_PATTERN.fullmatch(line)
+            if not match:
+                return
+            name, stream, pts, dts, size, duration, flags = match.groups()
+            stream = int(stream)
+            row = {
+                "wall_ms": int(elapsed * 1000),
+                "pts": None if pts == b"NOPTS" else int(pts),
+                "dts": None if dts == b"NOPTS" else int(dts),
+                "duration": int(duration),
+                "size": int(size),
+                "flags": int(flags),
+            }
+            if (
+                stream > 255
+                or not 0 < row["size"] < 2**31
+                or row["flags"] >= 2**31
+                or any(
+                    item is not None and not -(2**63) <= item < 2**63
+                    for item in (row["pts"], row["dts"], row["duration"])
+                )
+            ):
+                return
+            if stream not in self.streams and len(self.streams) == 4:
+                self.flags["streams_limited"] = True
+                return
+            self.streams.add(stream)
+            phase = PACKET_PHASES[name == b"read_frame_internal"]
+            group = self.groups.setdefault(
+                (phase, stream),
+                {
+                    "phase": phase,
+                    "stream": stream,
+                    "count": 0,
+                    "first_ms": row["wall_ms"],
+                    "last_ms": row["wall_ms"],
+                    "rows": [],
+                },
+            )
+            group["count"] = min(group["count"] + 1, 65535)
+            group["last_ms"] = row["wall_ms"]
+            if len(group["rows"]) == 16:
+                del group["rows"][8]
+                self.flags["sampled"] = True
+            group["rows"].append(row)
+
+    def finish(self):
+        with self.lock:
+            self.closed = True
+            return safe_reader_packet_trace(
+                {
+                    "version": 1,
+                    "scope": "strict-reader-collector-not-network-or-decode",
+                    "timebase": "flv-milliseconds",
+                    "flags": dict(self.flags),
+                    "groups": list(self.groups.values()),
+                }
+            )
+
+
+def install_reader_packet_trace(api, state):
+    """Instance-local observer adapter; original process lifecycle/deadline stays intact."""
+    original = api.get("run_capture_reader")
+    if not callable(original) or "CaptureReaderProgress" not in api:
+        return
+    if getattr(original, "_private_reader_packet_trace", False):
+        return
+    original_drain = api["CaptureReaderProgress"].drain
+
+    class ObservedReader:
+        def __init__(self, diagnostic, trace):
+            self.diagnostic, self.trace = diagnostic, trace
+
+        def __getattr__(self, name):
+            return getattr(self.diagnostic, name)
+
+        def observe_line(self, line, *, progress):
+            self.diagnostic.observe_line(line, progress=progress)
+            with contextlib.suppress(Exception):
+                self.trace.observe_line(line, progress=progress)
+
+        def drain(self, pipe, *, progress):
+            # Same implementation, same pipe reads/limits and no added I/O/thread.
+            return original_drain(self, pipe, progress=progress)
+
+    def run_capture_reader(command, diagnostic, *, timeout):
+        if (
+            not isinstance(command, list)
+            or command.count("-i") != 1
+            or "-fdebug" in command
+            or state.get("reader_packet_failure") is not None
+        ):
+            return original(command, diagnostic, timeout=timeout)
+        input_index = command.index("-i")
+        observed_command = command[:input_index] + ["-fdebug", "ts"] + command[input_index:]
+        trace = ReaderPacketTrace()
+        try:
+            return original(observed_command, ObservedReader(diagnostic, trace), timeout=timeout)
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                state["reader_packet_failure"] = (exc, state.get("last_stage"), trace.finish())
+            raise
+        finally:
+            # Success records are discarded. A late optional callback cannot grow them.
+            with contextlib.suppress(Exception):
+                trace.finish()
+
+    run_capture_reader._private_reader_packet_trace = True
+    api["run_capture_reader"] = run_capture_reader
+
+
+def failed_reader_packet_trace(api, state, progress):
+    """Only the first caught reader exception in the final failure chain may be exported."""
+    failed = state.get("reader_packet_failure")
+    media = api.get("SELF_TEST_MEDIA_FAILURE")
+    if not failed or not media or failed[1] != progress.get("stage"):
+        return None
+    current, visited = media[0], set()
+    for _ in range(8):
+        if not isinstance(current, BaseException) or id(current) in visited:
+            return None
+        if current is failed[0]:
+            return safe_reader_packet_trace(failed[2])
+        visited.add(id(current))
+        current = current.__cause__ if current.__cause__ is not None else current.__context__
+    return None
+
+
 def install_prefix(api, stage, mediamtx, stage_file):
     """Keep real gates/cleanup; stop after the original supervisor-crash checks."""
     api.update(
@@ -260,6 +543,7 @@ def install_prefix(api, stage, mediamtx, stage_file):
     api["mark_self_test_stage"] = mark
     api["write_configs"] = write_configs
     api["MediaFailureDiagnostics"] = CrashDiagnostics
+    install_reader_packet_trace(api, state)
     return state
 
 
@@ -662,6 +946,9 @@ def main():
         report["startup_input"] = api["safe_startup_input_failure"](
             progress.get("failure_startup_input")
         )
+        report["reader_packet_trace"] = None
+        with contextlib.suppress(Exception):
+            report["reader_packet_trace"] = failed_reader_packet_trace(api, state, progress)
     report["private_stage_removed"] = False
     if report["cleanup_passed"]:
         require(
