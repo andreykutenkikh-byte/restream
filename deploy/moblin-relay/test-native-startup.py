@@ -71,12 +71,28 @@ def save_new(path, data, mode=0o600):
         os.fsync(output.fileno())
 
 
+def renderer_for_stage(data, stage):
+    """Change only the private renderer's asset location, retaining source bytes."""
+    require(
+        re.fullmatch(r"/tmp/adojapan-ci-startup-[A-Za-z0-9_-]{8,64}", str(stage)),  # noqa: S108
+        "PRIVATE_RENDERER_STAGE_PATH",
+    )
+    original = b'SLATE_FILE = "/var/lib/moblin-relay/slate.mp4"'
+    require(data.count(original) == 1, "PRIVATE_RENDERER_SLATE_ANCHOR_CHANGED")
+    replacement = ("SLATE_FILE = " + repr(str(stage / "slate.mp4"))).encode("ascii")
+    return data.replace(original, replacement, 1)
+
+
 def stage_sources(stage):
     hashes = {}
     for name, source in STAGED.items():
         data = read_private(source)
-        save_new(stage / name, data, 0o755 if name == "wrapper.py" else 0o600)
         hashes[name] = hashlib.sha256(data).hexdigest()
+        if name == "renderer.py":
+            save_new(stage / "renderer-source.py", data)
+            data = renderer_for_stage(data, stage)
+            hashes["renderer-staged.py"] = hashlib.sha256(data).hexdigest()
+        save_new(stage / name, data, 0o755 if name == "wrapper.py" else 0o600)
     manifest = {
         "version": 1,
         "purpose": PURPOSE,
@@ -221,7 +237,14 @@ def prefix_summary(result, progress, state, code):
         result.get("workdir_removed") is True
         and not result.get("cleanup_failure")
         and type(result.get("secret_configs_wiped")) is int
-        and result["secret_configs_wiped"] >= 1
+        and (
+            result["secret_configs_wiped"] >= 1
+            or (
+                result["secret_configs_wiped"] == 0
+                and not state["initial_completed"]
+                and state.get("last_stage") in {"startup", "assets"}
+            )
+        )
     )
     stopped_as_planned = code == 1 and state["initial_completed"] and result.get("failure") == STOP
     return {
@@ -237,6 +260,21 @@ def prefix_summary(result, progress, state, code):
         "cleanup_passed": clean,
         "media_oracle_or_deadline_changed": False,
         "diagnostic_log_level_variant": True,
+    }
+
+
+def failure_location(progress, allowed_stages):
+    """Keep the original fixed checkpoint and source lines, never exception text."""
+    source = progress if type(progress) is dict else {}
+    stage = source.get("stage")
+    lines = source.get("failure_lines")
+    return {
+        "stage": stage if type(stage) is str and stage in allowed_stages else None,
+        "failure_lines": lines
+        if type(lines) is list
+        and len(lines) <= 8
+        and all(type(line) is int and 1 <= line <= 20000 for line in lines)
+        else [],
     }
 
 
@@ -306,6 +344,7 @@ def main():
         result = json.loads(read_private(stage / "prefix-result.json", maximum=2 * 1024**2))
         progress = json.loads(read_private(stage / "prefix-progress.json", maximum=2 * 1024**2))
         report = prefix_summary(result, progress, state, code)
+        report["checkpoint"] = failure_location(progress, api["SELF_TEST_STAGES"])
         report["source_hashes"] = hashes
         report["ffmpeg_version"] = match[1].decode("ascii")
         if (stage / "normalizer-phases.json").exists():

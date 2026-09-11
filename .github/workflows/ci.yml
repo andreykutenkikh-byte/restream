@@ -180,32 +180,6 @@ jobs:
             exec -T -e CI_NATIVE_READER_CLOCK=isolated-fixture ci-ssh-target \
             python3 - < deploy/moblin-relay/test-native-reader-clock.py
 
-      - name: First-child native startup diagnostic
-        # One separate prefix, never a rerun or replacement of native acceptance.
-        # Run in the same disposable Linux image even after an original failure.
-        if: ${{ !cancelled() && (success() || steps.native_onboarding.outcome == 'failure') }}
-        shell: bash
-        run: |
-          for name in normalizer wrapper renderer reader slate; do
-            case "$name" in
-              normalizer) source='deploy/moblin-relay/moblin-relay-normalize'; suffix='py' ;;
-              wrapper) source='deploy/moblin-relay/test-native-startup-normalizer.py'; suffix='py' ;;
-              renderer) source='deploy/moblin-relay/moblin-relay-render-config'; suffix='py' ;;
-              reader) source='deploy/moblin-relay/test-native-reader-clock.py'; suffix='py' ;;
-              slate) source='deploy/moblin-relay/slate.txt'; suffix='txt' ;;
-              *) exit 2 ;;
-            esac
-            target="/tmp/adojapan-ci-startup-${name}.${suffix}"
-            docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml \
-              exec -T ci-ssh-target python3 -c \
-              'import pathlib,sys; data=sys.stdin.buffer.read(); target=pathlib.Path(sys.argv[1]); target.write_bytes(data); target.chmod(0o600); assert data and target.read_bytes() == data' \
-              "$target" < "$source"
-          done
-          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml \
-            exec -T -e CI_NATIVE_STARTUP=isolated-fixture ci-ssh-target \
-            timeout --signal=TERM --kill-after=15s 240s python3 - \
-            < deploy/moblin-relay/test-native-startup.py
-
       - name: Post-onboarding runtime limits
         run: sh scripts/check_runtime_limits.sh
 
@@ -240,3 +214,80 @@ jobs:
           fi
           rm -f .env.ci .bootstrap-worker-secret.ci
           exit "$cleanup_status"
+
+  native-startup-diagnostic:
+    # Independent, non-acceptance evidence; failure remains fatal in this job.
+    # No dependency on the long main job and no retry of its native acceptance.
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      DIAGNOSTIC_CONTAINER: adojapan-native-startup-${{ github.run_id }}-${{ github.run_attempt }}
+      DIAGNOSTIC_IMAGE: adojapan-native-startup:ci-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Diagnostic source identity
+        run: |
+          git rev-parse HEAD
+          git rev-parse 'HEAD^{tree}'
+
+      - name: Build exact native fixture image
+        run: docker build --file ci/ssh-target/Dockerfile --tag "$DIAGNOSTIC_IMAGE" .
+
+      - name: Start isolated native diagnostic container
+        shell: bash
+        run: |
+          # Match compose.ci.yml's native CPU/memory/PID/tmpfs profile. No SSH,
+          # host mounts, published ports, external network or privileged mode.
+          docker run --detach --name "$DIAGNOSTIC_CONTAINER" \
+            --label "adojapan.ci.native-startup=${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --init --user 0:0 --network none --restart no --stop-timeout 10 \
+            --cpus 1.50 --memory 1536m --pids-limit 512 \
+            --tmpfs /run:size=16m,mode=0755 --tmpfs /tmp:size=256m,mode=1777 \
+            --log-driver json-file --log-opt max-size=10m --log-opt max-file=3 \
+            "$DIAGNOSTIC_IMAGE" sleep infinity
+          docker exec "$DIAGNOSTIC_CONTAINER" install -d -m 0755 /run/lock
+          docker inspect --format '{{json .HostConfig}}' "$DIAGNOSTIC_CONTAINER" \
+            | python3 -c 'import json,sys; c=json.load(sys.stdin); assert c["NanoCpus"] == 1500000000 and c["Memory"] == 1536*1024**2 and c["PidsLimit"] == 512; assert c["NetworkMode"] == "none" and c["Privileged"] is False and not c.get("Binds") and not c.get("PortBindings") and not c.get("CapAdd"); assert c["Tmpfs"] == {"/run":"size=16m,mode=0755", "/tmp":"size=256m,mode=1777"}; print("Native startup isolated resource profile: PASS")'
+
+      - name: Stage exact diagnostic sources
+        shell: bash
+        run: |
+          # /tmp is a live tmpfs. Stage exact bytes via stdin, not docker cp.
+          docker exec --interactive "$DIAGNOSTIC_CONTAINER" python3 -c \
+            'import pathlib,sys; data=sys.stdin.buffer.read(); target=pathlib.Path("/tmp/adojapan-ci-clock-self-test.py"); target.write_bytes(data); target.chmod(0o600); assert data and target.read_bytes() == data' \
+            < deploy/moblin-relay/self-test
+          for name in normalizer wrapper renderer reader slate; do
+            case "$name" in
+              normalizer) source='deploy/moblin-relay/moblin-relay-normalize'; suffix='py' ;;
+              wrapper) source='deploy/moblin-relay/test-native-startup-normalizer.py'; suffix='py' ;;
+              renderer) source='deploy/moblin-relay/moblin-relay-render-config'; suffix='py' ;;
+              reader) source='deploy/moblin-relay/test-native-reader-clock.py'; suffix='py' ;;
+              slate) source='deploy/moblin-relay/slate.txt'; suffix='txt' ;;
+              *) exit 2 ;;
+            esac
+            target="/tmp/adojapan-ci-startup-${name}.${suffix}"
+            docker exec --interactive "$DIAGNOSTIC_CONTAINER" python3 -c \
+              'import pathlib,sys; data=sys.stdin.buffer.read(); target=pathlib.Path(sys.argv[1]); target.write_bytes(data); target.chmod(0o600); assert data and target.read_bytes() == data' \
+              "$target" < "$source"
+          done
+
+      - name: First-child native startup diagnostic
+        shell: bash
+        run: |
+          docker exec --interactive --env CI_NATIVE_STARTUP=isolated-fixture \
+            "$DIAGNOSTIC_CONTAINER" \
+            timeout --signal=TERM --kill-after=15s 240s python3 - \
+            < deploy/moblin-relay/test-native-startup.py
+
+      - name: Remove exact native diagnostic container
+        if: always()
+        shell: bash
+        run: |
+          container_id="$(docker container ls --all --filter "name=^/${DIAGNOSTIC_CONTAINER}$" --format '{{.ID}}')"
+          if [ -n "$container_id" ]; then
+            test "$(docker inspect --format '{{index .Config.Labels "adojapan.ci.native-startup"}}' "$container_id")" = "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            docker container rm --force "$container_id"
+          fi
+          test -z "$(docker container ls --all --filter "name=^/${DIAGNOSTIC_CONTAINER}$" --format '{{.ID}}')"
+          printf '%s\n' 'Native startup diagnostic container cleanup: PASS'
