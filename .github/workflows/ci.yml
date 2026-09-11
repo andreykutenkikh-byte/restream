@@ -180,6 +180,32 @@ jobs:
             exec -T -e CI_NATIVE_READER_CLOCK=isolated-fixture ci-ssh-target \
             python3 - < deploy/moblin-relay/test-native-reader-clock.py
 
+      - name: First-child native startup diagnostic
+        # One separate prefix, never a rerun or replacement of native acceptance.
+        # Run in the same disposable Linux image even after an original failure.
+        if: ${{ !cancelled() && (success() || steps.native_onboarding.outcome == 'failure') }}
+        shell: bash
+        run: |
+          for name in normalizer wrapper renderer reader slate; do
+            case "$name" in
+              normalizer) source='deploy/moblin-relay/moblin-relay-normalize'; suffix='py' ;;
+              wrapper) source='deploy/moblin-relay/test-native-startup-normalizer.py'; suffix='py' ;;
+              renderer) source='deploy/moblin-relay/moblin-relay-render-config'; suffix='py' ;;
+              reader) source='deploy/moblin-relay/test-native-reader-clock.py'; suffix='py' ;;
+              slate) source='deploy/moblin-relay/slate.txt'; suffix='txt' ;;
+              *) exit 2 ;;
+            esac
+            target="/tmp/adojapan-ci-startup-${name}.${suffix}"
+            docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml \
+              exec -T ci-ssh-target python3 -c \
+              'import pathlib,sys; data=sys.stdin.buffer.read(); target=pathlib.Path(sys.argv[1]); target.write_bytes(data); target.chmod(0o600); assert data and target.read_bytes() == data' \
+              "$target" < "$source"
+          done
+          docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml \
+            exec -T -e CI_NATIVE_STARTUP=isolated-fixture ci-ssh-target \
+            timeout --signal=TERM --kill-after=15s 240s python3 - \
+            < deploy/moblin-relay/test-native-startup.py
+
       - name: Post-onboarding runtime limits
         run: sh scripts/check_runtime_limits.sh
 
