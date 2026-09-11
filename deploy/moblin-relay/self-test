@@ -469,6 +469,12 @@ def persist_self_test_failure_progress(exc: BaseException) -> None:
                     progress = candidate
     # Preserve the existing 2 KiB checkpoint limit with structured failure
     # evidence, not indentation. Normal progress/results remain human-readable.
+    if (
+        "capture_wait" in progress.get("failure_flow", {})
+        and len(json.dumps(progress, separators=(",", ":"), allow_nan=False).encode()) > 2048
+    ):
+        progress["failure_flow"] = dict(progress["failure_flow"])
+        progress["failure_flow"].pop("capture_wait")
     atomic_json(SELF_TEST_PROGRESS_FILE, progress, compact=True)
 
 
@@ -1842,6 +1848,7 @@ class CaptureObserver(threading.Thread):
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
         self.samples: list[dict] = []
+        self.growth_failure: tuple[BaseException, dict] | None = None
 
     def read_sample(self) -> dict:
         capture_ok = False
@@ -1891,6 +1898,7 @@ class CaptureObserver(threading.Thread):
         minimum_growth: int,
         timeout: float,
     ) -> dict:
+        self.growth_failure = None
         if not self.is_alive():
             raise TestFailure(f"capture observer stopped during {description}")
         baseline = self.append_sample()
@@ -1907,7 +1915,39 @@ class CaptureObserver(threading.Thread):
             if not self.is_alive():
                 raise TestFailure(f"capture observer stopped during {description}")
             time.sleep(0.05)
-        raise TestFailure(f"timed out waiting for {description}")
+        failure = TestFailure(f"timed out waiting for {description}")
+        # Retain the exact evaluated samples, not a later stat or another wait.
+        # This snapshot is diagnostic only and bound to this exception identity.
+        with contextlib.suppress(Exception):
+            finished = time.monotonic()
+            first, last = baseline["t"], sample["t"]
+            if (
+                all(
+                    type(value) in (int, float) and math.isfinite(value)
+                    for value in (first, last, finished)
+                )
+                and first <= last <= finished <= first + 660
+                and type(minimum_growth) is int
+                and 1 <= minimum_growth <= 2**31
+            ):
+                initial, final = baseline["capture_size"], sample["capture_size"]
+                delta = (
+                    final - initial
+                    if type(initial) is int and type(final) is int and 0 <= initial <= final <= 2**31
+                    else None
+                )
+                self.growth_failure = (
+                    failure,
+                    {
+                        "started": first,
+                        "finished": finished,
+                        "growth_bytes": delta,
+                        "required_bytes": minimum_growth,
+                        "elapsed_ms": round((finished - first) * 1000),
+                        "last_sample_age_ms": round((finished - last) * 1000),
+                    },
+                )
+        raise failure
 
     def finish(self) -> None:
         self.stop_event.set()
@@ -1968,6 +2008,66 @@ def safe_wait_failure_flags(
     if expected_ingest_ids is not None:
         flags["ingest_match"] = ingest_ids == expected_ingest_ids
     return flags
+
+
+def capture_wait_failure_summary(
+    failure: BaseException,
+    capture_observer: CaptureObserver,
+    observer: Observer,
+    samples: list[dict],
+    started: float,
+    finished: float,
+) -> dict | None:
+    """Existing wait samples only; recorder poll describes collection, not the past."""
+    bound = capture_observer.growth_failure
+    if bound is None or bound[0] is not failure:
+        return None
+    snapshot = bound[1]
+    first, last = snapshot["started"], snapshot["finished"]
+    if not started <= first <= last <= finished:
+        return None
+    retained = [sample for sample in samples if first <= sample["t"] <= sample["finished"] <= last]
+    value = {
+        "window_seconds": [round(first - started, 3), round(last - started, 3)],
+        "recorder_at_collection": "unknown",
+        **{
+            key: snapshot[key]
+            for key in ("growth_bytes", "required_bytes", "elapsed_ms", "last_sample_age_ms")
+        },
+        "sink_state": "unknown",
+        "sink_samples": len(retained),
+        "sink_sample_window_seconds": (
+            [round(retained[0]["t"] - started, 3), round(retained[-1]["finished"] - started, 3)]
+            if retained
+            else None
+        ),
+    }
+    with contextlib.suppress(OSError, ValueError):
+        value["recorder_at_collection"] = "alive" if observer.reader.poll() is None else "exited"
+    if len(retained) >= 2:
+        ids = retained[0].get("sink_ids")
+        if (
+            isinstance(ids, list)
+            and len(ids) == 1
+            and isinstance(ids[0], str)
+            and ids[0]
+            and ids[0] != "missing-id"
+            and all(
+                sample.get("sink_metrics_ok") is True
+                and sample.get("sink_ids") == ids
+                and type(sample.get("sink_bytes")) is int
+                and 0 <= sample["sink_bytes"] <= 2**63 - 1
+                for sample in retained
+            )
+            and all(
+                right["sink_bytes"] >= left["sink_bytes"]
+                for left, right in zip(retained, retained[1:], strict=False)
+            )
+        ):
+            value["sink_state"] = (
+                "growth" if retained[-1]["sink_bytes"] > retained[0]["sink_bytes"] else "unchanged"
+            )
+    return value
 
 
 def record_outage_flow_failure(
@@ -2068,6 +2168,12 @@ def record_outage_flow_failure(
         }
         value["log_ok"] = True
     if capture_observer is not None:
+        with contextlib.suppress(Exception):
+            capture_wait = capture_wait_failure_summary(
+                failure, capture_observer, observer, samples, started, finished,
+            )
+            if capture_wait is not None:
+                value["capture_wait"] = capture_wait
         with capture_observer.lock:
             captured = [dict(item) for item in capture_observer.samples]
         value["capture_tracks"] = capture_track_failure_summary(
@@ -7115,10 +7221,19 @@ def main() -> int:
                     )
                 raise
             to_slate = float(detached["t"]) - outage_started
-            wait_slate_capture_growth(
-                f"outage {index} SLATE capture growth",
-                detached,
-            )
+            try:
+                wait_slate_capture_growth(
+                    f"outage {index} SLATE capture growth",
+                    detached,
+                )
+            except TestFailure as exc:
+                with contextlib.suppress(Exception):
+                    record_outage_flow_failure(
+                        exc, observer, outage_started, time.monotonic(),
+                        transition_log_descriptor, outage_reset_log_offset,
+                        capture_observer=capture_observer,
+                    )
+                raise
             _srt_expired, srt_idle_elapsed = wait_srt_idle_expiry(
                 f"outage {index} SRT idle expiry",
                 outage_started,

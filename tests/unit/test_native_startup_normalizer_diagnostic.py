@@ -406,6 +406,29 @@ def test_first_natural_exit_is_frozen_before_later_retry_evidence(helper, captur
     assert not fixture.writes[0]["first_child_timeout"]
 
 
+def test_video_progress_receipt_uses_existing_sample_without_extra_read_or_poll(capture_fixture):
+    fixture = capture_fixture
+    child = fixture.api["subprocess"].Popen(fixture.argv, **fixture.kwargs)
+    progress = fixture.api["VideoProgress"](child.stdout, 1.0)
+    for frames, now in ((0, 1.1), (1, 1.25), (15, 1.5), (12, 1.75)):
+        progress.frames = frames
+        assert progress.sample(now) == "original-progress"
+    fixture.api["stop_child"](child)
+    assert fixture.samples == [1.1, 1.25, 1.5, 1.75]
+    assert fixture.writes[0]["first_video_progress_ms"] == 250
+    assert fixture.writes[0]["max_video_frames"] == 15
+
+
+@pytest.mark.parametrize(
+    "frames,stamp",
+    [(True, 1), (-1, 1), (10**310, 1), (1, None), (0, 1), (1, True), (1, -1), (1, 20001)],
+)
+def test_progress_receipt_fields_reject_invalid_values(helper, frames, stamp):
+    record = helper["Milestones"](0).record
+    record.update(max_video_frames=frames, first_video_progress_ms=stamp)
+    assert helper["validated_report"](record) is None
+
+
 @pytest.mark.parametrize("change", ["argv", "stderr", "stdout"])
 def test_unexpected_first_child_is_refused_before_spawn(helper, capture_fixture, change):
     fixture = capture_fixture
@@ -524,17 +547,35 @@ def test_capture_claim_is_exclusive_and_existing_claim_is_revalidated(helper, mo
         return 9
 
     fake_os = SimpleNamespace(
-        O_WRONLY=1, O_CREAT=2, O_EXCL=4, O_NOFOLLOW=8, O_CLOEXEC=16, open=claim, close=closed.append
+        O_WRONLY=1,
+        O_CREAT=2,
+        O_EXCL=4,
+        O_NOFOLLOW=8,
+        O_CLOEXEC=16,
+        open=claim,
+        close=closed.append,
+        getpid=lambda: 123,
     )
     globals_ = helper["claim_capture"].__globals__
     monkeypatch.setitem(globals_, "os", fake_os)
-    monkeypatch.setitem(globals_, "trusted_file", lambda *args: validated.append(args) or b"")
+    monkeypatch.setitem(
+        globals_,
+        "trusted_file",
+        lambda *args: (
+            validated.append(args)
+            or (b"crash-first-child\n122\n" if args[0].name.endswith(".arm") else b"")
+        ),
+    )
     stage = PurePosixPath("/private")
     assert helper["claim_capture"](stage) is True
     assert flags == [(31, 0o600)] and closed == [9]
     state["exists"] = True
     assert helper["claim_capture"](stage) is False
-    assert validated == [(stage / "normalizer-capture.claim", 0o600, 0)]
+    assert validated == [
+        (stage / "normalizer-capture.arm", 0o600, 64),
+        (stage / "normalizer-capture.arm", 0o600, 64),
+        (stage / "normalizer-capture.claim", 0o600, 0),
+    ]
 
 
 @pytest.mark.parametrize("supervisor,claim", [(False, False), (True, False), (True, True)])

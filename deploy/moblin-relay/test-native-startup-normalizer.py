@@ -150,7 +150,15 @@ def load_stage(wrapper):
 
 
 def claim_capture(stage):
-    """One supervisor, one first child, even if MediaMTX restarts its hook."""
+    """Arm before the crash; only a new supervisor may claim its first child."""
+    try:
+        armed = trusted_file(stage / "normalizer-capture.arm", 0o600, 64)
+    except FileNotFoundError:
+        return False
+    match = re.fullmatch(rb"crash-first-child\n([1-9][0-9]{0,9})\n", armed)
+    require(match is not None and int(match[1]) <= 2**31 - 1, "CI_DIAGNOSTIC_ARM_INVALID")
+    if os.getpid() == int(match[1]):
+        return False
     path = stage / "normalizer-capture.claim"
     try:
         descriptor = os.open(
@@ -210,6 +218,8 @@ class Milestones:
             "spawn_failed": False,
             "first_child_timeout": False,
             "first_child_bridge_active": False,
+            "first_video_progress_ms": None,
+            "max_video_frames": 0,
             "events": {name: {"count": 0, "first_ms": None, "last_ms": None} for name in EVENTS},
         }
 
@@ -295,7 +305,22 @@ def validated_report(value):
         or not 0 <= value["parse_bytes"] <= MAX_PARSE_BYTES + 1
     ):
         return None
-    flags = set(shape) - {"version", "scope", "parse_bytes", "events"}
+    frames, first_video = value["max_video_frames"], value["first_video_progress_ms"]
+    if (
+        type(frames) is not int
+        or not 0 <= frames <= 10**9
+        or (frames == 0 and first_video is not None)
+        or (frames > 0 and (type(first_video) is not int or not 0 <= first_video <= WINDOW_MS))
+    ):
+        return None
+    flags = set(shape) - {
+        "version",
+        "scope",
+        "parse_bytes",
+        "events",
+        "first_video_progress_ms",
+        "max_video_frames",
+    }
     if any(type(value[name]) is not bool for name in flags):
         return None
     events = value["events"]
@@ -397,7 +422,17 @@ def install_capture(api, stage, clock=time.monotonic):
         def sample(self, now):
             result = super().sample(now)
             if state["child"] is not None and not state["finished"]:
-                state["parser"].drain(state["child"].stderr)
+                parser = state["parser"]
+                parser.drain(state["child"].stderr)
+                # Observe the original sample only: no extra progress read/poll.
+                frames = getattr(self, "frames", 0)
+                elapsed = (now - parser.started) * 1000
+                if type(frames) is int and 0 < frames <= 10**9 and 0 <= elapsed <= WINDOW_MS:
+                    if parser.record["first_video_progress_ms"] is None:
+                        parser.record["first_video_progress_ms"] = round(elapsed)
+                    parser.record["max_video_frames"] = max(
+                        parser.record["max_video_frames"], frames
+                    )
             return result
 
         def close(self):

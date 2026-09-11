@@ -26,8 +26,9 @@ STAGED = {
     "slate.txt": Path("/tmp/adojapan-ci-startup-slate.txt"),  # noqa: S108
 }
 PURPOSE = "adojapan-ci-native-startup-diagnostic"
-STOP = "CI_DIAGNOSTIC_INITIAL_PREFIX_FINISHED"
-WORK_SECONDS = 240
+TARGET = "crash-first-child"
+STOP = "CI_DIAGNOSTIC_CRASH_PREFIX_FINISHED"
+WORK_SECONDS = 480
 
 
 class DiagnosticFailure(Exception):
@@ -176,7 +177,7 @@ def slate_command(stage):
 
 
 def install_prefix(api, stage, mediamtx, stage_file):
-    """Keep real startup gates/cleanup; stop only after the original LIVE checks."""
+    """Keep real gates/cleanup; stop after the original supervisor-crash checks."""
     api.update(
         NORMALIZER=stage / "wrapper.py",
         RENDERER=stage / "renderer.py",
@@ -188,7 +189,33 @@ def install_prefix(api, stage, mediamtx, stage_file):
     )
     original_mark = api["mark_self_test_stage"]
     original_write_configs = api["write_configs"]
-    state = {"initial_completed": False, "last_stage": "startup"}
+    original_diagnostics = api["MediaFailureDiagnostics"]
+    state = {
+        "initial_completed": False,
+        "target_armed": False,
+        "target_completed": False,
+        "crash_cont_seen": False,
+        "last_stage": "startup",
+    }
+
+    class CrashDiagnostics(original_diagnostics):
+        def __init__(self, scope, *args, ignored_supervisor=None, **kwargs):
+            if scope == "crash":
+                require(
+                    state["last_stage"] == "crash-death"
+                    and not state["target_armed"]
+                    and type(ignored_supervisor) is int
+                    and 1 <= ignored_supervisor <= 2**31 - 1,
+                    "PRIVATE_CRASH_ARM_PRECONDITION",
+                )
+                # Before original diagnostic/fault clocks and SIGKILL. Already
+                # running supervisors never recheck this marker; exclude the old PID too.
+                save_new(
+                    stage / "normalizer-capture.arm",
+                    f"{TARGET}\n{ignored_supervisor}\n".encode("ascii"),
+                )
+                state["target_armed"] = True
+            super().__init__(scope, *args, ignored_supervisor=ignored_supervisor, **kwargs)
 
     def write_configs(*args, **kwargs):
         # Keep /tmp noexec: the fixed interpreter reads this private script.
@@ -216,13 +243,21 @@ def install_prefix(api, stage, mediamtx, stage_file):
         original_mark(name, strict_segment_index=strict_segment_index)
         # Only fixed original stage names are recorded, never exception strings.
         state["last_stage"] = name
-        if name == "auth-exclusive" and not state["initial_completed"]:
+        if name == "auth-exclusive":
             state["initial_completed"] = True
+        if name == "crash-cont":
+            state["crash_cont_seen"] = True
+        if name == "reset-start" and not state["target_completed"]:
+            require(
+                state["target_armed"] and state["crash_cont_seen"], "PRIVATE_CRASH_NOT_OBSERVED"
+            )
+            state["target_completed"] = True
             raise api["TestFailure"](STOP)
 
     api["cleanup_stale_workdirs"] = no_stale_work
     api["mark_self_test_stage"] = mark
     api["write_configs"] = write_configs
+    api["MediaFailureDiagnostics"] = CrashDiagnostics
     return state
 
 
@@ -263,17 +298,26 @@ def prefix_summary(result, progress, state, code):
             )
         )
     )
-    stopped_as_planned = code == 1 and state["initial_completed"] and result.get("failure") == STOP
+    stopped_as_planned = (
+        code == 1
+        and state.get("target_armed") is True
+        and state.get("target_completed") is True
+        and result.get("failure") == STOP
+    )
     return {
-        "status": "PREFIX_OBSERVED_NO_STARTUP_FAILURE"
+        "status": "TARGET_CRASH_PREFIX_COMPLETED"
         if stopped_as_planned and clean
         else "ORIGINAL_PREFIX_FAILURE",
+        "target_phase": TARGET,
+        "target_armed": state.get("target_armed") is True,
+        "target_completed": state.get("target_completed") is True,
+        "initial_prefix_completed": state["initial_completed"] is True,
         "acceptance": False,
         "attempts": 1,
         "original_exit": code,
-        "first_start_timeout": progress.get("failure_initial_live_reason")
+        "initial_start_timeout": progress.get("failure_initial_live_reason")
         == "output-start-timeout",
-        "startup": numeric_startup(progress.get("failure_startup")),
+        "initial_startup": numeric_startup(progress.get("failure_startup")),
         "cleanup_passed": clean,
         "media_oracle_or_deadline_changed": False,
         "diagnostic_log_level_variant": True,
@@ -373,10 +417,10 @@ def main():
                 read_private(stage / "normalizer-phases.json", maximum=4096),
                 object_pairs_hook=wrapper["unique_object"],
             )
-            report["first_child_phases"] = wrapper["validated_report"](phases)
+            report["target_first_child_phases"] = wrapper["validated_report"](phases)
         else:
-            report["first_child_phases"] = None
-        report["phase_evidence_available"] = report["first_child_phases"] is not None
+            report["target_first_child_phases"] = None
+        report["phase_evidence_available"] = report["target_first_child_phases"] is not None
         report["startup_input"] = api["safe_startup_input_failure"](
             progress.get("failure_startup_input")
         )
@@ -393,7 +437,7 @@ def main():
     )
     return (
         0
-        if report["status"] == "PREFIX_OBSERVED_NO_STARTUP_FAILURE"
+        if report["status"] == "TARGET_CRASH_PREFIX_COMPLETED"
         and report["phase_evidence_available"]
         else 1
     )

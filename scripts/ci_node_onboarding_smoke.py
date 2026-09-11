@@ -591,11 +591,78 @@ def _safe_capture_tracks(value: Any, elapsed: float) -> dict[str, Any] | None:
     return result
 
 
+def _safe_capture_wait(value: Any, elapsed: float) -> dict[str, Any] | None:
+    """Capture timeout observations only; recorder state is collection-time state."""
+    required = {
+        "window_seconds",
+        "recorder_at_collection",
+        "growth_bytes",
+        "required_bytes",
+        "elapsed_ms",
+        "last_sample_age_ms",
+        "sink_state",
+        "sink_samples",
+        "sink_sample_window_seconds",
+    }
+    if not isinstance(value, dict) or value.keys() != required:
+        return None
+    window = value["window_seconds"]
+    if (
+        not isinstance(window, list)
+        or len(window) != 2
+        or not all(_diagnostic_seconds(n, elapsed) for n in window)
+        or window[0] > window[1]
+        or not isinstance(value["recorder_at_collection"], str)
+        or value["recorder_at_collection"] not in {"unknown", "alive", "exited"}
+        or not isinstance(value["sink_state"], str)
+        or value["sink_state"] not in {"unknown", "unchanged", "growth"}
+    ):
+        return None
+    for name, maximum in (
+        ("required_bytes", 2**31),
+        ("elapsed_ms", 660000),
+        ("last_sample_age_ms", 660000),
+        ("sink_samples", 4096),
+    ):
+        if type(value[name]) is not int or not 0 <= value[name] <= maximum:
+            return None
+    growth = value["growth_bytes"]
+    if (
+        value["required_bytes"] < 1
+        or value["last_sample_age_ms"] > value["elapsed_ms"]
+        or abs(value["elapsed_ms"] - (window[1] - window[0]) * 1000) > 2
+        or (
+            growth is not None
+            and (type(growth) is not int or not 0 <= growth < value["required_bytes"])
+        )
+    ):
+        return None
+    count = value["sink_samples"]
+    observed = value["sink_sample_window_seconds"]
+    if count:
+        if (
+            not isinstance(observed, list)
+            or len(observed) != 2
+            or not all(_diagnostic_seconds(n, elapsed) for n in observed)
+            or not window[0] <= observed[0] <= observed[1] <= window[1]
+        ):
+            return None
+    elif observed is not None:
+        return None
+    if count < 2 and value["sink_state"] != "unknown":
+        return None
+    return {
+        **value,
+        "window_seconds": list(window),
+        "sink_sample_window_seconds": list(observed) if count else None,
+    }
+
+
 def _safe_failure_flow(value: Any) -> dict[str, Any] | None:
     """Project only outage-local, identity-free sampled counter evidence."""
     required = {"elapsed_seconds", "sample_count", "log_ok", "markers", "channels"}
     windows = {"sample_window_seconds", "max_observation_gap_seconds"}
-    optional = windows | {"capture_tracks"}
+    optional = windows | {"capture_tracks", "capture_wait"}
     if not isinstance(value, dict) or not required <= value.keys() <= required | optional:
         return None
     elapsed, count = value["elapsed_seconds"], value["sample_count"]
@@ -669,6 +736,23 @@ def _safe_failure_flow(value: Any) -> dict[str, Any] | None:
         if tracks is None:
             return None
         result["capture_tracks"] = tracks
+    if "capture_wait" in value:
+        capture_wait = _safe_capture_wait(value["capture_wait"], elapsed)
+        if (
+            capture_wait is None
+            or capture_wait["sink_samples"] > count
+            or (
+                capture_wait["sink_samples"]
+                and not (
+                    value["sample_window_seconds"][0]
+                    <= capture_wait["sink_sample_window_seconds"][0]
+                    <= capture_wait["sink_sample_window_seconds"][1]
+                    <= value["sample_window_seconds"][1]
+                )
+            )
+        ):
+            return None
+        result["capture_wait"] = capture_wait
     if count:
         result["sample_window_seconds"] = list(value["sample_window_seconds"])
     return result

@@ -272,12 +272,14 @@ jobs:
               "$target" < "$source"
           done
 
-      - name: First-child native startup diagnostic
+      - name: Post-crash first-child native startup diagnostic
         shell: bash
         run: |
+          # Total diagnostic bound includes the unchanged pre-crash scenarios.
+          # Per-child startup and media acceptance deadlines are not extended.
           docker exec --interactive --env CI_NATIVE_STARTUP=isolated-fixture \
             "$DIAGNOSTIC_CONTAINER" \
-            timeout --signal=TERM --kill-after=15s 240s python3 - \
+            timeout --signal=TERM --kill-after=15s 480s python3 - \
             < deploy/moblin-relay/test-native-startup.py
 
       - name: Remove exact native diagnostic container

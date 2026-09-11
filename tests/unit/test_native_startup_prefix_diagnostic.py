@@ -14,9 +14,9 @@ API = runpy.run_path(str(SOURCE), run_name="_startup_prefix_unit")
 
 def test_summary_requires_actual_planned_stop_and_cleanup():
     original = {"failure": API["STOP"], "workdir_removed": True, "secret_configs_wiped": 6}
-    state = {"initial_completed": True}
+    state = {"initial_completed": True, "target_armed": True, "target_completed": True}
     value = API["prefix_summary"](original, {}, state, 1)
-    assert value["status"] == "PREFIX_OBSERVED_NO_STARTUP_FAILURE"
+    assert value["status"] == "TARGET_CRASH_PREFIX_COMPLETED"
     assert value["acceptance"] is False
     for changes, code in (
         ({"failure": "media-failed"}, 1),
@@ -40,9 +40,10 @@ def test_original_timeout_cannot_be_hidden_by_later_recovery():
         {"initial_completed": False},
         1,
     )
-    assert value["status"] == "ORIGINAL_PREFIX_FAILURE" and value["first_start_timeout"]
-    assert value["startup"]["elapsed_ms"] == 6026
-    assert value["startup"]["reads"] == value["startup"]["absent"] == 119
+    assert value["status"] == "ORIGINAL_PREFIX_FAILURE" and value["initial_start_timeout"]
+    assert value["initial_startup"]["elapsed_ms"] == 6026
+    assert value["initial_startup"]["reads"] == value["initial_startup"]["absent"] == 119
+    assert not value["target_armed"] and not value["target_completed"]
 
 
 @pytest.mark.parametrize(
@@ -75,7 +76,7 @@ def test_failure_checkpoint_preserves_exact_code_location_without_exception_text
         assert API["failure_location"](value, {"assets"}) == {"stage": None, "failure_lines": []}
 
 
-def test_prefix_preserves_original_stage_call_and_stops_only_after_initial_live(tmp_path):
+def test_prefix_preserves_initial_stages_and_original_cleanup(tmp_path):
     calls = []
     test_root = tmp_path / "tests"
     test_root.mkdir()
@@ -86,6 +87,7 @@ def test_prefix_preserves_original_stage_call_and_stops_only_after_initial_live(
     fixture = {
         "mark_self_test_stage": lambda name, **kwargs: calls.append((name, kwargs)),
         "write_configs": lambda *args, **kwargs: None,
+        "MediaFailureDiagnostics": object,
         "validate_test_root": lambda: None,
         "TEST_ROOT": test_root,
         "SELF_TEST_LOCK": "/run/lock/moblin-relay-self-test.lock",
@@ -96,12 +98,9 @@ def test_prefix_preserves_original_stage_call_and_stops_only_after_initial_live(
     )
     fixture["mark_self_test_stage"]("live-normalize")
     assert not state["initial_completed"]
-    with pytest.raises(Failure, match=API["STOP"]):
-        fixture["mark_self_test_stage"]("auth-exclusive")
+    fixture["mark_self_test_stage"]("auth-exclusive")
     assert calls[-1][0] == "auth-exclusive" and state["initial_completed"]
-    fixture["mark_self_test_stage"](
-        "auth-exclusive"
-    )  # Original failure checkpoint is not re-thrown.
+    assert not state["target_armed"] and not state["target_completed"]
     assert fixture["TEST_ROOT"] == test_root
     assert fixture["SELF_TEST_LOCK"] == "/run/lock/moblin-relay-self-test.lock"
     assert fixture["RESULT_FILE"].parent == tmp_path
@@ -180,9 +179,9 @@ def test_ci_diagnostic_is_independent_contained_and_retains_original_main_gates(
     assert "< deploy/moblin-relay/self-test" in stage
     assert 'docker exec --interactive "$DIAGNOSTIC_CONTAINER" python3 -c' in stage
     assert "target.chmod(0o600)" in stage and "target.read_bytes() == data" in stage
-    run = steps["First-child native startup diagnostic"]
+    run = steps["Post-crash first-child native startup diagnostic"]
     assert "if" not in run and "continue-on-error" not in run
-    assert "timeout --signal=TERM --kill-after=15s 240s" in run["run"]
+    assert "timeout --signal=TERM --kill-after=15s 480s" in run["run"]
     assert "CI_NATIVE_STARTUP=isolated-fixture" in run["run"]
     assert "< deploy/moblin-relay/test-native-startup.py" in run["run"]
     cleanup = steps["Remove exact native diagnostic container"]
