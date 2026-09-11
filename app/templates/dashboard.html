@@ -154,6 +154,36 @@
       </div>
     </section>
 
+    <section class="panel moblin-hud-admin" aria-labelledby="moblin-hud-admin-title" data-moblin-hud-admin>
+      <div class="panel__heading panel__heading--split">
+        <div>
+          <p class="eyebrow">Мониторинг в Moblin</p>
+          <h2 id="moblin-hud-admin-title">Moblin HUD</h2>
+          <p>Следите за состоянием эфира и предупреждениями прямо во встроенном браузере Moblin. HUD не попадает в трансляцию.</p>
+        </div>
+        <button class="button button--secondary" type="button" data-hud-create-pairing>
+          Подключить Moblin HUD
+        </button>
+      </div>
+
+      <div class="moblin-hud-admin__pairing" data-hud-pairing hidden>
+        <p><strong>Ссылка действует 10 минут и используется один раз.</strong></p>
+        <div class="moblin-hud-admin__actions">
+          <a class="button button--primary" href="#" data-hud-moblin-link>Добавить в Moblin</a>
+          <button class="button button--secondary" type="button" data-hud-copy-pairing>Скопировать ссылку</button>
+        </div>
+        <input type="text" readonly autocomplete="off" spellcheck="false" aria-label="Одноразовая ссылка Moblin HUD" data-hud-pairing-url>
+        <p class="form-help" data-hud-pairing-expiry></p>
+      </div>
+
+      <p class="field-error" role="alert" data-hud-admin-error hidden></p>
+      <div class="moblin-hud-admin__devices">
+        <h3>Подключённые устройства</h3>
+        <p class="form-help" data-hud-devices-empty>Подключённых HUD-устройств пока нет.</p>
+        <ul class="moblin-hud-device-list" data-hud-device-list></ul>
+      </div>
+    </section>
+
     <details class="panel relay-advanced" data-relay-advanced>
       <summary>
         <span><strong>Дополнительно</strong><small>Управление relay, технические статусы и серверы</small></span>
@@ -278,4 +308,5 @@
 
 {% block scripts %}
   <script src="/static/relay-dashboard.js?v=20260904.1" defer></script>
+  <script src="/static/moblin-hud-admin.js?v=20260904.1" defer></script>
 {% endblock %}

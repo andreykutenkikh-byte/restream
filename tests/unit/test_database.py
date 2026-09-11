@@ -22,7 +22,7 @@ def test_migrations_are_idempotent(tmp_path: Path) -> None:
         job_columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(node_install_jobs)")
         }
-    assert version == SCHEMA_VERSION == 6
+    assert version == SCHEMA_VERSION == 7
     assert "input_bitrate_bps" in relay_columns
     assert "node_kind" in node_columns
     assert "install_profile" in job_columns
@@ -83,9 +83,16 @@ def test_v6_migration_classifies_existing_relays_and_their_install_jobs(tmp_path
         )
         connection.execute("ALTER TABLE restream_nodes DROP COLUMN node_kind")
         connection.execute("ALTER TABLE node_install_jobs DROP COLUMN install_profile")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 6")
+        # HUD v7 must not already exist in a fixture claiming to start at v5.
+        connection.execute("DROP TABLE moblin_hud_pairings")
+        connection.execute("DROP TABLE moblin_hud_devices")
+        connection.execute("DELETE FROM schema_migrations WHERE version >= 6")
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 5
 
+    assert database.ready() is False
     database.migrate()
+    database.migrate()
+    assert database.ready() is True
 
     with database.connect() as connection:
         nodes = {
@@ -96,6 +103,10 @@ def test_v6_migration_classifies_existing_relays_and_their_install_jobs(tmp_path
             row["id"]: row["install_profile"]
             for row in connection.execute("SELECT id, install_profile FROM node_install_jobs")
         }
+        assert connection.execute("SELECT COUNT(*) FROM moblin_hud_devices").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM moblin_hud_pairings").fetchone()[0] == 0
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     assert nodes == {"generic": "generic_node", "relay": "moblin_relay"}
     assert jobs == {"generic-job": "generic_node", "relay-job": "moblin_relay"}
 
@@ -259,7 +270,7 @@ def test_schema_v3_database_is_upgraded_with_nullable_bitrate(tmp_path: Path) ->
                 """
             )
     assert "input_bitrate_bps" in columns
-    assert value == 6
+    assert value == SCHEMA_VERSION == 7
     assert node["node_kind"] == "moblin_relay"
     assert "CONFIGURE_YOUTUBE_KEY" in command_schema
     assert after == before

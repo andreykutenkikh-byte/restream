@@ -2542,6 +2542,73 @@ h3 {
   overflow: hidden;
 }
 
+.moblin-hud-admin {
+  display: grid;
+  gap: 1.25rem;
+}
+
+.moblin-hud-admin .panel__heading p:not(.eyebrow) {
+  max-width: 62ch;
+  margin: 0.45rem 0 0;
+  color: var(--muted);
+}
+
+.moblin-hud-admin__pairing {
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--surface-soft);
+}
+
+.moblin-hud-admin__pairing > p {
+  margin: 0 0 0.75rem;
+}
+
+.moblin-hud-admin__pairing > input {
+  width: 100%;
+  margin-top: 0.75rem;
+}
+
+.moblin-hud-admin__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+}
+
+.moblin-hud-admin__devices h3 {
+  margin: 0 0 0.7rem;
+}
+
+.moblin-hud-device-list {
+  display: grid;
+  gap: 0.65rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.moblin-hud-device {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.85rem 0;
+  border-top: 1px solid var(--line);
+}
+
+.moblin-hud-device > div {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.moblin-hud-device__state[data-state="active"] {
+  color: var(--success);
+}
+
+.moblin-hud-device small {
+  color: var(--muted);
+}
+
 .relay-advanced > summary {
   display: flex;
   min-height: 76px;
