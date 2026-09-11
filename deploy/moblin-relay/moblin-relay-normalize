@@ -760,6 +760,10 @@ def build_ffmpeg_argv(rtsp_port: int, rtmp_port: int) -> list[str]:
         "+genpts",
         "-rtsp_transport",
         "tcp",
+        # Experimental: skip only optional FPS estimation during input discovery.
+        # Retain codec-parameter discovery, source timing and H.264 stream copy.
+        "-fpsprobesize",
+        "0",
         "-i",
         f"rtsp://127.0.0.1:{rtsp_port}/{INGEST_PATH}",
         "-map",
