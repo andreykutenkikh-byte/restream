@@ -203,6 +203,7 @@ test("relay status helpers fail closed and never accept injected SRT output", ()
 });
 
 test("relay presentation separates server connection, stopped state, Moblin, and YouTube", () => {
+  assert.equal(hasMoblinRelayCapability({ node_kind: "moblin_relay", capabilities: [] }), true);
   assert.deepEqual(nodeStatusPresentation("ready", true), {
     status: "ready",
     label: "Агент на связи",
@@ -453,9 +454,9 @@ test("UI includes progress, sudo, revoke confirmation, and mobile layout", () =>
   assert.match(source, /Дополнительные действия/);
   assert.match(source, /data-relay-action-reason/);
   assert.match(source, /button\.disabled = true/);
-  assert.match(baseTemplate, /styles\.css[^"\n]*\?v=20260902\.3/);
+  assert.match(baseTemplate, /styles\.css[^"\n]*\?v=20260904\.1/);
   assert.match(baseTemplate, /app\.js[^"\n]*\?v=20260902\.3/);
-  assert.match(template, /servers\.js\?v=20260903\.1/);
+  assert.match(template, /servers\.js\?v=20260904\.1/);
   assert.match(source, /result\.safe_result\?\.status === "ok"/);
   assert.match(source, /Docker может остаться установленным на сервере/);
 });

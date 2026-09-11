@@ -16,19 +16,19 @@
     checking_privileges: "Проверяем права root или sudo",
     checking_system: "Проверяем операционную систему",
     checking_resources: "Проверяем ресурсы",
-    checking_docker: "Проверяем Docker",
-    installing_docker: "Устанавливаем Docker",
-    needs_enrollment_token: "Подготавливаем Node Agent",
-    preparing_agent: "Подготавливаем Node Agent",
-    installing_agent: "Устанавливаем Node Agent",
-    waiting_for_enrollment: "Подключаем агент к панели",
+    checking_docker: "Проверяем системные зависимости",
+    installing_docker: "Устанавливаем системные компоненты",
+    needs_enrollment_token: "Подготавливаем защищённый доступ",
+    preparing_agent: "Подготавливаем Moblin Relay",
+    installing_agent: "Устанавливаем Moblin Relay",
+    waiting_for_enrollment: "Подключаем relay к панели",
     running_self_test: "Выполняем финальную проверку",
   });
   const KNOWN_STEP_STATES = new Set(["pending", "running", "completed", "failed", "skipped"]);
   const NODE_STATUS = Object.freeze({
     installing: ["Установка", "warning"],
     connecting: ["Подключается", "warning"],
-    ready: ["Готов к назначению", "success"],
+    ready: ["Готов к трансляции", "success"],
     degraded: ["Требуется внимание", "warning"],
     offline: ["Нет связи", "neutral"],
     revoked: ["Доступ отозван", "danger"],
@@ -84,7 +84,8 @@
   }
 
   function hasMoblinRelayCapability(node) {
-    return Array.isArray(node?.capabilities) && node.capabilities.includes("moblin_relay");
+    return node?.node_kind === "moblin_relay"
+      || (Array.isArray(node?.capabilities) && node.capabilities.includes("moblin_relay"));
   }
 
   function canRevokeNode(status, relayCapable = false) {
@@ -258,7 +259,7 @@
     if (!operable) {
       badgeLabel = "Нет связи с сервером";
       badgeTone = "danger";
-      notice = "Агент HK-сервера не отвечает. Команды временно недоступны.";
+      notice = "Агент relay-сервера не отвечает. Команды временно недоступны.";
     } else if (attention) {
       badgeLabel = "Нужна проверка";
       badgeTone = "danger";
@@ -483,6 +484,7 @@
     if (error.status === 401) return "Сессия завершена. Войдите снова.";
     if (error.status === 403) return "Сессия устарела. Обновите страницу и повторите действие.";
     if (error.status === 409) {
+      if (code === "relay_bootstrap_active") return "Установка relay ещё выполняется. Дождитесь её завершения.";
       if (code === "relay_unavailable") return "Relay-сервер сейчас не на связи.";
       if (code === "youtube_not_configured") return "Сначала настройте YouTube RTMPS URL и stream key.";
       if (code === "relay_command_pending") return "Предыдущая команда relay ещё выполняется.";
@@ -679,7 +681,7 @@
     const titleGroup = document.createElement("div");
     const title = appendText(titleGroup, "h3", "", "Управление трансляцией");
     title.id = relayTitleId;
-    appendText(titleGroup, "p", "", "Moblin → SRT → HK relay → YouTube");
+    appendText(titleGroup, "p", "", "Moblin → SRT → relay-сервер → YouTube");
     const badge = appendText(heading, "span", "relay-badge relay-badge--neutral", "Проверяем…");
     badge.dataset.relayBadge = "";
     badge.setAttribute("role", "status");
@@ -881,7 +883,7 @@
     );
     availability.setAttribute(
       "title",
-      relayCapable ? "Состояние relay обновляется агентом HK-сервера" : "Передача видеопотока пока не назначена",
+      relayCapable ? "Состояние relay обновляется агентом сервера" : "Передача видеопотока пока не назначена",
     );
     card.append(heading);
 
@@ -997,7 +999,7 @@
     }
     if (jobProgressLabel) jobProgressLabel.textContent = `${progress}%`;
     if (jobStateLabel) {
-      jobStateLabel.textContent = state === "completed" ? "Сервер готов к назначению" : "Выполняем безопасную установку";
+      jobStateLabel.textContent = state === "completed" ? "Moblin Relay готов к настройке" : "Выполняем безопасную установку";
     }
     const steps = Array.isArray(job?.steps) ? job.steps : [];
     const rows = [];
@@ -1057,7 +1059,7 @@
       if (state === "needs_sudo_password") return;
       if (TERMINAL_JOB_STATES.has(state)) {
         if (state === "completed") {
-          showToast("Сервер подключён", "Узел готов к назначению.");
+          showToast("Moblin Relay установлен", "Настройте YouTube и скопируйте SRT URL в приложении.");
           await loadServers();
         }
         return;

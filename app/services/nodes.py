@@ -30,6 +30,7 @@ COMMAND_MAX_AGE_SECONDS: Final = 300
 NodeStatus = Literal[
     "installing", "connecting", "ready", "degraded", "offline", "revoked", "failed"
 ]
+NodeKind = Literal["generic_node", "moblin_relay"]
 CommandType = Literal["PING", "SELF_TEST"]
 
 
@@ -201,6 +202,7 @@ class NodeService:
         host_key_fingerprint: str | None = None,
         host_key_trust_mode: str | None = None,
         status: NodeStatus = "installing",
+        node_kind: NodeKind = "generic_node",
         node_id: str | None = None,
     ) -> dict[str, Any]:
         identifier = node_id or str(uuid4())
@@ -208,32 +210,123 @@ class NodeService:
         now = _timestamp(self._time())
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                """
-                INSERT INTO restream_nodes(
-                    id, display_name, address, resolved_ip, ssh_port, ssh_username,
-                    host_key_algorithm, host_key_fingerprint, host_key_trust_mode,
-                    status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    identifier,
-                    display_name,
-                    address,
-                    resolved_ip,
-                    ssh_port,
-                    ssh_username,
-                    host_key_algorithm,
-                    host_key_fingerprint,
-                    host_key_trust_mode,
-                    status,
-                    now,
-                    now,
-                ),
+            self._insert_pending_node(
+                connection,
+                identifier=identifier,
+                node_kind=node_kind,
+                display_name=display_name,
+                address=address,
+                resolved_ip=resolved_ip,
+                ssh_port=ssh_port,
+                ssh_username=ssh_username,
+                host_key_algorithm=host_key_algorithm,
+                host_key_fingerprint=host_key_fingerprint,
+                host_key_trust_mode=host_key_trust_mode,
+                status=status,
+                now=now,
             )
-            self._add_event(connection, identifier, "node.created")
             connection.execute("COMMIT")
         node = self.get_node(identifier)
+        if node is None:  # pragma: no cover - SQLite invariant
+            raise RuntimeError("node was not persisted")
+        return node
+
+    def _insert_pending_node(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        identifier: str,
+        node_kind: NodeKind,
+        display_name: str,
+        address: str,
+        resolved_ip: str,
+        ssh_port: int,
+        ssh_username: str,
+        host_key_algorithm: str | None,
+        host_key_fingerprint: str | None,
+        host_key_trust_mode: str | None,
+        status: NodeStatus,
+        now: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO restream_nodes(
+                id, node_kind, display_name, address, resolved_ip, ssh_port, ssh_username,
+                host_key_algorithm, host_key_fingerprint, host_key_trust_mode,
+                status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                identifier,
+                node_kind,
+                display_name,
+                address,
+                resolved_ip,
+                ssh_port,
+                ssh_username,
+                host_key_algorithm,
+                host_key_fingerprint,
+                host_key_trust_mode,
+                status,
+                now,
+                now,
+            ),
+        )
+        self._add_event(connection, identifier, "node.created")
+
+    def create_pending_bootstrap_node(
+        self,
+        *,
+        job_id: str,
+        install_profile: NodeKind,
+        display_name: str,
+        address: str,
+        resolved_ip: str,
+        ssh_port: int,
+        ssh_username: str,
+        node_id: str,
+    ) -> dict[str, Any]:
+        """Atomically reserve a typed node, optional relay row, and install job."""
+
+        UUID(node_id)
+        UUID(job_id)
+        now = _timestamp(self._time())
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._insert_pending_node(
+                connection,
+                identifier=node_id,
+                node_kind=install_profile,
+                display_name=display_name,
+                address=address,
+                resolved_ip=resolved_ip,
+                ssh_port=ssh_port,
+                ssh_username=ssh_username,
+                host_key_algorithm=None,
+                host_key_fingerprint=None,
+                host_key_trust_mode=None,
+                status="installing",
+                now=now,
+            )
+            if install_profile == "moblin_relay":
+                connection.execute(
+                    """
+                    INSERT INTO relay_nodes(node_id, created_at, updated_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    (node_id, now, now),
+                )
+            connection.execute(
+                """
+                INSERT INTO node_install_jobs(
+                    id, node_id, install_profile, state, current_step,
+                    progress_percent, created_at, updated_at
+                ) VALUES (?, ?, ?, 'queued', 'queued', 0, ?, ?)
+                """,
+                (job_id, node_id, install_profile, now, now),
+            )
+            connection.execute("COMMIT")
+        node = self.get_node(node_id)
         if node is None:  # pragma: no cover - SQLite invariant
             raise RuntimeError("node was not persisted")
         return node
@@ -249,7 +342,7 @@ class NodeService:
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             node = connection.execute(
-                "SELECT status, capabilities_json FROM restream_nodes WHERE id = ?", (node_id,)
+                "SELECT status, node_kind FROM restream_nodes WHERE id = ?", (node_id,)
             ).fetchone()
             if node is None:
                 connection.execute("ROLLBACK")
@@ -257,6 +350,9 @@ class NodeService:
             if node["status"] == "revoked":
                 connection.execute("ROLLBACK")
                 raise NodeAuthenticationError("node access is revoked")
+            if node["node_kind"] != "generic_node":
+                connection.execute("ROLLBACK")
+                raise NodeUnavailableError("node does not use generic enrollment")
             connection.execute(
                 """
                 UPDATE node_enrollment_tokens
@@ -277,6 +373,184 @@ class NodeService:
             connection.execute("COMMIT")
         return token
 
+    def issue_relay_bootstrap_credential(self, node_id: str, job_id: str) -> str:
+        """Issue a permanent relay credential only for an active relay bootstrap.
+
+        The raw token crosses only the existing secret UDS channel.  SQLite gets
+        its digest, and the relay protocol row is created/reset in the same
+        transaction so a credential can never authenticate to a half-provisioned
+        relay identity.
+        """
+
+        node_token = generate_node_token(node_id)
+        credential_digest = digest_opaque_token(node_token)
+        now_text = _timestamp(self._time())
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            node = connection.execute(
+                "SELECT status, node_kind FROM restream_nodes WHERE id = ?",
+                (node_id,),
+            ).fetchone()
+            active_job = connection.execute(
+                """
+                SELECT 1 FROM node_install_jobs
+                WHERE id = ? AND node_id = ? AND install_profile = 'moblin_relay'
+                  AND state NOT IN ('completed', 'cancelled', 'failed')
+                LIMIT 1
+                """,
+                (job_id, node_id),
+            ).fetchone()
+            if node is None:
+                connection.execute("ROLLBACK")
+                raise NodeNotFoundError("node not found")
+            if (
+                node["node_kind"] != "moblin_relay"
+                or node["status"] not in {"installing", "connecting"}
+                or active_job is None
+            ):
+                connection.execute("ROLLBACK")
+                raise NodeUnavailableError("relay bootstrap credential is not authorized")
+
+            # A relay bootstrap never participates in the generic one-time
+            # enrollment protocol. Expire any residual generic grants before
+            # publishing its permanent credential.
+            connection.execute(
+                """
+                UPDATE node_enrollment_tokens SET used_at = COALESCE(used_at, ?)
+                WHERE node_id = ?
+                """,
+                (now_text, node_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO node_credentials(node_id, token_digest, issued_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(node_id) DO UPDATE SET
+                    token_digest = excluded.token_digest,
+                    issued_at = excluded.issued_at,
+                    last_rotated_at = excluded.issued_at,
+                    revoked_at = NULL
+                """,
+                (node_id, credential_digest, now_text),
+            )
+            connection.execute(
+                """
+                INSERT INTO relay_nodes(node_id, created_at, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(node_id) DO UPDATE SET
+                    service_state = 'unknown', service_enabled = 0,
+                    main_process = 'unknown', srt_listener = 'unknown',
+                    source = 'UNKNOWN', input_bitrate_bps = NULL,
+                    youtube_forward = 'unknown', overall = 'unknown',
+                    youtube_url_configured = 0, youtube_key_configured = 0,
+                    healthy = 0, portrait_profile = 0, last_error_code = NULL,
+                    current_command_id = NULL, last_seen_at = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (node_id, now_text, now_text),
+            )
+            connection.execute(
+                """
+                UPDATE restream_nodes
+                SET status = 'connecting', protocol_version = 1,
+                    capabilities_json = ?, current_command_id = NULL,
+                    last_seen_at = NULL, updated_at = ?, revoked_at = NULL
+                WHERE id = ?
+                """,
+                (_json(["moblin_relay"]), now_text, node_id),
+            )
+            self._add_event(connection, node_id, "node.relay_credential_issued")
+            connection.execute("COMMIT")
+        return node_token
+
+    def revoke_incomplete_bootstrap(
+        self,
+        connection: sqlite3.Connection,
+        node_id: str,
+        now_text: str,
+    ) -> None:
+        """Invalidate every control credential within the caller's transaction."""
+
+        connection.execute(
+            """
+            UPDATE restream_nodes
+            SET status = CASE WHEN status = 'revoked' THEN status ELSE 'failed' END,
+                current_command_id = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (now_text, node_id),
+        )
+        connection.execute(
+            """
+            UPDATE node_enrollment_tokens SET used_at = COALESCE(used_at, ?)
+            WHERE node_id = ?
+            """,
+            (now_text, node_id),
+        )
+        connection.execute(
+            """
+            UPDATE node_credentials SET revoked_at = COALESCE(revoked_at, ?)
+            WHERE node_id = ?
+            """,
+            (now_text, node_id),
+        )
+        connection.execute(
+            """
+            UPDATE node_commands
+            SET state = 'cancelled', lease_until = NULL, completed_at = ?,
+                safe_result_json = '{"code":"bootstrap_not_completed","status":"failed"}'
+            WHERE node_id = ? AND state IN ('queued', 'leased', 'acknowledged')
+            """,
+            (now_text, node_id),
+        )
+        relay = connection.execute(
+            "SELECT 1 FROM relay_nodes WHERE node_id = ?",
+            (node_id,),
+        ).fetchone()
+        if relay is None:
+            return
+        if self._relay_payload_tombstone:
+            connection.execute(
+                """
+                UPDATE relay_commands
+                SET state = 'cancelled', lease_until = NULL, completed_at = ?,
+                    completion_status = 'failed',
+                    safe_result_json = '{"error_code":"internal_error"}',
+                    payload_encrypted = ?, secret_result_encrypted = NULL,
+                    secret_consumed_at = COALESCE(secret_consumed_at, ?)
+                WHERE node_id = ? AND state IN ('queued', 'leased', 'acknowledged')
+                """,
+                (now_text, self._relay_payload_tombstone, now_text, node_id),
+            )
+        else:
+            # Tests and explicitly unconfigured services have no encryption
+            # tombstone. Deleting an incomplete command is safer than retaining
+            # an encrypted bootstrap-era secret that no valid credential can use.
+            connection.execute(
+                """
+                DELETE FROM relay_commands
+                WHERE node_id = ? AND state IN ('queued', 'leased', 'acknowledged')
+                """,
+                (node_id,),
+            )
+        connection.execute(
+            """
+            UPDATE relay_commands
+            SET secret_result_encrypted = NULL,
+                secret_consumed_at = COALESCE(secret_consumed_at, ?)
+            WHERE node_id = ? AND secret_result_encrypted IS NOT NULL
+            """,
+            (now_text, node_id),
+        )
+        connection.execute(
+            """
+            UPDATE relay_nodes
+            SET current_command_id = NULL, healthy = 0, updated_at = ?
+            WHERE node_id = ?
+            """,
+            (now_text, node_id),
+        )
+
     def enroll(
         self,
         enrollment_token: str,
@@ -288,6 +562,8 @@ class NodeService:
 
         if profile.get("protocol_version") != SUPPORTED_PROTOCOL_VERSION:
             raise UnsupportedProtocolError("unsupported node protocol version")
+        if "moblin_relay" in profile.get("capabilities", []):
+            raise UnsupportedProtocolError("unsupported node capabilities")
         try:
             supplied_digest = digest_opaque_token(enrollment_token)
         except (TypeError, ValueError):
@@ -300,7 +576,7 @@ class NodeService:
                 connection.execute(
                     """
                     SELECT token.id, token.node_id, token.token_digest, token.expires_at,
-                           token.used_at, node.status
+                           token.used_at, node.status, node.node_kind
                     FROM node_enrollment_tokens AS token
                     JOIN restream_nodes AS node ON node.id = token.node_id
                     WHERE token.token_digest = ?
@@ -318,6 +594,7 @@ class NodeService:
                 and row["used_at"] is None
                 and str(row["expires_at"]) > current_time
                 and row["status"] != "revoked"
+                and row["node_kind"] == "generic_node"
             )
 
         # Random public input never asks SQLite for a writer lock. The indexed
@@ -420,7 +697,8 @@ class NodeService:
             row = connection.execute(
                 """
                 SELECT credential.node_id, credential.token_digest, credential.revoked_at,
-                       node.status, node.protocol_version, node.capabilities_json
+                       node.status, node.node_kind, node.protocol_version,
+                       node.capabilities_json
                 FROM node_credentials AS credential
                 JOIN restream_nodes AS node ON node.id = credential.node_id
                 WHERE credential.node_id = ?
@@ -442,7 +720,7 @@ class NodeService:
         # Native relay credentials share the identity/credential tables so the
         # server list has one node ID. They belong to a distinct protocol trust
         # domain and must never authenticate to the generic Node Agent API.
-        if "moblin_relay" in capabilities:
+        if row["node_kind"] != "generic_node" or "moblin_relay" in capabilities:
             raise NodeAuthenticationError("node authentication failed")
         if require_supported_protocol and row["protocol_version"] != SUPPORTED_PROTOCOL_VERSION:
             raise UnsupportedProtocolError("unsupported node protocol version")
@@ -456,6 +734,8 @@ class NodeService:
         authenticated = self.authenticate(node_token)
         if snapshot.get("protocol_version") != SUPPORTED_PROTOCOL_VERSION:
             raise UnsupportedProtocolError("unsupported node protocol version")
+        if "moblin_relay" in snapshot.get("capabilities", []):
+            raise UnsupportedProtocolError("unsupported node capabilities")
         node_id = str(authenticated["node_id"])
         now = self._time()
         now_text = _timestamp(now)
@@ -578,7 +858,7 @@ class NodeService:
             node = connection.execute(
                 """
                 SELECT node.status, node.protocol_version,
-                       node.capabilities_json,
+                       node.node_kind, node.capabilities_json,
                        credential.node_id AS credential_node_id,
                        credential.revoked_at AS credential_revoked_at
                 FROM restream_nodes AS node
@@ -600,7 +880,7 @@ class NodeService:
                 capabilities = json.loads(str(node["capabilities_json"]))
             except (TypeError, ValueError):
                 capabilities = []
-            if "moblin_relay" in capabilities:
+            if node["node_kind"] != "generic_node" or "moblin_relay" in capabilities:
                 connection.execute("ROLLBACK")
                 raise NodeUnavailableError("node does not support generic commands")
             if node["protocol_version"] != SUPPORTED_PROTOCOL_VERSION:
@@ -893,7 +1173,7 @@ class NodeService:
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             node = connection.execute(
-                "SELECT status, capabilities_json FROM restream_nodes WHERE id = ?",
+                "SELECT status, node_kind FROM restream_nodes WHERE id = ?",
                 (node_id,),
             ).fetchone()
             if node is None:
@@ -914,11 +1194,7 @@ class NodeService:
                 "SELECT 1 FROM relay_nodes WHERE node_id = ?",
                 (node_id,),
             ).fetchone()
-            try:
-                capabilities = json.loads(str(node["capabilities_json"]))
-            except (TypeError, ValueError):
-                capabilities = []
-            is_relay = relay is not None and "moblin_relay" in capabilities
+            is_relay = relay is not None and node["node_kind"] == "moblin_relay"
             allowed_statuses = {"ready", "degraded", "offline", "revoked"}
             if is_relay:
                 allowed_statuses.add("connecting")

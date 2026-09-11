@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "public_srt_host": "relay.example.com",
+  "fallback_srt_hosts": [],
+  "srt_port": 8890,
+  "srt_path": "iphone-live"
+}

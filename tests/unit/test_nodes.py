@@ -144,6 +144,42 @@ def test_node_schema_migration_is_idempotent_and_has_no_password_columns(tmp_pat
     assert database.ready()
 
 
+def test_typed_bootstrap_reservation_rolls_back_node_relay_and_event_together(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "atomic-bootstrap.sqlite")
+    database.migrate()
+    with database.connect() as connection:
+        connection.executescript(
+            """
+            CREATE TRIGGER reject_bootstrap_job
+            BEFORE INSERT ON node_install_jobs
+            BEGIN
+                SELECT RAISE(ABORT, 'injected bootstrap job failure');
+            END;
+            """
+        )
+    service = NodeService(database)
+
+    with pytest.raises(sqlite3.DatabaseError, match="injected bootstrap job failure"):
+        service.create_pending_bootstrap_node(
+            job_id=str(uuid4()),
+            install_profile="moblin_relay",
+            display_name="relay-01",
+            address="relay.example.test",
+            resolved_ip="",
+            ssh_port=22,
+            ssh_username="root",
+            node_id=str(uuid4()),
+        )
+
+    with database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM restream_nodes").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM relay_nodes").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM node_install_jobs").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM node_events").fetchone()[0] == 0
+
+
 def test_schema_v1_upgrade_preserves_existing_restream_data(tmp_path: Path) -> None:
     path = tmp_path / "schema-v1.sqlite"
     connection = sqlite3.connect(path)

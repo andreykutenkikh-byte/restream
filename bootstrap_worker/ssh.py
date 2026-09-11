@@ -141,7 +141,9 @@ class AsyncSSHSession:
                 completed = True
         except BootstrapError:
             raise
-        except (asyncssh.Error, OSError, TimeoutError) as exc:
+        except TimeoutError as exc:
+            raise safe_failure("remote_command_timeout") from exc
+        except (asyncssh.Error, OSError) as exc:
             raise safe_failure("remote_command_failed") from exc
         finally:
             if process is not None and not completed:

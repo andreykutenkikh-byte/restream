@@ -1,4 +1,8 @@
 .env
+.env.*
+.[eE][nN][vV]
+.[eE][nN][vV].*
+!.env.example
 .bootstrap-worker-secret.*
 secrets/
 .venv/
@@ -18,3 +22,12 @@ logs/*
 !logs/.gitkeep
 backups/*
 !backups/.gitkeep
+*.age
+*.age.*
+*.age-*
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*

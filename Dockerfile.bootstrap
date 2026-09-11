@@ -15,6 +15,9 @@ WORKDIR /srv/bootstrap
 
 COPY pyproject.toml uv.lock README.md ./
 COPY bootstrap_worker ./bootstrap_worker
+COPY relay_agent ./relay_agent
+COPY deploy/hk-relay-agent ./deploy/hk-relay-agent
+COPY deploy/moblin-relay ./deploy/moblin-relay
 
 RUN pip install "uv==0.11.28" \
     && uv sync --locked --no-dev --no-editable --compile-bytecode \

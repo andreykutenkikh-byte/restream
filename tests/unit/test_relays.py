@@ -22,6 +22,7 @@ from app.services.relays import (
     RELAY_COMMAND_TTL_SECONDS,
     RelayActiveError,
     RelayAuthenticationError,
+    RelayBootstrapActiveError,
     RelayCommandPendingError,
     RelayCommandStateError,
     RelayIdempotencyConflictError,
@@ -184,7 +185,7 @@ def test_provision_is_one_identity_and_rotation_requires_explicit_stopped_flag(
     database, service, node_id, token, _ = provisioned(tmp_path)
     with database.connect() as connection:
         node = connection.execute(
-            "SELECT id, capabilities_json FROM restream_nodes WHERE id = ?", (node_id,)
+            "SELECT id, node_kind, capabilities_json FROM restream_nodes WHERE id = ?", (node_id,)
         ).fetchone()
         relay = connection.execute(
             "SELECT node_id FROM relay_nodes WHERE node_id = ?", (node_id,)
@@ -193,6 +194,7 @@ def test_provision_is_one_identity_and_rotation_requires_explicit_stopped_flag(
             "SELECT token_digest FROM node_credentials WHERE node_id = ?", (node_id,)
         ).fetchone()
     assert node is not None and "moblin_relay" in node["capabilities_json"]
+    assert node["node_kind"] == "moblin_relay"
     assert relay is not None
     assert credential is not None
     assert token not in database_dump(database)
@@ -489,6 +491,78 @@ def test_provision_refuses_to_convert_an_existing_generic_node(tmp_path: Path) -
     service = RelayService(database, generate_master_key())
     with pytest.raises(RelayProvisionConflictError):
         service.provision_node(display_name="relay", address="198.51.100.30")
+
+
+def test_relay_commands_are_blocked_until_bootstrap_is_terminal(tmp_path: Path) -> None:
+    database, service, node_id, _, _ = provisioned(tmp_path)
+    with database.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO node_install_jobs(
+                id, node_id, install_profile, state, current_step,
+                progress_percent, created_at, updated_at
+            ) VALUES (
+                'bootstrap-job', ?, 'moblin_relay', 'waiting_for_enrollment',
+                'waiting_for_enrollment', 85, 'created', 'updated'
+            )
+            """,
+            (node_id,),
+        )
+
+    with pytest.raises(RelayBootstrapActiveError):
+        service.create_command(node_id, "STATUS")
+
+    with database.connect() as connection:
+        connection.execute(
+            """
+            UPDATE node_install_jobs
+            SET state = 'completed', current_step = 'completed', progress_percent = 100
+            WHERE id = 'bootstrap-job'
+            """
+        )
+    assert service.create_command(node_id, "STATUS")["state"] == "queued"
+
+
+def test_failed_bootstrap_revokes_credential_and_tombstones_relay_payload(
+    tmp_path: Path,
+) -> None:
+    database, service, node_id, token, clock = provisioned(tmp_path)
+    marker = "FAILED_BOOTSTRAP_STREAM_KEY_CANARY_91"
+    command = service.create_command(
+        node_id,
+        "CONFIGURE_YOUTUBE",
+        payload={
+            "youtube_rtmps_url": "rtmps://a.rtmps.youtube.com/live2",
+            "youtube_stream_key": marker,
+        },
+    )
+    nodes = NodeService(
+        database,
+        clock=clock,
+        relay_payload_tombstone=service.encrypted_empty_payload(),
+    )
+    with database.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        nodes.revoke_incomplete_bootstrap(connection, node_id, clock().isoformat())
+        connection.execute("COMMIT")
+
+    with database.connect() as connection:
+        saved = connection.execute(
+            "SELECT state, payload_encrypted FROM relay_commands WHERE id = ?",
+            (command["id"],),
+        ).fetchone()
+        credential = connection.execute(
+            "SELECT revoked_at FROM node_credentials WHERE node_id = ?",
+            (node_id,),
+        ).fetchone()
+    assert saved["state"] == "cancelled"
+    assert (
+        decrypt_destination_key(saved["payload_encrypted"], service.master_encryption_key) == "{}"
+    )
+    assert credential["revoked_at"] is not None
+    assert marker not in database_dump(database)
+    with pytest.raises(RelayAuthenticationError):
+        service.authenticate(token)
 
 
 def test_connecting_relay_can_be_revoked_then_rotated_and_requires_new_heartbeat(

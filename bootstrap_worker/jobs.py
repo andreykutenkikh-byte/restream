@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import cast
 from uuid import UUID, uuid4
 
 from pydantic import SecretStr
@@ -37,6 +38,7 @@ from bootstrap_worker.models import (
     BootstrapRequest,
     DockerDisposition,
     HostKeyResult,
+    InstallProfile,
     JobAccepted,
     JobState,
     JobView,
@@ -45,6 +47,11 @@ from bootstrap_worker.models import (
     TargetIdentity,
     TimeoutPolicy,
     utc_now,
+)
+from bootstrap_worker.relay_installer import (
+    RelayInstallReceipt,
+    RemoteRelayInstaller,
+    validate_relay_platform,
 )
 from bootstrap_worker.ssh import AsyncSSHConnector, RemoteSession, SSHConnector
 from bootstrap_worker.state_machine import JobStateMachine
@@ -66,6 +73,7 @@ def _request_identity(request: BootstrapRequest) -> tuple[object, ...]:
         request.control_url,
         request.node_agent_image,
         request.node_agent_environment,
+        request.install_profile,
         request.recover_failed_install,
         request.adopt_empty_managed_root_for_test,
     )
@@ -230,19 +238,22 @@ class BootstrapExecutor:
         connector: SSHConnector | None = None,
         docker: DockerBootstrap | None = None,
         installer: RemoteNodeInstaller | None = None,
+        relay_installer: RemoteRelayInstaller | None = None,
         timeouts: TimeoutPolicy | None = None,
     ) -> None:
         self._target_policy = target_policy
         self._connector = connector or AsyncSSHConnector()
         self._docker = docker or DockerBootstrap()
         self._installer = installer or RemoteNodeInstaller()
+        self._relay_installer = relay_installer or RemoteRelayInstaller()
         self.timeouts = timeouts or TimeoutPolicy()
 
     async def run(self, record: JobRecord) -> None:
         request = record.require_request()
+        relay_profile = request.install_profile is InstallProfile.MOBLIN_RELAY
         session: RemoteSession | None = None
         privilege: PrivilegeContext | None = None
-        receipt: InstallReceipt | None = None
+        receipt: InstallReceipt | RelayInstallReceipt | None = None
         completed = False
         try:
             record.transition(JobState.RESOLVING)
@@ -327,6 +338,8 @@ class BootstrapExecutor:
             record.transition(JobState.CHECKING_SYSTEM)
             facts = await probe_system(session, timeout=self.timeouts.command_seconds)
             facts = validate_operating_system(facts)
+            if relay_profile:
+                validate_relay_platform(facts)
             record.system = facts
             record.checkpoint()
 
@@ -336,27 +349,28 @@ class BootstrapExecutor:
             record.checkpoint()
 
             record.transition(JobState.CHECKING_DOCKER)
-            docker_state = await self._docker.inspect(
-                session,
-                privilege,
-                facts,
-                timeout=self.timeouts.command_seconds,
-            )
-            if docker_state is DockerDisposition.UNSUPPORTED:
-                raise safe_failure("unsupported_docker_installation")
-            if docker_state is DockerDisposition.ABSENT:
-                record.transition(JobState.INSTALLING_DOCKER)
-                record.docker_install_started = True
-                record.updated_at = utc_now()
-                await self._docker.install(
+            if not relay_profile:
+                docker_state = await self._docker.inspect(
                     session,
                     privilege,
                     facts,
-                    timeouts=self.timeouts,
+                    timeout=self.timeouts.command_seconds,
                 )
-                record.docker_installed = True
-            # READY is intentionally observation-only: the install/start plan is
-            # unreachable for an existing supported Docker daemon.
+                if docker_state is DockerDisposition.UNSUPPORTED:
+                    raise safe_failure("unsupported_docker_installation")
+                if docker_state is DockerDisposition.ABSENT:
+                    record.transition(JobState.INSTALLING_DOCKER)
+                    record.docker_install_started = True
+                    record.updated_at = utc_now()
+                    await self._docker.install(
+                        session,
+                        privilege,
+                        facts,
+                        timeouts=self.timeouts,
+                    )
+                    record.docker_installed = True
+                # READY is intentionally observation-only: the install/start
+                # plan is unreachable for an existing supported Docker daemon.
             record.checkpoint()
 
             record.transition(JobState.NEEDS_ENROLLMENT_TOKEN)
@@ -366,28 +380,50 @@ class BootstrapExecutor:
 
             record.transition(JobState.PREPARING_AGENT)
             try:
-                receipt = await self._installer.prepare(
-                    session,
-                    privilege,
-                    request,
-                    facts,
-                    enrollment_token=enrollment_token,
-                    job_id=record.job_id,
-                    docker_installed=record.docker_installed,
-                    timeouts=self.timeouts,
-                )
+                if relay_profile:
+                    receipt = await self._relay_installer.prepare(
+                        session,
+                        privilege,
+                        request,
+                        facts,
+                        enrollment_token=enrollment_token,
+                        job_id=record.job_id,
+                        docker_installed=record.docker_installed,
+                        timeouts=self.timeouts,
+                        target=record.target,
+                    )
+                else:
+                    receipt = await self._installer.prepare(
+                        session,
+                        privilege,
+                        request,
+                        facts,
+                        enrollment_token=enrollment_token,
+                        job_id=record.job_id,
+                        docker_installed=record.docker_installed,
+                        timeouts=self.timeouts,
+                        target=record.target,
+                    )
             finally:
                 enrollment_token = SecretStr("")
                 record.clear_enrollment_token()
             record.checkpoint()
 
             record.transition(JobState.INSTALLING_AGENT)
-            await self._installer.install(
-                session,
-                privilege,
-                receipt,
-                timeouts=self.timeouts,
-            )
+            if relay_profile:
+                await self._relay_installer.install(
+                    session,
+                    privilege,
+                    cast(RelayInstallReceipt, receipt),
+                    timeouts=self.timeouts,
+                )
+            else:
+                await self._installer.install(
+                    session,
+                    privilege,
+                    cast(InstallReceipt, receipt),
+                    timeouts=self.timeouts,
+                )
             record.checkpoint()
 
             record.transition(JobState.WAITING_FOR_ENROLLMENT)
@@ -400,12 +436,20 @@ class BootstrapExecutor:
             receipt.enrollment_completed = True
 
             record.transition(JobState.RUNNING_SELF_TEST)
-            await self._installer.final_check(
-                session,
-                privilege,
-                receipt,
-                timeout=self.timeouts.command_seconds,
-            )
+            if relay_profile:
+                await self._relay_installer.final_check(
+                    session,
+                    privilege,
+                    cast(RelayInstallReceipt, receipt),
+                    timeout=self.timeouts.command_seconds,
+                )
+            else:
+                await self._installer.final_check(
+                    session,
+                    privilege,
+                    cast(InstallReceipt, receipt),
+                    timeout=self.timeouts.command_seconds,
+                )
             record.transition(JobState.COMPLETED)
             receipt.workflow_committed = True
             completed = True
@@ -416,18 +460,34 @@ class BootstrapExecutor:
                 try:
                     async with asyncio.timeout(self.timeouts.command_seconds):
                         if not completed:
-                            await self._installer.rollback(
+                            if relay_profile:
+                                await self._relay_installer.rollback(
+                                    session,
+                                    privilege,
+                                    cast(RelayInstallReceipt, receipt),
+                                    timeout=self.timeouts.command_seconds,
+                                )
+                            else:
+                                await self._installer.rollback(
+                                    session,
+                                    privilege,
+                                    cast(InstallReceipt, receipt),
+                                    timeout=self.timeouts.command_seconds,
+                                )
+                        if relay_profile:
+                            await self._relay_installer.cleanup_temp(
                                 session,
                                 privilege,
-                                receipt,
+                                cast(RelayInstallReceipt, receipt),
                                 timeout=self.timeouts.command_seconds,
                             )
-                        await self._installer.cleanup_temp(
-                            session,
-                            privilege,
-                            receipt,
-                            timeout=self.timeouts.command_seconds,
-                        )
+                        else:
+                            await self._installer.cleanup_temp(
+                                session,
+                                privilege,
+                                cast(InstallReceipt, receipt),
+                                timeout=self.timeouts.command_seconds,
+                            )
                 except TimeoutError:
                     pass
             if privilege is not None:

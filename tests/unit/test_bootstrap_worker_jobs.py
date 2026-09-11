@@ -19,6 +19,7 @@ from bootstrap_worker.models import (
     BootstrapRequest,
     DockerDisposition,
     InstallOwnership,
+    InstallProfile,
     JobState,
     TimeoutPolicy,
 )
@@ -136,6 +137,14 @@ class FailingDockerInstall:
 
     async def install(self, *args: object, **kwargs: object) -> None:
         raise safe_failure("remote_command_failed")
+
+
+class ForbiddenDocker:
+    async def inspect(self, *args: object, **kwargs: object) -> DockerDisposition:
+        raise AssertionError("native relay bootstrap must not inspect Docker")
+
+    async def install(self, *args: object, **kwargs: object) -> None:
+        raise AssertionError("native relay bootstrap must not install Docker")
 
 
 class FakeInstaller:
@@ -335,9 +344,11 @@ async def cancel_after_successful_final_check(
     return installer, connector.sessions[0]
 
 
-async def test_full_fake_workflow_completes_and_drops_all_secret_models() -> None:
+async def test_legacy_generic_profile_workflow_completes_and_drops_secrets() -> None:
     store, installer = await build_store()
-    accepted = await store.create(make_request())
+    request = make_request(install_profile=InstallProfile.GENERIC_NODE)
+    assert request.install_profile is InstallProfile.GENERIC_NODE
+    accepted = await store.create(request)
     await persist_verified_host_key(store, accepted.job_id)
     await provide_jit_enrollment_token(store, accepted.job_id)
     await wait_for_state(store, accepted.job_id, JobState.WAITING_FOR_ENROLLMENT)
@@ -357,6 +368,31 @@ async def test_full_fake_workflow_completes_and_drops_all_secret_models() -> Non
     assert installer.rollback_count == 0
     assert installer.cleanup_count == 1
     assert installer.receipt is not None and installer.receipt.workflow_committed is True
+    await store.shutdown()
+
+
+async def test_native_relay_profile_never_calls_docker_workflow() -> None:
+    selected_policy = policy()
+    installer = FakeInstaller()
+    executor = BootstrapExecutor(
+        target_policy=selected_policy,
+        connector=FakeConnector(FakeSession),
+        docker=ForbiddenDocker(),  # type: ignore[arg-type]
+        relay_installer=installer,  # type: ignore[arg-type]
+        timeouts=TimeoutPolicy(enrollment_seconds=2),
+    )
+    store = JobStore(target_policy=selected_policy, executor=executor)
+    accepted = await store.create(make_request(install_profile=InstallProfile.MOBLIN_RELAY))
+    await persist_verified_host_key(store, accepted.job_id)
+    await provide_jit_enrollment_token(store, accepted.job_id)
+    await wait_for_state(store, accepted.job_id, JobState.WAITING_FOR_ENROLLMENT)
+    await store.mark_enrollment_completed(
+        accepted.job_id,
+        expected_instance_id=store.instance_id,
+    )
+    await wait_for_state(store, accepted.job_id, JobState.COMPLETED)
+    assert installer.receipt is not None
+    assert installer.receipt.workflow_committed is True
     await store.shutdown()
 
 
