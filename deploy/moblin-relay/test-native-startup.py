@@ -187,7 +187,23 @@ def install_prefix(api, stage, mediamtx, stage_file):
         SELF_TEST_STAGE_FILE=str(stage_file),
     )
     original_mark = api["mark_self_test_stage"]
+    original_write_configs = api["write_configs"]
     state = {"initial_completed": False, "last_stage": "startup"}
+
+    def write_configs(*args, **kwargs):
+        # Keep /tmp noexec: the fixed interpreter reads this private script.
+        wrapper = str(stage / "wrapper.py")
+        require(
+            re.fullmatch(r"/tmp/adojapan-ci-startup-[A-Za-z0-9_-]{8,64}/wrapper\.py", wrapper),  # noqa: S108
+            "PRIVATE_HOOK_STAGE_PATH",
+        )
+        sink_path, dut_path = original_write_configs(*args, **kwargs)
+        config = json.loads(read_private(dut_path))
+        ingest = config["paths"][api["INGEST_PATH"]]
+        require(ingest.get("runOnAvailable") == wrapper, "PRIVATE_HOOK_ANCHOR_CHANGED")
+        ingest["runOnAvailable"] = "/usr/bin/python3 " + wrapper
+        api["atomic_json"](dut_path, config)
+        return sink_path, dut_path
 
     def no_stale_work():
         # Never delete residues from the preceding acceptance attempt.
@@ -206,6 +222,7 @@ def install_prefix(api, stage, mediamtx, stage_file):
 
     api["cleanup_stale_workdirs"] = no_stale_work
     api["mark_self_test_stage"] = mark
+    api["write_configs"] = write_configs
     return state
 
 
@@ -298,6 +315,7 @@ def main():
             and re.fullmatch(r"adojapan-ci-startup-[A-Za-z0-9_-]{8,64}", stage.name),
             "PRIVATE_STAGE_PATH",
         )
+        stage_noexec = bool(os.statvfs(stage).f_flag & os.ST_NOEXEC)
         # Verified image artifact, independent of successful native installation.
         reader = runpy.run_path(str(stage / "reader.py"), run_name="_startup_reader_verifier")
         reader["verify_reader_binary"]()
@@ -344,6 +362,8 @@ def main():
         result = json.loads(read_private(stage / "prefix-result.json", maximum=2 * 1024**2))
         progress = json.loads(read_private(stage / "prefix-progress.json", maximum=2 * 1024**2))
         report = prefix_summary(result, progress, state, code)
+        report["stage_noexec"] = stage_noexec
+        report["hook_launch"] = "python-interpreter-noexec-compatible"
         report["checkpoint"] = failure_location(progress, api["SELF_TEST_STAGES"])
         report["source_hashes"] = hashes
         report["ffmpeg_version"] = match[1].decode("ascii")

@@ -85,6 +85,7 @@ def test_prefix_preserves_original_stage_call_and_stops_only_after_initial_live(
 
     fixture = {
         "mark_self_test_stage": lambda name, **kwargs: calls.append((name, kwargs)),
+        "write_configs": lambda *args, **kwargs: None,
         "validate_test_root": lambda: None,
         "TEST_ROOT": test_root,
         "SELF_TEST_LOCK": "/run/lock/moblin-relay-self-test.lock",
