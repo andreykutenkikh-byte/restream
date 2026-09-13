@@ -61,6 +61,9 @@ def observer_wait(monkeypatch: pytest.MonkeyPatch, samples: list[dict]):
 
     observer.checked_snapshot = snapshot
     monkeypatch.setitem(state, "time", SimpleNamespace(monotonic=lambda: clock.now, sleep=sleep))
+    observer.sample_ready = SimpleNamespace(
+        clear=lambda: None, wait=lambda timeout: state["time"].sleep(timeout)
+    )
     return observer, state, clock
 
 
@@ -82,7 +85,7 @@ def test_observer_timeout_retains_last_distinct_flags_and_safe_checkpoint(monkey
     assert failure is caught.value
     assert str(failure) == "timed out waiting for PRIVATE_DESCRIPTION"
     assert elapsed == 0.2
-    assert clock.sleeps == [0.05] * 4
+    assert clock.sleeps == pytest.approx([0.05] * 4)
     assert predicates == [samples[0], samples[1], samples[1], samples[1]]
     assert len(health_checks) == 5
     assert flags == {
@@ -186,6 +189,32 @@ def test_observer_success_never_invokes_failure_diagnostics(monkeypatch) -> None
     assert observer.wait_sample("fixture", lambda _sample: True, 1) is current
     assert clock.sleeps == []
     assert state["SELF_TEST_WAIT_FAILURE"] is None
+
+
+@pytest.mark.parametrize("phase", ["health", "predicate"])
+@pytest.mark.parametrize("finished", [100.1, 100.101])
+def test_observer_rejects_success_when_work_finishes_at_or_after_deadline(
+    monkeypatch, phase, finished
+):
+    current = sample(100.0, 12345)
+    observer, state, clock = observer_wait(monkeypatch, [current])
+    evaluated = []
+
+    def health():
+        if phase == "health":
+            clock.now = finished
+
+    def predicate(item):
+        evaluated.append(item)
+        if phase == "predicate":
+            clock.now = finished
+        return True
+
+    with pytest.raises(state["TestFailure"], match="timed out waiting for fixture"):
+        observer.wait_sample("fixture", predicate, 0.1, health_check=health)
+    assert evaluated == [current]
+    assert clock.now == finished
+    assert clock.sleeps == [0.0]
 
 
 def flow_sample(timestamp: float, **updates) -> dict:

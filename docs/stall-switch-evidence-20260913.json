@@ -1,0 +1,713 @@
+{
+  "scope": "Historical failure and two bounded pre-fix baselines; not historical-cause attribution or release acceptance",
+  "production_connections": false,
+  "original": {
+    "head": "592c04a35f0b1fde1eab1b05b050e593338f616e",
+    "run": 34556604870,
+    "job": 103130491437,
+    "result": {
+      "status": "ORIGINAL_PREFIX_FAILURE",
+      "target_phase": "crash-first-child",
+      "target_armed": false,
+      "target_completed": false,
+      "initial_prefix_completed": true,
+      "acceptance": false,
+      "attempts": 1,
+      "original_exit": 1,
+      "initial_start_timeout": false,
+      "initial_startup": {
+        "elapsed_ms": null,
+        "spawn_ms": null,
+        "post_spawn_ms": null,
+        "reads": null,
+        "failed": null,
+        "absent": null,
+        "present": null,
+        "growth": null,
+        "video_frames": null,
+        "first_output_ms": null,
+        "first_growth_ms": null,
+        "max_read_ms": null
+      },
+      "cleanup_passed": true,
+      "media_oracle_or_deadline_changed": false,
+      "diagnostic_log_level_variant": true,
+      "stage_noexec": true,
+      "hook_launch": "python-interpreter-noexec-compatible",
+      "checkpoint": {
+        "stage": "stall-switch",
+        "failure_lines": [
+          6551,
+          5951,
+          1672
+        ],
+        "failure_flags": {
+          "core_alive": true,
+          "ingest_live": true,
+          "ingest_one": true,
+          "live": true,
+          "metrics_ok": true,
+          "normalized": true,
+          "path_ready": true,
+          "sink_growth": true,
+          "sink_one": true,
+          "state_ok": false
+        },
+        "failure_wait_seconds": 8.029
+      },
+      "source_hashes": {
+        "self-test": "1388dfc786554dafc0f758342d3eb2702e3a09a8a3a5f4cd4d97d793eb9618ef",
+        "normalizer.py": "03c21c5df9fcb26dddb3c472810bafe9fd6aa57027b3e3dae344a35b170a1bf8",
+        "wrapper.py": "b8923007d103e674cffa9a4f44a35b658135b86da6152a65b84dfaf8783d228e",
+        "renderer.py": "76c0f2969a9e62daf356769a43a27fcc9a493d1bcc23935787226f4ded7d029a",
+        "renderer-staged.py": "1b267fb6caf4587ae71d81f9acb85c9edbd29365cf9fee14033a5d8b0d27fa8d",
+        "reader.py": "35a48edc326f5b0b6258a6e4af8c4a2c35ede3479490c136c5a747913e7bbbb5",
+        "slate.txt": "4bccc81000bb85a41ab5309243ae52a91f1201c6040af17cdee1afcd56bc2453"
+      },
+      "ffmpeg_version": "5.1.9-0+deb12u1",
+      "target_first_child_phases": null,
+      "phase_evidence_available": false,
+      "startup_input": null,
+      "reader_packet_trace": null,
+      "private_stage_removed": true
+    }
+  },
+  "baseline1": {
+    "head": "592c04a35f0b1fde1eab1b05b050e593338f616e",
+    "run": 34556604870,
+    "job": 103713751456,
+    "result": {
+      "status": "TARGET_CRASH_PREFIX_COMPLETED",
+      "target_phase": "crash-first-child",
+      "target_armed": true,
+      "target_completed": true,
+      "initial_prefix_completed": true,
+      "acceptance": false,
+      "attempts": 1,
+      "original_exit": 1,
+      "initial_start_timeout": false,
+      "initial_startup": {
+        "elapsed_ms": null,
+        "spawn_ms": null,
+        "post_spawn_ms": null,
+        "reads": null,
+        "failed": null,
+        "absent": null,
+        "present": null,
+        "growth": null,
+        "video_frames": null,
+        "first_output_ms": null,
+        "first_growth_ms": null,
+        "max_read_ms": null
+      },
+      "cleanup_passed": true,
+      "media_oracle_or_deadline_changed": false,
+      "diagnostic_log_level_variant": true,
+      "stage_noexec": true,
+      "hook_launch": "python-interpreter-noexec-compatible",
+      "checkpoint": {
+        "stage": "reset-start",
+        "failure_lines": [
+          7031
+        ]
+      },
+      "source_hashes": {
+        "self-test": "1388dfc786554dafc0f758342d3eb2702e3a09a8a3a5f4cd4d97d793eb9618ef",
+        "normalizer.py": "03c21c5df9fcb26dddb3c472810bafe9fd6aa57027b3e3dae344a35b170a1bf8",
+        "wrapper.py": "b8923007d103e674cffa9a4f44a35b658135b86da6152a65b84dfaf8783d228e",
+        "renderer.py": "76c0f2969a9e62daf356769a43a27fcc9a493d1bcc23935787226f4ded7d029a",
+        "renderer-staged.py": "fa8adaf91e7fbc9b21f9807dadea6c630c5a987f7722f4d6aa83be502a7cc968",
+        "reader.py": "35a48edc326f5b0b6258a6e4af8c4a2c35ede3479490c136c5a747913e7bbbb5",
+        "slate.txt": "4bccc81000bb85a41ab5309243ae52a91f1201c6040af17cdee1afcd56bc2453"
+      },
+      "ffmpeg_version": "5.1.9-0+deb12u1",
+      "target_first_child_phases": {
+        "version": 1,
+        "scope": "first-child-collector-receipt-not-decode-proof",
+        "parse_bytes": 18997,
+        "byte_cap_exceeded": false,
+        "line_cap_exceeded": false,
+        "event_cap_exceeded": false,
+        "clock_invalid": false,
+        "outside_window": false,
+        "reader_error": false,
+        "drain_cap_reached": false,
+        "eof": true,
+        "child_stopped": true,
+        "first_child_spawned": true,
+        "spawn_failed": false,
+        "first_child_timeout": false,
+        "first_child_bridge_active": true,
+        "first_video_progress_ms": 2636,
+        "max_video_frames": 153,
+        "events": {
+          "input_open": {
+            "count": 1,
+            "first_ms": 105,
+            "last_ms": 105
+          },
+          "input_info": {
+            "count": 1,
+            "first_ms": 1927,
+            "last_ms": 1927
+          },
+          "output_open": {
+            "count": 1,
+            "first_ms": 1927,
+            "last_ms": 1927
+          },
+          "output_info": {
+            "count": 1,
+            "first_ms": 2079,
+            "last_ms": 2079
+          },
+          "rtmp_handshake": {
+            "count": 1,
+            "first_ms": 1927,
+            "last_ms": 1927
+          },
+          "rtmp_create": {
+            "count": 1,
+            "first_ms": 1978,
+            "last_ms": 1978
+          },
+          "rtmp_publish": {
+            "count": 1,
+            "first_ms": 2028,
+            "last_ms": 2028
+          },
+          "info_complete": {
+            "count": 1,
+            "first_ms": 1927,
+            "last_ms": 1927
+          },
+          "info_before_optional": {
+            "count": 0,
+            "first_ms": null,
+            "last_ms": null
+          },
+          "info_after_optional": {
+            "count": 0,
+            "first_ms": null,
+            "last_ms": null
+          },
+          "analyze_limit": {
+            "count": 0,
+            "first_ms": null,
+            "last_ms": null
+          },
+          "probe_limit": {
+            "count": 0,
+            "first_ms": null,
+            "last_ms": null
+          },
+          "missing_codec": {
+            "count": 0,
+            "first_ms": null,
+            "last_ms": null
+          },
+          "missing_pps": {
+            "count": 0,
+            "first_ms": null,
+            "last_ms": null
+          },
+          "missing_picture": {
+            "count": 0,
+            "first_ms": null,
+            "last_ms": null
+          },
+          "nal_sps": {
+            "count": 3,
+            "first_ms": 105,
+            "last_ms": 1724
+          },
+          "nal_pps": {
+            "count": 3,
+            "first_ms": 105,
+            "last_ms": 1724
+          },
+          "nal_idr": {
+            "count": 1,
+            "first_ms": 1724,
+            "last_ms": 1724
+          }
+        }
+      },
+      "phase_evidence_available": true,
+      "startup_input": null,
+      "reader_packet_trace": null,
+      "private_stage_removed": true
+    }
+  },
+  "instrumented_baseline": {
+    "head": "c491685fc351e8f9b789ba9fb62eed6bae5d17bf",
+    "run": 34754093941,
+    "job": 103715424689,
+    "result": {
+      "status": "TARGET_CRASH_PREFIX_COMPLETED",
+      "target_phase": "crash-first-child",
+      "target_armed": true,
+      "target_completed": true,
+      "initial_prefix_completed": true,
+      "acceptance": false,
+      "attempts": 1,
+      "original_exit": 1,
+      "initial_start_timeout": false,
+      "initial_startup": {
+        "elapsed_ms": null,
+        "spawn_ms": null,
+        "post_spawn_ms": null,
+        "reads": null,
+        "failed": null,
+        "absent": null,
+        "present": null,
+        "growth": null,
+        "video_frames": null,
+        "first_output_ms": null,
+        "first_growth_ms": null,
+        "max_read_ms": null
+      },
+      "cleanup_passed": true,
+      "media_oracle_or_deadline_changed": false,
+      "diagnostic_log_level_variant": true,
+      "stall_switch_timeline": {
+        "available": true,
+        "version": 1,
+        "clock": "monotonic_ns_relative_to_pause_request",
+        "scope": "observation-receipts-not-wire-or-media-event-times",
+        "summary": {
+          "pause_request_ns": 0,
+          "pause_ack_observed_ns": 63608,
+          "last_feeder_dispatch_receipt_ns": -5232199,
+          "pause_deadline_ns": 8000067996,
+          "paused_window_end_ns": 4367406407,
+          "last_observed_growth_intervals_ns": {
+            "ingest_bytes": [
+              1840977703,
+              2043244814
+            ],
+            "normalized_bytes": [
+              1840977703,
+              2043244814
+            ],
+            "normalized_media_bytes": [
+              1840977703,
+              2043244814
+            ],
+            "sink_bytes": [
+              4067273258,
+              4269424682
+            ]
+          },
+          "last_runtime_video_progress": [
+            4080432035,
+            3,
+            1,
+            652,
+            2539690402
+          ],
+          "first_runtime_watchdog_reject": [
+            4080453605,
+            6,
+            7
+          ],
+          "first_runtime_kill_request": [
+            4080649240,
+            8,
+            1,
+            0
+          ],
+          "first_runtime_child_wait_completed": [
+            4083939534,
+            9,
+            1,
+            1,
+            -9
+          ],
+          "first_normalized_absent_sample": {
+            "started_ns": 4267356030,
+            "finished_ns": 4269424682,
+            "collection_age_ns": 8995487399,
+            "dut_alive": true,
+            "sink_alive": true,
+            "reader_alive": true,
+            "dut_metrics_ok": true,
+            "sink_metrics_ok": true,
+            "path_ready": true,
+            "ingest_live": true,
+            "live": false,
+            "normalized": false,
+            "forward": true,
+            "ingest_bytes": 25033189,
+            "ingest_transport_bytes": 26925532,
+            "normalized_bytes": null,
+            "normalized_media_bytes": 70051245,
+            "sink_bytes": 69364028,
+            "capture_size": 65606525,
+            "ingest_generations": [
+              1
+            ],
+            "normalized_generations": [],
+            "sink_generations": [
+              1
+            ]
+          },
+          "first_local_slate_state_sample": {
+            "started_ns": 4267356030,
+            "finished_ns": 4269424682,
+            "collection_age_ns": 8995487399,
+            "dut_alive": true,
+            "sink_alive": true,
+            "reader_alive": true,
+            "dut_metrics_ok": true,
+            "sink_metrics_ok": true,
+            "path_ready": true,
+            "ingest_live": true,
+            "live": false,
+            "normalized": false,
+            "forward": true,
+            "ingest_bytes": 25033189,
+            "ingest_transport_bytes": 26925532,
+            "normalized_bytes": null,
+            "normalized_media_bytes": 70051245,
+            "sink_bytes": 69364028,
+            "capture_size": 65606525,
+            "ingest_generations": [
+              1
+            ],
+            "normalized_generations": [],
+            "sink_generations": [
+              1
+            ]
+          },
+          "wait_return": [
+            4316732129,
+            "wait-return",
+            true
+          ],
+          "resume_request": [
+            4367406407,
+            "resume-request"
+          ],
+          "resume_return": [
+            4367480335,
+            "resume-return",
+            true
+          ],
+          "last_evaluated_predicate": [
+            4316725036,
+            "predicate",
+            4316718915,
+            4267356030,
+            4269424682,
+            47294233,
+            true
+          ],
+          "latest_completed_sample_before_deadline": {
+            "started_ns": 7910140065,
+            "finished_ns": 7912526681,
+            "collection_age_ns": 5352385400,
+            "dut_alive": true,
+            "sink_alive": true,
+            "reader_alive": true,
+            "dut_metrics_ok": true,
+            "sink_metrics_ok": true,
+            "path_ready": true,
+            "ingest_live": true,
+            "live": false,
+            "normalized": false,
+            "forward": true,
+            "ingest_bytes": 26389188,
+            "ingest_transport_bytes": 30662820,
+            "normalized_bytes": null,
+            "normalized_media_bytes": 73689295,
+            "sink_bytes": 72966013,
+            "capture_size": 69178636,
+            "ingest_generations": [
+              1
+            ],
+            "normalized_generations": [],
+            "sink_generations": [
+              1
+            ]
+          },
+          "observer_metrics": [
+            {
+              "role": 0,
+              "requests": 75,
+              "available": 75,
+              "last_generation": 369,
+              "max_duration_ns": 1457223
+            },
+            {
+              "role": 1,
+              "requests": 75,
+              "available": 75,
+              "last_generation": 369,
+              "max_duration_ns": 873313
+            }
+          ]
+        },
+        "clock_invalid": false,
+        "invalid_data": false,
+        "dropped_events": 318,
+        "sample_rows_omitted": 0,
+        "runtime_rows_omitted": 237,
+        "runtime_quality": {
+          "available": true,
+          "dropped_events": 797,
+          "clock_invalid": false,
+          "invalid_data": false
+        },
+        "event_fields": {
+          "pause-request": [],
+          "pause-return": [
+            "acknowledged",
+            "last_dispatch_ns",
+            "packets",
+            "bytes"
+          ],
+          "resume-request": [],
+          "resume-return": [
+            "acknowledged"
+          ],
+          "wait-start": [
+            "anchor_ns",
+            "deadline_ns"
+          ],
+          "predicate": [
+            "evaluated_ns",
+            "sample_started_ns",
+            "sample_finished_ns",
+            "sample_age_ns",
+            "accepted"
+          ],
+          "wait-return": [
+            "succeeded"
+          ],
+          "metrics": [
+            "role",
+            "generation",
+            "started_ns",
+            "finished_ns",
+            "available"
+          ]
+        },
+        "runtime_event_fields": {
+          "1": [
+            "metric_kind",
+            "request"
+          ],
+          "2": [
+            "metric_kind",
+            "request",
+            "availability",
+            "generation",
+            "counter",
+            "delta"
+          ],
+          "3": [
+            "child",
+            "frames",
+            "video_growth_age_ns"
+          ],
+          "4": [
+            "keep",
+            "probe_ingest",
+            "reason",
+            "output_growth_age_ns",
+            "idle_observations"
+          ],
+          "5": [
+            "keep",
+            "reason",
+            "ingest_counter",
+            "joint_idle_age_ns",
+            "idle_observations"
+          ],
+          "6": [
+            "reason"
+          ],
+          "7": [
+            "child",
+            "outcome"
+          ],
+          "8": [
+            "child",
+            "outcome"
+          ],
+          "9": [
+            "child",
+            "outcome",
+            "returncode"
+          ],
+          "10": [
+            "child",
+            "force",
+            "outcome"
+          ],
+          "11": [
+            "state"
+          ],
+          "12": [
+            "reason"
+          ],
+          "13": [
+            "child"
+          ]
+        },
+        "runtime_reasons": [
+          "",
+          "child-exit",
+          "output-start-timeout",
+          "metrics-blind",
+          "output-identity",
+          "output-regression",
+          "output-fallback",
+          "video-stalled",
+          "ingest-timing",
+          "ingest-missing",
+          "ingest-identity",
+          "ingest-regression",
+          "verified-stall",
+          "ingest-confirmed-stall",
+          "watchdog-unknown"
+        ]
+      },
+      "stage_noexec": true,
+      "hook_launch": "python-interpreter-noexec-compatible",
+      "checkpoint": {
+        "stage": "reset-start",
+        "failure_lines": [
+          7031
+        ]
+      },
+      "source_hashes": {
+        "self-test": "1388dfc786554dafc0f758342d3eb2702e3a09a8a3a5f4cd4d97d793eb9618ef",
+        "normalizer.py": "03c21c5df9fcb26dddb3c472810bafe9fd6aa57027b3e3dae344a35b170a1bf8",
+        "wrapper.py": "61df6ebb0a7eab8e92f9880814d3728a5974bda2cb07702b636865cd777f7e31",
+        "renderer.py": "76c0f2969a9e62daf356769a43a27fcc9a493d1bcc23935787226f4ded7d029a",
+        "renderer-staged.py": "a8c3a0c77858336374ecb3803b93c9a411ff2354c534a1153c9bf349bc0575c3",
+        "reader.py": "35a48edc326f5b0b6258a6e4af8c4a2c35ede3479490c136c5a747913e7bbbb5",
+        "slate.txt": "4bccc81000bb85a41ab5309243ae52a91f1201c6040af17cdee1afcd56bc2453"
+      },
+      "ffmpeg_version": "5.1.9-0+deb12u1",
+      "target_first_child_phases": {
+        "version": 1,
+        "scope": "first-child-collector-receipt-not-decode-proof",
+        "parse_bytes": 19833,
+        "byte_cap_exceeded": false,
+        "line_cap_exceeded": false,
+        "event_cap_exceeded": false,
+        "clock_invalid": false,
+        "outside_window": false,
+        "reader_error": false,
+        "drain_cap_reached": false,
+        "eof": true,
+        "child_stopped": true,
+        "first_child_spawned": true,
+        "spawn_failed": false,
+        "first_child_timeout": false,
+        "first_child_bridge_active": true,
+        "first_video_progress_ms": 2431,
+        "max_video_frames": 146,
+        "events": {
+          "input_open": {
+            "count": 1,
+            "first_ms": 104,
+            "last_ms": 104
+          },
+          "input_info": {
+            "count": 1,
+            "first_ms": 1722,
+            "last_ms": 1722
+          },
+          "output_open": {
+            "count": 1,
+            "first_ms": 1722,
+            "last_ms": 1722
+          },
+          "output_info": {
+            "count": 1,
+            "first_ms": 1874,
+            "last_ms": 1874
+          },
+          "rtmp_handshake": {
+            "count": 1,
+            "first_ms": 1722,
+            "last_ms": 1722
+          },
+          "rtmp_create": {
+            "count": 1,
+            "first_ms": 1773,
+            "last_ms": 1773
+          },
+          "rtmp_publish": {
+            "count": 1,
+            "first_ms": 1824,
+            "last_ms": 1824
+          },
+          "info_complete": {
+            "count": 1,
+            "first_ms": 1722,
+            "last_ms": 1722
+          },
+          "info_before_optional": {
+            "count": 0,
+            "first_ms": null,
+            "last_ms": null
+          },
+          "info_after_optional": {
+            "count": 0,
+            "first_ms": null,
+            "last_ms": null
+          },
+          "analyze_limit": {
+            "count": 0,
+            "first_ms": null,
+            "last_ms": null
+          },
+          "probe_limit": {
+            "count": 0,
+            "first_ms": null,
+            "last_ms": null
+          },
+          "missing_codec": {
+            "count": 0,
+            "first_ms": null,
+            "last_ms": null
+          },
+          "missing_pps": {
+            "count": 0,
+            "first_ms": null,
+            "last_ms": null
+          },
+          "missing_picture": {
+            "count": 0,
+            "first_ms": null,
+            "last_ms": null
+          },
+          "nal_sps": {
+            "count": 3,
+            "first_ms": 104,
+            "last_ms": 1722
+          },
+          "nal_pps": {
+            "count": 3,
+            "first_ms": 104,
+            "last_ms": 1722
+          },
+          "nal_idr": {
+            "count": 1,
+            "first_ms": 1722,
+            "last_ms": 1722
+          }
+        }
+      },
+      "phase_evidence_available": true,
+      "startup_input": null,
+      "reader_packet_trace": null,
+      "private_stage_removed": true
+    }
+  }
+}

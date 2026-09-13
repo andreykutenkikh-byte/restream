@@ -1434,6 +1434,7 @@ class Observer(threading.Thread):
         self.reader = reader
         self.capture = capture
         self.stop_event = threading.Event()
+        self.sample_ready = threading.Event()
         self.lock = threading.Lock()
         self.samples: list[dict] = []
         self.max_rss_kib = {"dut": 0, "sink": 0, "reader": 0}
@@ -1587,6 +1588,7 @@ class Observer(threading.Thread):
             with self.lock:
                 sample["finished"] = time.monotonic()
                 self.samples.append(sample)
+                self.sample_ready.set()
             optional_observer = self.startup_input_observer
             if optional_observer is not None:
                 with contextlib.suppress(Exception):
@@ -1631,6 +1633,8 @@ class Observer(threading.Thread):
         previous_sample = {}
         state_ok = False
         while time.monotonic() < deadline:
+            # Clear before reading: a later publication must wake this waiter.
+            self.sample_ready.clear()
             if health_check is not None:
                 health_check()
             sample = self.checked_snapshot(description)
@@ -1651,9 +1655,9 @@ class Observer(threading.Thread):
                 and complete_metrics_sample(sample)
                 and predicate(sample)
             )
-            if state_ok:
+            if state_ok and time.monotonic() < deadline:
                 return sample
-            time.sleep(0.05)
+            self.sample_ready.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic())))
         if health_check is not None:
             health_check()
         failure = TestFailure(f"timed out waiting for {description}")

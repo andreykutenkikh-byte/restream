@@ -439,3 +439,95 @@ def test_resumed_growth_does_not_replace_interval_observed_during_pause(runner):
     assert all(value == [50_000_000, 1_000_000_000] for value in growth.values())
     assert report["samples"][-1]["normalized_bytes"] == 400
     assert report["samples"][-1]["finished_ns"] == 2_500_000_000
+
+
+@pytest.mark.parametrize(
+    "succeeded,latest_ns", [(True, 4_000_000_000), (False, 7_990_000_000), (None, 7_990_000_000)]
+)
+def test_successful_wait_summary_excludes_later_samples_but_preserves_raw_rows(
+    runner, succeeded, latest_ns
+):
+    clock = [100 * 10**9]
+    timeline = runner["PauseTimeline"]({}, clock=lambda: clock[0])
+    timeline.start_pause()
+    timeline.deadline_ns = 108 * 10**9
+    timeline.observer = SimpleNamespace(
+        lock=threading.Lock(),
+        samples=[{"t": stamp - 0.01, "finished": stamp} for stamp in (104.0, 105.01, 107.99)],
+    )
+    clock[0] = 104 * 10**9
+    if succeeded is not None:
+        timeline.record("wait-return", succeeded)
+    clock[0] = 106 * 10**9
+    timeline.record("resume-request")
+    clock[0] = 109 * 10**9
+    report = timeline.report()
+    assert report["summary"]["latest_completed_sample_before_deadline"]["finished_ns"] == latest_ns
+    assert report["summary"]["pause_deadline_ns"] == 8_000_000_000
+    assert len(report["samples"]) == 3
+    assert report["samples"][-1]["finished_ns"] == 7_990_000_000
+
+
+@pytest.mark.parametrize("video_age,derived_ns", [(500, 600), (-1, None)])
+def test_runtime_summary_pairs_retained_requests_and_keeps_paused_watchdog_ages(
+    runner, video_age, derived_ns
+):
+    timeline = runner["PauseTimeline"]({}, clock=lambda: 10**9)
+    timeline.start_pause()
+    runtime = [
+        [-100, 1, 0, 1],
+        [100, 2, 0, 1, 2, 1, 100, -1],
+        [200, 1, 0, 2],
+        [300, 2, 0, 2, 0, 1, -1, -1],
+        [400, 1, 0, 3],
+        [600, 2, 0, 3, 1, 1, -1, -1],
+        [700, 2, 0, 4, 3, 1, -1, -1],  # Start was not retained; do not invent it.
+        [750, 1, 1, 1],
+        [1000, 2, 1, 1, 2, 2, 200, -1],
+        [1100, 3, 1, 90, video_age],
+        [1200, 1, 1, 2],  # No end receipt; no completed-request duration.
+        [1200, 4, 1, 0, 0, 1100, 2],
+        [1300, 5, 1, 0, 200, 1200, 3],
+        [1400, 4, 0, 1, 7, 1300, 3],
+        [1500, 5, 0, 12, 200, 1400, 4],
+        [2001, 2, 1, 2, 2, 3, 900, 700],
+        [2002, 3, 2, 180, 0],
+        [2003, 4, 1, 0, 0, 0, 0],
+        [2004, 5, 1, 0, 900, 0, 0],
+    ]
+    summary = timeline.summarize([[2000, "resume-request"]], [], runtime)
+    assert summary["runtime_metrics"] == [
+        {
+            "metric_kind": 0,
+            "completed_requests": 4,
+            "matched_requests": 3,
+            "availability_counts": [1, 1, 1, 1],
+            "max_duration_ns": 200,
+            "last_request": {
+                "request": 4,
+                "started_ns": None,
+                "finished_ns": 700,
+                "duration_ns": None,
+                "availability": 3,
+                "generation": 1,
+            },
+        },
+        {
+            "metric_kind": 1,
+            "completed_requests": 1,
+            "matched_requests": 1,
+            "availability_counts": [0, 0, 1, 0],
+            "max_duration_ns": 250,
+            "last_request": {
+                "request": 1,
+                "started_ns": 750,
+                "finished_ns": 1000,
+                "duration_ns": 250,
+                "availability": 2,
+                "generation": 2,
+            },
+        },
+    ]
+    assert summary["last_runtime_video_growth_receipt_derived_ns"] == derived_ns
+    assert summary["last_runtime_watchdog_output_observation"] == runtime[13]
+    assert summary["last_runtime_watchdog_ingest_observation"] == runtime[14]

@@ -677,11 +677,18 @@ class PauseTimeline:
         groups = {name: [row for row in events if row[1] == name] for name in PAUSE_EVENT_FIELDS}
         ack = next((row for row in groups["pause-return"] if row[2] is True), None)
         last_evaluated = groups["predicate"][-1] if groups["predicate"] else None
+        wait_return = groups["wait-return"][-1] if groups["wait-return"] else None
         deadline = self.deadline_ns - self.t0 if self.deadline_ns is not None else None
         timely = [
             sample
             for sample in samples
-            if deadline is not None and sample["finished_ns"] < deadline
+            if deadline is not None
+            and sample["finished_ns"] < deadline
+            and (
+                not wait_return
+                or wait_return[2] is not True
+                or sample["finished_ns"] <= wait_return[0]
+            )
         ]
         # Recovery growth must not replace the last growth observed while paused.
         pause_end = groups["resume-request"][0][0] if groups["resume-request"] else None
@@ -724,6 +731,38 @@ class PauseTimeline:
             row for row in runtime if row[0] >= 0 and (pause_end is None or row[0] <= pause_end)
         ]
         videos = [row for row in positive_runtime if row[1] == 3]
+        starts = {(row[2], row[3]): row[0] for row in runtime if row[1] == 1}
+        runtime_metrics = []
+        for kind in (0, 1):
+            rows = [row for row in positive_runtime if row[1] == 2 and row[2] == kind]
+            pairs = [(starts.get((kind, row[3])), row) for row in rows]
+            durations = [
+                row[0] - start for start, row in pairs if start is not None and start <= row[0]
+            ]
+            start, last = pairs[-1] if pairs else (None, None)
+            runtime_metrics.append(
+                {
+                    "metric_kind": kind,
+                    "completed_requests": len(rows),
+                    "matched_requests": len(durations),
+                    "availability_counts": [
+                        sum(row[4] == value for row in rows) for value in range(4)
+                    ],
+                    "max_duration_ns": max(durations, default=None),
+                    "last_request": {
+                        "request": last[3],
+                        "started_ns": start,
+                        "finished_ns": last[0],
+                        "duration_ns": last[0] - start
+                        if start is not None and start <= last[0]
+                        else None,
+                        "availability": last[4],
+                        "generation": last[5],
+                    }
+                    if last
+                    else None,
+                }
+            )
         return {
             "pause_request_ns": 0,
             "pause_ack_observed_ns": ack[0] if ack else None,
@@ -732,6 +771,16 @@ class PauseTimeline:
             "paused_window_end_ns": pause_end,
             "last_observed_growth_intervals_ns": growth,
             "last_runtime_video_progress": videos[-1] if videos else None,
+            # Receipt minus reported age is derived evidence, not a media-arrival timestamp.
+            "last_runtime_video_growth_receipt_derived_ns": (
+                videos[-1][0] - videos[-1][4] if videos and videos[-1][4] >= 0 else None
+            ),
+            "last_runtime_watchdog_output_observation": next(
+                (row for row in reversed(positive_runtime) if row[1] == 4), None
+            ),
+            "last_runtime_watchdog_ingest_observation": next(
+                (row for row in reversed(positive_runtime) if row[1] == 5), None
+            ),
             "first_runtime_watchdog_reject": next(
                 (row for row in positive_runtime if row[1] == 6), None
             ),
@@ -768,12 +817,13 @@ class PauseTimeline:
                 ),
                 None,
             ),
-            "wait_return": groups["wait-return"][-1] if groups["wait-return"] else None,
+            "wait_return": wait_return,
             "resume_request": groups["resume-request"][0] if groups["resume-request"] else None,
             "resume_return": groups["resume-return"][0] if groups["resume-return"] else None,
             "last_evaluated_predicate": last_evaluated,
             "latest_completed_sample_before_deadline": timely[-1] if timely else None,
             "observer_metrics": summaries,
+            "runtime_metrics": runtime_metrics,
         }
 
     def report(self, include_rows=True):

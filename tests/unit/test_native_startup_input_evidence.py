@@ -262,6 +262,7 @@ def test_observer_optional_callback_failure_does_not_change_metrics_or_fetches(m
         observer = object.__new__(observer_class)
         observer.dut = observer.sink = observer.reader = SimpleNamespace(poll=lambda: 0)
         observer.lock = threading.Lock()
+        observer.sample_ready = threading.Event()
         observer.capture = SimpleNamespace(exists=lambda: False)
         observer.samples = []
         stopped = [False]
@@ -281,6 +282,7 @@ def test_observer_optional_callback_failure_does_not_change_metrics_or_fetches(m
 
         observer.startup_input_observer = broken if callback_enabled else None
         observer.run()
+        assert observer.sample_ready.is_set()
         results.append((observer.samples, calls))
     assert results[0] == results[1]
     assert len(results[0][1]) == 2  # Existing DUT + sink requests only.
