@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -461,6 +462,463 @@ def failed_reader_packet_trace(api, state, progress):
     return None
 
 
+PAUSE_EVENT_FIELDS = {
+    "pause-request": (),
+    "pause-return": ("acknowledged", "last_dispatch_ns", "packets", "bytes"),
+    "resume-request": (),
+    "resume-return": ("acknowledged",),
+    "wait-start": ("anchor_ns", "deadline_ns"),
+    "predicate": (
+        "evaluated_ns",
+        "sample_started_ns",
+        "sample_finished_ns",
+        "sample_age_ns",
+        "accepted",
+    ),
+    "wait-return": ("succeeded",),
+    "metrics": ("role", "generation", "started_ns", "finished_ns", "available"),
+}
+PAUSE_SAMPLE_FLAGS = (
+    "dut_alive",
+    "sink_alive",
+    "reader_alive",
+    "dut_metrics_ok",
+    "sink_metrics_ok",
+    "path_ready",
+    "ingest_live",
+    "live",
+    "normalized",
+    "forward",
+)
+PAUSE_SAMPLE_COUNTERS = (
+    "ingest_bytes",
+    "ingest_transport_bytes",
+    "normalized_bytes",
+    "normalized_media_bytes",
+    "sink_bytes",
+    "capture_size",
+)
+
+
+def pause_seconds_ns(value):
+    if type(value) in (int, float) and 0 <= value <= 2**33 and math.isfinite(value):
+        return round(value * 10**9)
+    return None
+
+
+class PauseTimeline:
+    """Bounded observation receipts; no request timestamp is a media arrival time."""
+
+    def __init__(self, api, clock=time.monotonic_ns):
+        self.api, self.clock = api, clock
+        self.lock = threading.Lock()
+        self.events = deque(maxlen=512)
+        self.t0 = self.observer = self.frozen = self.deadline_ns = None
+        self.runtime_api = {}
+        self.dropped = 0
+        self.clock_invalid = self.invalid_data = self.closed = self.wait_seen = False
+        self.last = 0
+
+    def record(self, code, *values):
+        with self.lock:
+            if self.closed:
+                return
+            fields = PAUSE_EVENT_FIELDS.get(code)
+            if (
+                fields is None
+                or len(fields) != len(values)
+                or any(
+                    item is not None
+                    and type(item) is not bool
+                    and (type(item) is not int or not -(2**63) < item < 2**63)
+                    for item in values
+                )
+            ):
+                self.invalid_data = True
+                return
+            stamp = self.clock()
+            if type(stamp) is not int or not self.last <= stamp < 2**63:
+                self.clock_invalid = True
+                return
+            self.last = stamp
+            if code == "pause-request" and self.t0 is None:
+                self.t0 = stamp
+            if len(self.events) == self.events.maxlen:
+                self.dropped += 1
+            self.events.append([stamp, code, *values])
+
+    def start_pause(self):
+        if self.t0 is None:
+            self.record("pause-request")
+
+    def freeze(self, runtime=None):
+        if self.frozen is not None:
+            return self.frozen
+        with self.lock:
+            self.closed = True
+            ended = self.clock()
+            if type(ended) is not int or not self.last <= ended < 2**63:
+                self.clock_invalid = True
+                ended = self.last
+            events = [list(row) for row in self.events]
+        if self.t0 is None:
+            self.frozen = {"available": False}
+            return self.frozen
+        origin = self.t0
+        parent = []
+        for row in events:
+            if not origin - 2_000_000_000 <= row[0] <= ended:
+                continue
+            fields = PAUSE_EVENT_FIELDS[row[1]]
+            parent.append(
+                [
+                    row[0] - origin,
+                    row[1],
+                    *[
+                        item - origin
+                        if name.endswith("_ns") and not name.endswith("age_ns") and item is not None
+                        else item
+                        for name, item in zip(fields, row[2:], strict=True)
+                    ],
+                ]
+            )
+        samples = []
+        if self.observer is not None:
+            with self.observer.lock:
+                samples = [dict(sample) for sample in self.observer.samples]
+        identities = {role: {} for role in ("ingest", "normalized", "sink")}
+        projected = []
+        for sample in samples:
+            first, last = (
+                pause_seconds_ns(sample.get("t")),
+                pause_seconds_ns(sample.get("finished")),
+            )
+            if (
+                first is None
+                or last is None
+                or not origin - 2_000_000_000 <= first <= last <= ended
+            ):
+                continue
+            item = {
+                "started_ns": first - origin,
+                "finished_ns": last - origin,
+                "collection_age_ns": ended - last,
+            }
+            item.update(
+                {
+                    name: sample.get(name) if type(sample.get(name)) is bool else None
+                    for name in PAUSE_SAMPLE_FLAGS
+                }
+            )
+            item.update(
+                {
+                    name: sample.get(name)
+                    if type(sample.get(name)) is int and 0 <= sample[name] < 2**63
+                    else None
+                    for name in PAUSE_SAMPLE_COUNTERS
+                }
+            )
+            for role, mapping in identities.items():
+                ids = sample.get(role + "_ids")
+                ordinals = None
+                if (
+                    type(ids) is list
+                    and len(ids) <= 8
+                    and all(type(value) is str and 0 < len(value) <= 256 for value in ids)
+                    and len(mapping) + len(ids) <= 256
+                ):
+                    ordinals = [mapping.setdefault(value, len(mapping) + 1) for value in ids]
+                item[role + "_generations"] = ordinals
+            projected.append(item)
+        runtime_rows, runtime_quality = [], {"available": False}
+        validator = self.runtime_api.get("validated_timeline_report")
+        trusted = validator(runtime) if callable(validator) else None
+        if trusted is not None:
+            runtime_rows = [
+                [row[0] - origin, *row[1:]]
+                for row in trusted["events"]
+                if origin - 2_000_000_000 <= row[0] <= ended
+            ]
+            runtime_quality = {
+                "available": True,
+                **{
+                    key: trusted[key] for key in ("dropped_events", "clock_invalid", "invalid_data")
+                },
+            }
+        summary = self.summarize(parent, projected, runtime_rows)
+        sample_dropped = max(0, len(projected) - 128)
+        runtime_dropped = max(0, len(runtime_rows) - 512)
+        if sample_dropped:
+            projected = projected[:64] + projected[-64:]
+        if runtime_dropped:
+            runtime_rows = runtime_rows[:256] + runtime_rows[-256:]
+        self.frozen = {
+            "available": True,
+            "version": 1,
+            "clock": "monotonic_ns_relative_to_pause_request",
+            "scope": "observation-receipts-not-wire-or-media-event-times",
+            "summary": summary,
+            "clock_invalid": self.clock_invalid,
+            "invalid_data": self.invalid_data,
+            "dropped_events": self.dropped,
+            "sample_rows_omitted": sample_dropped,
+            "runtime_rows_omitted": runtime_dropped,
+            "runtime_quality": runtime_quality,
+            "event_fields": PAUSE_EVENT_FIELDS,
+            "events": parent,
+            "samples": projected,
+            "runtime_event_fields": self.runtime_api.get("TIMELINE_EVENT_FIELDS", {}),
+            "runtime_reasons": self.runtime_api.get("TIMELINE_REASONS", ()),
+            "runtime_events": runtime_rows,
+        }
+        return self.frozen
+
+    def summarize(self, events, samples, runtime):
+        groups = {name: [row for row in events if row[1] == name] for name in PAUSE_EVENT_FIELDS}
+        ack = next((row for row in groups["pause-return"] if row[2] is True), None)
+        last_evaluated = groups["predicate"][-1] if groups["predicate"] else None
+        deadline = self.deadline_ns - self.t0 if self.deadline_ns is not None else None
+        timely = [
+            sample
+            for sample in samples
+            if deadline is not None and sample["finished_ns"] < deadline
+        ]
+        # Recovery growth must not replace the last growth observed while paused.
+        pause_end = groups["resume-request"][0][0] if groups["resume-request"] else None
+        paused_samples = [
+            sample for sample in samples if pause_end is None or sample["finished_ns"] <= pause_end
+        ]
+        before_pause = [sample for sample in samples if sample["finished_ns"] < 0]
+        expected_ingest = before_pause[-1]["ingest_generations"] if before_pause else None
+        growth = {}
+        for counter, role in (
+            ("ingest_bytes", "ingest"),
+            ("normalized_bytes", "normalized"),
+            ("normalized_media_bytes", "normalized"),
+            ("sink_bytes", "sink"),
+        ):
+            intervals = [
+                [left["finished_ns"], right["finished_ns"]]
+                for left, right in zip(paused_samples, paused_samples[1:], strict=False)
+                if type(left[counter]) is int
+                and type(right[counter]) is int
+                and right[counter] > left[counter]
+                and left[role + "_generations"]
+                and left[role + "_generations"] == right[role + "_generations"]
+            ]
+            growth[counter] = intervals[-1] if intervals else None
+        metrics = groups["metrics"]
+        summaries = []
+        for role in (0, 1):
+            rows = [row for row in metrics if row[2] == role]
+            summaries.append(
+                {
+                    "role": role,
+                    "requests": len(rows),
+                    "available": sum(row[6] is True for row in rows),
+                    "last_generation": rows[-1][3] if rows else None,
+                    "max_duration_ns": max((row[5] - row[4] for row in rows), default=None),
+                }
+            )
+        positive_runtime = [
+            row for row in runtime if row[0] >= 0 and (pause_end is None or row[0] <= pause_end)
+        ]
+        videos = [row for row in positive_runtime if row[1] == 3]
+        return {
+            "pause_request_ns": 0,
+            "pause_ack_observed_ns": ack[0] if ack else None,
+            "last_feeder_dispatch_receipt_ns": ack[3] if ack else None,
+            "pause_deadline_ns": deadline,
+            "paused_window_end_ns": pause_end,
+            "last_observed_growth_intervals_ns": growth,
+            "last_runtime_video_progress": videos[-1] if videos else None,
+            "first_runtime_watchdog_reject": next(
+                (row for row in positive_runtime if row[1] == 6), None
+            ),
+            "first_runtime_kill_request": next(
+                (row for row in positive_runtime if row[1] == 8 and row[3] == 0), None
+            ),
+            "first_runtime_child_wait_completed": next(
+                (row for row in positive_runtime if row[1] == 9 and row[3] == 1), None
+            ),
+            "first_normalized_absent_sample": next(
+                (
+                    sample
+                    for sample in paused_samples
+                    if sample["finished_ns"] >= 0
+                    and sample["dut_metrics_ok"] is True
+                    and sample["normalized"] is False
+                ),
+                None,
+            ),
+            "first_local_slate_state_sample": next(
+                (
+                    sample
+                    for sample in paused_samples
+                    if sample["finished_ns"] >= 0
+                    and sample["dut_metrics_ok"] is True
+                    and sample["sink_metrics_ok"] is True
+                    and sample["ingest_live"] is True
+                    and expected_ingest is not None
+                    and len(expected_ingest) == 1
+                    and sample["ingest_generations"] == expected_ingest
+                    and sample["path_ready"] is True
+                    and sample["live"] is False
+                    and sample["normalized"] is False
+                ),
+                None,
+            ),
+            "wait_return": groups["wait-return"][-1] if groups["wait-return"] else None,
+            "resume_request": groups["resume-request"][0] if groups["resume-request"] else None,
+            "resume_return": groups["resume-return"][0] if groups["resume-return"] else None,
+            "last_evaluated_predicate": last_evaluated,
+            "latest_completed_sample_before_deadline": timely[-1] if timely else None,
+            "observer_metrics": summaries,
+        }
+
+    def report(self, include_rows=True):
+        value = self.frozen if self.frozen is not None else self.freeze()
+        omitted = set() if include_rows else {"events", "samples", "runtime_events"}
+        return json.loads(
+            json.dumps(
+                {key: item for key, item in value.items() if key not in omitted}, allow_nan=False
+            )
+        )
+
+
+def install_pause_timeline(api, state, stage, runtime_api):
+    """Observe only original calls; added work never supplies an acceptance sample."""
+    timeline = PauseTimeline(api)
+    timeline.runtime_api = runtime_api
+    state["pause_timeline"] = timeline
+    original_fetch = api["fetch_metrics"]
+    feeder, requests = [None], [0, 0]
+
+    class Feeder(api["PacedMPEGTSFeeder"]):
+        def pause(self, *args, **kwargs):
+            observed = timeline.t0 is None and state.get("last_stage") == "stall-pause"
+            if observed:
+                timeline.start_pause()
+                feeder[0] = self
+            try:
+                result = super().pause(*args, **kwargs)
+            except BaseException:
+                if observed:
+                    timeline.record("pause-return", None, None, None, None)
+                raise
+            if observed:
+                with contextlib.suppress(Exception), self._condition:
+                    timeline.record(
+                        "pause-return",
+                        result if type(result) is bool else None,
+                        pause_seconds_ns(self._clock_last),
+                        self._clock_packets,
+                        self._clock_bytes,
+                    )
+            return result
+
+        def resume(self, *args, **kwargs):
+            observed = self is feeder[0] and not timeline.closed
+            if observed:
+                timeline.record("resume-request")
+            try:
+                result = super().resume(*args, **kwargs)
+            except BaseException:
+                if observed:
+                    timeline.record("resume-return", None)
+                raise
+            if observed:
+                timeline.record("resume-return", result if type(result) is bool else None)
+            return result
+
+    class Observed(api["Observer"]):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            timeline.observer = self
+
+        def wait_sample(self, description, predicate, timeout, **kwargs):
+            if (
+                description != "same-session SLATE transition"
+                or timeline.t0 is None
+                or timeline.wait_seen
+            ):
+                return super().wait_sample(description, predicate, timeout, **kwargs)
+            timeline.wait_seen = True
+            anchor = pause_seconds_ns(kwargs.get("not_before"))
+            bound = pause_seconds_ns(api.get("SRT_IDLE_LOWER_BOUND_SECONDS"))
+            timeline.deadline_ns = (
+                anchor + bound if anchor is not None and bound is not None else None
+            )
+            timeline.record("wait-start", anchor, timeline.deadline_ns)
+
+            def observed_predicate(sample):
+                accepted = None
+                try:
+                    accepted = predicate(sample)
+                    return accepted
+                finally:
+                    with contextlib.suppress(Exception):
+                        evaluated = timeline.clock()
+                        finished = pause_seconds_ns(sample.get("finished"))
+                        age = (
+                            evaluated - finished
+                            if finished is not None and evaluated >= finished
+                            else None
+                        )
+                        timeline.record(
+                            "predicate",
+                            evaluated,
+                            pause_seconds_ns(sample.get("t")),
+                            finished,
+                            age,
+                            accepted if type(accepted) is bool else None,
+                        )
+
+            try:
+                result = super().wait_sample(description, observed_predicate, timeout, **kwargs)
+            except BaseException:
+                timeline.record("wait-return", False)
+                raise
+            timeline.record("wait-return", True)
+            return result
+
+    def fetch(port):
+        roles = (api["DUT_METRICS_PORT"], api["SINK_METRICS_PORT"])
+        if (
+            threading.current_thread() is not timeline.observer
+            or port not in roles
+            or timeline.closed
+        ):
+            return original_fetch(port)
+        role, started, available = roles.index(port), timeline.clock(), False
+        requests[role] += 1
+        try:
+            result = original_fetch(port)
+            available = True
+            return result
+        finally:
+            with contextlib.suppress(Exception):
+                timeline.record(
+                    "metrics", role, requests[role], started, timeline.clock(), available
+                )
+
+    def freeze():
+        if timeline.frozen is not None:
+            return
+        runtime = None
+        with contextlib.suppress(Exception):
+            runtime = json.loads(
+                read_private(
+                    stage / runtime_api["TIMELINE_FILE"], maximum=runtime_api["TIMELINE_MAX_BYTES"]
+                )
+            )
+        timeline.freeze(runtime)
+
+    api.update(PacedMPEGTSFeeder=Feeder, Observer=Observed, fetch_metrics=fetch)
+    state["freeze_pause_timeline"] = freeze
+    return timeline
+
+
 def install_prefix(api, stage, mediamtx, stage_file):
     """Keep real gates/cleanup; stop after the original supervisor-crash checks."""
     api.update(
@@ -528,6 +986,9 @@ def install_prefix(api, stage, mediamtx, stage_file):
         original_mark(name, strict_segment_index=strict_segment_index)
         # Only fixed original stage names are recorded, never exception strings.
         state["last_stage"] = name
+        if name == "stuck-start" and "freeze_pause_timeline" in state:
+            with contextlib.suppress(Exception):
+                state["freeze_pause_timeline"]()
         if name == "auth-exclusive":
             state["initial_completed"] = True
         if name == "crash-cont":
@@ -907,6 +1368,10 @@ def main():
         save_new(stage_file, b"startup\n")
         stage_identity = stage_file.stat()
         state = install_prefix(api, stage, reader["MEDIAMTX"], stage_file)
+        timeline_api = runpy.run_path(
+            str(stage / "wrapper.py"), run_name="_pause_timeline_validator"
+        )
+        pause_timeline = install_pause_timeline(api, state, stage, timeline_api)
         sys.argv = [str(stage / "self-test")]
         # Never expose the original diagnostic log or synthetic credentials.
         try:
@@ -927,7 +1392,13 @@ def main():
             stage_file.unlink()
         result = json.loads(read_private(stage / "prefix-result.json", maximum=2 * 1024**2))
         progress = json.loads(read_private(stage / "prefix-progress.json", maximum=2 * 1024**2))
+        with contextlib.suppress(Exception):
+            state["freeze_pause_timeline"]()
         report = prefix_summary(result, progress, state, code)
+        with contextlib.suppress(Exception):
+            report["stall_switch_timeline"] = pause_timeline.report(
+                include_rows=report["status"] != "TARGET_CRASH_PREFIX_COMPLETED"
+            )
         report["stage_noexec"] = stage_noexec
         report["hook_launch"] = "python-interpreter-noexec-compatible"
         report["checkpoint"] = failure_location(progress, api["SELF_TEST_STAGES"])

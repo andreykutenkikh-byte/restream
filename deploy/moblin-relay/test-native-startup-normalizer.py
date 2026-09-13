@@ -19,6 +19,7 @@ import stat
 import sys
 import tempfile
 import time
+from collections import deque
 from pathlib import Path
 
 PURPOSE = "adojapan-ci-native-startup-diagnostic"
@@ -53,6 +54,393 @@ EVENTS = {
     "nal_pps": re.compile(rb"nal_unit_type:\s*8\b"),
     "nal_idr": re.compile(rb"nal_unit_type:\s*5\b"),
 }
+
+# Numeric receipts from the original supervisor, not media/packet timestamps.
+# This diagnostic never supplies observations to the supervisor's decisions.
+TIMELINE_FILE = "normalizer-timeline.json"
+TIMELINE_LIMIT = 2048
+TIMELINE_MAX_BYTES = 512 * 1024
+TIMELINE_INTEGER_MAX = 2**63 - 1
+TIMELINE_REASONS = (
+    "",
+    "child-exit",
+    "output-start-timeout",
+    "metrics-blind",
+    "output-identity",
+    "output-regression",
+    "output-fallback",
+    "video-stalled",
+    "ingest-timing",
+    "ingest-missing",
+    "ingest-identity",
+    "ingest-regression",
+    "verified-stall",
+    "ingest-confirmed-stall",
+    "watchdog-unknown",
+)
+# Rows are [monotonic_ns, event_code, ...fields]. IDs/paths/errors are never retained.
+TIMELINE_EVENT_FIELDS = {
+    1: ("metric_kind", "request"),
+    2: ("metric_kind", "request", "availability", "generation", "counter", "delta"),
+    3: ("child", "frames", "video_growth_age_ns"),
+    4: ("keep", "probe_ingest", "reason", "output_growth_age_ns", "idle_observations"),
+    5: ("keep", "reason", "ingest_counter", "joint_idle_age_ns", "idle_observations"),
+    6: ("reason",),
+    7: ("child", "outcome"),
+    8: ("child", "outcome"),
+    9: ("child", "outcome", "returncode"),
+    10: ("child", "force", "outcome"),
+    11: ("state",),
+    12: ("reason",),
+    13: ("child",),
+}
+_N = TIMELINE_INTEGER_MAX
+_R = (0, len(TIMELINE_REASONS) - 1)
+TIMELINE_EVENT_BOUNDS = {
+    1: ((0, 1), (1, _N)),
+    2: ((0, 1), (1, _N), (0, 3), (0, _N), (-1, _N), (-_N, _N)),
+    3: ((0, _N), (0, _N), (-1, _N)),
+    4: ((0, 1), (0, 1), _R, (-1, _N), (0, _N)),
+    5: ((0, 1), _R, (-1, _N), (-1, _N), (0, _N)),
+    6: (_R,),
+    7: ((1, _N), (0, 2)),
+    8: ((1, _N), (0, 2)),
+    9: ((1, _N), (0, 3), (-9999, 255)),
+    10: ((0, _N), (0, 1), (0, 2)),
+    11: ((0, 3),),
+    12: (_R,),
+    13: ((0, _N),),
+}
+
+
+def timeline_row_valid(row):
+    if (
+        type(row) is not list
+        or len(row) < 2
+        or type(row[0]) is not int
+        or not 0 <= row[0] <= TIMELINE_INTEGER_MAX
+        or type(row[1]) is not int
+        or row[1] not in TIMELINE_EVENT_BOUNDS
+    ):
+        return False
+    bounds = TIMELINE_EVENT_BOUNDS[row[1]]
+    return len(row) == len(bounds) + 2 and all(
+        type(value) is int and low <= value <= high
+        for value, (low, high) in zip(row[2:], bounds, strict=False)
+    )
+
+
+def validated_timeline_report(value):
+    fields = {
+        "version",
+        "scope",
+        "clock",
+        "supervisor_pid",
+        "started_ns",
+        "ended_ns",
+        "dropped_events",
+        "clock_invalid",
+        "invalid_data",
+        "events",
+    }
+    if type(value) is not dict or set(value) != fields:
+        return None
+    if (
+        type(value["version"]) is not int
+        or value["version"] != 1
+        or value["scope"] != "supervisor-observation-receipts-not-media-timestamps"
+        or value["clock"] != "monotonic_ns"
+        or type(value["supervisor_pid"]) is not int
+        or not 1 <= value["supervisor_pid"] <= 2**31 - 1
+        or type(value["clock_invalid"]) is not bool
+        or type(value["invalid_data"]) is not bool
+        or any(
+            type(value[key]) is not int or not 0 <= value[key] <= TIMELINE_INTEGER_MAX
+            for key in ("started_ns", "ended_ns", "dropped_events")
+        )
+        or value["ended_ns"] < value["started_ns"]
+        or type(value["events"]) is not list
+        or len(value["events"]) > TIMELINE_LIMIT
+    ):
+        return None
+    previous = value["started_ns"]
+    events = []
+    for row in value["events"]:
+        if not timeline_row_valid(row) or not previous <= row[0] <= value["ended_ns"]:
+            return None
+        previous = row[0]
+        events.append(list(row))
+    safe = {key: value[key] for key in fields if key != "events"}
+    safe["events"] = events
+    if len(json.dumps(safe, separators=(",", ":")).encode("ascii")) > TIMELINE_MAX_BYTES:
+        return None
+    return safe
+
+
+def atomic_timeline_record(stage, value):
+    safe = validated_timeline_report(value)
+    require(safe is not None, "CI_TIMELINE_RECORD_INVALID")
+    metadata = stage.lstat()
+    require(
+        os.geteuid() == 0
+        and STAGE_PATTERN.fullmatch(str(stage))
+        and stage.resolve(strict=True) == stage
+        and stat.S_ISDIR(metadata.st_mode)
+        and metadata.st_uid == 0
+        and stat.S_IMODE(metadata.st_mode) == 0o700,
+        "CI_TIMELINE_STAGE_INVALID",
+    )
+    destination = stage / TIMELINE_FILE
+    with contextlib.suppress(FileNotFoundError):
+        trusted_file(destination, 0o600, TIMELINE_MAX_BYTES)
+    payload = json.dumps(safe, allow_nan=False, separators=(",", ":")).encode("ascii")
+    descriptor, temporary = tempfile.mkstemp(prefix=".normalizer-timeline-", dir=stage)
+    temporary_path = Path(temporary)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, destination)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+class SupervisorTimeline:
+    def __init__(self, stage, clock=time.monotonic_ns):
+        self.stage, self.clock = stage, clock
+        self.started = self.last = clock()
+        self.rows = deque(maxlen=TIMELINE_LIMIT)
+        self.dropped = 0
+        self.clock_invalid = self.invalid_data = False
+
+    def add(self, code, *values):
+        stamp = self.clock()
+        if type(stamp) is not int or not self.last <= stamp <= TIMELINE_INTEGER_MAX:
+            self.clock_invalid = True
+            return None
+        row = [stamp, code, *values]
+        if not timeline_row_valid(row):
+            self.invalid_data = True
+            return None
+        self.last = stamp
+        if len(self.rows) == TIMELINE_LIMIT:
+            self.dropped = min(TIMELINE_INTEGER_MAX, self.dropped + 1)
+        self.rows.append(row)
+        return stamp
+
+    def save(self):
+        # Called only after an original stop or at supervisor teardown, never per poll.
+        with contextlib.suppress(OSError, ValueError, TypeError):
+            atomic_timeline_record(
+                self.stage,
+                {
+                    "version": 1,
+                    "scope": "supervisor-observation-receipts-not-media-timestamps",
+                    "clock": "monotonic_ns",
+                    "supervisor_pid": os.getpid(),
+                    "started_ns": self.started,
+                    "ended_ns": self.last,
+                    "dropped_events": self.dropped,
+                    "clock_invalid": self.clock_invalid,
+                    "invalid_data": self.invalid_data,
+                    "events": list(self.rows),
+                },
+            )
+
+
+def install_timeline(api, stage, clock=time.monotonic_ns):
+    """Delegate original calls exactly once; no extra reads, waits, logging or policy."""
+    trace = SupervisorTimeline(stage, clock)
+    original_subprocess, original_stop = api["subprocess"], api["stop_child"]
+    original_state, original_restart = api["emit_state_event"], api["emit_restart_reason"]
+    child_generation = 0
+
+    def reason(value):
+        return (
+            TIMELINE_REASONS.index(value)
+            if value in TIMELINE_REASONS
+            else len(TIMELINE_REASONS) - 1
+        )
+
+    def age(now, previous):
+        if type(previous) not in (float, int) or not math.isfinite(previous) or now < previous:
+            return -1
+        return min(TIMELINE_INTEGER_MAX, round((now - previous) * 10**9))
+
+    class Reader(api["MetricsReader"]):
+        def __init__(self, port, path, parser):
+            super().__init__(port, path, parser)
+            self.trace_kind = int(path != api["OUTPUT_METRICS_PATH"])
+            self.trace_request = self.trace_generation = 0
+            self.trace_identity = self.trace_counter = None
+
+        def sample(self):
+            self.trace_request += 1
+            trace.add(1, self.trace_kind, self.trace_request)
+            try:
+                result = super().sample()
+            except BaseException:
+                trace.add(2, self.trace_kind, self.trace_request, 3, self.trace_generation, -1, -1)
+                raise
+            successful, sample = result
+            availability, counter, delta = int(bool(successful)), -1, -1
+            if successful and sample is not None:
+                identity, counter = sample
+                availability = 2
+                if identity != self.trace_identity:
+                    self.trace_generation += 1
+                    self.trace_identity, self.trace_counter = identity, None
+                if self.trace_counter is not None:
+                    delta = counter - self.trace_counter
+                self.trace_counter = counter
+            trace.add(
+                2,
+                self.trace_kind,
+                self.trace_request,
+                availability,
+                self.trace_generation,
+                counter,
+                delta,
+            )
+            return result
+
+    class Progress(api["VideoProgress"]):
+        def __init__(self, pipe, now):
+            super().__init__(pipe, now)
+            self.trace_child, self.trace_frames, self.trace_growth = child_generation, 0, None
+
+        def sample(self, now):
+            result = super().sample(now)
+            observed = clock()
+            if self.frames > self.trace_frames:
+                self.trace_growth = observed
+            self.trace_frames = self.frames
+            elapsed = observed - self.trace_growth if self.trace_growth is not None else -1
+            trace.add(3, self.trace_child, self.frames, elapsed)
+            return result
+
+        def close(self):
+            result = super().close()
+            trace.add(13, self.trace_child)
+            return result
+
+    class Watchdog(api["MediaWatchdog"]):
+        def reject(self, value):
+            result = super().reject(value)
+            trace.add(6, reason(self.failure_reason))
+            return result
+
+        def observe_output(self, successful, sample, now):
+            result = super().observe_output(successful, sample, now)
+            trace.add(
+                4,
+                int(result[0]),
+                int(result[1]),
+                reason(self.failure_reason),
+                age(now, self.output_last_growth),
+                self.output_unchanged_observations,
+            )
+            return result
+
+        def observe_ingest(self, successful, sample, started_at, finished_at):
+            result = super().observe_ingest(successful, sample, started_at, finished_at)
+            trace.add(
+                5,
+                int(result),
+                reason(self.failure_reason),
+                self.ingest_counter if self.ingest_counter is not None else -1,
+                age(started_at, self.joint_idle_since),
+                self.joint_unchanged_observations,
+            )
+            return result
+
+    class Child:
+        def __init__(self, child, generation):
+            self.original, self.trace_child = child, generation
+
+        def __getattr__(self, name):
+            return getattr(self.original, name)
+
+        def kill(self):
+            trace.add(8, self.trace_child, 0)
+            try:
+                result = self.original.kill()
+            except BaseException:
+                trace.add(8, self.trace_child, 2)
+                raise
+            trace.add(8, self.trace_child, 1)
+            return result
+
+        def wait(self, *args, **kwargs):
+            trace.add(9, self.trace_child, 0, -9999)
+            try:
+                result = self.original.wait(*args, **kwargs)
+            except original_subprocess.TimeoutExpired:
+                trace.add(9, self.trace_child, 2, -9999)
+                raise
+            except BaseException:
+                trace.add(9, self.trace_child, 3, -9999)
+                raise
+            trace.add(9, self.trace_child, 1, result)
+            return result
+
+    class SubprocessProxy:
+        def __getattr__(self, name):
+            return getattr(original_subprocess, name)
+
+        def Popen(self, argv, **kwargs):  # noqa: N802 - exact delegated API.
+            nonlocal child_generation
+            child_generation += 1
+            trace.add(7, child_generation, 0)
+            try:
+                child = original_subprocess.Popen(argv, **kwargs)
+            except BaseException:
+                trace.add(7, child_generation, 2)
+                raise
+            trace.add(7, child_generation, 1)
+            return Child(child, child_generation)
+
+    def stop(child, *, force=False):
+        generation = getattr(child, "trace_child", 0)
+        trace.add(10, generation, int(force), 0)
+        try:
+            result = original_stop(child, force=force)
+        except BaseException:
+            trace.add(10, generation, int(force), 2)
+            raise
+        else:
+            trace.add(10, generation, int(force), 1)
+            return result
+        finally:
+            trace.save()
+
+    def state(value):
+        result = original_state(value)
+        states = ("", "source-attached", "source-detached", "bridge-active")
+        trace.add(11, states.index(value) if value in states else 0)
+        return result
+
+    def restart(value):
+        result = original_restart(value)
+        trace.add(12, reason(value))
+        return result
+
+    api.update(
+        MetricsReader=Reader,
+        VideoProgress=Progress,
+        MediaWatchdog=Watchdog,
+        subprocess=SubprocessProxy(),
+        stop_child=stop,
+        emit_state_event=state,
+        emit_restart_reason=restart,
+    )
+    return trace.save
 
 
 def require(condition, code):
@@ -474,19 +862,23 @@ def install_capture(api, stage, clock=time.monotonic):
     return finish
 
 
-def delegate(wrapper, stage, source):
+def delegate(wrapper, stage, source, *, timeline=False):
     api = {"__name__": "_ci_original_normalizer", "__file__": str(wrapper)}
     exec(compile(source, str(stage / "normalizer.py"), "exec"), api)  # noqa: S102
     # The original unsanitized entrypoint re-execs this wrapper before hooks are installed.
     # Its real supervisor argv therefore still matches self-test's NORMALIZER identity.
-    if sys.argv[1:] != [api["SUPERVISOR_ARGUMENT"]] or not claim_capture(stage):
+    if sys.argv[1:] != [api["SUPERVISOR_ARGUMENT"]]:
         return api["main"]()
-    finish = install_capture(api, stage)
+    finish_timeline = install_timeline(api, stage) if timeline else None
+    finish = install_capture(api, stage) if claim_capture(stage) else None
     try:
         return api["main"]()
     finally:
         with contextlib.suppress(OSError, ValueError):
-            finish()
+            if finish is not None:
+                finish()
+        if finish_timeline is not None:
+            finish_timeline()
 
 
 def main():
@@ -496,7 +888,7 @@ def main():
     except (OSError, ValueError, TypeError):
         print("CI startup diagnostic unavailable", file=sys.stderr)
         return 2
-    return delegate(wrapper, stage, source)
+    return delegate(wrapper, stage, source, timeline=True)
 
 
 if __name__ == "__main__":
