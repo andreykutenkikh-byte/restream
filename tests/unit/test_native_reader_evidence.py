@@ -21,6 +21,37 @@ ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / "deploy/moblin-relay/test-native-reader-evidence.py"
 
 
+def fixture_owned_validator(original, fixture_root, fixture_uid):
+    """Validate nonroot fixture files with the real guard, retain real identity."""
+
+    def owned(path, *, directory=False, source=False):
+        info = path.lstat()
+        if info.st_uid != fixture_uid or not path.absolute().is_relative_to(fixture_root):
+            raise ValueError("unexpected fixture ownership or path")
+
+        class Metadata:
+            st_uid = 0
+
+            def __getattr__(self, name):
+                return getattr(info, name)
+
+        class FixturePath:
+            def lstat(self):
+                return Metadata()
+
+            def absolute(self):
+                return path.absolute()
+
+            def resolve(self):
+                return path.resolve()
+
+        original(FixturePath(), directory=directory, source=source)
+        # fstat/identity checks later must see the actual unprivileged UID.
+        return info
+
+    return owned
+
+
 @pytest.fixture
 def evidence(tmp_path, monkeypatch):
     api = load_self_test()
@@ -46,6 +77,12 @@ def evidence(tmp_path, monkeypatch):
             return info
 
         monkeypatch.setitem(helper, "owned", owned)
+    elif tmp_path.stat().st_uid != 0:
+        monkeypatch.setitem(
+            helper,
+            "owned",
+            fixture_owned_validator(helper["owned"], tmp_path.absolute(), tmp_path.stat().st_uid),
+        )
     monkeypatch.setitem(helper, "cgroup_snapshot", lambda: {"usage_usec": 10})
     namespace["install"](
         api,
@@ -388,3 +425,64 @@ def test_optional_resource_diagnostic_failure_cannot_prevent_reader_or_replace_t
     assert value["cgroup_before"] == value["cgroup_after"] == {}
     assert value["progress"][-1][1] == 89
     assert "PRIVATE" not in json.dumps(value)
+
+
+def nonroot_fixture_path(tmp_path, **changes):
+    metadata = {
+        "st_uid": 1001,
+        "st_mode": stat.S_IFREG | 0o600,
+        "st_nlink": 1,
+        "st_dev": 1,
+        "st_ino": 2,
+        "st_size": 10,
+        "st_mtime_ns": 100,
+    }
+    metadata.update(changes)
+    info = SimpleNamespace(**metadata)
+    target = tmp_path / "owned.flv"
+    path = SimpleNamespace(lstat=lambda: info, absolute=lambda: target, resolve=lambda: target)
+    return path, info
+
+
+def test_nonroot_fixture_adapter_preserves_real_fstat_identity_and_production_guard(tmp_path):
+    namespace = runpy.run_path(str(HELPER))
+    path, info = nonroot_fixture_path(tmp_path)
+    original = namespace["owned"]
+    adapted = fixture_owned_validator(original, tmp_path, 1001)
+    assert adapted(path) is info
+    assert adapted(path).st_uid == 1001
+    assert namespace["stable"](adapted(path)) == namespace["stable"](info)
+    assert namespace["owned"] is original
+    with pytest.raises(ValueError, match="private evidence path"):
+        original(path)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"st_uid": 1002},
+        {"st_mode": stat.S_IFREG | 0o666},
+        {"st_mode": stat.S_IFLNK | 0o600},
+        {"st_nlink": 2},
+    ],
+)
+def test_nonroot_fixture_adapter_preserves_mode_type_link_and_other_owner_rejection(
+    tmp_path, changes
+):
+    namespace = runpy.run_path(str(HELPER))
+    path, _info = nonroot_fixture_path(tmp_path, **changes)
+    adapted = fixture_owned_validator(namespace["owned"], tmp_path, 1001)
+    with pytest.raises(ValueError):
+        adapted(path)
+
+
+def test_nonroot_fixture_adapter_does_not_admit_external_or_symlink_resolved_paths(tmp_path):
+    namespace = runpy.run_path(str(HELPER))
+    path, _info = nonroot_fixture_path(tmp_path)
+    adapted = fixture_owned_validator(namespace["owned"], tmp_path, 1001)
+    path.resolve = lambda: tmp_path.parent / "external.flv"
+    with pytest.raises(ValueError, match="private evidence path"):
+        adapted(path)
+    path.absolute = path.resolve
+    with pytest.raises(ValueError, match="fixture ownership or path"):
+        adapted(path)
