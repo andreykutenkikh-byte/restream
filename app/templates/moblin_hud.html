@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#080b0e">
+    <title>Moblin HUD · AdoJapan Restream</title>
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/static/moblin-hud.css?v=20260904.1">
+    <script src="/static/moblin-hud.js?v=20260906.1" defer></script>
+  </head>
+  <body data-hud-state="monitoring" data-hud-paired="{{ 'true' if hud_paired else 'false' }}">
+    <main class="hud" aria-labelledby="hud-title">
+      <header class="hud__header">
+        <div>
+          <p class="hud__brand">AdoJapan Restream</p>
+          <p class="hud__eyebrow">Moblin HUD · только мониторинг</p>
+        </div>
+        <span class="hud__signal" aria-hidden="true"></span>
+      </header>
+
+      <section class="health-card" aria-live="polite" aria-atomic="true">
+        <p class="health-card__server" data-hud-server>Подключение…</p>
+        <h1 id="hud-title" class="health-card__title" data-hud-title>Проверяем мониторинг</h1>
+        <p class="health-card__message" data-hud-message>Получаем безопасный статус эфира.</p>
+      </section>
+
+      <section class="metric-grid" aria-label="Показатели потока">
+        <div class="metric metric--wide">
+          <span class="metric__label">Входящий битрейт</span>
+          <strong class="metric__value" data-hud-bitrate>—</strong>
+          <span class="metric__hint" data-hud-trend>Динамика неизвестна</span>
+        </div>
+        <div class="metric">
+          <span class="metric__label">Источник</span>
+          <strong class="metric__value metric__value--small" data-hud-source>—</strong>
+        </div>
+        <div class="metric">
+          <span class="metric__label">YouTube</span>
+          <strong class="metric__value metric__value--small" data-hud-youtube>—</strong>
+        </div>
+        <div class="metric">
+          <span class="metric__label">Heartbeat</span>
+          <strong class="metric__value metric__value--small" data-hud-heartbeat>—</strong>
+        </div>
+        <div class="metric">
+          <span class="metric__label">Резерв</span>
+          <strong class="metric__value metric__value--small" data-hud-standby>—</strong>
+        </div>
+      </section>
+
+      <section class="recommendation" aria-label="Рекомендация">
+        <p class="recommendation__action" data-hud-recommendation>Наблюдаем за потоком</p>
+        <p class="recommendation__reason" data-hud-reason>Ожидаем свежие данные.</p>
+      </section>
+
+      <nav class="hud__actions" aria-label="Управление HUD">
+        <button class="hud-button" type="button" data-hud-sound>Включить звуковые предупреждения</button>
+        <button class="hud-button" type="button" data-hud-mute disabled>Заглушить на 60 секунд</button>
+        <button class="hud-button hud-button--details" type="button" data-hud-details-open>Подробнее</button>
+      </nav>
+
+      <p class="hud__updated" data-hud-updated>Статус ещё не получен</p>
+    </main>
+
+    <section class="details-sheet" data-hud-details hidden role="dialog" aria-modal="true" aria-labelledby="hud-details-title">
+      <div class="details-sheet__panel">
+        <header class="details-sheet__header">
+          <h2 id="hud-details-title">Подробности</h2>
+          <button class="details-sheet__close" type="button" data-hud-details-close aria-label="Закрыть">Закрыть</button>
+        </header>
+        <dl class="details-list">
+          <div><dt>CPU сервера</dt><dd data-hud-cpu>—</dd></div>
+          <div><dt>Свободная RAM</dt><dd data-hud-memory>—</dd></div>
+          <div><dt>Состояние</dt><dd data-hud-raw-state>—</dd></div>
+          <div><dt>Точность оценки</dt><dd data-hud-confidence>—</dd></div>
+          <div><dt>Причины</dt><dd data-hud-reason-codes>—</dd></div>
+          <div><dt>Обновление сервера</dt><dd data-hud-server-time>—</dd></div>
+        </dl>
+        <p class="details-sheet__note">HUD только показывает состояние. Переключение сервера выполняется вручную в Moblin.</p>
+        <button class="hud-button hud-button--logout" type="button" data-hud-logout>Отключить это устройство</button>
+      </div>
+    </section>
+  </body>
+</html>
