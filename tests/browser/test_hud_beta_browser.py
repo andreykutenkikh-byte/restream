@@ -81,6 +81,8 @@ async def _exercise_browser(
     )
     page_errors: list[str] = []
     requests: list[tuple[str, str]] = []
+    admin_requests: list[tuple[str, str]] = []
+    admin_image_urls: set[str] = set()
     hud_requests: list[tuple[str, str]] = []
     admin_responses: list[tuple[str, str, int]] = []
 
@@ -104,6 +106,13 @@ async def _exercise_browser(
         admin = await admin_context.new_page()
         admin.on("pageerror", lambda error: page_errors.append(error.message))
         admin.on("request", lambda request: requests.append((request.method, request.url)))
+        admin.on("request", lambda request: admin_requests.append((request.method, request.url)))
+        admin.on(
+            "request",
+            lambda request: (
+                admin_image_urls.add(request.url) if request.resource_type == "image" else None
+            ),
+        )
         admin.on(
             "response",
             lambda response: admin_responses.append(
@@ -127,6 +136,10 @@ async def _exercise_browser(
         pairing_response = await pending.value
         assert pairing_response.status == 200
         pairing = await pairing_response.json()
+        await admin.wait_for_function(
+            "() => document.querySelector('[data-hud-pairing-url]')"
+            ".value.includes('/moblin-hud#pair=')"
+        )
         pairing_url = await admin.locator("[data-hud-pairing-url]").input_value()
         pair_token = urlsplit(pairing_url).fragment.removeprefix("pair=")
         assert pair_token
@@ -252,6 +265,23 @@ async def _exercise_browser(
         )
         assert (await hud_context.request.get(origin + "/moblin-hud/api/status")).status == 401
         assert not page_errors, "A real panel/HUD entrypoint raised a JavaScript error"
+
+        # WebKit's existing admin page requests local blob images while preview
+        # is denied. Accept only admin image GETs with the exact embedded origin.
+        def expected_origin(method: str, url: str) -> bool:
+            parsed = urlsplit(url)
+            if parsed.scheme == "https":
+                return f"{parsed.scheme}://{parsed.netloc}" == origin
+            if (
+                parsed.scheme == "blob"
+                and method == "GET"
+                and (method, url) in admin_requests
+                and url in admin_image_urls
+            ):
+                embedded = urlsplit(parsed.path)
+                return f"{embedded.scheme}://{embedded.netloc}" == origin
+            return False
+
         unexpected_origins = {
             (
                 urlsplit(url).scheme,
@@ -260,10 +290,14 @@ async def _exercise_browser(
                 if urlsplit(url).scheme in {"http", "https"}
                 else "<non-network>",
             )
-            for _, url in requests
-            if urlsplit(url).hostname != "127.0.0.1"
+            for method, url in requests
+            if not expected_origin(method, url)
         }
         assert not unexpected_origins, unexpected_origins
+        assert all(
+            urlsplit(url).scheme == "https" and f"https://{urlsplit(url).netloc}" == origin
+            for _, url in hud_requests
+        )
         allowed_posts = {
             "/api/auth/login",
             "/api/moblin-hud/pairings",
