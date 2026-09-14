@@ -8,8 +8,10 @@ PR16 was `6995dc10bf7065fef6860db9342d95cfeac125ee`. Neither is modified.
 
 Historical evidence: [main job 103717052883](https://github.com/andreykutenkikh-byte/restream/actions/runs/34754722280/job/103717052883)
 failed at `stuck-live`. Its companion diagnostic succeeded, not full acceptance.
-The original safe evidence remains in `stall-switch-evidence-20260913.json` and
+The target's original safe evidence is in
 [the previous report](https://github.com/andreykutenkikh-byte/restream/pull/15#issuecomment-5653022791).
+The older `stall-switch-evidence-20260913.json` is preserved separately; it
+predates this stuck-live CI failure and must not be treated as its receipt.
 
 ## What was actually observed
 
@@ -27,7 +29,7 @@ recovery), and both pause/recovery histories must precede this capture unchanged
 
 The paced source clock measures successful local UDP sends of a fixed-rate TS
 multiplex (including audio/null/table packets). Ratio 0.999998, max gap 0.010783 s,
-zero discarded/rebased packets do not prove timely video delivery at the final
+zero discarded pacing-debt seconds and zero rebases do not prove timely video delivery at the final
 RTMP sink. Aggregate sink byte growth likewise does not prove video cadence.
 Normalized-publisher generation is not pinned by the existing start/end Boolean
 preconditions; new diagnostic ordinals observe that gap without changing gates.
