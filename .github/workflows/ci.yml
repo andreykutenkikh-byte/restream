@@ -160,14 +160,27 @@ jobs:
       - name: Post-preview runtime limits
         run: sh scripts/check_runtime_limits.sh
 
+      - name: Prepare isolated stuck-live reader evidence
+        # No warmup/retry: opt-in evidence observes only original capture #4.
+        # The stage contains synthetic fixture data, never real credentials.
+        # Keep all preceding workloads and the native acceptance unchanged.
+        id: native_reader_evidence
+        run: uv run --locked python scripts/ci_native_reader_evidence.py prepare
+
       - name: SSH bootstrap and native Moblin Relay end-to-end smoke
         id: native_onboarding
         run: uv run --locked python scripts/ci_node_onboarding_smoke.py
 
+      - name: Strict stuck-live reader postmortem and private artifact cleanup
+        if: ${{ !cancelled() && steps.native_reader_evidence.outcome == 'success' }}
+        # Offline analysis runs after the original capture and scenario stopped.
+        # It cannot replace the acceptance outcome or count a partial as PASS.
+        run: uv run --locked python scripts/ci_native_reader_evidence.py collect
+
       - name: Strict native reader clock counterfactual
         # Collect independent media evidence even when native self-test failed.
         # The preceding failure remains fatal; this is not a retry or fallback.
-        if: ${{ !cancelled() && (success() || steps.native_onboarding.outcome == 'failure') }}
+        if: ${{ !cancelled() && (steps.native_onboarding.outcome == 'success' || steps.native_onboarding.outcome == 'failure') }}
         shell: bash
         run: |
           # Use the verified CI-image artifact, independent of install rollback.
