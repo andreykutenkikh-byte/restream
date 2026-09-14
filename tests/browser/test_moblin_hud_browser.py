@@ -547,8 +547,8 @@ def test_failed_logout_requires_confirmation_before_session_revocation(
         page.wait_for_function("() => document.body.dataset.hudState === 'logout-error'")
         assert page.locator("[data-hud-title]").inner_text() == "Не удалось отключить HUD"
         assert page.locator("[data-hud-updated]").inner_text() == "Отключение не подтверждено"
-        assert page.locator("[data-hud-bitrate]").inner_text() == "—"
-        assert page.locator("[data-hud-cpu]").inner_text() == "—"
+        assert page.locator("[data-hud-bitrate]").inner_text() == "Нет данных"
+        assert page.locator("[data-hud-cpu]").inner_text() == "Нет данных"
         assert page.locator("[data-hud-logout]").is_enabled()
         assert context.request.get(fixture.origin + "/moblin-hud/api/status").status == 200
 

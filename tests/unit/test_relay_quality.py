@@ -321,6 +321,44 @@ def test_tracker_remembers_previous_active_route_when_source_disappears() -> Non
     assert "source_lost" in result.health.reason_codes
 
 
+@pytest.mark.parametrize("warm", [False, True])
+def test_omitted_optional_bitrate_never_establishes_media_loss_or_health(warm: bool) -> None:
+    tracker = RelayQualityTracker()
+    now = warm_stable(tracker) if warm else 0.0
+    for elapsed in range(2, 182, 2):
+        result = evaluate(tracker, route(bitrate=None), now + elapsed, standby())
+        assert result.health.level == HealthLevel.UNKNOWN
+        assert result.health.reason_codes == ("input_bitrate_unavailable",)
+        assert result.current_route is not None
+        assert result.current_route.input_bitrate_bps is None
+        assert result.recommendation.action == RecommendationAction.WATCH
+    assert tracker.baseline_for("hong_kong") is None
+
+
+def test_omitted_bitrate_does_not_hide_confirmed_forward_or_process_failure() -> None:
+    tracker = RelayQualityTracker()
+    failed_forward = evaluate(tracker, route(bitrate=None, youtube="failed"), 0)
+    assert failed_forward.health.level == HealthLevel.RED
+    assert "youtube_forward_failed" in failed_forward.health.reason_codes
+    process = replace(route(bitrate=None), service_state="failed", main_process_state="failed")
+    failed_process = evaluate(tracker, process, 40)
+    assert failed_process.health.level == HealthLevel.BLACK
+    assert "relay_process_failed" in failed_process.health.reason_codes
+    assert "media_stalled" not in failed_process.health.reason_codes
+
+
+def test_unavailable_measurement_breaks_continuous_zero_evidence() -> None:
+    tracker = RelayQualityTracker()
+    now = warm_stable(tracker)
+    evaluate(tracker, route(bitrate=0), now + 2)
+    evaluate(tracker, route(bitrate=None), now + 28)
+    first_zero = evaluate(tracker, route(bitrate=0), now + 34)
+    assert "media_stalled" not in first_zero.health.reason_codes
+    stalled = evaluate(tracker, route(bitrate=0), now + 66)
+    assert stalled.health.level == HealthLevel.BLACK
+    assert "media_stalled" in stalled.health.reason_codes
+
+
 def test_missing_media_progress_escalates_from_red_to_black() -> None:
     tracker = RelayQualityTracker()
     now = warm_stable(tracker)

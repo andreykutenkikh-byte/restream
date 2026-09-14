@@ -60,7 +60,7 @@ the administrator-issued link as a fresh page, not just a fragment change in the
 ## What the HUD shows
 
 The compact view shows the current server, LIVE/SLATE/NONE source, input bitrate and
-trend, YouTube forwarding state, heartbeat freshness, available standby server, and a
+trend, server-reported forwarding (`Отправка потока`), heartbeat freshness, available standby server, and a
 plain-language reason. **Подробнее** expands safe host CPU/RAM and diagnostic states.
 The API does not return IP addresses, SSH data, SRT URLs, YouTube URLs or stream keys,
 node tokens, or internal paths.
@@ -106,30 +106,30 @@ or `switch_recommended` with one. Restored LIVE cancels the pending manual recom
 immediately; normal health recovery hysteresis can still take additional good samples.
 RED without a standby remains `watch`.
 
-The existing media-stall threshold (over 30 seconds of zero/missing input bitrate)
+The existing media-stall threshold (over 30 seconds of measured zero input bitrate)
 also uses this grace even if the source label still says LIVE. Its timer starts at
-the first zero/missing observation; confirmation is required before treating it as a
+the first zero observation; confirmation is required before treating it as a
 stall. The wording states that telemetry does not confirm media arrival, not that a
 particular SRT connection is broken. Expiring learned bitrate statistics never erases
 an ongoing failure or restarts its clock. Fresh positive media clears obsolete loss
 severity immediately to a warming-up state; current lower bitrate can independently
 become yellow/red instead of remaining falsely black.
 
+An older agent may omit optional bitrate telemetry. That is `Нет данных`, not
+measured zero: it neither starts nor continues a media-stall interval. If this is
+the only uncertainty, quality remains unknown and the recommendation is watch.
+Independent confirmed process, forwarding or source failures remain meaningful.
+
 The main control-plane ingest API has no independent native service/process/listener
 states. Its missing input is therefore not treated as proof of manual stop; only actual
 available telemetry is used. Native relay coherent-stop checks use the real reported
 states shown above.
 
-The merged runtime allows 2 seconds of jointly stalled input/output, 2.5 seconds
-of output-only inactivity, and 2 seconds without usable metrics before its
-corresponding watchdog action. Its continuously verified no-growth interval
-carries into the existing 6-second exact-publisher stall proof; the watchdog's
-2 seconds are not followed by a new 6-second interval. Media growth, failed
-measurements or a changed publisher identity invalidate that proof. Retry
-cooldowns and attempt limits are unchanged, so the HUD grace remains 120 seconds.
-
-The value comes from the existing native recovery constants, not an assumed recovery
-phase exposed by the agent:
+The HUD grace remains **120 seconds**, unchanged from the extracted HUD policy.
+It was originally selected conservatively against the separate PR15 recovery
+design. That native implementation is **not merged or shipped in this release**;
+the calculation below records policy provenance, not this candidate's runtime
+behavior or a recovery guarantee for an already registered server:
 
 ```text
 6s confirmed stall
@@ -140,9 +140,10 @@ phase exposed by the agent:
 ```
 
 Some operations overlap; this conservative observation window is a HUD policy, not a
-guarantee about network recovery. Sources are the constants in
-`deploy/moblin-relay/moblin-relay-normalize`, the output gate in its `self-test`, and the
-existing five-second heartbeat contract in `relay_agent/client.py`. The HUD requires
+guarantee about network recovery. Historical sources are the constants in
+PR15's `deploy/moblin-relay/moblin-relay-normalize` and its `self-test` at
+`de42b2bfe8663b3ec6c137e5669a87c856cb66ac`, plus the five-second heartbeat contract
+in `relay_agent/client.py`. The native files are intentionally absent here. The HUD requires
 no agent protocol change or agent release. The current API does not carry recovery
 phase/exhaustion, so the HUD never invents «reset succeeded» or claims that retries
 are exhausted.
@@ -208,7 +209,9 @@ not guaranteed.
 The required `hud-browser` CI job launches Chromium and WebKit against the actual
 `create_app` over isolated loopback HTTPS with a temporary SQLite database. It loads the
 ordinary `/moblin-hud` HTML and script tags, not a CommonJS substitute. It is separate
-from the existing native media/preview/security job, which remains required.
+from the unchanged main RTMP/output/preview/security gates, which remain required.
+The excluded PR15 native startup diagnostic is not a gate for code absent from
+this release; its historical failure remains open in the separate native work.
 
 ```bash
 uv sync --locked --group browser

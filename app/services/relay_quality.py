@@ -663,7 +663,12 @@ class RelayQualityTracker:
             reasons.append("source_lost")
             hard_level = HealthLevel.BLACK
 
-        if bitrate is None or bitrate <= 0:
+        if bitrate is None:
+            # Older agents may omit this optional metric. Absence is not a
+            # measured zero and cannot establish a stalled-media interval.
+            reasons.append("input_bitrate_unavailable")
+            state.zero_bitrate_started_at = None
+        elif bitrate <= 0:
             reasons.append("input_bitrate_missing")
             if state.zero_bitrate_started_at is None:
                 state.zero_bitrate_started_at = now
@@ -729,6 +734,17 @@ class RelayQualityTracker:
         now: float,
         new_sample: bool,
     ) -> HealthLevel:
+        if reasons == ("input_bitrate_unavailable",) and hard_level is None:
+            # Read compatibility only: neither infer healthy media nor count
+            # missing optional measurements as evidence of deterioration.
+            state.consecutive_good = 0
+            state.consecutive_yellow = 0
+            state.consecutive_red = 0
+            state.red_started_at = None
+            if state.level != HealthLevel.UNKNOWN or state.level_started_at is None:
+                state.level_started_at = now
+            state.level = HealthLevel.UNKNOWN
+            return state.level
         good = reasons == ("healthy",)
         red_candidate = any(
             reason
@@ -970,6 +986,18 @@ class RelayQualityTracker:
         state: _RouteState,
         now: float,
     ) -> HealthAssessment:
+        if reasons == ("input_bitrate_unavailable",) and level == HealthLevel.UNKNOWN:
+            return HealthAssessment(
+                level=level,
+                title="Нет данных о битрейте",
+                message="Сервер сообщает о LIVE, но не передаёт битрейт. Качество не подтверждено.",
+                reason_codes=reasons,
+                confidence=MeasurementConfidence.ACTIVE_PATH_MEASURED,
+                state_duration_seconds=max(
+                    0.0,
+                    now - (state.level_started_at if state.level_started_at is not None else now),
+                ),
+            )
         titles = {
             HealthLevel.UNKNOWN: "Состояние уточняется",
             HealthLevel.GREEN: "ЭФИР СТАБИЛЕН",
@@ -979,7 +1007,7 @@ class RelayQualityTracker:
         }
         messages = {
             HealthLevel.UNKNOWN: "Недостаточно свежих данных для оценки.",
-            HealthLevel.GREEN: "Входящий поток и отправка в YouTube работают.",
+            HealthLevel.GREEN: "Входящий поток стабилен. Отправка активна по данным сервера.",
             HealthLevel.YELLOW: "Наблюдаем за ухудшением входящего потока.",
             HealthLevel.RED: "Ухудшение входящего потока сохраняется.",
             HealthLevel.BLACK: "Нет свежего медиапотока от текущего relay.",

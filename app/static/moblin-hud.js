@@ -55,7 +55,7 @@
 
   function formatBitrate(value) {
     const bitrate = finiteNumber(value, 1_000_000_000);
-    if (bitrate === null) return "—";
+    if (bitrate === null) return "Нет данных";
     if (bitrate >= 1_000_000) return `${(bitrate / 1_000_000).toFixed(1).replace(".0", "")} Мбит/с`;
     if (bitrate >= 1000) return `${Math.round(bitrate / 1000)} Кбит/с`;
     return `${Math.round(bitrate)} бит/с`;
@@ -72,7 +72,7 @@
 
   function formatSource(value) {
     const source = safeText(value, "UNKNOWN", 16).toUpperCase();
-    return source === "LIVE" ? "Moblin LIVE" : source === "SLATE" ? "Заставка" : source === "NONE" ? "Нет потока" : "Неизвестно";
+    return source === "LIVE" ? "Moblin LIVE" : source === "SLATE" ? "Заставка" : source === "NONE" ? "Нет потока" : "Нет данных";
   }
 
   function formatYouTube(value) {
@@ -88,7 +88,7 @@
       inactive: "Остановлен",
       failed: "Ошибка",
       error: "Ошибка",
-    }[state] || "Неизвестно";
+    }[state] || "Нет данных";
   }
 
   function formatHeartbeat(value) {
@@ -101,13 +101,13 @@
 
   function formatPercent(value) {
     const percent = finiteNumber(value, 100);
-    return percent === null ? "—" : `${Math.round(percent)}%`;
+    return percent === null ? "Нет данных" : `${Math.round(percent)}%`;
   }
 
   function formatMemory(available, total) {
     const safeAvailable = finiteNumber(available, Number.MAX_SAFE_INTEGER);
     const safeTotal = finiteNumber(total, Number.MAX_SAFE_INTEGER);
-    if (safeAvailable === null || safeTotal === null || safeTotal <= 0 || safeAvailable > safeTotal) return "—";
+    if (safeAvailable === null || safeTotal === null || safeTotal <= 0 || safeAvailable > safeTotal) return "Нет данных";
     const gib = safeAvailable / (1024 ** 3);
     return `${gib.toFixed(1)} ГБ (${Math.round((safeAvailable / safeTotal) * 100)}%)`;
   }
@@ -503,10 +503,10 @@
         setText(elements.message, mode === "revoked"
           ? "Создайте новую одноразовую привязку в панели администратора."
           : "Связь с панелью потеряна. Повторяем безопасно.");
-        setText(elements.bitrate, "—");
+        setText(elements.bitrate, "Нет данных");
         setText(elements.trend, "Нет свежих данных");
-        setText(elements.source, "—");
-        setText(elements.youtube, "—");
+        setText(elements.source, "Нет данных");
+        setText(elements.youtube, "Нет данных");
         setText(elements.heartbeat, "Нет связи");
         setText(elements.standby, "—");
         setText(elements.recommendation, mode === "revoked" ? "Требуется новая привязка" : "Не переключайте сервер по этому экрану");
@@ -515,7 +515,7 @@
         if (mode === "logout-pending" || mode === "logout-error") {
           const pending = mode === "logout-pending";
           for (const name of ["cpu", "memory", "rawState", "confidence", "reasonCodes", "serverTime"]) {
-            setText(elements[name], "—");
+            setText(elements[name], "Нет данных");
           }
           setText(elements.title, pending ? "Отключаем HUD…" : "Не удалось отключить HUD");
           setText(elements.message, pending

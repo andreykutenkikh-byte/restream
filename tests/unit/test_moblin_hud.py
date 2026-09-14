@@ -120,7 +120,7 @@ def test_schema_v7_adds_scoped_hud_tables_idempotently(database: Database) -> No
     assert foreign_key_errors == []
 
 
-def seed_existing_schema_v6_data(connection: sqlite3.Connection) -> None:
+def seed_existing_schema_v5_data(connection: sqlite3.Connection) -> None:
     """Representative durable pre-HUD state; every credential here is synthetic."""
     created = "2026-09-03T00:00:00+00:00"
     updated = "2026-09-03T00:01:00+00:00"
@@ -173,7 +173,6 @@ def seed_existing_schema_v6_data(connection: sqlite3.Connection) -> None:
             "restream_nodes",
             {
                 "id": node_id,
-                "node_kind": kind,
                 "display_name": f"Synthetic node {index}",
                 "address": f"node{index}.example",
                 "resolved_ip": f"192.0.2.{index}",
@@ -214,7 +213,6 @@ def seed_existing_schema_v6_data(connection: sqlite3.Connection) -> None:
             {
                 "id": f"job-{index}",
                 "node_id": node_id,
-                "install_profile": kind,
                 "state": "completed" if index == 2 else "failed",
                 "current_step": "finalize",
                 "progress_percent": 100 if index == 2 else 60,
@@ -343,10 +341,10 @@ def seed_existing_schema_v6_data(connection: sqlite3.Connection) -> None:
     )
 
 
-def test_schema_v6_upgrade_preserves_all_existing_rows_schema_and_foreign_keys(
+def test_schema_v5_upgrade_preserves_all_existing_rows_schema_and_foreign_keys(
     tmp_path: Path,
 ) -> None:
-    database = Database(tmp_path / "schema-v6.sqlite")
+    database = Database(tmp_path / "schema-v5.sqlite")
     database.migrate()
 
     def schema(connection: sqlite3.Connection) -> list[tuple[Any, ...]]:
@@ -377,7 +375,7 @@ def test_schema_v6_upgrade_preserves_all_existing_rows_schema_and_foreign_keys(
         )
         result = {}
         for table in tables:
-            suffix = " WHERE version <= 6" if table == "schema_migrations" else ""
+            suffix = " WHERE version <= 5" if table == "schema_migrations" else ""
             result[table] = [
                 tuple(row)
                 for row in connection.execute(
@@ -387,10 +385,10 @@ def test_schema_v6_upgrade_preserves_all_existing_rows_schema_and_foreign_keys(
         return result
 
     with database.connect() as connection:
-        seed_existing_schema_v6_data(connection)
+        seed_existing_schema_v5_data(connection)
         expected_schema_v7 = schema(connection)
-        # Verified against the PR15 base schema: v7 adds only these two HUD
-        # tables (and their indexes), plus marker7. No legacy column differs.
+        # v7 adds only these HUD tables/indexes and marker 7 to main's v5 schema.
+        # The independent pinned-main/future checks live in test_hud_release_migrations.
         connection.execute("DROP TABLE moblin_hud_pairings")
         connection.execute("DROP TABLE moblin_hud_devices")
         connection.execute("DELETE FROM schema_migrations WHERE version = 7")
@@ -400,7 +398,7 @@ def test_schema_v6_upgrade_preserves_all_existing_rows_schema_and_foreign_keys(
             for row in expected_schema_v7
             if row[2] not in {"moblin_hud_devices", "moblin_hud_pairings"}
         ]
-        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 6
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 5
         before = existing_rows(connection)
         assert all(before.values()), "Every legacy table must contain real synthetic fixture rows"
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -412,6 +410,15 @@ def test_schema_v6_upgrade_preserves_all_existing_rows_schema_and_foreign_keys(
         with database.connect() as connection:
             assert schema(connection) == expected_schema_v7
             assert existing_rows(connection) == before
+            assert [
+                row[0] for row in connection.execute("SELECT version FROM schema_migrations")
+            ] == [1, 2, 3, 4, 5, 7]
+            assert "node_kind" not in {
+                row["name"] for row in connection.execute("PRAGMA table_info(restream_nodes)")
+            }
+            assert "install_profile" not in {
+                row["name"] for row in connection.execute("PRAGMA table_info(node_install_jobs)")
+            }
             assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
             assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
             assert connection.execute("SELECT COUNT(*) FROM moblin_hud_devices").fetchone()[0] == 0

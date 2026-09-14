@@ -225,12 +225,16 @@ test("unknown enums, oversized numbers, and unsafe reason codes fail closed", ()
 test("operator-friendly formatters stay bounded and unambiguous", () => {
   assert.equal(formatBitrate(7_500_000), "7.5 Мбит/с");
   assert.equal(formatBitrate(850_000), "850 Кбит/с");
-  assert.equal(formatBitrate(null), "—");
+  assert.equal(formatBitrate(null), "Нет данных");
+  assert.equal(formatBitrate(-1), "Нет данных");
+  assert.equal(formatBitrate(0), "0 бит/с");
   assert.equal(formatTrend("falling"), "Битрейт снижается");
   assert.equal(formatSource("LIVE"), "Moblin LIVE");
   assert.equal(formatSource("SLATE"), "Заставка");
+  assert.equal(formatSource(null), "Нет данных");
   assert.equal(formatYouTube("active"), "Передаётся");
   assert.equal(formatYouTube("failed"), "Ошибка");
+  assert.equal(formatYouTube(null), "Нет данных");
 });
 
 test("heartbeat and resource formatters reject misleading values", () => {
@@ -238,7 +242,7 @@ test("heartbeat and resource formatters reject misleading values", () => {
   assert.equal(formatHeartbeat(31), "31 с назад");
   assert.equal(formatHeartbeat(-1), "Нет данных");
   assert.equal(formatMemory(2 * 1024 ** 3, 4 * 1024 ** 3), "2.0 ГБ (50%)");
-  assert.equal(formatMemory(5, 4), "—");
+  assert.equal(formatMemory(5, 4), "Нет данных");
 });
 
 test("generated timestamp is displayed as age without locale-dependent data", () => {
@@ -616,8 +620,8 @@ for (const failure of ["http-500", "network-rejection"]) {
     assert.equal(harness.window.document.body.dataset.hudState, "logout-error");
     assert.equal(harness.elements.get("[data-hud-title]").textContent, "Не удалось отключить HUD");
     assert.equal(harness.elements.get("[data-hud-updated]").textContent, "Отключение не подтверждено");
-    assert.equal(harness.elements.get("[data-hud-bitrate]").textContent, "—");
-    assert.equal(harness.elements.get("[data-hud-cpu]").textContent, "—");
+    assert.equal(harness.elements.get("[data-hud-bitrate]").textContent, "Нет данных");
+    assert.equal(harness.elements.get("[data-hud-cpu]").textContent, "Нет данных");
     assert.equal(harness.elements.get("[data-hud-details]").hidden, false);
     assert.equal(logout.disabled, false);
     harness.window.dispatch("pagehide");

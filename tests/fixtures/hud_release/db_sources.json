@@ -1,0 +1,16 @@
+{
+  "source_path": "app/db.py",
+  "extraction": "Exact git show COMMIT:app/db.py, stored only as test data; SHA-256 uses UTF-8 with LF newlines.",
+  "main": {
+    "commit": "8136480d22ca7d4fdae82c70b4b34c1d638a9026",
+    "blob": "4fd64c79f09cd561bf75b85eefca70ee2b0a9d72",
+    "filename": "db_main_v5.py.txt",
+    "sha256": "629a484f5d4165bf3f566a3767f7b712a12c736177883d33eb586c2cadd9754f"
+  },
+  "combined": {
+    "commit": "cfc8b11ba33c79582d8e326eb1207b936643155d",
+    "blob": "6dcf9a1095c5289105f711f15b797f73fbd66f5a",
+    "filename": "db_combined_v7.py.txt",
+    "sha256": "a9e44f3adecd22d015c62ee71751c7300766a9af6a0731b8631b7d41100ee081"
+  }
+}
