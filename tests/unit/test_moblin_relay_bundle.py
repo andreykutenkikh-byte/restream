@@ -2361,6 +2361,8 @@ def test_bundle_contains_only_portable_sources_and_no_instance_manifest() -> Non
         "test-render-config.py",
         "test-native-feeder-media.py",
         "test-native-reader-clock.py",
+        "test-native-reader-evidence.py",
+        "test-native-reader-postmortem.py",
         "test-native-short-eof.py",
         "test-native-startup-normalizer.py",
         "test-native-startup.py",

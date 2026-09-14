@@ -88,7 +88,14 @@ def test_workflow_keeps_main_failure_and_runs_postmortem_outside_measured_step()
         i for i, step in enumerate(steps) if step.get("id") == "native_reader_evidence"
     )
     original = steps[preparation + 1]
-    postmortem = steps[preparation + 2]
+    postmortem_index = next(
+        i
+        for i, step in enumerate(steps)
+        if step.get("run", "").endswith("ci_native_reader_evidence.py collect")
+    )
+    postmortem = steps[postmortem_index]
+    assert steps[preparation + 2]["name"] == "Strict native reader clock counterfactual"
+    assert steps[postmortem_index - 1]["name"] == "Post-onboarding runtime limits"
     assert original["id"] == "native_onboarding"
     assert original["run"] == "uv run --locked python scripts/ci_node_onboarding_smoke.py"
     assert "continue-on-error" not in original
