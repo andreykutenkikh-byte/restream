@@ -44,6 +44,26 @@ def test_rtmps_mediamtx_fragment_stream_key_is_always_redacted() -> None:
     assert redacted_url == f"rtmps://a.rtmps.youtube.com/live2#{REDACTION_MARKER}"
 
 
+def test_srt_streamid_and_passphrase_are_always_redacted() -> None:
+    password = "SRT_PUBLISH_PASSWORD_CANARY_96"
+    passphrase = "SRT_PASSPHRASE_CANARY_97"
+    destination = (
+        "srt://relay.example:8890?"
+        f"streamid=publish:iphone-live:publisher:{password}"
+        f"&passphrase={passphrase}&pbkeylen=32"
+    )
+
+    redacted_url = redact_url(destination)
+    redacted_text = redact_text(f"input={destination}")
+
+    for redacted in (redacted_url, redacted_text):
+        assert password not in redacted
+        assert passphrase not in redacted
+        assert "streamid=[REDACTED]" in redacted
+        assert "passphrase=[REDACTED]" in redacted
+        assert "pbkeylen=32" in redacted
+
+
 def test_destination_url_can_redact_exact_key_without_path_guessing() -> None:
     redacted = redact_destination_url(
         "rtmp://example.com/live?name=secret-value",
@@ -166,5 +186,7 @@ def test_sensitive_key_detection_avoids_unrelated_key_suffixes() -> None:
     assert is_sensitive_key("enrollment_token")
     assert is_sensitive_key("node_token")
     assert is_sensitive_key("bootstrap_secret")
+    assert is_sensitive_key("srt_streamid")
+    assert is_sensitive_key("srt_passphrase")
     assert not is_sensitive_key("monkey")
     assert not is_sensitive_key("destination_name")

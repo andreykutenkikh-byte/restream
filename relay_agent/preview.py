@@ -159,9 +159,7 @@ class LocalHLSReader:
         if _SEGMENT_RESOURCE.fullmatch(name) is None:
             raise RelayAgentError("preview_segment_invalid")
         try:
-            payload = self._fetch(
-                f"{_LOCAL_HLS_PREFIX}{name}", MAX_SEGMENT_BYTES, playlist=False
-            )
+            payload = self._fetch(f"{_LOCAL_HLS_PREFIX}{name}", MAX_SEGMENT_BYTES, playlist=False)
         except RelayAgentError as exc:
             if exc.code == "preview_local_unavailable":
                 self._media_path = None

@@ -13,6 +13,7 @@ const {
   formatBitrate,
   formatResolution,
   isCurrentDialogRequest,
+  normalizeRelayNodeOptions,
   normalizeRelayStatus,
   previewUpdateIsCurrent,
   relayCommandOutcome,
@@ -55,6 +56,19 @@ test("old relay heartbeat remains compatible without bitrate", () => {
   const relay = status();
   assert.equal(relay.inputBitrateBps, null);
   assert.equal(relayViewModel(relay).startDisabled, false);
+});
+
+test("relay selector accepts unique bounded node identifiers and safe labels", () => {
+  assert.deepEqual(normalizeRelayNodeOptions({ items: [
+    { node_id: "relay-a", display_name: "HK relay", address: "176.98.181.225" },
+    { node_id: "relay-a", display_name: "duplicate", address: "127.0.0.1" },
+    { node_id: "relay-b", display_name: "New\nrelay", address: "relay.example" },
+    { node_id: "", display_name: "invalid" },
+  ] }), [
+    { nodeId: "relay-a", label: "HK relay · 176.98.181.225" },
+    { nodeId: "relay-b", label: "New relay · relay.example" },
+  ]);
+  assert.deepEqual(normalizeRelayNodeOptions(null), []);
 });
 
 test("normal offline state remains operable before and after YouTube setup", () => {
@@ -213,7 +227,8 @@ test("routine setup omits step-up password while destructive clear keeps it", ()
   assert.doesNotMatch(dashboardTemplate, /data-dashboard-(?:youtube|moblin)-admin-password/);
   assert.equal((dashboardTemplate.match(/name="admin_password"/g) || []).length, 1);
   assert.match(dashboardTemplate, /data-dashboard-clear-admin-password/);
-  assert.match(dashboardTemplate, /relay-dashboard\.js\?v=20260903\.1/);
+  assert.match(dashboardTemplate, /relay-dashboard\.js\?v=20260904\.1/);
+  assert.match(dashboardTemplate, /data-relay-node-select/);
   assert.match(dashboardTemplate, /preview-player\.js\?v=20260903\.1/);
   assert.match(dashboardTemplate, /Разрешение LIVE[\s\S]*data-relay-live-resolution/);
   assert.match(dashboardTemplate, /Серверная заставка[\s\S]*1080×1920 · 30 FPS/);

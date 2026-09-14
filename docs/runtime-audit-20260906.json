@@ -1,0 +1,287 @@
+{
+  "audit": "read-only",
+  "completed_at": "2026-09-06 04:05:57 UTC",
+  "production_mutations": false,
+  "production_tests": false,
+  "bytecode_writes_disabled": true,
+  "ssh_security": {
+    "batch_mode": true,
+    "identities_only": true,
+    "strict_host_key_checking": true
+  },
+  "control_plane": {
+    "ssh_access_verified": false,
+    "failure": "Existing explicitly designated SSH key rejected: Permission denied (publickey,password).",
+    "runtime_inventory_status": "RUNTIME_AUDIT_UNVERIFIED_CURRENT_CONTROL_PLANE",
+    "public_health": {
+      "live": {
+        "http_status": 200
+      },
+      "ready": {
+        "http_status": 200
+      }
+    },
+    "prior_inventory": "Historical September 5 audit; see docs/pr-stack-recovery-review.md on the HUD branch",
+    "known_historical_drift": "Earlier bootstrap pyproject.toml differed from checkout only by missing relay_agent* package discovery; not reverified during this audit."
+  },
+  "native_relay": {
+    "audit": "read-only",
+    "finished_at": "2026-09-06T04:04:05.103734+00:00",
+    "observed_at": "2026-09-06T04:04:04.102814+00:00",
+    "python_version": "3.10.12",
+    "relayctl_readonly": {
+      "health": {
+        "exit_code": 0,
+        "lines": [
+          "Service: active",
+          "Enabled at boot: yes",
+          "Main process: running",
+          "SRT listener UDP/8890: listening",
+          "Internal RTSP TCP/8554: loopback-only",
+          "Internal RTMP TCP/1935: loopback-only",
+          "Recovery API TCP/9997: loopback-only",
+          "Source: SLATE",
+          "Audio normalizer: waiting",
+          "YouTube forward: active",
+          "Overall: PASS"
+        ]
+      },
+      "status": {
+        "exit_code": 0,
+        "lines": [
+          "YouTube RTMPS URL: configured",
+          "YouTube stream key: configured"
+        ]
+      }
+    },
+    "relayctl_source_verified": true,
+    "release_metadata": {
+      "manifest_present": true,
+      "release": "unavailable"
+    },
+    "runtime_files": {
+      "/etc/systemd/system/adojapan-relay-broker.service": {
+        "gid": 0,
+        "git_blob": "89f516f49d08368d2bf444d0b24c64cbe8edfa08",
+        "mode": "0644",
+        "repository_source": "deploy/hk-relay-agent/adojapan-relay-broker.service",
+        "safe_regular_file": true,
+        "sha256": "9b441a4a3c50bed54b694174c8fa71c93bd877fa93c24d5631654ad4ba1bb820",
+        "size": 1029,
+        "uid": 0,
+        "comparison": {
+          "pr15_commit": "243d8418fe0969f0f27b5ed0270731d6f45ad65d",
+          "pr15_blob": "89f516f49d08368d2bf444d0b24c64cbe8edfa08",
+          "observability_5669278_blob": "89f516f49d08368d2bf444d0b24c64cbe8edfa08",
+          "original_recovery_2b34748_blob": "635ffae9f83532bcc24116ad486d6d32b302aac0",
+          "matches_pr15": true,
+          "matches_pr15_worktree": true,
+          "matches_observability_5669278": true,
+          "matches_original_recovery_2b34748": false
+        }
+      },
+      "/etc/systemd/system/moblin-relay.service": {
+        "gid": 0,
+        "git_blob": "e9aa1d68d7e65b0ef691ad0bb52ba95a9f86cf6c",
+        "mode": "0644",
+        "repository_source": "deploy/moblin-relay/moblin-relay.service",
+        "safe_regular_file": true,
+        "sha256": "fcace8ef9d8306ca246fa2b4d24fe3e2721428c1b8f496e66bbe75608015955c",
+        "size": 1794,
+        "uid": 0,
+        "comparison": {
+          "pr15_commit": "243d8418fe0969f0f27b5ed0270731d6f45ad65d",
+          "pr15_blob": "e9aa1d68d7e65b0ef691ad0bb52ba95a9f86cf6c",
+          "observability_5669278_blob": "e9aa1d68d7e65b0ef691ad0bb52ba95a9f86cf6c",
+          "original_recovery_2b34748_blob": "8b1fbbf9b6ea6b54fefd9d6f1d1e96d56ea7d721",
+          "matches_pr15": true,
+          "matches_pr15_worktree": true,
+          "matches_observability_5669278": true,
+          "matches_original_recovery_2b34748": false
+        }
+      },
+      "/etc/tmpfiles.d/adojapan-relay-agent.conf": {
+        "gid": 0,
+        "git_blob": "d7f22ba65efa66dc4f800ed9cf5df77c2925caad",
+        "mode": "0644",
+        "repository_source": "deploy/hk-relay-agent/adojapan-relay-agent.tmpfiles",
+        "safe_regular_file": true,
+        "sha256": "20b26bfe00626e36cc4d77aea7681f86c92bd0681fac219df8e171ff2fcbea33",
+        "size": 266,
+        "uid": 0,
+        "comparison": {
+          "pr15_commit": "243d8418fe0969f0f27b5ed0270731d6f45ad65d",
+          "pr15_blob": "d7f22ba65efa66dc4f800ed9cf5df77c2925caad",
+          "observability_5669278_blob": "d7f22ba65efa66dc4f800ed9cf5df77c2925caad",
+          "original_recovery_2b34748_blob": "67ef618a847847f23701689017bda7d486a5b856",
+          "matches_pr15": true,
+          "matches_pr15_worktree": true,
+          "matches_observability_5669278": true,
+          "matches_original_recovery_2b34748": false
+        }
+      },
+      "/opt/moblin-relay/libexec/moblin-relay-normalize": {
+        "gid": 0,
+        "git_blob": "471674e5d1cc36a755e2b03206f50653c58e4aa5",
+        "mode": "0755",
+        "repository_source": "deploy/moblin-relay/moblin-relay-normalize",
+        "safe_regular_file": true,
+        "sha256": "0bacc8c83abc3e687e5f15f927d45ea94d1c323a8dd47a42229718e5868d9098",
+        "size": 52372,
+        "uid": 0,
+        "comparison": {
+          "pr15_commit": "243d8418fe0969f0f27b5ed0270731d6f45ad65d",
+          "pr15_blob": "471674e5d1cc36a755e2b03206f50653c58e4aa5",
+          "observability_5669278_blob": "471674e5d1cc36a755e2b03206f50653c58e4aa5",
+          "original_recovery_2b34748_blob": "0f95307e388e99db4d9cff150c5fc97d005e150a",
+          "matches_pr15": true,
+          "matches_pr15_worktree": true,
+          "matches_observability_5669278": true,
+          "matches_original_recovery_2b34748": false
+        }
+      },
+      "/usr/local/lib/adojapan-relay-agent/relay_agent/broker.py": {
+        "gid": 0,
+        "git_blob": "544e2e779400ff57028dfa652ed140115adcb05f",
+        "mode": "0644",
+        "repository_source": "relay_agent/broker.py",
+        "safe_regular_file": true,
+        "sha256": "6c8e1f81525e4930ff5ba826a3074f4b25407e054e56a97f7e898398e98d0040",
+        "size": 66741,
+        "uid": 0,
+        "comparison": {
+          "pr15_commit": "243d8418fe0969f0f27b5ed0270731d6f45ad65d",
+          "pr15_blob": "544e2e779400ff57028dfa652ed140115adcb05f",
+          "observability_5669278_blob": "544e2e779400ff57028dfa652ed140115adcb05f",
+          "original_recovery_2b34748_blob": "f3e34ae7db453b6867539a786b3f16eeb2eab3d7",
+          "matches_pr15": true,
+          "matches_pr15_worktree": true,
+          "matches_observability_5669278": true,
+          "matches_original_recovery_2b34748": false
+        }
+      },
+      "/usr/local/lib/adojapan-relay-agent/relay_agent/history.py": {
+        "gid": 0,
+        "git_blob": "a332e09b55a151de6fc8240c2432fb6d85c70144",
+        "mode": "0644",
+        "repository_source": "relay_agent/history.py",
+        "safe_regular_file": true,
+        "sha256": "7f7ca20b68e656181f12bfde2d75e88b25ab48ce7832047034778fc8d4c612b3",
+        "size": 27098,
+        "uid": 0,
+        "comparison": {
+          "pr15_commit": "243d8418fe0969f0f27b5ed0270731d6f45ad65d",
+          "pr15_blob": "a332e09b55a151de6fc8240c2432fb6d85c70144",
+          "observability_5669278_blob": "a332e09b55a151de6fc8240c2432fb6d85c70144",
+          "original_recovery_2b34748_blob": null,
+          "matches_pr15": true,
+          "matches_pr15_worktree": true,
+          "matches_observability_5669278": true,
+          "matches_original_recovery_2b34748": false
+        }
+      },
+      "/usr/local/libexec/moblin-relay-render-config": {
+        "gid": 0,
+        "git_blob": "86ba606bf5bdff846cd3e797cc88112dee512829",
+        "mode": "0755",
+        "repository_source": "deploy/moblin-relay/moblin-relay-render-config",
+        "safe_regular_file": true,
+        "sha256": "76c0f2969a9e62daf356769a43a27fcc9a493d1bcc23935787226f4ded7d029a",
+        "size": 19148,
+        "uid": 0,
+        "comparison": {
+          "pr15_commit": "243d8418fe0969f0f27b5ed0270731d6f45ad65d",
+          "pr15_blob": "86ba606bf5bdff846cd3e797cc88112dee512829",
+          "observability_5669278_blob": "86ba606bf5bdff846cd3e797cc88112dee512829",
+          "original_recovery_2b34748_blob": "b8ab9ed077f05932429f73c66460b43e3b6b9cc2",
+          "matches_pr15": true,
+          "matches_pr15_worktree": true,
+          "matches_observability_5669278": true,
+          "matches_original_recovery_2b34748": false
+        }
+      },
+      "/usr/local/sbin/relayctl": {
+        "gid": 0,
+        "git_blob": "311b9475a073cb46ebd968fea82254b56a27f91d",
+        "mode": "0755",
+        "repository_source": "deploy/moblin-relay/relayctl",
+        "safe_regular_file": true,
+        "sha256": "33f15b6e8ddae5154f4d7197d8711bb52fab77f09a10ded9af36d3d90fe668ac",
+        "size": 51688,
+        "uid": 0,
+        "comparison": {
+          "pr15_commit": "243d8418fe0969f0f27b5ed0270731d6f45ad65d",
+          "pr15_blob": "311b9475a073cb46ebd968fea82254b56a27f91d",
+          "observability_5669278_blob": "311b9475a073cb46ebd968fea82254b56a27f91d",
+          "original_recovery_2b34748_blob": "d298626f952dd943790e6b67cbcfe6b50d4f6973",
+          "matches_pr15": true,
+          "matches_pr15_worktree": true,
+          "matches_observability_5669278": true,
+          "matches_original_recovery_2b34748": false
+        }
+      }
+    },
+    "services": {
+      "adojapan-relay-agent.service": {
+        "exit_code": 0,
+        "properties": {
+          "ActiveEnterTimestamp": "Sun 2026-09-06 00:46:45 HKT",
+          "ActiveState": "active",
+          "FragmentPath": "/etc/systemd/system/adojapan-relay-agent.service",
+          "SubState": "running",
+          "UnitFileState": "enabled"
+        }
+      },
+      "adojapan-relay-broker.service": {
+        "exit_code": 0,
+        "properties": {
+          "ActiveEnterTimestamp": "Sun 2026-09-06 00:46:45 HKT",
+          "ActiveState": "active",
+          "FragmentPath": "/etc/systemd/system/adojapan-relay-broker.service",
+          "SubState": "running",
+          "UnitFileState": "static"
+        }
+      },
+      "adojapan-relay-broker.socket": {
+        "exit_code": 0,
+        "properties": {
+          "ActiveEnterTimestamp": "Sun 2026-09-06 00:46:45 HKT",
+          "ActiveState": "active",
+          "FragmentPath": "/etc/systemd/system/adojapan-relay-broker.socket",
+          "SubState": "running",
+          "UnitFileState": "enabled"
+        }
+      },
+      "moblin-relay.service": {
+        "exit_code": 0,
+        "properties": {
+          "ActiveEnterTimestamp": "Sun 2026-09-06 10:54:58 HKT",
+          "ActiveState": "active",
+          "FragmentPath": "/etc/systemd/system/moblin-relay.service",
+          "SubState": "running",
+          "UnitFileState": "enabled"
+        }
+      }
+    },
+    "versions": {
+      "ffmpeg": {
+        "exit_code": 0,
+        "version": "4.4.2-0ubuntu0.22.04.1"
+      },
+      "mediamtx": {
+        "exit_code": 0,
+        "version": "v1.20.1",
+        "executable": "/opt/moblin-relay/bin/mediamtx",
+        "checked_with": "read-only --version; initial inventory used an absent path"
+      }
+    }
+  },
+  "native_selected_files_status": "VERIFIED_MATCHES_OBSERVABILITY_AND_MERGED_PR15",
+  "limitations": [
+    "Selected eight nonsecret runtime files, not a full installed-filesystem/image attestation.",
+    "Native release marker unavailable; install manifest exists but no allowlisted public version field was returned.",
+    "Native health reports server-side source/output state, not viewer delivery or intentional-stop attribution.",
+    "Historical incident events do not prove root cause of mobile-link interruptions.",
+    "No deployment approval is implied."
+  ]
+}

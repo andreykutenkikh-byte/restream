@@ -2,7 +2,10 @@
 
 Stage 4A bootstrap is a narrow, password-based SSH installer. It is deliberately separated from
 the web/backend process because SSH passwords, privileged remote commands, and target-network
-access form a different trust domain from the media control plane.
+access form a different trust domain from the media control plane. The public browser workflow
+always selects the fixed `moblin_relay` profile; the older `generic_node` profile remains an
+internal compatibility path. See [Moblin Relay onboarding](moblin-relay-onboarding.md) for its
+exact host matrix and installed media runtime.
 
 This is an implementation description, not permission to connect to a production host.
 
@@ -18,9 +21,11 @@ FastAPI backend
 isolated bootstrap worker
   | outbound password-only SSH to one validated numeric IP
   v
-marker-owned remote Compose project
+marker-owned remote profile
   |
-  +-- outbound HTTPS Node Agent --> FastAPI /node-api/v1/*
+  +-- generic: Compose Node Agent --> FastAPI /node-api/v1/*
+  |
+  +-- native: MediaMTX + Relay Agent --> FastAPI /relay-agent/v1/*
 ```
 
 The backend and bootstrap worker share only the named Unix-domain-socket volume mounted at
@@ -65,13 +70,17 @@ accepted only in `needs_sudo_password`, held in a queue of size one, written onl
 process stdin via `sudo -S -p ''`, and cleared after use. It is never appended to a command, process
 argument, environment variable, database row, log, or UI response.
 
-The initial create request contains no enrollment credential. After SSH/sudo/resource/Docker work
-finishes, the worker pauses in `needs_enrollment_token`. The backend monitor then issues a fresh
-ten-minute, digest-only enrollment grant and sends its raw value through an authenticated UDS
-endpoint. The worker holds it only in a one-item in-memory queue, stages it immediately, and clears
+The initial create request contains no enrollment credential. After SSH, sudo, resource, and
+profile-specific preflight checks finish (Docker checks apply only to `generic_node`), the worker
+pauses in `needs_enrollment_token`. For a generic node, the backend issues the existing fresh
+ten-minute one-time enrollment grant. For a native relay, it creates a distinct permanent relay
+credential just in time and stores only its digest. In both cases the raw value crosses only the
+authenticated UDS and a mode-`0600` SFTP staging file; it is never a command argument or browser
+response. The worker holds it only in a one-item in-memory queue, stages it immediately, and clears
 the reference. Concurrent browser and monitor polls are serialized, and the worker exposes only a
 non-secret received flag so a lost response cannot cause a second token to invalidate the one it
-already accepted. Cancellation and worker restart drain an unconsumed token.
+already accepted. Cancellation and failed bootstrap revoke the credential and drain an unconsumed
+token.
 
 ## Target and SSRF policy
 

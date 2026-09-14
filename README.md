@@ -3,11 +3,13 @@
 AdoJapan Restream is a small, self-hosted service that accepts one authenticated RTMP stream
 from OBS and copies it to manually configured RTMP/RTMPS destinations. Its media path is optimized
 for a modest host shared with other services: no transcoding, no recording, and no heavy frontend
-toolchain. Stage 4A adds password-based SSH onboarding and outbound-only health agents for future
-restream nodes. A separate native, outbound-only integration manages the existing HK Moblin relay
-from a simplified authenticated broadcast console without moving that relay into Docker or exposing
-a new management port. The main flow contains only YouTube key setup and one-time Moblin SRT URL
-reveal; infrastructure controls remain in the additional section.
+toolchain. Stage 4A adds password-based SSH onboarding. The public **Servers** workflow now
+provisions a complete native Moblin relay on each supported fresh VPS; the older Docker Node Agent
+profile is retained only as an internal compatibility path. Every native relay is controlled
+through an outbound-only agent and the same simplified authenticated broadcast console, without
+moving the relay into Docker or exposing a management port. The main flow contains only YouTube
+setup and a one-time Moblin SRT URL reveal; infrastructure controls remain in the additional
+section.
 
 Production domain: `restream.adojapan.ru`. Repository changes do not authorize deployment or
 change production.
@@ -40,7 +42,7 @@ administrator --> FastAPI -- authenticated UDS --> isolated bootstrap worker
 
 remote Node Agent -- outbound HTTPS protocol v1 --> FastAPI node API
 
-HK Relay Agent -- outbound HTTPS protocol v1 --> FastAPI relay API
+Relay Agent(s) -- outbound HTTPS protocol v1 --> FastAPI relay API
        |                                                ^
        +-- authenticated root UDS broker                |
                     |                                   |
@@ -54,11 +56,12 @@ HK Relay Agent -- outbound HTTPS protocol v1 --> FastAPI relay API
   proxies HLS to the authenticated same-origin browser, owns FFmpeg child processes, and exposes
   the authenticated node control API.
 - **Bootstrap worker** accepts one fixed installation job at a time over an authenticated
-  Unix-domain socket. It has its own egress network and no database, media network, Docker socket,
-  or inbound port.
+  Unix-domain socket. The public profile installs a native, pinned MediaMTX/Moblin relay bundle;
+  the legacy internal profile installs the Docker Node Agent. The worker has its own egress network
+  and no database, media network, Docker socket, or inbound port.
 - **Node Agent** runs on an attached server as fixed UID/GID `10001:10001`, publishes no ports,
   enrolls once, sends five-second heartbeats, and accepts only `PING` and `SELF_TEST`.
-- **HK Relay Agent** is a native, unprivileged service with an allowlisted root Unix-socket broker.
+- **Relay Agent** is a native, unprivileged service with an allowlisted root Unix-socket broker.
   It connects outward over HTTPS and exposes only safe status plus `start`, `stop`, YouTube
   configuration/clear, one-time Moblin SRT URL reveal, bounded LIVE input bitrate, and an on-demand
   loopback-HLS preview forwarded to the authenticated browser through a memory-only cache. It does
@@ -182,15 +185,25 @@ token protects every mutating operation. Production marks both cookies `Secure`.
 Repeated failed login attempts receive a small in-memory rate limit. Logout deletes the
 server-side session and both browser cookies.
 
-## Server onboarding (Stage 4A)
+## Server onboarding
 
-The authenticated **Servers** page accepts only a public server address, SSH port, username,
-password, and optional expected SHA-256 host-key fingerprint. There is no OS, package-manager, or
-Docker-install selector: the worker detects those properties from the server. The backend sends the job over an authenticated
-Unix-domain socket to the isolated bootstrap worker. The password exists only for that in-memory
-job: it is not stored in SQLite, rendered back to the browser, placed in environment variables or
-arguments, or included in logs. A worker or backend-coordinator restart requires password
-re-entry.
+The authenticated **Servers** page now provisions a complete native Moblin Relay on a supported
+fresh Ubuntu/Debian VPS. The administrator supplies only SSH connection data; the installer pins
+MediaMTX, generates SRT/preview secrets, installs the vertical 1080×1920 runtime and outbound relay
+agent, and leaves the broadcast service inactive and disabled. It never changes Docker, Amnezia,
+firewalls, routes, or network interfaces. See
+[`docs/moblin-relay-onboarding.md`](docs/moblin-relay-onboarding.md) for the current operator flow
+and safety boundary.
+
+The legacy Stage 4A generic Node Agent bootstrap remains as an internal compatibility profile.
+
+Like the public relay workflow, its bounded request contains only a public server address, SSH
+port, username, password, and optional expected SHA-256 host-key fingerprint. There is no OS,
+package-manager, or Docker-install selector: the worker detects those properties from the server.
+The backend sends the job over an authenticated Unix-domain socket to the isolated bootstrap
+worker. The password exists only for that in-memory job: it is not stored in SQLite, rendered back
+to the browser, placed in environment variables or arguments, or included in logs. A worker or
+backend-coordinator restart requires password re-entry.
 
 Bootstrap supports Ubuntu 22.04/24.04/26.04, Debian 12/13, AlmaLinux 8/9, Rocky Linux 8/9,
 RHEL 8/9, and CentOS Stream 9 on amd64. It reads `/etc/os-release`, verifies the matching
@@ -212,15 +225,16 @@ host ports and never uses host networking. On SELinux hosts, SELinux remains ena
 agent data bind uses Compose private relabel `Z` with `create_host_path: false` and no host policy
 or manual relabel command.
 
-- [Node onboarding and operator flow](docs/node-onboarding.md)
+- [Moblin Relay onboarding and operator flow](docs/moblin-relay-onboarding.md)
+- [Legacy generic Node Agent onboarding](docs/node-onboarding.md)
 - [Node Agent protocol v1](docs/node-agent-protocol.md)
 - [Bootstrap security boundaries](docs/node-bootstrap-security.md)
+- [Disaster recovery boundary](docs/disaster-recovery.md)
 
-Stage 4A generic Docker nodes remain control-plane groundwork only: they do not receive real
-video, publish to YouTube, or hot-switch streams. The dedicated native HK Moblin relay is a
-separate integration of the already deployed media service; see
-[`docs/native-relay-control.md`](docs/native-relay-control.md). SSH-key onboarding and generic-node
-remote uninstall remain future work.
+Legacy Stage 4A generic Docker nodes remain control-plane groundwork only: they do not receive real
+video, publish to YouTube, or hot-switch streams. Existing and newly installed native Moblin relays
+share the protocol in [`docs/native-relay-control.md`](docs/native-relay-control.md). SSH-key
+onboarding and generic-node remote uninstall remain future work.
 
 ## Ingest and destination states
 
@@ -368,8 +382,20 @@ files per container.
 
 ## Backup and restore
 
-The application does not schedule production backups. To create a consistent, bounded
-project-only SQLite backup from the running backend and its named database volume:
+**This is an operational rollback backup, not disaster recovery.** The command below writes to a
+Compose volume on the same host. Loss of that VPS or its storage can destroy both the live database
+and every one of these copies. Never commit `.env`, SQLite backups, relay credentials, or encrypted
+command payloads to this public repository. A recoverable production installation requires a
+separately configured encrypted off-server backup; see
+[`docs/disaster-recovery.md`](docs/disaster-recovery.md).
+
+The repository includes a fail-closed `age` + private-Git publication command for that separate
+off-server copy. It is deliberately not enabled by default: the recovery-key custodian and private
+repository must be chosen first. The private recovery identity never belongs on the VPS, and this
+public repository rejects `.age` backup artifacts as well as plaintext runtime data.
+
+The application does not schedule production backups. To create a consistent, bounded project-only
+SQLite backup from the running backend and its named database volume:
 
 ```bash
 docker compose -p adojapan-restream --env-file .env \
@@ -488,9 +514,11 @@ in the production audit.
 
 - [Production audit and go/no-go checklist](docs/production-audit.md)
 - [Controlled deployment and project-only rollback](docs/deployment-and-rollback.md)
-- [Node onboarding and remote rollback](docs/node-onboarding.md)
+- [Moblin Relay onboarding](docs/moblin-relay-onboarding.md)
+- [Legacy Node Agent onboarding and remote rollback](docs/node-onboarding.md)
 - [Node Agent protocol v1](docs/node-agent-protocol.md)
 - [Bootstrap security model](docs/node-bootstrap-security.md)
+- [Disaster recovery boundary](docs/disaster-recovery.md)
 
 If TCP 1935 is occupied, keep the owning service running, choose an approved alternative (for
 example 1936), and update both `PUBLIC_RTMP_PORT` and the displayed documentation. Production
@@ -541,7 +569,7 @@ Do not expose an inbound agent port or run a command supplied through the UI.
 - no persisted bitrate history or synthetic browser speed test;
 - no production deployment in this stage.
 
-## Stage 4A limitations
+## Legacy Stage 4A generic-node limitations
 
 - attached nodes do not carry real video;
 - nodes do not publish to YouTube or another platform;

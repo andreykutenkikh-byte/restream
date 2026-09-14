@@ -226,3 +226,24 @@ async def test_remote_upload_is_created_exclusively_with_requested_mode() -> Non
     assert attrs.permissions == 0o600
     assert connection.sftp.remote_file.content == b"secret"
     assert connection.sftp.chmod_calls == [(path, 0o600)]
+
+
+@pytest.mark.parametrize(
+    "exception_type,expected_code",
+    [(TimeoutError, "remote_command_timeout"), (OSError, "remote_command_failed")],
+)
+async def test_remote_session_distinguishes_timeout_and_closes_failed_channel(
+    monkeypatch: pytest.MonkeyPatch, exception_type: type[Exception], expected_code: str
+) -> None:
+    async def failed_wait_closed(self: FakeProcess) -> None:
+        raise exception_type("raw-remote-secret-detail")
+
+    monkeypatch.setattr(FakeProcess, "wait_closed", failed_wait_closed)
+    connection = FakeConnection()
+    session = AsyncSSHSession(connection)  # type: ignore[arg-type]
+    with pytest.raises(BootstrapError) as captured:
+        await session.run("safe-command", stdin=SecretStr("sudo-private"), timeout=10)
+    assert captured.value.code == expected_code
+    assert "raw-remote-secret-detail" not in str(captured.value)
+    assert "sudo-private" not in str(captured.value)
+    assert connection.processes[0].closed

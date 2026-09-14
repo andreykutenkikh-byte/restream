@@ -1,0 +1,529 @@
+#!/usr/bin/python3
+"""Render the secret-bearing MediaMTX runtime config into tmpfs."""
+
+from __future__ import annotations
+
+import base64
+import contextlib
+import errno
+import grp
+import hashlib
+import json
+import os
+import pwd
+import re
+import secrets
+import stat
+import sys
+from pathlib import Path
+from urllib.parse import urlsplit
+
+SECRET_FILE = Path("/etc/moblin-relay/secrets.json")
+PREVIEW_TOKEN_FILE = Path("/etc/adojapan-relay-agent/preview-reader.token")
+RUNTIME_DIR = Path("/run/moblin-relay")
+RUNTIME_FILE = RUNTIME_DIR / "mediamtx.json"
+CONTROL_TOKEN_FILE = RUNTIME_DIR / "control-api.token"
+SLATE_FILE = "/var/lib/moblin-relay/slate.mp4"
+NORMALIZER = "/opt/moblin-relay/libexec/moblin-relay-normalize"
+INGEST_PATH = "iphone-live"
+OUTPUT_PATH = "relay-output"
+PREVIEW_USER = "relay-preview"
+CONTROL_API_USER = "relay-recovery"
+CONTROL_TOKEN_PATTERN = re.compile(rb"[A-Za-z0-9_-]{43}\Z")
+PREVIEW_TOKEN_PATTERN = re.compile(rb"[A-Za-z0-9._~+/=-]{32,512}\Z")
+PREVIEW_TOKEN_MAX_FILE_BYTES = 513
+RUNTIME_TEMP_PATTERN = re.compile(r"\.(?:mediamtx\.json|control-api\.token)\.[0-9a-f]{32}\Z")
+
+
+def die(message: str) -> None:
+    raise SystemExit(message)
+
+
+def validate_secret_file() -> dict:
+    try:
+        parent_stat = SECRET_FILE.parent.lstat()
+        st = SECRET_FILE.lstat()
+        if (
+            not stat.S_ISDIR(parent_stat.st_mode)
+            or parent_stat.st_uid != 0
+            or parent_stat.st_mode & 0o077
+            or not stat.S_ISREG(st.st_mode)
+            or st.st_uid != 0
+            or st.st_mode & 0o077
+        ):
+            die("unsafe relay secret file permissions")
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(SECRET_FILE, flags)
+        opened_stat = os.fstat(fd)
+        if (opened_stat.st_dev, opened_stat.st_ino) != (st.st_dev, st.st_ino):
+            os.close(fd)
+            die("relay secret file changed while opening")
+        with os.fdopen(fd, "r", encoding="utf-8") as fp:
+            return json.load(fp)
+    except FileNotFoundError:
+        die("relay secrets are missing")
+    except (OSError, json.JSONDecodeError):
+        die("relay secrets are invalid")
+
+
+def validate_youtube(url: str, key: str) -> None:
+    if not url or not key or "#" in url:
+        die("YouTube is not configured")
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() != "rtmps" or not parsed.hostname:
+        die("invalid YouTube RTMPS URL")
+    if parsed.username is not None or parsed.password is not None or parsed.fragment:
+        die("invalid YouTube RTMPS URL")
+    if any(ord(ch) < 0x20 or ch.isspace() for ch in url):
+        die("invalid YouTube RTMPS URL")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", key):
+        die("invalid YouTube stream key")
+
+
+def read_preview_token() -> bytes | None:
+    """Read the optional agent-owned HLS credential without following links."""
+
+    try:
+        PREVIEW_TOKEN_FILE.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        die("preview reader credential is unsafe")
+
+    try:
+        parent = PREVIEW_TOKEN_FILE.parent.lstat()
+        account = pwd.getpwnam("restream-agent")
+    except (KeyError, OSError):
+        die("preview reader credential is unsafe")
+
+    if (
+        stat.S_ISLNK(parent.st_mode)
+        or not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != 0
+        or parent.st_gid != account.pw_gid
+        or stat.S_IMODE(parent.st_mode) != 0o750
+    ):
+        die("preview reader credential is unsafe")
+
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    try:
+        parent_fd = os.open(PREVIEW_TOKEN_FILE.parent, directory_flags)
+    except OSError:
+        die("preview reader credential is unsafe")
+    try:
+        opened_parent = os.fstat(parent_fd)
+        if (
+            not stat.S_ISDIR(opened_parent.st_mode)
+            or (opened_parent.st_dev, opened_parent.st_ino) != (parent.st_dev, parent.st_ino)
+            or opened_parent.st_uid != 0
+            or opened_parent.st_gid != account.pw_gid
+            or stat.S_IMODE(opened_parent.st_mode) != 0o750
+        ):
+            die("preview reader credential is unsafe")
+
+        try:
+            before = os.stat(
+                PREVIEW_TOKEN_FILE.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError:
+            die("preview reader credential is unsafe")
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_uid != account.pw_uid
+            or before.st_gid != account.pw_gid
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink != 1
+            or not 32 <= before.st_size <= PREVIEW_TOKEN_MAX_FILE_BYTES
+        ):
+            die("preview reader credential is unsafe")
+
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(PREVIEW_TOKEN_FILE.name, flags, dir_fd=parent_fd)
+        except OSError:
+            die("preview reader credential is unsafe")
+        try:
+            opened = os.fstat(fd)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+                or opened.st_uid != account.pw_uid
+                or opened.st_gid != account.pw_gid
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or opened.st_nlink != 1
+                or opened.st_size != before.st_size
+                or opened.st_mtime_ns != before.st_mtime_ns
+                or opened.st_ctime_ns != before.st_ctime_ns
+            ):
+                die("preview reader credential is unsafe")
+            payload = os.read(fd, PREVIEW_TOKEN_MAX_FILE_BYTES + 1)
+            if os.read(fd, 1):
+                die("preview reader credential is invalid")
+            after = os.fstat(fd)
+            if (
+                (after.st_dev, after.st_ino, after.st_size)
+                != (opened.st_dev, opened.st_ino, opened.st_size)
+                or after.st_mtime_ns != opened.st_mtime_ns
+                or after.st_ctime_ns != opened.st_ctime_ns
+            ):
+                die("preview reader credential changed while reading")
+        finally:
+            os.close(fd)
+    except OSError:
+        die("preview reader credential is unsafe")
+    finally:
+        os.close(parent_fd)
+
+    if payload.endswith(b"\n"):
+        payload = payload[:-1]
+    if not PREVIEW_TOKEN_PATTERN.fullmatch(payload):
+        die("preview reader credential is invalid")
+    return payload
+
+
+def preview_config(token: bytes | None) -> tuple[dict, dict | None]:
+    """Return the conditional HLS config and its least-privilege reader."""
+
+    if token is None:
+        return {"hls": False}, None
+    password_hash = base64.b64encode(hashlib.sha256(token).digest()).decode("ascii")
+    return (
+        {
+            "hls": True,
+            "hlsAddress": "127.0.0.1:8888",
+            "hlsEncryption": False,
+            "hlsAllowOrigins": [],
+            "hlsTrustedProxies": [],
+            "hlsAlwaysRemux": False,
+            "hlsVariant": "mpegts",
+            "hlsSegmentCount": 4,
+            "hlsSegmentDuration": "2s",
+            "hlsSegmentMaxSize": "3M",
+            "hlsDirectory": "",
+            "hlsMuxerCloseAfter": "10s",
+        },
+        {
+            "user": PREVIEW_USER,
+            "pass": f"sha256:{password_hash}",
+            "ips": ["127.0.0.1", "::1"],
+            "permissions": [{"action": "read", "path": OUTPUT_PATH}],
+        },
+    )
+
+
+def generate_control_token() -> bytearray:
+    """Generate a 256-bit, URL-safe credential for the loopback control API."""
+    token = bytearray(base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"="))
+    if CONTROL_TOKEN_PATTERN.fullmatch(token) is None:
+        die("unable to generate control API credential")
+    return token
+
+
+def open_runtime_directory(
+    relay_gid: int, *, create: bool = False, for_cleanup: bool = False
+) -> int | None:
+    """Pin a root-owned directory below a root-owned, non-writable parent."""
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent_fd = os.open(RUNTIME_DIR.parent, flags)
+    try:
+        parent = os.fstat(parent_fd)
+        if parent.st_uid != 0 or stat.S_IMODE(parent.st_mode) & 0o022:
+            die("unsafe relay runtime parent permissions")
+        created = False
+        if create:
+            try:
+                os.mkdir(RUNTIME_DIR.name, mode=0o750, dir_fd=parent_fd)
+                created = True
+            except FileExistsError:
+                pass
+        try:
+            before = os.stat(RUNTIME_DIR.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            if not create:
+                return None
+            raise
+        if not stat.S_ISDIR(before.st_mode) or before.st_uid != 0:
+            die("unsafe relay runtime directory permissions")
+        directory_fd = os.open(RUNTIME_DIR.name, flags, dir_fd=parent_fd)
+        try:
+            opened = os.fstat(directory_fd)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                die("relay runtime directory changed while opening")
+            if created:
+                os.fchown(directory_fd, 0, relay_gid)
+                os.fchmod(directory_fd, 0o750)
+                opened = os.fstat(directory_fd)
+            # Cleanup also handles a renderer killed between mkdir and fchown.
+            allowed_groups = {0, relay_gid} if for_cleanup else {relay_gid}
+            allowed_modes = {0o700, 0o750} if for_cleanup else {0o750}
+            if (
+                opened.st_uid != 0
+                or opened.st_gid not in allowed_groups
+                or stat.S_IMODE(opened.st_mode) not in allowed_modes
+            ):
+                die("unsafe relay runtime directory permissions")
+            return directory_fd
+        except BaseException:
+            os.close(directory_fd)
+            raise
+    finally:
+        os.close(parent_fd)
+
+
+def cleanup_runtime_files(relay_gid: int) -> None:
+    """Remove only our validated runtime secrets, including interrupted writes."""
+    directory_fd = open_runtime_directory(relay_gid, for_cleanup=True)
+    if directory_fd is None:
+        return
+    try:
+        unsafe_entry = False
+        for name in os.listdir(directory_fd):
+            is_temporary = RUNTIME_TEMP_PATTERN.fullmatch(name) is not None
+            if name not in {RUNTIME_FILE.name, CONTROL_TOKEN_FILE.name} and not is_temporary:
+                continue
+            entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            # A temporary file may precede fchown/fchmod; payload writes follow
+            # both. Final secret files retain the exact root/relay contract.
+            allowed_groups = {0, relay_gid} if is_temporary else {relay_gid}
+            allowed_modes = {0o600, 0o640} if is_temporary else {0o640}
+            if (
+                not stat.S_ISREG(entry.st_mode)
+                or entry.st_uid != 0
+                or entry.st_gid not in allowed_groups
+                or stat.S_IMODE(entry.st_mode) not in allowed_modes
+                or entry.st_nlink != 1
+            ):
+                unsafe_entry = True
+                continue
+            os.unlink(name, dir_fd=directory_fd)
+        os.fsync(directory_fd)
+        if unsafe_entry:
+            die("unsafe relay runtime file during cleanup")
+        if os.listdir(directory_fd):
+            die("unexpected files remain in relay runtime directory")
+        # The fixed parent is root-owned and not writable by the relay account.
+        before = RUNTIME_DIR.lstat()
+        opened = os.fstat(directory_fd)
+        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+            die("relay runtime directory changed during cleanup")
+        try:
+            RUNTIME_DIR.rmdir()
+        except OSError as exc:
+            # ReadOnlyPaths makes this directory a bind mount for ExecStopPost.
+            # The secrets are already gone; its empty mount point can remain.
+            if exc.errno != errno.EBUSY or os.listdir(directory_fd):
+                raise
+            # Repair only this proven-empty directory after partial creation so
+            # the next start cannot be blocked by a pre-fchown interruption.
+            os.fchown(directory_fd, 0, relay_gid)
+            os.fchmod(directory_fd, 0o750)
+    finally:
+        os.close(directory_fd)
+
+
+def atomic_write_runtime_file(
+    path: Path, payload: bytes, relay_gid: int, directory_fd: int
+) -> None:
+    """Atomically install one root/relay runtime file into the tmpfs directory."""
+    if path not in {RUNTIME_FILE, CONTROL_TOKEN_FILE} or path.parent != RUNTIME_DIR:
+        die("invalid relay runtime file")
+    temporary = f".{path.name}.{secrets.token_hex(16)}"
+    fd = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o640,
+        dir_fd=directory_fd,
+    )
+    try:
+        with os.fdopen(fd, "wb") as fp:
+            os.fchmod(fp.fileno(), 0o640)
+            os.fchown(fp.fileno(), 0, relay_gid)
+            fp.write(payload)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(temporary, path.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=directory_fd)
+
+
+def build_runtime_config(
+    user: str,
+    password: str,
+    passphrase: str,
+    url: str,
+    key: str,
+    preview_token: bytes | None,
+    control_token: bytes | bytearray,
+) -> dict:
+    password_hash = base64.b64encode(hashlib.sha256(password.encode("utf-8")).digest()).decode(
+        "ascii"
+    )
+    preview_settings, preview_user = preview_config(preview_token)
+    if CONTROL_TOKEN_PATTERN.fullmatch(control_token) is None:
+        die("invalid control API credential")
+    control_password_hash = base64.b64encode(hashlib.sha256(control_token).digest()).decode("ascii")
+    auth_users = [
+        {
+            "user": user,
+            "pass": f"sha256:{password_hash}",
+            "ips": [],
+            "permissions": [{"action": "publish", "path": INGEST_PATH}],
+        },
+        {
+            "user": "any",
+            "pass": "",
+            "ips": ["127.0.0.1", "::1"],
+            "permissions": [
+                {"action": "metrics"},
+                {"action": "read", "path": INGEST_PATH},
+                {"action": "publish", "path": OUTPUT_PATH},
+            ],
+        },
+        {
+            "user": CONTROL_API_USER,
+            "pass": f"sha256:{control_password_hash}",
+            "ips": ["127.0.0.1", "::1"],
+            "permissions": [{"action": "api"}],
+        },
+    ]
+    if preview_user is not None:
+        auth_users.append(preview_user)
+    return {
+        "logLevel": "warn",
+        "logDestinations": ["stdout"],
+        "logStructured": False,
+        "dumpPackets": False,
+        "readTimeout": "10s",
+        "writeTimeout": "10s",
+        "writeQueueSize": 1024,
+        "authMethod": "internal",
+        "authInternalUsers": auth_users,
+        "api": True,
+        "apiAddress": "127.0.0.1:9997",
+        "apiEncryption": False,
+        "apiAllowOrigins": [],
+        "apiTrustedProxies": [],
+        "metrics": True,
+        "metricsAddress": "127.0.0.1:9998",
+        "pprof": False,
+        "playback": False,
+        "rtsp": True,
+        "rtspAddress": "127.0.0.1:8554",
+        "rtspTransports": ["tcp"],
+        "rtmp": True,
+        "rtmpAddress": "127.0.0.1:1935",
+        "rtmpEncryption": "no",
+        "webrtc": False,
+        "srt": True,
+        # Bind IPv4 explicitly.  An unspecified host can resolve to an IPv6-only
+        # socket on hosts where IPV6_V6ONLY is enabled, while Moblin connects to
+        # the relay by its public IPv4 address.
+        "srtAddress": "0.0.0.0:8890",
+        "moq": False,
+        "paths": {
+            INGEST_PATH: {
+                "source": "publisher",
+                "overridePublisher": False,
+                "srtPublishPassphrase": passphrase,
+                "runOnAvailable": NORMALIZER,
+                "runOnAvailableRestart": True,
+            },
+            OUTPUT_PATH: {
+                "source": "publisher",
+                "overridePublisher": False,
+                "alwaysAvailable": True,
+                "alwaysAvailableFile": SLATE_FILE,
+                "forward": [{"dest": f"{url}#{key}"}],
+            },
+        },
+        **preview_settings,
+    }
+
+
+def render_runtime_config(relay_gid: int) -> None:
+    data = validate_secret_file()
+    try:
+        srt = data["srt"]
+        user = srt["user"]
+        password = srt["password"]
+        passphrase = srt["passphrase"]
+        url = data["youtube"]["url"].strip()
+        key = data["youtube"]["key"].strip()
+    except (KeyError, TypeError, AttributeError):
+        die("relay secrets are incomplete")
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", user):
+        die("invalid SRT user")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", password):
+        die("invalid SRT password")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{10,79}", passphrase):
+        die("invalid SRT passphrase")
+    validate_youtube(url, key)
+
+    preview_token = read_preview_token()
+    directory_fd = open_runtime_directory(relay_gid, create=True)
+    if directory_fd is None:
+        die("relay runtime directory is missing")
+
+    control_token = bytearray()
+    try:
+        control_token = generate_control_token()
+        config = build_runtime_config(
+            user,
+            password,
+            passphrase,
+            url,
+            key,
+            preview_token,
+            control_token,
+        )
+        serialized = (
+            json.dumps(
+                config,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+        atomic_write_runtime_file(
+            CONTROL_TOKEN_FILE,
+            bytes(control_token) + b"\n",
+            relay_gid,
+            directory_fd,
+        )
+        atomic_write_runtime_file(RUNTIME_FILE, serialized, relay_gid, directory_fd)
+    finally:
+        os.close(directory_fd)
+        for index in range(len(control_token)):
+            control_token[index] = 0
+
+
+def main() -> None:
+    if os.geteuid() != 0:
+        die("runtime config renderer must run as root")
+    if sys.argv[1:] not in ([], ["--cleanup"]):
+        die("invalid runtime config renderer arguments")
+    try:
+        relay_gid = grp.getgrnam("moblin-relay").gr_gid
+        if sys.argv[1:] == ["--cleanup"]:
+            cleanup_runtime_files(relay_gid)
+        else:
+            render_runtime_config(relay_gid)
+    except (KeyError, OSError):
+        die("relay runtime configuration operation failed")
+
+
+if __name__ == "__main__":
+    main()

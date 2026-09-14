@@ -108,6 +108,13 @@ class PrivilegeMode(StrEnum):
     PASSWORD_SUDO = "password_sudo"  # noqa: S105 - privilege mode name
 
 
+class InstallProfile(StrEnum):
+    """The bounded server role selected by the control plane."""
+
+    GENERIC_NODE = "generic_node"
+    MOBLIN_RELAY = "moblin_relay"
+
+
 class TimeoutPolicy(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -136,6 +143,7 @@ class BootstrapRequest(BaseModel):
     control_url: str = Field(min_length=1, max_length=2048)
     node_agent_image: str = Field(min_length=1, max_length=512)
     node_agent_environment: Literal["development", "production", "test"] = "production"
+    install_profile: InstallProfile = InstallProfile.GENERIC_NODE
     recover_failed_install: bool = Field(default=False, strict=True)
     adopt_empty_managed_root_for_test: bool = Field(default=False, strict=True)
 

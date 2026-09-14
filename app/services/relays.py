@@ -79,6 +79,10 @@ class RelayUnavailableError(RelayDomainError):
     pass
 
 
+class RelayBootstrapActiveError(RelayUnavailableError):
+    """Raised while the privileged installer still owns the relay identity."""
+
+
 class RelayUnsupportedProtocolError(RelayDomainError):
     pass
 
@@ -302,7 +306,8 @@ class RelayService:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
                 """
-                SELECT id, status, capabilities_json, current_command_id FROM restream_nodes
+                SELECT id, status, node_kind, capabilities_json, current_command_id
+                FROM restream_nodes
                 WHERE address = ? AND ssh_port = 22
                 """,
                 (clean_address,),
@@ -312,7 +317,7 @@ class RelayService:
                     existing_capabilities = json.loads(str(existing["capabilities_json"]))
                 except (TypeError, ValueError):
                     existing_capabilities = []
-                if "moblin_relay" not in existing_capabilities:
+                if existing["node_kind"] != "moblin_relay":
                     connection.execute("ROLLBACK")
                     raise RelayProvisionConflictError(
                         "address belongs to a non-relay node; refusing credential rotation"
@@ -399,9 +404,11 @@ class RelayService:
                 connection.execute(
                     """
                     INSERT INTO restream_nodes(
-                        id, display_name, address, resolved_ip, ssh_port, ssh_username,
+                        id, node_kind, display_name, address, resolved_ip,
+                        ssh_port, ssh_username,
                         status, protocol_version, capabilities_json, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, 22, 'relay', 'connecting', ?, ?, ?, ?)
+                    ) VALUES (?, 'moblin_relay', ?, ?, ?, 22, 'relay',
+                              'connecting', ?, ?, ?, ?)
                     """,
                     (
                         node_id,
@@ -495,7 +502,8 @@ class RelayService:
         row = connection.execute(
             """
             SELECT credential.node_id, credential.token_digest, credential.revoked_at,
-                   node.status, node.protocol_version, node.capabilities_json,
+                   node.status, node.node_kind, node.protocol_version,
+                   node.capabilities_json,
                    relay.last_seen_at AS relay_last_seen_at
             FROM node_credentials AS credential
             JOIN restream_nodes AS node ON node.id = credential.node_id
@@ -512,8 +520,7 @@ class RelayService:
             or row["status"] == "revoked"
         ):
             raise RelayAuthenticationError("relay authentication failed")
-        capabilities = _relay_capabilities(row)
-        if "moblin_relay" not in capabilities:
+        if row["node_kind"] != "moblin_relay":
             raise RelayAuthenticationError("relay authentication failed")
         if require_supported_protocol and row["protocol_version"] != RELAY_PROTOCOL_VERSION:
             raise RelayUnsupportedProtocolError("unsupported relay protocol version")
@@ -717,7 +724,7 @@ class RelayService:
         row = connection.execute(
             """
             SELECT relay.*, node.status AS node_status, node.protocol_version,
-                   node.capabilities_json,
+                   node.node_kind, node.capabilities_json,
                    credential.revoked_at AS credential_revoked_at
             FROM relay_nodes AS relay
             JOIN restream_nodes AS node ON node.id = relay.node_id
@@ -729,6 +736,8 @@ class RelayService:
         if row is None:
             raise RelayNotFoundError("relay node not found")
         if row["node_status"] == "revoked" or row["credential_revoked_at"] is not None:
+            raise RelayAuthenticationError("relay access is revoked")
+        if row["node_kind"] != "moblin_relay":
             raise RelayAuthenticationError("relay access is revoked")
         if row["protocol_version"] != RELAY_PROTOCOL_VERSION:
             raise RelayUnsupportedProtocolError("unsupported relay protocol version")
@@ -779,6 +788,18 @@ class RelayService:
         command_id = str(uuid4())
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            active_bootstrap = connection.execute(
+                """
+                SELECT 1 FROM node_install_jobs
+                WHERE node_id = ?
+                  AND state NOT IN ('completed', 'cancelled', 'failed')
+                LIMIT 1
+                """,
+                (node_id,),
+            ).fetchone()
+            if active_bootstrap is not None:
+                connection.execute("ROLLBACK")
+                raise RelayBootstrapActiveError("relay bootstrap is still active")
             try:
                 relay = self._check_node_for_command(
                     connection,
@@ -1365,6 +1386,7 @@ __all__ = [
     "RELAY_COMMAND_MAX_ATTEMPTS",
     "RELAY_COMMAND_TTL_SECONDS",
     "RelayActiveError",
+    "RelayBootstrapActiveError",
     "RelayAuthenticationError",
     "RelayCommandNotFoundError",
     "RelayCommandPendingError",

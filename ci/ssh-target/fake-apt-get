@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+
+# Dependencies are installed while building the disposable SSH image. Runtime
+# package mutation would make the test nondeterministic and can overwrite the
+# systemctl fixture, so accept only the native installer's exact two probes.
+if [ "$#" -eq 2 ] && [ "$1" = -qq ] && [ "$2" = update ]; then
+  exit 0
+fi
+
+if [ "$#" -eq 10 ] && [ "$1" = -qq ] && [ "$2" = install ] \
+  && [ "$3" = -y ] && [ "$4" = --no-install-recommends ] \
+  && [ "$5" = ca-certificates ] && [ "$6" = curl ] \
+  && [ "$7" = ffmpeg ] && [ "$8" = fonts-dejavu-core ] \
+  && [ "$9" = iproute2 ] && [ "${10}" = python3 ]; then
+  for package in ca-certificates curl ffmpeg fonts-dejavu-core iproute2 python3; do
+    /usr/bin/dpkg-query -W -f='${db:Status-Abbrev}\n' "$package" | grep -Fx 'ii ' >/dev/null
+  done
+  exit 0
+fi
+
+exit 64

@@ -7,7 +7,42 @@ combine the two procedures or repeat first-install DNS, proxy, firewall, or secr
 during an incremental application release.
 
 The shared control-plane host is `147.45.231.225`. An attached restream node is a different host
-and must pass the onboarding gates in [Node onboarding](node-onboarding.md).
+and must pass the current gates in [Moblin Relay onboarding](moblin-relay-onboarding.md).
+
+## Native multi-relay installer release (schema v6)
+
+Schema v6 adds durable `node_kind` and `install_profile` fields and backfills every existing row in
+`relay_nodes` as `moblin_relay`. It also ships the native relay bundle inside the isolated bootstrap
+image and changes the public **Connect server** workflow to provision that fixed profile. Existing
+relay machines are not reinstalled or contacted by this database migration.
+
+Do not release this version until the exact commit passes the complete Python/frontend/lint/type
+suite **and** a fresh-host smoke test on one supported disposable Ubuntu/Debian VPS. The smoke test
+must prove real package installation, systemd units, MediaMTX/FFmpeg self-test, first outbound agent
+heartbeat, one-time SRT reveal, and external UDP 8890 reachability. It must finish with the relay
+inactive and disabled and without a real YouTube URL or key.
+
+For the control-plane change window:
+
+1. Record the current commit and fingerprints of `backend`, `bootstrap`, and `mediamtx`; create and
+   verify a protected SQLite backup through the running backend.
+2. Preserve `.env`, `MASTER_ENCRYPTION_KEY`, the bootstrap worker secret, proxy configuration, and
+   every existing relay secret. Do not rotate or print them.
+3. Build the reviewed `backend` and `bootstrap` images only. Recreate those two services only;
+   `mediamtx` and all remote relay services must retain their state.
+4. Require both services to become healthy, verify schema version 6, verify that the existing HK
+   relay is still classified as `moblin_relay`, and confirm its heartbeat/status without queueing a
+   start, stop, configure, or reveal command.
+5. Keep new-server onboarding closed until those checks pass. Then run one disposable fresh-host
+   installation and verify the post-install service/mode contract documented in
+   [Moblin Relay onboarding](moblin-relay-onboarding.md).
+
+Application rollback after schema 6 requires both the pre-release images **and the verified
+pre-v6 database backup**, because a schema-5 backend intentionally fails readiness when it sees a
+newer schema. Stop only `backend` and `bootstrap`, restore the backup through the documented
+volume-aware procedure, recreate those services from their rollback images, and recheck all three
+container fingerprints. Do not roll back, delete, or reinstall a successfully provisioned remote
+relay as part of the control-plane rollback.
 
 ## Incremental simplified relay console release (schema v5)
 
@@ -415,6 +450,10 @@ docker compose -p adojapan-restream --env-file .env -f compose.yml -f compose.pr
 Restore only the dedicated reverse-proxy site backup and safely reload the existing proxy. If a
 database rollback is explicitly approved, keep the backend stopped and restore only a selected
 project backup through a one-off container that mounts the project's named volumes:
+
+The same-host backup used here is rollback input only. It must never be presented as recovery from
+loss of the VPS; that requires the encrypted off-server set in
+[Disaster recovery](disaster-recovery.md).
 
 ```bash
 docker compose -p adojapan-restream --env-file .env \

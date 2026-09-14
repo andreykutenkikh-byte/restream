@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from contextlib import suppress
 from ipaddress import ip_address
@@ -34,6 +35,7 @@ from app.services.relay_preview import RelayPreviewStore
 from app.services.relays import (
     RelayActiveError,
     RelayAuthenticationError,
+    RelayBootstrapActiveError,
     RelayCommandNotFoundError,
     RelayCommandPendingError,
     RelayCommandStateError,
@@ -49,6 +51,7 @@ from app.services.relays import (
 from app.step_up_limiter import StepUpRateLimiter
 
 router = APIRouter()
+LOGGER = logging.getLogger(__name__)
 _SRT_TOKEN = re.compile(r"srt://[^\s\"'<>]+", re.IGNORECASE)
 
 
@@ -130,6 +133,12 @@ def _command_error(exc: Exception) -> NoReturn:
     if isinstance(exc, RelayAuthenticationError):
         _fail(status.HTTP_409_CONFLICT, "relay_revoked", "Relay access is revoked")
     if isinstance(exc, RelayUnavailableError):
+        if isinstance(exc, RelayBootstrapActiveError):
+            _fail(
+                status.HTTP_409_CONFLICT,
+                "relay_bootstrap_active",
+                "Relay installation is still in progress",
+            )
         _fail(status.HTTP_409_CONFLICT, "relay_unavailable", "Relay node is offline")
     if isinstance(exc, RelayUnsupportedProtocolError):
         _fail(status.HTTP_409_CONFLICT, "unsupported_protocol", "Relay protocol is unsupported")
@@ -168,6 +177,17 @@ def _idempotency_key(value: str | None) -> str | None:
     return value
 
 
+async def _notify_bootstrap_enrollment(request: Request, node_id: str) -> None:
+    """Keep bootstrap coordination failures out of the relay heartbeat contract."""
+
+    try:
+        await request.app.state.bootstrap.notify_enrollment_completed(node_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        LOGGER.warning("Relay bootstrap enrollment notification failed")
+
+
 def _queue(
     request: Request,
     node_id: str,
@@ -186,6 +206,7 @@ def _queue(
     except (
         RelayNotFoundError,
         RelayAuthenticationError,
+        RelayBootstrapActiveError,
         RelayUnavailableError,
         RelayUnsupportedProtocolError,
         RelayActiveError,
@@ -230,6 +251,10 @@ async def relay_heartbeat(
         _relay_preview(request).purge_node(node_id)
     if _supports_preview_demand(str(snapshot["agent_version"])):
         response["preview_requested"] = relay_is_live and _relay_preview(request).requested(node_id)
+    # The native installer waits for the first authenticated relay heartbeat,
+    # just as the legacy installer waits for generic Node Agent enrollment.
+    # Notify only after relay state is committed, outside its SQLite transaction.
+    await _notify_bootstrap_enrollment(request, node_id)
     return response
 
 
@@ -472,6 +497,11 @@ def _parse_srt_result(secret: str) -> dict[str, str | None]:
             value = decoded.get(label)
             if isinstance(value, str):
                 candidates.append((label, value.strip()))
+        fallback_urls = decoded.get("fallback_urls")
+        if isinstance(fallback_urls, list):
+            candidates.extend(
+                ("fallback_url", value.strip()) for value in fallback_urls if isinstance(value, str)
+            )
     if not candidates:
         for line in secret.splitlines():
             for match in _SRT_TOKEN.findall(line):
@@ -488,7 +518,7 @@ def _parse_srt_result(secret: str) -> dict[str, str | None]:
         normalized_label = label.strip().lower()
         label_prefix = normalized_label.split(":", 1)[0].strip().replace(" ", "_")
         explicitly_public = label_prefix in {"public", "public_url"}
-        explicitly_vpn = label_prefix in {"vpn", "vpn_url"}
+        explicitly_vpn = label_prefix in {"vpn", "vpn_url", "fallback_url"}
         is_vpn = explicitly_vpn
         if not explicitly_public and not explicitly_vpn:
             with suppress(ValueError):

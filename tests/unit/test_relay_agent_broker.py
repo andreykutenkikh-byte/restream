@@ -218,6 +218,14 @@ def broker_with_fake(monkeypatch: pytest.MonkeyPatch) -> tuple[RelayBroker, Fake
     return broker, fake
 
 
+def structured_srt_url(host: str) -> str:
+    return (
+        f"srt://{host}:8890?streamid=publish:iphone-live:publisher:"
+        "publisher_password_1234&passphrase=srt_passphrase_1234"
+        "&pbkeylen=32&latency=2000&payloadsize=1316"
+    )
+
+
 @pytest.mark.parametrize(
     ("width", "height", "expected"),
     [(1080, 1920, True), (720, 1280, False), (1920, 1080, False)],
@@ -359,6 +367,95 @@ def test_broker_configure_clear_start_stop_and_reveal(monkeypatch: pytest.Monkey
     cleared = broker.handle({"action": "clear_youtube", "payload": {}})
     assert cleared["status"] == "ok"
     assert fake.secrets["youtube"] == {"url": "", "key": ""}
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["203.0.113.10", "relay.example.test", "[2001:db8::10]"],
+)
+def test_broker_reveals_structured_public_url_without_legacy_host_constants(
+    host: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeRelayCtl()
+    namespace = fake.namespace()
+    namespace.pop("PUBLIC_HOST")
+    namespace.pop("VPN_HOST")
+    url = structured_srt_url(host)
+    namespace["build_moblin_urls"] = lambda: {"public_url": url, "fallback_urls": []}
+    broker = RelayBroker(namespace)
+    monkeypatch.setattr(broker, "_portrait_profile", lambda: True)
+
+    revealed = broker.handle({"action": "reveal_moblin_url", "payload": {}})
+
+    assert revealed["status"] == "ok"
+    assert json.loads(str(revealed["secret_result"])) == {
+        "fallback_urls": [],
+        "public_url": url,
+    }
+    assert "publisher_password_1234" not in json.dumps(revealed["safe_result"], sort_keys=True)
+
+
+def test_broker_reveals_optional_structured_fallback_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeRelayCtl()
+    namespace = fake.namespace()
+    namespace.pop("PUBLIC_HOST")
+    namespace.pop("VPN_HOST")
+    public_url = structured_srt_url("relay.example.test")
+    fallback_urls = [
+        structured_srt_url("198.51.100.25"),
+        structured_srt_url("backup.example.test"),
+        structured_srt_url("[2001:db8::25]"),
+    ]
+    namespace["build_moblin_urls"] = lambda: {
+        "public_url": public_url,
+        "fallback_urls": fallback_urls,
+    }
+    broker = RelayBroker(namespace)
+    monkeypatch.setattr(broker, "_portrait_profile", lambda: True)
+
+    revealed = broker.handle({"action": "reveal_moblin_url", "payload": {}})
+
+    assert revealed["status"] == "ok"
+    assert json.loads(str(revealed["secret_result"])) == {
+        "fallback_urls": fallback_urls,
+        "public_url": public_url,
+    }
+
+
+@pytest.mark.parametrize(
+    "structured",
+    [
+        {"public_url": structured_srt_url("relay.example.test"), "fallback_urls": [], "x": 1},
+        {"public_url": "rtmp://relay.example.test/live", "fallback_urls": []},
+        {"public_url": structured_srt_url("relay.example.test") + "&extra=1", "fallback_urls": []},
+        {
+            "public_url": structured_srt_url("relay.example.test"),
+            "fallback_urls": [structured_srt_url("relay.example.test")],
+        },
+        {
+            "public_url": structured_srt_url("relay.example.test"),
+            "fallback_urls": [structured_srt_url("backup.example.test")] * 5,
+        },
+    ],
+)
+def test_broker_rejects_invalid_structured_moblin_urls(
+    structured: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeRelayCtl()
+    namespace = fake.namespace()
+    namespace.pop("PUBLIC_HOST")
+    namespace.pop("VPN_HOST")
+    namespace["build_moblin_urls"] = lambda: structured
+    broker = RelayBroker(namespace)
+    monkeypatch.setattr(broker, "_portrait_profile", lambda: True)
+
+    revealed = broker.handle({"action": "reveal_moblin_url", "payload": {}})
+
+    assert revealed["status"] == "failed"
+    assert revealed["safe_result"]["error_code"] == "relayctl_failed"
+    assert revealed["secret_result"] is None
 
 
 def test_broker_key_only_configuration_preserves_existing_url_and_other_secrets(

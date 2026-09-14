@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def utc_now() -> str:
@@ -85,6 +85,9 @@ class Database:
                     ON audit_events(created_at DESC);
                 CREATE TABLE IF NOT EXISTS restream_nodes (
                     id TEXT PRIMARY KEY,
+                    node_kind TEXT NOT NULL DEFAULT 'generic_node' CHECK (
+                        node_kind IN ('generic_node', 'moblin_relay')
+                    ),
                     display_name TEXT NOT NULL,
                     address TEXT NOT NULL,
                     resolved_ip TEXT NOT NULL,
@@ -136,6 +139,9 @@ class Database:
                 CREATE TABLE IF NOT EXISTS node_install_jobs (
                     id TEXT PRIMARY KEY,
                     node_id TEXT NOT NULL REFERENCES restream_nodes(id) ON DELETE CASCADE,
+                    install_profile TEXT NOT NULL DEFAULT 'generic_node' CHECK (
+                        install_profile IN ('generic_node', 'moblin_relay')
+                    ),
                     state TEXT NOT NULL,
                     current_step TEXT NOT NULL,
                     progress_percent INTEGER NOT NULL DEFAULT 0
@@ -418,6 +424,54 @@ class Database:
                     "VALUES (5, CURRENT_TIMESTAMP)"
                 )
                 connection.execute("COMMIT")
+            node_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(restream_nodes)").fetchall()
+            }
+            install_job_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(node_install_jobs)").fetchall()
+            }
+            connection.execute("BEGIN IMMEDIATE")
+            if "node_kind" not in node_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE restream_nodes ADD COLUMN node_kind TEXT NOT NULL
+                    DEFAULT 'generic_node' CHECK (
+                        node_kind IN ('generic_node', 'moblin_relay')
+                    )
+                    """
+                )
+            # relay_nodes is the durable pre-v6 source of truth. Existing HK
+            # relays must never be reclassified from their separate trust domain.
+            connection.execute(
+                """
+                UPDATE restream_nodes SET node_kind = 'moblin_relay'
+                WHERE id IN (SELECT node_id FROM relay_nodes)
+                """
+            )
+            if "install_profile" not in install_job_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE node_install_jobs ADD COLUMN install_profile TEXT NOT NULL
+                    DEFAULT 'generic_node' CHECK (
+                        install_profile IN ('generic_node', 'moblin_relay')
+                    )
+                    """
+                )
+            connection.execute(
+                """
+                UPDATE node_install_jobs SET install_profile = 'moblin_relay'
+                WHERE node_id IN (
+                    SELECT id FROM restream_nodes WHERE node_kind = 'moblin_relay'
+                )
+                """
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) "
+                "VALUES (6, CURRENT_TIMESTAMP)"
+            )
+            connection.execute("COMMIT")
 
     def ready(self) -> bool:
         try:

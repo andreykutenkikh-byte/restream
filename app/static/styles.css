@@ -2319,6 +2319,26 @@ h3 {
   min-width: 230px;
 }
 
+.relay-node-picker {
+  display: grid;
+  min-width: 230px;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 0.74rem;
+  font-weight: 750;
+}
+
+.relay-node-picker select {
+  width: 100%;
+  min-height: 42px;
+  padding: 0 34px 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: #fff;
+  color: var(--ink);
+  font: inherit;
+}
+
 .relay-setup {
   padding: 28px;
 }
@@ -2707,6 +2727,10 @@ h3 {
   }
 
   .relay-console__hero-state .button {
+    width: 100%;
+  }
+
+  .relay-node-picker {
     width: 100%;
   }
 
