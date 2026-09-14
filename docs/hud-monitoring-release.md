@@ -65,6 +65,14 @@ candidate or its deployment package, the corresponding failed case applies again
 
 ## Reads, startup and persistence
 
+The actual local Windows WebKit navigation probe sent the HUD cookie despite
+the server's `SameSite=Strict` header. The release therefore also refuses HUD
+cookie authentication when the browser reports `Sec-Fetch-Site: cross-site`.
+Direct homepage entry and existing clients without fetch metadata retain the
+existing checks. This is additional read-side protection, not a cookie-policy
+relaxation. The beta browser regression requires the real cross-site navigation
+to return 401, alongside the original strict cookie/header and origin tests.
+
 HUD status performs SQLite reads, one existing MediaMTX status GET, in-memory
 sampling and quality evaluation. The browser requests only status, pairing and
 logout; its admin component creates/lists/revokes HUD grants. It cannot submit

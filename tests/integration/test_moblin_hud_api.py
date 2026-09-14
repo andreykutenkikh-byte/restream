@@ -762,3 +762,19 @@ def test_hud_page_only_exposes_validated_pairing_boolean(hud_scenario: HudScenar
     page = client.get("/moblin-hud")
     assert 'data-hud-paired="false"' in page.text
     assert "unvalidated-cookie" not in page.text
+
+
+def test_cross_site_navigation_cannot_use_hud_cookie(hud_scenario: HudScenario) -> None:
+    client = hud_scenario.client
+    original_cookie = client.cookies.get(HUD_SESSION_COOKIE)
+    assert client.get("/moblin-hud/api/status").status_code == 200
+    headers = {"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"}
+    assert client.get("/moblin-hud/api/status", headers=headers).status_code == 401
+    assert 'data-hud-paired="false"' in client.get("/moblin-hud", headers=headers).text
+    assert client.cookies.get(HUD_SESSION_COOKIE) == original_cookie
+    for site in ("none", "same-origin", "same-site"):
+        assert (
+            client.get("/moblin-hud/api/status", headers={"Sec-Fetch-Site": site}).status_code
+            == 200
+        )
+    assert client.get("/moblin-hud/api/status").status_code == 200

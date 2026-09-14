@@ -225,8 +225,17 @@ def _limit(request: Request, state_name: str, purpose: str) -> None:
         )
 
 
+def _hud_cookie_token(request: Request) -> str | None:
+    # Defense in depth for WebViews that send a Strict cookie on cross-site
+    # navigation. Direct homepage entry and older clients without metadata keep
+    # the existing cookie/origin checks; this never grants authentication.
+    if request.headers.get("sec-fetch-site", "").strip().lower() == "cross-site":
+        return None
+    return request.cookies.get(HUD_SESSION_COOKIE)
+
+
 def require_hud_session(request: Request) -> dict[str, Any]:
-    token = request.cookies.get(HUD_SESSION_COOKIE)
+    token = _hud_cookie_token(request)
     try:
         return cast(dict[str, Any], _hud(request).authenticate_session(token))
     except HudSessionAuthenticationError:
@@ -507,7 +516,7 @@ async def _status_payload(request: Request) -> dict[str, Any]:
 async def hud_page(request: Request) -> Response:
     paired = False
     try:
-        _hud(request).authenticate_session(request.cookies.get(HUD_SESSION_COOKIE))
+        _hud(request).authenticate_session(_hud_cookie_token(request))
         paired = True
     except HudSessionAuthenticationError:
         pass

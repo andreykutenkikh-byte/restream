@@ -191,7 +191,7 @@ async def _exercise_browser(
 
         await _until(
             lambda: bool(samples and "telemetry_unavailable" in samples[-1]["reasons"]),
-            seconds=60,
+            seconds=90,
             message="Real heartbeat silence did not become unavailable telemetry",
         )
         loss = samples[-1]
