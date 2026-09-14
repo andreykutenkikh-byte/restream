@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -46,7 +47,7 @@ class SecretLogCheck:
 
 
 def _control_snapshot(database: Path) -> tuple[Any, ...]:
-    with sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True) as connection:
+    with closing(sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)) as connection:
         return tuple(
             tuple(connection.execute(query))
             for query in (
@@ -80,28 +81,39 @@ async def _exercise_browser(
     )
     page_errors: list[str] = []
     requests: list[tuple[str, str]] = []
-    samples: list[dict[str, Any]] = []
+    hud_requests: list[tuple[str, str]] = []
+    admin_responses: list[tuple[str, str, int]] = []
 
-    async def observe(response: Any) -> None:
-        if urlsplit(response.url).path != "/moblin-hud/api/status" or response.status != 200:
-            return
+    async def status_snapshot() -> dict[str, Any]:
+        # Read the real HTTPS API only after the real page renders each phase.
+        # Reading here avoids engine-specific delivery delays in response callbacks.
+        response = await hud_context.request.get(origin + "/moblin-hud/api/status")
+        assert response.status == 200
         payload = await response.json()
         route = payload.get("current_route") or {}
-        samples.append(
-            {
-                "time": time.monotonic() - started,
-                "level": payload["health"]["level"],
-                "reasons": payload["health"]["reason_codes"],
-                "source": route.get("source"),
-                "bitrate": route.get("input_bitrate_bps"),
-                "heartbeat_age": route.get("heartbeat_age_seconds"),
-            }
-        )
+        return {
+            "time": time.monotonic() - started,
+            "level": payload["health"]["level"],
+            "reasons": payload["health"]["reason_codes"],
+            "source": route.get("source"),
+            "bitrate": route.get("input_bitrate_bps"),
+            "heartbeat_age": route.get("heartbeat_age_seconds"),
+        }
 
     try:
         admin = await admin_context.new_page()
         admin.on("pageerror", lambda error: page_errors.append(error.message))
         admin.on("request", lambda request: requests.append((request.method, request.url)))
+        admin.on(
+            "response",
+            lambda response: admin_responses.append(
+                (
+                    response.request.method,
+                    urlsplit(response.url).path,
+                    response.status,
+                )
+            ),
+        )
         await admin.goto(origin + "/login")
         await admin.locator("#login").fill("beta")
         await admin.locator("#password").fill(SYNTHETIC_PASSWORD)
@@ -126,7 +138,7 @@ async def _exercise_browser(
         hud = await hud_context.new_page()
         hud.on("pageerror", lambda error: page_errors.append(error.message))
         hud.on("request", lambda request: requests.append((request.method, request.url)))
-        hud.on("response", observe)
+        hud.on("request", lambda request: hud_requests.append((request.method, request.url)))
         try:
             async with hud.expect_response(
                 lambda response: urlsplit(response.url).path == "/moblin-hud/api/pair"
@@ -163,8 +175,9 @@ async def _exercise_browser(
         ) as cross_site_response:
             await cross_site.locator("#cross-site-check").click()
         cross_site_result = await cross_site_response.value
+        request_headers = await cross_site_result.request.all_headers()
+        assert request_headers.get("sec-fetch-site") == "cross-site"
         if cross_site_result.status != 401:
-            request_headers = await cross_site_result.request.all_headers()
             metadata = {
                 key: request_headers.get(key)
                 for key in ("sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest")
@@ -176,29 +189,31 @@ async def _exercise_browser(
                 }
             )
             print(f"BETA {name} cross-site response={cross_site_result.status}; {metadata}")
-        assert cross_site_result.status == 401, "Cross-site navigation sent HUD cookie"
+        assert cross_site_result.status == 401, "Cross-site navigation authenticated HUD"
         await cross_site.close()
         assert (await hud_context.request.get(origin + "/api/nodes")).status == 401
 
         await hud.wait_for_function(
             "() => document.body.dataset.hudState === 'green'", timeout=45_000
         )
-        normal = samples[-1]
+        normal = await status_snapshot()
         assert normal["source"] == "LIVE" and normal["bitrate"] == 4_000_000
         assert await hud.locator("[data-hud-bitrate]").inner_text() == "4 Мбит/с"
         assert "SYNTHETIC" in await hud.locator("[data-hud-server]").inner_text()
         await hud.screenshot(path=str(artifacts / f"{name}-normal.png"), full_page=True)
 
-        await _until(
-            lambda: bool(samples and "telemetry_unavailable" in samples[-1]["reasons"]),
-            seconds=90,
-            message="Real heartbeat silence did not become unavailable telemetry",
+        await hud.wait_for_function(
+            "() => document.body.dataset.hudState === 'unknown' && "
+            "document.querySelector('[data-hud-title]').textContent === 'Нет свежей телеметрии'",
+            timeout=90_000,
         )
-        loss = samples[-1]
+        loss = await status_snapshot()
+        assert "telemetry_unavailable" in loss["reasons"]
         assert loss["source"] == "UNKNOWN" and loss["bitrate"] is None
         assert loss["heartbeat_age"] > 30
         await hud.wait_for_function("() => document.body.dataset.hudState === 'unknown'")
         assert await hud.locator("[data-hud-source]").inner_text() == "Нет данных"
+        assert await hud.locator("[data-hud-trend]").inner_text() == "Динамика уточняется"
         assert "Потеря мониторинга не означает остановку эфира" in (
             await hud.locator("[data-hud-message]").inner_text()
         )
@@ -207,7 +222,7 @@ async def _exercise_browser(
         await hud.wait_for_function(
             "() => document.body.dataset.hudState === 'green'", timeout=60_000
         )
-        recovered = samples[-1]
+        recovered = await status_snapshot()
         assert recovered["source"] == "LIVE" and recovered["bitrate"] == 4_000_000
         assert recovered["heartbeat_age"] < 10
         await hud.screenshot(path=str(artifacts / f"{name}-recovered.png"), full_page=True)
@@ -237,16 +252,40 @@ async def _exercise_browser(
         )
         assert (await hud_context.request.get(origin + "/moblin-hud/api/status")).status == 401
         assert not page_errors, "A real panel/HUD entrypoint raised a JavaScript error"
-        assert all(urlsplit(url).hostname == "127.0.0.1" for _, url in requests)
+        unexpected_origins = {
+            (
+                urlsplit(url).scheme,
+                urlsplit(url).hostname,
+                urlsplit(url).path
+                if urlsplit(url).scheme in {"http", "https"}
+                else "<non-network>",
+            )
+            for _, url in requests
+            if urlsplit(url).hostname != "127.0.0.1"
+        }
+        assert not unexpected_origins, unexpected_origins
         allowed_posts = {
             "/api/auth/login",
             "/api/moblin-hud/pairings",
             "/moblin-hud/api/pair",
             f"/api/moblin-hud/devices/{pairing['device_id']}/revoke",
         }
-        assert all(
-            method == "GET" or urlsplit(url).path in allowed_posts for method, url in requests
-        )
+        # main's admin dashboard requests its existing preview lease automatically.
+        # The synthetic beta rejects it; no HUD request may touch preview at all.
+        blocked_preview_paths = {
+            path
+            for method, path, status in admin_responses
+            if method == "POST"
+            and status == 403
+            and re.fullmatch(r"/api/nodes/[A-Za-z0-9-]+/relay/preview/lease", path)
+        }
+        unexpected_calls = [
+            (method, urlsplit(url).path)
+            for method, url in requests
+            if method != "GET" and urlsplit(url).path not in allowed_posts | blocked_preview_paths
+        ]
+        assert not unexpected_calls, unexpected_calls
+        assert not any("/preview" in urlsplit(url).path for _, url in hud_requests)
         leaked = any(secrets.contains_secret(url) for _, url in requests)
         assert not leaked, "A credential appeared in a browser request URL"
         print(

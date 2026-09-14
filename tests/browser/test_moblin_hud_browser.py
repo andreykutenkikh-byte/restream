@@ -311,9 +311,14 @@ def test_ordinary_hud_browser_contract(
                 else None
             ),
         )
-        with page.expect_response(
-            lambda response: urlsplit(response.url).path == "/moblin-hud/api/status"
-        ) as first:
+        with (
+            page.expect_response(
+                lambda response: urlsplit(response.url).path == "/moblin-hud/api/status"
+            ) as first,
+            page.expect_response(
+                lambda response: urlsplit(response.url).path == "/moblin-hud/api/pair"
+            ) as paired,
+        ):
             navigation = page.goto(pairing["pairing_url"], wait_until="load")
         assert navigation.status == 200
         assert first.value.status == 200
@@ -325,7 +330,10 @@ def test_ordinary_hud_browser_contract(
         cookies = [cookie for cookie in context.cookies() if cookie["name"] == HUD_SESSION_COOKIE]
         assert len(cookies) == 1
         cookie = cookies[0]
-        assert cookie["secure"] and cookie["httpOnly"] and cookie["sameSite"] == "Strict"
+        assert cookie["secure"] and cookie["httpOnly"]
+        # Verify the actual policy header, not platform-specific cookie metadata.
+        # The standalone beta gate also tests real cross-site navigation denial.
+        assert "samesite=strict" in (paired.value.header_value("set-cookie") or "").lower()
         assert cookie["path"] == "/"
         assert context.request.get(fixture.origin + "/api/nodes").status == 401
         assert not page_errors and not console_errors

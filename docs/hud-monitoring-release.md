@@ -71,7 +71,11 @@ cookie authentication when the browser reports `Sec-Fetch-Site: cross-site`.
 Direct homepage entry and existing clients without fetch metadata retain the
 existing checks. This is additional read-side protection, not a cookie-policy
 relaxation. The beta browser regression requires the real cross-site navigation
-to return 401, alongside the original strict cookie/header and origin tests.
+to return 401, alongside strict cookie/header and origin tests. The reused HUD
+browser test checks the actual pairing response's Strict policy, Secure,
+HttpOnly and path; it no longer mistakes Windows WebKit's `sameSite=None`
+metadata for the server header. This is supplemented by the real navigation
+denial in both engines, with no platform skip or production cookie relaxation.
 
 HUD status performs SQLite reads, one existing MediaMTX status GET, in-memory
 sampling and quality evaluation. The browser requests only status, pairing and
@@ -128,6 +132,13 @@ at most these five actions on an operator-approved reachable HTTPS test origin:
 3. Confirm source, `Отправка потока`, freshness and unavailable metrics are intelligible.
 4. Observe normal → monitoring connection loss → recovery using the test scenario.
 5. Revoke the device in the panel and verify the HUD requests pairing again.
+
+Local runner limitation: the Windows Playwright WebKit build exposes neither
+`AudioContext` nor `webkitAudioContext`/`OscillatorNode`. The reused native-audio
+instrumentation test therefore fails there; it has not been skipped or given
+a fake audio implementation. The mandatory Linux Chromium/WebKit CI still
+requires that full native-audio contract. The standalone local beta tests the
+real UI/API cycle, not sound output or physical iPhone behavior.
 
 ## Deployment plan — commands are not executed by this change
 
@@ -225,8 +236,8 @@ Restoring the pre-HUD database removes HUD devices and grants. Old HUD cookies
 then authorize nothing; the old backend does not expose the HUD routes. Users
 must pair again after a later HUD rollout. Never restore the failed HUD database
 as a convenience, since doing so can revive device grants or undo revocations.
-For an image-only rollback that deliberately retains HUD tables, revocations
-must be preserved; before a future re-enable, revoke old HUD devices through the
-approved HUD admin workflow. Do not rotate shared administrator/encryption keys
-to revoke a HUD device. No merge, deployment or production connection is
-authorized by this document itself.
+Image-only rollback is not this release's supported path: main expects schema 5
+and fails readiness against the HUD schema. Do not delete migration identities
+to bypass that check. Restore the verified pre-HUD backup with the old image.
+Do not rotate shared administrator/encryption keys to revoke a HUD device.
+No merge, deployment or production connection is authorized by this document itself.

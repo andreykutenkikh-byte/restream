@@ -75,6 +75,11 @@ prevent FFmpeg/media traffic. A beta-only route allowlist permits panel reads,
 login/logout, HUD pairing/revoke, and the synthetic heartbeat. Control commands,
 onboarding, destination changes, ingest rotation and preview are denied. This
 wrapper does not remove or change those features in the shipped application.
+The original administrator dashboard may automatically request its existing
+relay preview lease; the beta rejects that request with HTTP 403. An unavailable
+administrator preview is expected here because the fixture has no video. The
+HUD never requests preview, and the existing production preview implementation
+is unchanged.
 
 Ctrl+C or the duration limit shuts down Uvicorn and deletes the temporary DB and
 TLS key. Nothing is deployed. A forced process kill can leave a directory named

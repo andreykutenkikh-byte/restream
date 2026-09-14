@@ -191,6 +191,16 @@ test("normalizer copies only the explicit secret-free route fields", () => {
   assert.equal(normalized.currentRoute.displayName, "HK relay");
 });
 
+test("absent current bitrate cannot display a stable historical trend", () => {
+  const raw = statusPayload();
+  raw.current_route.input_bitrate_bps = null;
+  raw.current_route.bitrate_trend = "stable";
+  const normalized = normalizeStatus(raw);
+  assert.equal(normalized.currentRoute.inputBitrateBps, null);
+  assert.equal(normalized.currentRoute.bitrateTrend, "unknown");
+  assert.equal(formatTrend(normalized.currentRoute.bitrateTrend), "Динамика уточняется");
+});
+
 test("route and target labels fail closed when they contain an address", () => {
   assert.equal(safeDisplayName("relay 176.98.181.225"), "Сервер не определён");
   assert.equal(safeDisplayName("https://relay.example"), "Сервер не определён");

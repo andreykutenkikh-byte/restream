@@ -273,6 +273,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not 12 <= len(password) <= 128:
         print("The temporary password must contain 12–128 characters.", flush=True)
         return 2
+    stage = "initialization"
     try:
         with (
             TemporaryDirectory(prefix="adojapan-hud-beta-") as temporary,
@@ -324,6 +325,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     flush=True,
                 )
                 context = ssl.create_default_context(cafile=str(cert_path))
+                stage = "synthetic heartbeat demo"
                 with httpx.Client(
                     base_url=origin, verify=context, trust_env=False, timeout=5
                 ) as client:
@@ -333,6 +335,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         duration=args.duration,
                         phase_seconds=args.phase_seconds,
                     )
+                stage = "shutdown"
             finally:
                 server.should_exit = True
                 thread.join(timeout=10)
@@ -340,9 +343,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     raise RuntimeError("The beta server did not finish shutdown")
     except KeyboardInterrupt:
         pass
-    except Exception:
+    except Exception as exc:
         # Exception text can contain submitted credentials; report no raw values.
-        print("HUD beta failed. Check the loopback port and local Python dependencies.", flush=True)
+        print(f"HUD beta failed during {stage} ({type(exc).__name__}).", flush=True)
         return 1
     print("HUD beta stopped; disposable database and TLS key removed.", flush=True)
     return 0

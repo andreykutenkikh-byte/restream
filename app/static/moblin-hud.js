@@ -117,15 +117,16 @@
     const routeId = typeof value.route_id === "string" && ROUTE_ID_PATTERN.test(value.route_id)
       ? value.route_id
       : "unknown";
+    const inputBitrateBps = finiteNumber(value.input_bitrate_bps, 1_000_000_000);
     return {
       routeId,
       displayName: safeDisplayName(value.display_name),
       kind: value.kind === "main" || value.kind === "relay" ? value.kind : "relay",
       source: safeText(value.source, "UNKNOWN", 16),
-      inputBitrateBps: finiteNumber(value.input_bitrate_bps, 1_000_000_000),
+      inputBitrateBps,
       emaInputBitrateBps: finiteNumber(value.ema_input_bitrate_bps, 1_000_000_000),
       stableBaselineBps: finiteNumber(value.stable_baseline_bps, 1_000_000_000),
-      bitrateTrend: allowedToken(value.bitrate_trend, TRENDS, "unknown"),
+      bitrateTrend: inputBitrateBps === null ? "unknown" : allowedToken(value.bitrate_trend, TRENDS, "unknown"),
       youtubeForwardState: safeText(value.youtube_forward_state, "unknown", 32).toLowerCase(),
       overallState: safeText(value.overall_state, "unknown", 32).toLowerCase(),
       heartbeatAgeSeconds: finiteNumber(value.heartbeat_age_seconds, 86_400),
