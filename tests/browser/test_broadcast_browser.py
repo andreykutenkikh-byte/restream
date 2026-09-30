@@ -82,6 +82,21 @@ def test_broadcast_forms_independent_outputs_and_reload_secrecy(
         assert (
             page.locator(".broadcast-output").nth(1).get_by_text("READY", exact=True).count() == 1
         )
+        # Selection targets only the checked output and survives ordinary status renders.
+        page.get_by_label("Выбрать Output One", exact=True).check()
+        page.get_by_role("button", name="Остановить выбранные", exact=True).click()
+        page.locator(".broadcast-output").first.get_by_text("STOP_REQUESTED", exact=True).wait_for()
+        assert page.get_by_label("Выбрать Output One", exact=True).is_checked()
+        assert (
+            page.locator(".broadcast-output").nth(1).get_by_text("READY", exact=True).count() == 1
+        )
+        page.get_by_role("button", name="Запустить выбранные", exact=True).click()
+        page.locator(".broadcast-output").first.get_by_text(
+            "START_REQUESTED", exact=True
+        ).wait_for()
+        assert (
+            page.locator(".broadcast-output").nth(1).get_by_text("READY", exact=True).count() == 1
+        )
         assert errors == []
     finally:
         context.close()

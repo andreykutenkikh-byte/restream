@@ -63,6 +63,7 @@ class Publisher:
         self.process: subprocess.Popen[str] | None = None
         self.frames = 0
         self.time_us = 0
+        self.bytes = 0
         self.last_progress = 0.0
         self.first_progress = 0.0
         self.started = 0.0
@@ -87,6 +88,8 @@ class Publisher:
                 self.first_progress = self.first_progress or self.last_progress
             if key == "out_time_us" and number >= 0:
                 self.time_us = number
+            if key == "total_size" and number >= 0:
+                self.bytes = number
 
     def tick(self) -> None:
         now = time.monotonic()
@@ -101,6 +104,7 @@ class Publisher:
         if now < self.retry_at or self.failures >= 5:
             return
         self.frames, self.time_us, self.last_progress, self.first_progress = 0, 0, 0, 0
+        self.bytes = 0
         self.started = now
         self.process = launch(self.argv, progress=True)
         self.reader = threading.Thread(target=self._read, args=(self.process,), daemon=True)
@@ -136,6 +140,8 @@ class PacketProbe:
         self.bytes = 0
         self.started = time.monotonic()
         self.last_packet = 0.0
+        self.first_video_packet = 0.0
+        self.last_video_packet = 0.0
         self.process = launch(
             [
                 ffprobe,
@@ -167,6 +173,8 @@ class PacketProbe:
                 pts, size = float(fields["pts_time"]), int(fields["size"])
                 if fields.get("codec_type") == "video":
                     self.video_pts, self.video_frames = pts, self.video_frames + 1
+                    self.last_video_packet = time.monotonic()
+                    self.first_video_packet = self.first_video_packet or self.last_video_packet
                 elif fields.get("codec_type") == "audio":
                     self.audio_pts, self.audio_packets = pts, self.audio_packets + 1
                 self.bytes += size
@@ -597,8 +605,18 @@ class MediaRuntime:
         probes: dict[str, dict[str, Any] | None] = {}
         for route in self.plan["routes"]:
             route_id = route["id"]
+            existing = self.publishers.get(route_id)
+            status = {
+                "route_id": route_id,
+                "egress_generation": route["egress_generation"],
+                "egress_lease_id": route["egress_lease"]["id"] if route["egress_lease"] else None,
+                "runtime_secret_present": route["destination"] is not None,
+                "publisher_running": bool(
+                    existing and existing[1].process and existing[1].process.poll() is None
+                ),
+            }
             if not route["media_enabled"]:
-                observations.append({"route_id": route_id, "source_kind": "unknown"})
+                observations.append({**status, "source_kind": "unknown"})
                 continue
             direct_path = f"source/{route['source_id']}/direct"
             if direct_path not in probes:
@@ -647,16 +665,14 @@ class MediaRuntime:
             if not measurement:
                 observations.append(
                     {
-                        "route_id": route_id,
+                        **status,
                         "source_kind": "unknown",
                         "safe_error_code": "source_lost" if route_id in self.publishers else None,
                     }
                 )
                 continue
             if not route["enabled"]:
-                observations.append(
-                    {"route_id": route_id, "source_kind": source_kind, **measurement}
-                )
+                observations.append({**status, "source_kind": source_kind, **measurement})
                 continue
             dest = route["destination"]
             if dest is None:
@@ -691,17 +707,24 @@ class MediaRuntime:
             if switch and worker.first_progress:
                 switch["gap_ms"] = 1000 * (worker.first_progress - switch["last_old_progress"])
             observation = {
-                "route_id": route_id,
+                **status,
                 "source_kind": source_kind,
                 **measurement,
                 "publisher_frames": worker.frames,
                 "publisher_time_us": worker.time_us,
                 "publisher_connected": worker.connected,
+                "publisher_running": bool(worker.process and worker.process.poll() is None),
+                "publisher_bytes": worker.bytes,
+                "source_switch_gap_ms": max(0, switch["gap_ms"])
+                if switch and "gap_ms" in switch
+                else None,
                 "egress_generation": lease["generation"],
                 "egress_lease_id": lease["id"],
             }
             if worker.failures >= 5:
                 observation["safe_error_code"] = "retry_exhausted"
+            elif worker.failures:
+                observation["safe_error_code"] = "publisher_failed"
             observations.append(observation)
         self.last_observations = observations
         return observations

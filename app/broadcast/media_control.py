@@ -41,6 +41,10 @@ class Observation(Input):
     publisher_frames: int = Field(default=0, ge=0, le=10**12)
     publisher_time_us: int = Field(default=0, ge=0, le=10**18)
     publisher_connected: bool = False
+    publisher_running: bool = False
+    runtime_secret_present: bool = False
+    publisher_bytes: int = Field(default=0, ge=0, le=10**18)
+    source_switch_gap_ms: float | None = Field(default=None, ge=0, le=3600000, allow_inf_nan=False)
     egress_generation: int = Field(default=0, ge=0, le=10**15)
     egress_lease_id: str | None = Field(default=None, max_length=64)
     safe_error_code: Literal["publisher_failed", "source_lost", "retry_exhausted"] | None = None
@@ -80,33 +84,38 @@ class MediaControl:
             exclude={"expected_bitrate_bps"}
         ):
             raise BroadcastError("media_profile_incompatible")
-        limits = ResourceLimits.model_validate_json(node["limits_json"])
+        # Reserve warm routes too: two concurrent preparations cannot both claim
+        # the final publisher/forwarding capacity before either receives a key.
         active = db.execute(
-            "SELECT src.profile_json FROM broadcast_routes r "
+            "SELECT r.node_id,src.ingress_node_id,src.profile_json FROM broadcast_routes r "
             "JOIN broadcast_outputs o ON o.id=r.output_id "
             "JOIN broadcast_sessions s ON s.id=o.session_id "
             "JOIN broadcast_sources src ON src.id=s.source_id "
-            "WHERE r.node_id=? AND r.desired_enabled=1 "
-            "AND r.id!=?",
-            (route["node_id"], route["id"]),
+            "WHERE (r.desired_enabled=1 OR r.media_warm=1) AND r.id!=?",
+            (route["id"],),
         ).fetchall()
-        if len(active) + 1 > limits.max_publishers_per_node:
-            raise BroadcastError("publisher_limit")
-        bitrate = profile.expected_bitrate_bps + sum(
-            json.loads(r["profile_json"])["expected_bitrate_bps"] for r in active
-        )
-        if bitrate > limits.max_expected_egress_bps:
-            raise BroadcastError("egress_limit")
+        projected = [*active, route]
+        nodes = {route["node_id"]: node}
         if route["ingress_node_id"] != route["node_id"]:
-            source = self.ready_node(db, route["ingress_node_id"], capability="inter_relay_srt_v1")
-            source_limits = ResourceLimits.model_validate_json(source["limits_json"])
-            count = db.execute(
-                "SELECT COUNT(*) FROM broadcast_forwarding WHERE source_node_id=? "
-                "AND enabled=1 AND route_id!=?",
-                (route["ingress_node_id"], route["id"]),
-            ).fetchone()[0]
-            if count + 1 > source_limits.max_forwarded_routes:
+            nodes[route["ingress_node_id"]] = self.ready_node(
+                db, route["ingress_node_id"], capability="inter_relay_srt_v1"
+            )
+        for node_id, configuration in nodes.items():
+            limits = ResourceLimits.model_validate_json(configuration["limits_json"])
+            publishers = [r for r in projected if r["node_id"] == node_id]
+            forwards = [
+                r for r in projected if r["ingress_node_id"] == node_id and r["node_id"] != node_id
+            ]
+            if len(publishers) > limits.max_publishers_per_node:
+                raise BroadcastError("publisher_limit")
+            if len(forwards) > limits.max_forwarded_routes:
                 raise BroadcastError("forward_limit")
+            bitrate = sum(
+                json.loads(r["profile_json"])["expected_bitrate_bps"]
+                for r in [*publishers, *forwards]
+            )
+            if bitrate > limits.max_expected_egress_bps:
+                raise BroadcastError("egress_limit")
 
     def enable(self, node_id: str, data: MediaNodeEnable) -> None:
         try:
@@ -259,7 +268,11 @@ class MediaControl:
                 samples = min(100, old["valid_samples"] + 1) if moving else 0
                 direct = samples if obs.source_kind == "direct" else 0
                 db.execute(
-                    "INSERT OR REPLACE INTO broadcast_media_observations VALUES "
+                    "INSERT OR REPLACE INTO broadcast_media_observations "
+                    "(route_id,node_id,plan_generation,sequence,source_kind,source_identity,"
+                    "video_pts,audio_pts,video_frames,audio_packets,bitrate_bps,publisher_frames,"
+                    "publisher_time_us,publisher_connected,valid_samples,direct_samples,"
+                    "safe_error_code,observed_at) VALUES "
                     "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         obs.route_id,
@@ -283,9 +296,55 @@ class MediaControl:
                     ),
                 )
                 db.execute(
+                    "UPDATE broadcast_media_observations SET publisher_running=?,"
+                    "runtime_secret_present=?,egress_generation=?,egress_lease_id=?,"
+                    "publisher_bytes=?,source_switch_gap_ms=? WHERE route_id=?",
+                    (
+                        obs.publisher_running,
+                        obs.runtime_secret_present,
+                        obs.egress_generation,
+                        obs.egress_lease_id,
+                        obs.publisher_bytes,
+                        obs.source_switch_gap_ms,
+                        obs.route_id,
+                    ),
+                )
+                db.execute(
                     "UPDATE broadcast_routes SET source_kind=? WHERE id=?",
                     (obs.source_kind, obs.route_id),
                 )
+                output = self.store.row(
+                    db,
+                    "SELECT session_id,state FROM broadcast_outputs WHERE id=?",
+                    (route["output_id"],),
+                )
+                was_forwarded = bool(
+                    old
+                    and old["source_kind"] == "forwarded"
+                    and old["valid_samples"] >= 2
+                    and not old["safe_error_code"]
+                )
+                is_forwarded = bool(
+                    obs.source_kind == "forwarded" and samples >= 2 and not obs.safe_error_code
+                )
+                if was_forwarded != is_forwarded:
+                    self.store.event(
+                        db,
+                        output["session_id"],
+                        "interrelay.connected" if is_forwarded else "interrelay.disconnected",
+                        output_id=route["output_id"],
+                        detail={"route_id": obs.route_id},
+                    )
+                if obs.safe_error_code and (
+                    not old or old["safe_error_code"] != obs.safe_error_code
+                ):
+                    self.store.event(
+                        db,
+                        output["session_id"],
+                        "output.failed",
+                        output_id=route["output_id"],
+                        detail={"route_id": obs.route_id, "code": obs.safe_error_code},
+                    )
                 if route["role"] == "current":
                     state = (
                         "PUBLISHING"
@@ -298,6 +357,14 @@ class MediaControl:
                     )
                     if not route["desired_enabled"]:
                         state = "STOPPED" if not obs.publisher_connected else "STOP_REQUESTED"
+                    if state == "PUBLISHING" and state != output["state"]:
+                        self.store.event(
+                            db,
+                            output["session_id"],
+                            "output.live",
+                            output_id=route["output_id"],
+                            detail={"route_id": obs.route_id},
+                        )
                     db.execute(
                         "UPDATE broadcast_outputs SET state=? WHERE id=?",
                         (state, route["output_id"]),

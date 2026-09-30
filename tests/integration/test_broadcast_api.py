@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from test_api_smoke import FakeMediaMTX, login
 
+from app.broadcast.models import OutputCreate, SessionCreate
 from app.core.config import Settings
 from app.logging_config import OAuthAccessFilter
 from app.main import create_app
@@ -87,3 +91,48 @@ def test_oauth_callback_access_log_keeps_no_code_or_state() -> None:
     OAuthAccessFilter().filter(record)
     assert "secret" not in record.getMessage()
     assert "opaque" not in record.getMessage()
+
+
+def test_youtube_health_events_only_record_changes_without_provider_details(
+    settings: Settings, admin_password: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    status = {"lifecycle_status": "live", "stream_status": "active", "health_status": "good"}
+    monkeypatch.setattr(
+        "app.broadcast.api.provider", lambda *_: SimpleNamespace(status=lambda *_: dict(status))
+    )
+    app = create_app(settings, mediamtx=FakeMediaMTX())
+    with TestClient(app) as client:
+        csrf, _ = login(client, settings, admin_password)
+        node = app.state.relays.provision_node(
+            display_name="Event fixture", address="event.example"
+        )
+        store = app.state.broadcasts
+        sid = store.create_session(
+            SessionCreate(name="Event fixture", ingress_node_id=node.node_id), "event-session-key"
+        )
+        output = store.create_output(
+            sid,
+            OutputCreate(
+                name="Event",
+                node_id=node.node_id,
+                primary_url="rtmps://a.rtmps.youtube.com/live2",
+                stream_key=SecretStr("synthetic-event-secret"),
+            ),
+            "event-output-key",
+        )
+        with store.transaction() as db:
+            db.execute("UPDATE youtube_bindings SET broadcast_id='event',stream_id='stream'")
+        headers = {"Origin": "http://testserver", "X-CSRF-Token": csrf}
+        url = f"/api/broadcasts/outputs/{output}/youtube-status"
+        for _ in range(2):
+            assert client.post(url, headers=headers).status_code == 200
+        status["health_status"] = "bad"
+        assert client.post(url, headers=headers).status_code == 200
+        with store.database.connect() as db:
+            events = db.execute(
+                "SELECT event_type,safe_detail_json FROM broadcast_events "
+                "WHERE event_type LIKE 'youtube.%'"
+            ).fetchall()
+        assert [e["event_type"] for e in events].count("youtube.stream_status") == 1
+        assert [e["event_type"] for e in events].count("youtube.health_change") == 2
+        assert all(e["safe_detail_json"] == "{}" for e in events)

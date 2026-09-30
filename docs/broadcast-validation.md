@@ -83,3 +83,50 @@ The FFmpeg 9 local spike decoded the encoded colons and slashes, masking that di
 SRT query generation now leaves those grammar separators literal; random URL-safe tokens
 stay scoped and encrypted. The failed run and its report remain available. No threshold
 or production binary was changed.
+
+B final source `dbc74b30ae538e1efd3ebcc22017aa9e284ee282` passed
+[run 36670498556](https://github.com/andreykutenkikh-byte/restream/actions/runs/36670498556):
+all original container/SSH/media gates, Chromium/WebKit and the dedicated Linux broadcast lab.
+Its base is `0b2197500896f4ec2f56b24d930f76f10ae09efe`; checkout logs prove synthetic merge
+`7c2429d8f77a4559fbdd0399b992734cf180b92e`, tested tree
+`2fbb0414dec622e99fbce9d923282b606f975119`. Linux lab FFmpeg 5.1.9 recorded 121/172/173
+frames, 112 common hashes and A/C advancing 182/179 frames during B failure, unchanged PIDs.
+Final local B suite was 905 passed, 23 skipped after the lease correction.
+
+A source `0b2197500896f4ec2f56b24d930f76f10ae09efe`, base
+`cf84fcdb0d5e58ae07ddca9fd783c0ca3c469d61`, was tested as synthetic merge
+`b8713bd631ffdb0642db1a218795522fc9744b6a`, tree
+`58267947857bac3e8eba9a1b19a6696ba5e3b8e1`. No stack commits were rewritten or rebased;
+C had uncommitted work while B fixes were added, then fast-forwarded to B's final head.
+
+## C switching gate
+
+The four-node real-media lab, measurement definitions, retained development failures and
+physical acceptance boundary are in [route-switch-acceptance.md](route-switch-acceptance.md).
+C reuses B's runtime and authority; schema 11 adds operator scope and measured publisher
+metadata. Source/merge/tree identity for C belongs in the final PR report so recording it
+does not create a new untested commit solely to change its own SHA.
+
+Local suite: 916 passed, 25 skipped (10 separately enabled engine cases and 15 existing
+POSIX cases). JavaScript: all 89 tests passed. Ruff, strict mypy for Linux, repository
+policy, migration preservation and release-boundary checks passed. A full-suite collection
+failure exposed equal unit/integration test basenames; the new unit file was renamed.
+The required tests were retained.
+
+Final native C run 005 passed after resource-reservation and partition-deadline fixes:
+179/171/171 multicast frames, 171 common hashes, unaffected A/C advancing 231/230 frames;
+B→D retained other publisher PIDs and decoded 122 frames. A→B and B→C both measured 0 ms
+mock RTMP receiver egress gap (overlap), source progress gap 3406/3406 ms, conservative
+phone receiver gap 5188/5250 ms. The independent watchdog stopped a real publisher after
+3063 ms on a synthetic 3000 ms grant, removed its runtime key and rejected cold stale replay.
+Full local Chromium run 009 passed all five scenarios in 186.13 seconds, including the
+standalone beta helper after the diagnosed Windows transport fix. Local WebKit/Docker
+remain host limitations; the unchanged mandatory Linux CI jobs cover both.
+
+Final requirement review added selected-output batch controls (individual controls retained)
+and deduplicated output/inter-relay/YouTube status events. The updated Chromium batch case
+passed, including selection surviving a render and an unchecked output remaining unchanged.
+The two added event tests bring the full Python gate to 916 passes. CI run 36674635482's
+original test and Chromium/WebKit jobs passed; its diagnosed expiry-test race and unchanged
+deadline fix are recorded in the route acceptance document. A new commit, not a blind rerun,
+receives the final full CI gate.

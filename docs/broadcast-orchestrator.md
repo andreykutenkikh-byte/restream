@@ -26,6 +26,19 @@ Migration 10 adds output-wide egress generations and temporary EgressCredentialL
 BroadcastOutput owns the canonical YouTubeCredential on the control plane; a relay receives
 it only while assigned a role. See [credential delta review](credential-leases.md).
 
+Migration 9 adds managed media nodes, forwarding and measured observations; migration 11
+adds separate operator pairing/session records and safe publisher/lease measurements.
+The current schema version is 11; the sparse applied sequence remains 1–5, 7–11, without
+claiming the unrelated migration 6. Existing Fernet encryption, admin sessions, CSRF/origin
+checks, node identity, SQLite transaction helpers, audit, templates and HUD pairing are reused.
+No existing bootstrap, native relay runtime or legacy permanent-key command is replaced.
+
+Required capabilities are `multi_output_v1`, `inter_relay_srt_v1`, `route_switch_v1`,
+`youtube_dual_ingest_v1`, `egress_credential_lease_v1`; heartbeat protocol is 2.
+The UI separates SERVER READY from PHONE → SERVER ROUTE MEASURED and publisher progress
+from confirmed viewer playback. See [switch state machine and Moblin workflow](live-route-switching.md),
+[actual acceptance](route-switch-acceptance.md), and [future staged plan](staged-broadcast-deployment.md).
+
 `manual` is the default policy. `assisted` provides recommendations only.
 The schema reserves `auto`, but activation is rejected and the database enforces
 `auto_enabled = 0`. No production deployment or real YouTube acceptance is implied.

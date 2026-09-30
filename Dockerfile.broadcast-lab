@@ -11,4 +11,4 @@ RUN uv sync --locked --no-dev --no-install-project
 COPY app ./app
 COPY scripts ./scripts
 ENV PATH="/app/.venv/bin:$PATH"
-ENTRYPOINT ["python", "-m", "scripts.broadcast_media_lab", "--mediamtx", "/usr/local/bin/mediamtx", "--directory", "/evidence/run"]
+ENTRYPOINT ["python", "-m", "scripts.broadcast_switch_lab", "--mediamtx", "/usr/local/bin/mediamtx", "--directory", "/evidence/run"]

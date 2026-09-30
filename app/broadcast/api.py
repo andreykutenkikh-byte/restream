@@ -18,6 +18,7 @@ from app.broadcast.models import (
     SessionCreate,
 )
 from app.broadcast.oauth import YouTubeOAuth
+from app.broadcast.read_model import snapshot as broadcast_snapshot
 from app.broadcast.store import BroadcastStore
 from app.broadcast.youtube import YouTube, YouTubeHTTP, YouTubeProvisioner
 from app.db import utc_now
@@ -70,7 +71,7 @@ def page(request: Request) -> Response:
 
 @router.get("/api/broadcasts", dependencies=[Depends(require_session)])
 def snapshot(request: Request) -> dict[str, Any]:
-    return store(request).snapshot()
+    return broadcast_snapshot(store(request))
 
 
 @router.post("/api/broadcasts/sessions", dependencies=[Depends(mutation)], status_code=201)
@@ -142,6 +143,19 @@ def youtube_status(request: Request, output_id: str) -> dict[str, str]:
         raise BroadcastError("output_not_provisioned")
     result = provider(request, output_id).status(binding["broadcast_id"], binding["stream_id"])
     with store(request).transaction() as db:
+        current = store(request).row(
+            db,
+            "SELECT b.*,o.session_id FROM youtube_bindings b JOIN broadcast_outputs o "
+            "ON o.id=b.output_id WHERE b.output_id=?",
+            (output_id,),
+        )
+        for field, event_type in (
+            ("stream_status", "youtube.stream_status"),
+            ("health_status", "youtube.health_change"),
+        ):
+            if current[field] != result[field]:
+                # Event type signals the change; never copy a provider body into audit detail.
+                store(request).event(db, current["session_id"], event_type, output_id=output_id)
         db.execute(
             "UPDATE youtube_bindings SET lifecycle_status=?,stream_status=?,health_status=?,"
             "updated_at=? WHERE output_id=?",

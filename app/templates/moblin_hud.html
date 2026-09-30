@@ -9,6 +9,11 @@
     <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/static/moblin-hud.css?v=20260904.1">
   <script src="/static/moblin-hud.js?v=20260914.1" defer></script>
+  {% if has_broadcasts %}
+  <link rel="stylesheet" href="/static/broadcasts.css">
+  <script src="/static/broadcast-route-ui.js" defer></script>
+  <script src="/static/broadcast-monitor.js" defer></script>
+  {% endif %}
   </head>
   <body data-hud-state="monitoring" data-hud-paired="{{ 'true' if hud_paired else 'false' }}">
     <main class="hud" aria-labelledby="hud-title">
@@ -62,6 +67,7 @@
       </nav>
 
       <p class="hud__updated" data-hud-updated>Статус ещё не получен</p>
+      {% if has_broadcasts %}<section id="broadcast-monitor" aria-label="Трансляции · только мониторинг"></section>{% endif %}
     </main>
 
     <section class="details-sheet" data-hud-details hidden role="dialog" aria-modal="true" aria-labelledby="hud-details-title">

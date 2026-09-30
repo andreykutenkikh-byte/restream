@@ -200,3 +200,58 @@ def test_profile_capacity_and_transport_rotation(store: BroadcastStore) -> None:
         )
     with pytest.raises(BroadcastError, match="incompatible"):
         control.desired("relay-b")
+
+
+def test_media_events_record_transitions_without_heartbeat_flood_or_secrets(
+    store: BroadcastStore,
+) -> None:  # noqa: F811
+    sid = session(store)
+    output = store.create_output(sid, manual_output("relay-b"), "event-output-fixture")
+    control, keys = enable_nodes(store)
+    store.intent(output, True, "event-start-fixture")
+    envelope = control.desired("relay-b")
+    plan = open_envelope(keys["relay-b"], envelope, "relay-b")
+    route, lease = plan["routes"][0]["id"], plan["routes"][0]["egress_lease"]
+    for sequence in range(2, 9):
+        lost = sequence >= 7
+        control.heartbeat(
+            "relay-b",
+            MediaHeartbeat(
+                boot_id="synthetic-agent-boot",
+                sequence=sequence,
+                public_key=public_key(keys["relay-b"]),
+                capabilities=sorted(CAPABILITIES),
+                plan_generation=envelope["context"]["generation"],
+                observations=[
+                    Observation(
+                        route_id=route,
+                        source_kind="unknown" if lost else "forwarded",
+                        source_identity="synthetic-event-source",
+                        video_pts=float(sequence),
+                        audio_pts=float(sequence),
+                        video_frames=sequence * 30,
+                        audio_packets=sequence * 48,
+                        bitrate_bps=4000000,
+                        publisher_connected=not lost,
+                        publisher_running=not lost,
+                        runtime_secret_present=True,
+                        publisher_frames=sequence * 30,
+                        publisher_bytes=sequence * 100000,
+                        egress_generation=lease["generation"],
+                        egress_lease_id=lease["id"],
+                        safe_error_code="source_lost" if lost else None,
+                    )
+                ],
+            ),
+        )
+    with store.database.connect() as db:
+        events = db.execute("SELECT event_type,safe_detail_json FROM broadcast_events").fetchall()
+    names = [e["event_type"] for e in events]
+    for expected in (
+        "output.live",
+        "output.failed",
+        "interrelay.connected",
+        "interrelay.disconnected",
+    ):
+        assert names.count(expected) == 1
+    assert "synthetic-key-one" not in str([tuple(e) for e in events])

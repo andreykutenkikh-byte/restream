@@ -13,6 +13,7 @@ import re
 import secrets
 import socket
 import ssl
+import sys
 import threading
 import time
 from collections.abc import Sequence
@@ -287,6 +288,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             server = uvicorn.Server(
                 uvicorn.Config(
                     app,
+                    # Avoid CPython's Windows Proactor TLS-reset detach failure.
+                    loop="asyncio:SelectorEventLoop" if sys.platform == "win32" else "auto",
                     host=HOST,
                     port=port,
                     ssl_keyfile=str(key_path),

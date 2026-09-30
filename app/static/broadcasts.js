@@ -5,6 +5,7 @@
   if (!root) return;
   let snapshot = null, loading = false, busy = false, timer = null;
   const pending = new Map();
+  const selectedOutputs = new Set();
   const csrf = () => document.querySelector('meta[name="csrf-token"]').content;
   const message = (value, error = false) => {
     const target = document.querySelector("#broadcast-message");
@@ -64,16 +65,24 @@
     root.replaceChildren();
     for (const session of snapshot.sessions) {
       const card = el("article", undefined, "broadcast-card"); card.append(el("h2", session.name));
+      card.dataset.sessionId = session.id;
       card.append(el("p", `Moblin → ${nodeName(session.ingress_node_id)} · ${session.policy} · 1080 × 1920 / 30`));
       const batch = el("div", undefined, "broadcast-actions");
-      for (const enabled of [true, false]) batch.append(button(enabled ? "Запустить все выходы" : "Остановить все выходы", async () => {
-        const result = await api("/api/broadcasts/outputs/intent", {output_ids: session.outputs.map(o => o.id), enabled}, `batch:${session.id}:${enabled}`);
+      for (const enabled of [true, false]) batch.append(button(enabled ? "Запустить выбранные" : "Остановить выбранные", async () => {
+        const outputIds = session.outputs.filter(o => selectedOutputs.has(o.id)).map(o => o.id);
+        if (!outputIds.length) throw new Error("Выберите хотя бы один выход");
+        const result = await api("/api/broadcasts/outputs/intent", {output_ids: outputIds, enabled}, `batch:${session.id}:${enabled}:${outputIds.sort().join(",")}`);
         const failed = result.results.filter(r => !r.accepted); if (failed.length) throw new Error(failed.map(r => r.code).join(", "));
       }));
       card.append(batch);
       for (const output of session.outputs) {
         const block = el("section", undefined, "broadcast-output");
+        block.dataset.outputId = output.id;
         block.append(el("h3", output.name), el("p", output.state, "broadcast-state"));
+        const selection = el("label", undefined, "broadcast-selection"), checkbox = el("input");
+        checkbox.type = "checkbox"; checkbox.checked = selectedOutputs.has(output.id);
+        checkbox.addEventListener("change", () => checkbox.checked ? selectedOutputs.add(output.id) : selectedOutputs.delete(output.id));
+        selection.append(checkbox, document.createTextNode(` Выбрать ${output.name}`)); block.append(selection);
         block.append(el("p", `YouTube: ${output.youtube.lifecycle_status} · Приём: ${output.youtube.stream_status} · Зритель: UNKNOWN`));
         if (output.safe_error_code) block.append(el("p", output.safe_error_code));
         const controls = el("div", undefined, "broadcast-actions");
@@ -90,6 +99,7 @@
         const routes = el("div", undefined, "broadcast-routes");
         for (const route of output.routes) {
           const routeCard = el("div", undefined, "broadcast-route");
+          routeCard.dataset.routeId = route.id;
           routeCard.append(el("strong", nodeName(route.node_id)), el("p", `${route.role} · ${route.youtube_slot || "Свободный слот"}`));
           routeCard.append(el("p", `Источник: ${route.source_kind} · Телефон → резерв: UNKNOWN`));
           routes.append(routeCard);
