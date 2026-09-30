@@ -7,7 +7,12 @@ from typing import Any
 
 import pytest
 import test_moblin_hud_browser as hud_fixtures
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from test_moblin_hud_browser import HudServer
+
+from app.broadcast.envelope import public_key
+from app.broadcast.media_control import MediaHeartbeat, MediaNodeEnable
+from app.broadcast.models import CAPABILITIES, ResourceLimits
 
 browser = hud_fixtures.browser
 hud_server = hud_fixtures.hud_server
@@ -24,6 +29,17 @@ def test_broadcast_forms_independent_outputs_and_reload_secrecy(
 ) -> None:
     context = browser.new_context(ignore_https_errors=True)
     try:
+        media_key = X25519PrivateKey.generate()
+        node_id = hud_server.app.state.relays.authenticate(hud_server.token)["node_id"]
+        hud_server.app.state.broadcast_media.enable(
+            node_id,
+            MediaNodeEnable(
+                public_key=public_key(media_key),
+                srt_host="127.0.0.1",
+                srt_port=19000,
+                limits=ResourceLimits(),
+            ),
+        )
         page = context.new_page()
         errors = []
         page.on("pageerror", lambda error: errors.append(str(error)))
@@ -42,6 +58,16 @@ def test_broadcast_forms_independent_outputs_and_reload_secrecy(
             page.locator("#output-form button").click()
             page.get_by_role("heading", name=f"Output {suffix}").wait_for()
             assert page.locator('[name="stream_key"]').input_value() == ""
+        hud_server.app.state.broadcast_media.heartbeat(
+            node_id,
+            MediaHeartbeat(
+                boot_id="synthetic-browser-boot",
+                sequence=1,
+                public_key=public_key(media_key),
+                capabilities=sorted(CAPABILITIES),
+                plan_generation=0,
+            ),
+        )
         page.locator(".broadcast-output").first.get_by_role(
             "button", name="Начать передачу", exact=True
         ).click()

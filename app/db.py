@@ -9,7 +9,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from app.broadcast.schema import SCHEMA_VERSION
+from app.broadcast.egress_schema import SCHEMA_VERSION
+from app.broadcast.egress_schema import migrate as migrate_egress
+from app.broadcast.media_schema import migrate as migrate_media
 from app.broadcast.schema import migrate as migrate_broadcast
 
 # Migration 6 belongs to the separate native relay classification release.
@@ -474,6 +476,8 @@ class Database:
             )
 
             migrate_broadcast(connection)
+            migrate_media(connection)
+            migrate_egress(connection)
 
     def ready(self) -> bool:
         try:

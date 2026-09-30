@@ -11,7 +11,13 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 CAPABILITIES = frozenset(
-    {"multi_output_v1", "inter_relay_srt_v1", "route_switch_v1", "youtube_dual_ingest_v1"}
+    {
+        "multi_output_v1",
+        "inter_relay_srt_v1",
+        "route_switch_v1",
+        "youtube_dual_ingest_v1",
+        "egress_credential_lease_v1",
+    }
 )
 YOUTUBE_HOSTS = frozenset(
     {"a.rtmps.youtube.com", "b.rtmps.youtube.com", "a.rtmp.youtube.com", "b.rtmp.youtube.com"}

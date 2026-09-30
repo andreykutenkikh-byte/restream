@@ -21,6 +21,9 @@ from app.api import router
 from app.bootstrap_api import BootstrapRateLimiter
 from app.bootstrap_api import router as bootstrap_router
 from app.broadcast.api import router as broadcast_router
+from app.broadcast.media_api import MediaBodyLimitMiddleware
+from app.broadcast.media_api import router as broadcast_media_router
+from app.broadcast.media_control import MediaControl
 from app.broadcast.models import BroadcastError
 from app.broadcast.oauth import YouTubeOAuth
 from app.broadcast.store import BroadcastStore
@@ -163,6 +166,10 @@ def create_app(
     app.state.settings = settings
     app.state.database = database
     app.state.broadcasts = BroadcastStore(database, settings.master_encryption_key)
+    app.state.broadcast_media = MediaControl(
+        app.state.broadcasts, test_loopback=settings.environment == "test"
+    )
+    app.state.broadcasts.admission = app.state.broadcast_media.admit
     app.state.youtube_oauth = YouTubeOAuth(
         app.state.broadcasts,
         settings.youtube_client_id,
@@ -205,6 +212,7 @@ def create_app(
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
     app.add_middleware(NodeBodyLimitMiddleware)
     app.add_middleware(HudBodyLimitMiddleware)
+    app.add_middleware(MediaBodyLimitMiddleware)
     app.mount("/static", StaticFiles(directory=PACKAGE_DIR / "static"), name="static")
     app.include_router(router)
     app.include_router(node_router)
@@ -213,6 +221,7 @@ def create_app(
     app.include_router(bootstrap_router)
     app.include_router(moblin_hud_router)
     app.include_router(broadcast_router)
+    app.include_router(broadcast_media_router)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Callable[..., Any]) -> Any:
@@ -239,7 +248,14 @@ def create_app(
             "base-uri 'none'; form-action 'self'"
         )
         if request.url.path.startswith(
-            ("/api/", "/node-api/", "/relay-agent/", "/relay-media/", "/moblin-hud")
+            (
+                "/api/",
+                "/node-api/",
+                "/relay-agent/",
+                "/relay-media/",
+                "/moblin-hud",
+                "/broadcast-agent/",
+            )
         ) or request.url.path in {
             "/",
             "/login",
