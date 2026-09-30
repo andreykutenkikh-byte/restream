@@ -1,5 +1,9 @@
 # YouTube Live integration
 
+BroadcastOutput owns YouTubeCredential; a relay receives a temporary EgressCredentialLease.
+See [credential authority and correction](credential-leases.md). No standby key provisioning
+or permanent orchestrated node configuration is required.
+
 Reviewed 2026-09-30 against the official [liveStreams resource](https://developers.google.com/youtube/v3/live/docs/liveStreams),
 [liveBroadcasts resource](https://developers.google.com/youtube/v3/live/docs/liveBroadcasts),
 [broadcast lifecycle](https://developers.google.com/youtube/v3/live/life-of-a-broadcast)

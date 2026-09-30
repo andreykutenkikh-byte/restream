@@ -1,5 +1,8 @@
 # Independent outputs
 
+Each BroadcastOutput owns its credential on the control plane. A relay receives only a
+temporary egress lease for its role; [credential details](credential-leases.md).
+
 Create one broadcast session for a Moblin source, then add outputs on different enabled
 relay nodes. Each output has its own unique YouTube key (manual mode) or dedicated
 liveBroadcast/liveStream binding (API mode). Independent outputs may belong to the same

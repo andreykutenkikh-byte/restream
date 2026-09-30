@@ -56,7 +56,7 @@
       "source_pid_preserved": true,
       "other_publisher_pids_preserved": true,
       "unaffected_frames_during_failure": [
-        175,
+        176,
         174
       ],
       "independent_stop_restart": "PASS",

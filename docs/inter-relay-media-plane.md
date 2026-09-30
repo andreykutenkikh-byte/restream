@@ -44,7 +44,8 @@ instance (MoQ otherwise opens port 8892 by default in 1.19.2).
 Admin enables a node with a pinned X25519 public key, SRT address/port, explicit resource
 limits and media profile. Only then can its existing authenticated node identity use
 `/broadcast-agent/v2/heartbeat`. Required capabilities are exactly `multi_output_v1`,
-`inter_relay_srt_v1`, `route_switch_v1`, `youtube_dual_ingest_v1`. Legacy nodes continue
+`inter_relay_srt_v1`, `route_switch_v1`, `youtube_dual_ingest_v1`,
+`egress_credential_lease_v1`. Legacy nodes continue
 their existing endpoint and are rejected for new publishing/switch admission.
 
 The response is an X25519 + HKDF-SHA256 + ChaCha20-Poly1305 envelope over verified HTTPS.
@@ -57,8 +58,9 @@ fingerprint and rejects old, expired or conflicting intent after restart.
 YouTube and transport credentials use the existing database master-key encryption.
 Direct-source passwords are derived separately per node. Forwarding passwords rotate when
 a route is stopped and re-enabled. New remote admissions reject expired leases. Established
-publishers and forwarding connections survive controller outages; an expired credential
-cannot open a new remote connection. Local retries of already accepted publishers are
+publishers survive controller outages within their 300-second egress lease. A 250 ms
+watchdog stops expired publishers and clears runtime credentials and command arguments.
+An expired credential cannot open a new remote connection. Local publisher retries are
 bounded to five consecutive failures with exponential backoff, and reset after stable
 progress. Explicit revoke/HTTP 401 or 403 stops the agent. No raw command, URL, node token
 or passphrase is logged. MediaMTX and FFmpeg diagnostics can contain secrets, so runtime
@@ -91,3 +93,6 @@ The local spike found and fixed a default MoQ listener collision and FFmpeg's RT
 `timeout` option (SRT uses `rw_timeout`). The FFmpeg 9 SRT library also reports empty control
 message warnings against this peer; actual decoding, timestamps and frame identity are
 tested rather than inferring success from a socket. See the acceptance evidence for results.
+
+BroadcastOutput owns YouTubeCredential. Relays receive temporary EgressCredentialLease
+assignments; see [credential authority and delta review](credential-leases.md).

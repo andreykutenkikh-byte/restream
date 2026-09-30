@@ -11,6 +11,7 @@ from typing import Any, Literal
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
 from pydantic import Field
 
+from app.broadcast.egress import EgressLeases
 from app.broadcast.envelope import decode, seal
 from app.broadcast.models import CAPABILITIES, BroadcastError, Input, MediaProfile, ResourceLimits
 from app.broadcast.store import BroadcastStore
@@ -40,6 +41,8 @@ class Observation(Input):
     publisher_frames: int = Field(default=0, ge=0, le=10**12)
     publisher_time_us: int = Field(default=0, ge=0, le=10**18)
     publisher_connected: bool = False
+    egress_generation: int = Field(default=0, ge=0, le=10**15)
+    egress_lease_id: str | None = Field(default=None, max_length=64)
     safe_error_code: Literal["publisher_failed", "source_lost", "retry_exhausted"] | None = None
 
 
@@ -57,6 +60,8 @@ class MediaControl:
     def __init__(self, store: BroadcastStore, *, test_loopback: bool = False) -> None:
         self.store = store
         self.test_loopback = test_loopback
+        self.egress = EgressLeases(store)
+        store.egress_sync = self.egress.sync
 
     def admit(self, db: Any, output_id: str, target_route: str | None = None) -> None:
         route = self.store.row(
@@ -226,6 +231,15 @@ class MediaControl:
                 old = db.execute(
                     "SELECT * FROM broadcast_media_observations WHERE route_id=?", (obs.route_id,)
                 ).fetchone()
+                if obs.publisher_connected:
+                    lease = db.execute(
+                        "SELECT 1 FROM broadcast_egress_leases WHERE id=? AND node_id=? "
+                        "AND route_id=? AND generation=? AND state='ACTIVE' AND expires_at>?",
+                        (obs.egress_lease_id, node_id, obs.route_id, obs.egress_generation, now),
+                    ).fetchone()
+                    if not lease:
+                        # Old generations cannot prove readiness. Send current intent.
+                        continue
                 moving = bool(
                     old
                     and obs.source_identity
@@ -293,6 +307,8 @@ class MediaControl:
     def desired(self, node_id: str) -> dict[str, Any]:
         with self.store.transaction() as db:
             node = self.ready_node(db, node_id)
+            for output in db.execute("SELECT id FROM broadcast_outputs").fetchall():
+                self.egress.sync(db, output["id"])
             routes = db.execute(
                 "SELECT r.*,s.source_id,src.ingress_node_id,src.profile_json,"
                 "o.session_id,o.desired_enabled AS output_enabled,b.credentials_encrypted "
@@ -313,7 +329,10 @@ class MediaControl:
                     raise BroadcastError("media_profile_incompatible")
             db.execute(
                 "UPDATE broadcast_forwarding SET enabled=0 WHERE route_id IN "
-                "(SELECT id FROM broadcast_routes WHERE desired_enabled=0)"
+                "(SELECT r.id FROM broadcast_routes r JOIN broadcast_outputs o ON o.id=r.output_id "
+                "JOIN broadcast_sessions s ON s.id=o.session_id "
+                "JOIN broadcast_sources src ON src.id=s.source_id "
+                "WHERE (r.desired_enabled=0 AND r.media_warm=0) OR src.ingress_node_id=r.node_id)"
             )
             if len(publishing) > limits.max_publishers_per_node:
                 raise BroadcastError("publisher_limit")
@@ -348,21 +367,38 @@ class MediaControl:
                     "source_id": source_id,
                     "profile": json.loads(route["profile_json"]),
                     "enabled": bool(route["desired_enabled"]),
+                    "media_enabled": bool(route["desired_enabled"] or route["media_warm"]),
+                    "youtube_slot": route["youtube_slot"],
                     "generation": route["generation"],
+                    "egress_generation": self.store.row(
+                        db,
+                        "SELECT generation FROM broadcast_egress_authority WHERE output_id=?",
+                        (route["output_id"],),
+                    )["generation"],
+                    "egress_lease": None,
                     "forward": None,
                     "destination": None,
                 }
-                if route["desired_enabled"]:
-                    if route["ingress_node_id"] != node_id:
-                        forward = self.ensure_forward(db, route, route["ingress_node_id"])
-                        source = self.ready_node(db, forward["source_node_id"])
-                        item["forward"] = {
-                            "source_node_id": forward["source_node_id"],
-                            "host": source["srt_host"],
-                            "port": source["srt_port"],
-                            "path": f"relay/{source_id}/{route['id']}/{forward['generation']}",
-                            **self.store.unseal(forward["encrypted"]),
-                        }
+                if (route["desired_enabled"] or route["media_warm"]) and route[
+                    "ingress_node_id"
+                ] != node_id:
+                    forward = self.ensure_forward(db, route, route["ingress_node_id"])
+                    source = self.ready_node(db, forward["source_node_id"])
+                    item["forward"] = {
+                        "source_node_id": forward["source_node_id"],
+                        "host": source["srt_host"],
+                        "port": source["srt_port"],
+                        "path": f"relay/{source_id}/{route['id']}/{forward['generation']}",
+                        **self.store.unseal(forward["encrypted"]),
+                    }
+                grant = (
+                    self.egress.grant(db, route["id"], node_id)
+                    if route["desired_enabled"]
+                    else None
+                )
+                item["enabled"] = bool(grant)
+                if grant:
+                    item["egress_lease"] = grant
                     if not route["credentials_encrypted"]:
                         raise BroadcastError("output_not_provisioned")
                     credentials = self.store.unseal(route["credentials_encrypted"])

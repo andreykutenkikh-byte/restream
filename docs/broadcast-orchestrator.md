@@ -22,6 +22,10 @@ allowlisted; credentials use the existing master-key Fernet mechanism. Durable
 request keys reject reuse with different bodies, including changed credentials.
 The controller never handles media packets.
 
+Migration 10 adds output-wide egress generations and temporary EgressCredentialLease.
+BroadcastOutput owns the canonical YouTubeCredential on the control plane; a relay receives
+it only while assigned a role. See [credential delta review](credential-leases.md).
+
 `manual` is the default policy. `assisted` provides recommendations only.
 The schema reserves `auto`, but activation is rejected and the database enforces
 `auto_enabled = 0`. No production deployment or real YouTube acceptance is implied.

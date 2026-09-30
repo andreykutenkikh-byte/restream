@@ -43,7 +43,7 @@ def launch(argv: list[str], *, progress: bool = False) -> subprocess.Popen[str]:
         stdout=subprocess.PIPE if progress else subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         text=True,
-        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
 
 
@@ -221,10 +221,14 @@ class MediaRuntime:
         self.issued_at = ""
         self.fence_file = directory / "accepted-lease.json"
         self.fingerprint = ""
+        self.output_fences: dict[str, int] = {}
+        self.restarted = False
         if self.fence_file.exists():
             prior = json.loads(self.fence_file.read_text(encoding="utf-8"))
             self.generation, self.issued_at = prior["generation"], prior["issued_at"]
             self.fingerprint = prior["fingerprint"]
+            self.output_fences = prior.get("output_fences", {})
+            self.restarted = True
         self.expires_at = ""
         self.local_password = secrets.token_urlsafe(32)
         self.paths: dict[str, dict[str, Any]] = {}
@@ -234,6 +238,8 @@ class MediaRuntime:
         self.source_switches: dict[str, dict[str, float]] = {}
         self.last_observations: list[dict[str, Any]] = []
         self.probes: dict[str, PacketProbe] = {}
+        self.egress_lock = threading.RLock()
+        self.ending = threading.Event()
         runtime = self
 
         class AuthHandler(BaseHTTPRequestHandler):
@@ -292,6 +298,25 @@ class MediaRuntime:
         else:
             self.close()
             raise RuntimeError("media_server_unavailable")
+        self.expiry_thread = threading.Thread(target=self._expiry_watchdog, daemon=True)
+        self.expiry_thread.start()
+
+    def _expiry_watchdog(self) -> None:
+        while not self.ending.wait(0.25):
+            self.expire_egress()
+
+    def expire_egress(self) -> None:
+        with self.egress_lock:
+            now = datetime.now(UTC).isoformat()
+            for route in self.plan["routes"]:
+                lease = route.get("egress_lease")
+                if lease and lease["expires_at"] <= now:
+                    route["enabled"] = False
+                    route["destination"] = route["egress_lease"] = None
+                    existing = self.publishers.pop(route["id"], None)
+                    if existing:
+                        existing[1].close()
+                        existing[1].argv.clear()
 
     def authorize(self, request: dict[str, Any]) -> bool:
         path, user, password = request.get("path"), request.get("user"), request.get("password", "")
@@ -336,6 +361,10 @@ class MediaRuntime:
             raise RuntimeError("media_path_configuration_failed")
 
     def accept(self, envelope: dict[str, Any]) -> None:
+        with self.egress_lock:
+            self._accept(envelope)
+
+    def _accept(self, envelope: dict[str, Any]) -> None:
         context = envelope["context"]
         payload = open_envelope(self.private_key, envelope, self.node_id)
         now = datetime.now(UTC).isoformat()
@@ -343,6 +372,7 @@ class MediaRuntime:
             context["generation"] < self.generation
             or context["expires_at"] <= now
             or context["issued_at"] < self.issued_at
+            or (self.restarted and context["issued_at"] <= self.issued_at)
         ):
             raise ValueError("Stale media lease")
         lifetime = (
@@ -362,11 +392,29 @@ class MediaRuntime:
             raise ValueError("Publisher limit exceeded")
         for route in payload["routes"]:
             MediaProfile.model_validate(route["profile"])
+            if route["egress_generation"] < self.output_fences.get(route["output_id"], 0):
+                raise ValueError("Stale egress generation")
+            lease = route["egress_lease"]
+            if route["enabled"] != bool(lease and route["destination"]):
+                raise ValueError("Egress assignment requires a credential lease")
+            if lease and (
+                lease["output_id"] != route["output_id"]
+                or lease["node_id"] != self.node_id
+                or lease["youtube_slot"] != route["youtube_slot"]
+                or lease["generation"] != route["egress_generation"]
+                or lease["expires_at"] <= now
+                or (datetime.fromisoformat(lease["expires_at"]) - datetime.now(UTC)).total_seconds()
+                > 301
+            ):
+                raise ValueError("Invalid egress lease")
             if route["destination"]:
                 youtube_endpoint(route["destination"]["endpoint"])
+        for route in payload["routes"]:
+            self.output_fences[route["output_id"]] = route["egress_generation"]
         self.plan, self.generation = payload, context["generation"]
         self.issued_at, self.expires_at = context["issued_at"], context["expires_at"]
         self.fingerprint = fingerprint
+        self.restarted = False
         temporary = self.fence_file.with_suffix(".tmp")
         temporary.write_text(
             json.dumps(
@@ -374,11 +422,14 @@ class MediaRuntime:
                     "generation": self.generation,
                     "issued_at": self.issued_at,
                     "fingerprint": fingerprint,
+                    "output_fences": self.output_fences,
                 }
             ),
             encoding="utf-8",
         )
         temporary.replace(self.fence_file)
+        if os.name != "nt":
+            self.fence_file.chmod(0o600)
         wanted = set()
         for source_id, secret in payload["sources"].items():
             path = f"source/{source_id}/direct"
@@ -418,8 +469,10 @@ class MediaRuntime:
             del self.paths[path]
         enabled_ids = {r["id"] for r in enabled}
         for route_id in self.publishers.keys() - enabled_ids:
-            self.publishers.pop(route_id)[1].close()
-        forward_ids = {r["id"] for r in enabled if r["forward"]}
+            removed = self.publishers.pop(route_id)[1]
+            removed.close()
+            removed.argv.clear()
+        forward_ids = {r["id"] for r in payload["routes"] if r["media_enabled"] and r["forward"]}
         for route_id in self.forwarders.keys() - forward_ids:
             self.forwarders.pop(route_id)[1].close()
 
@@ -483,7 +536,11 @@ class MediaRuntime:
                 return None
             source_identity = str(response.json().get("source", {}).get("id", path))
             existing = self.probes.get(path)
-            if existing and existing.identity == source_identity:
+            if (
+                existing
+                and existing.identity == source_identity
+                and existing.process.poll() is None
+            ):
                 return existing.observation()
             if existing:
                 existing.close()
@@ -509,7 +566,7 @@ class MediaRuntime:
                 timeout=6,
                 check=False,
                 text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             if probe.returncode:
                 return None
@@ -535,11 +592,12 @@ class MediaRuntime:
             return None
 
     def tick(self) -> list[dict[str, Any]]:
+        self.expire_egress()
         observations = []
         probes: dict[str, dict[str, Any] | None] = {}
         for route in self.plan["routes"]:
             route_id = route["id"]
-            if not route["enabled"]:
+            if not route["media_enabled"]:
                 observations.append({"route_id": route_id, "source_kind": "unknown"})
                 continue
             direct_path = f"source/{route['source_id']}/direct"
@@ -594,23 +652,38 @@ class MediaRuntime:
                     }
                 )
                 continue
+            if not route["enabled"]:
+                observations.append(
+                    {"route_id": route_id, "source_kind": source_kind, **measurement}
+                )
+                continue
             dest = route["destination"]
+            if dest is None:
+                continue
             parsed = urlsplit(dest["endpoint"])
-            destination = self.test_destinations.get(route["output_id"]) or urlunsplit(
-                (
-                    parsed.scheme,
-                    parsed.netloc,
-                    f"{parsed.path}/{quote(dest['stream_key'], safe='')}",
-                    parsed.query,
-                    "",
+            destination = (
+                self.test_destinations.get(route["output_id"] + ":" + route["youtube_slot"])
+                or self.test_destinations.get(route["output_id"])
+                or urlunsplit(
+                    (
+                        parsed.scheme,
+                        parsed.netloc,
+                        f"{parsed.path}/{quote(dest['stream_key'], safe='')}",
+                        parsed.query,
+                        "",
+                    )
                 )
             )
-            worker = self._worker(
-                self.publishers,
-                route_id,
-                selected + destination,
-                self._copy(self.local_url(selected), destination),
-            )
+            with self.egress_lock:
+                lease = route["egress_lease"]
+                if not lease or lease["expires_at"] <= datetime.now(UTC).isoformat():
+                    continue
+                worker = self._worker(
+                    self.publishers,
+                    route_id,
+                    selected + destination,
+                    self._copy(self.local_url(selected), destination),
+                )
             if source_kind == "direct" and route_id in self.forwarders and worker.connected:
                 self.forwarders.pop(route_id)[1].close()
             switch = self.source_switches.get(route_id)
@@ -623,6 +696,8 @@ class MediaRuntime:
                 "publisher_frames": worker.frames,
                 "publisher_time_us": worker.time_us,
                 "publisher_connected": worker.connected,
+                "egress_generation": lease["generation"],
+                "egress_lease_id": lease["id"],
             }
             if worker.failures >= 5:
                 observation["safe_error_code"] = "retry_exhausted"
@@ -631,6 +706,9 @@ class MediaRuntime:
         return observations
 
     def close(self) -> None:
+        self.ending.set()
+        if hasattr(self, "expiry_thread"):
+            self.expiry_thread.join(timeout=4)
         for probe in self.probes.values():
             probe.close()
         self.probes.clear()
@@ -638,6 +716,7 @@ class MediaRuntime:
             worker.close()
         self.publishers.clear()
         self.forwarders.clear()
+        self.plan = {"routes": [], "exports": [], "sources": {}}
         if hasattr(self, "media"):
             stop(self.media)
         self.auth_server.shutdown()

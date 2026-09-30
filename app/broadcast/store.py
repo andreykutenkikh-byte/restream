@@ -23,6 +23,7 @@ class BroadcastStore:
         self.master_key = master_key
         self.limits = ResourceLimits()
         self.admission: Callable[[sqlite3.Connection, str], None] | None = None
+        self.egress_sync: Callable[[sqlite3.Connection, str], None] | None = None
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -268,6 +269,8 @@ class BroadcastStore:
                 "output.start_requested" if enabled else "output.stop_requested",
                 output_id=output_id,
             )
+            if self.egress_sync is not None:
+                self.egress_sync(db, output_id)
             self.remember(db, scope, key, enabled, output_id)
             return output_id
 

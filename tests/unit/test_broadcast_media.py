@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -112,6 +113,7 @@ def test_moving_audio_video_and_publisher_are_separate_from_socket_connect(
     store.intent(output, True, "synthetic-media-start")
     envelope = control.desired("relay-a")
     generation = envelope["context"]["generation"]
+    lease = open_envelope(keys["relay-a"], envelope, "relay-a")["routes"][0]["egress_lease"]
     route = store.snapshot()["sessions"][0]["outputs"][0]["routes"][0]["id"]
     for seq in range(2, 6):
         data = MediaHeartbeat(
@@ -132,6 +134,8 @@ def test_moving_audio_video_and_publisher_are_separate_from_socket_connect(
                     bitrate_bps=4_000_000,
                     publisher_frames=100,
                     publisher_connected=True,
+                    egress_generation=lease["generation"],
+                    egress_lease_id=lease["id"],
                 )
             ],
         )
@@ -152,6 +156,8 @@ def test_agent_rejects_expired_fenced_changed_or_overcommitted_plans(tmp_path: P
     private = X25519PrivateKey.generate()
     runtime = object.__new__(MediaRuntime)
     runtime.private_key, runtime.node_id = private, "relay-a"
+    runtime.egress_lock = threading.RLock()
+    runtime.restarted = False
     runtime.generation, runtime.issued_at, runtime.fingerprint = 3, "", "different"
     now = datetime.now(UTC)
     context = {

@@ -62,3 +62,16 @@ corrections; 006 includes durable agent fencing and per-node direct source crede
 The release-boundary test also caught an attempted shared middleware prefix edit; that
 edit was reverted and an existing unprotected body-limiter is reused instead. No legacy
 runtime hash or 90-frame threshold was changed.
+
+## Credential correction and first B CI failure
+
+B [run 36668310606](https://github.com/andreykutenkikh-byte/restream/actions/runs/36668310606)
+failed Linux typecheck on Windows-only subprocess.CREATE_NO_WINDOW. The new lab also could
+not write its bind-mounted report directory with all capabilities dropped. Chromium and
+WebKit passed. Fixes use an optional platform constant and the invoking user's UID/GID;
+no privileges were added, no media threshold changed, no failed run rerun.
+
+Migration 10 implements the owner's explicit credential correction. Native lab 007 passed
+with leases: 172/165/165 frames, 165 common hashes, A/C advanced 176/174 frames while B failed.
+New security tests cover expiry, revocation, removal, cold restart, stale replay, duplicate
+intent, and secret-free durable state. A fresh controller plan is required on cold restart.
