@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Трансляции · AdoJapan Restream{% endblock %}
+{% block head %}<link rel="stylesheet" href="/static/broadcasts.css">{% endblock %}
+{% block header %}
+<header class="site-header"><nav class="shell primary-nav" aria-label="Основные разделы">
+  <a class="primary-nav__link" href="/">Трансляция</a>
+  <a class="primary-nav__link" href="/servers">Серверы</a>
+  <a class="primary-nav__link" href="/broadcasts" aria-current="page">Трансляции</a>
+</nav></header>
+{% endblock %}
+{% block content %}
+<div class="shell broadcast-layout">
+  <header><p class="eyebrow">AdoJapan · Broadcast Orchestrator</p><h1>Трансляции</h1>
+    <p>Один источник Moblin. Независимые выходы и управляемое переключение серверов.</p></header>
+  <p id="broadcast-message" role="status" aria-live="polite"></p>
+  <div class="broadcast-forms">
+    <section class="broadcast-card"><h2>Новая сессия</h2>
+      <form id="session-form">
+        <label>Название <input name="name" required maxlength="120" autocomplete="off"></label>
+        <label>Входящий сервер <select name="ingress_node_id" class="node-select" required></select></label>
+        <label>Режим <select name="policy"><option value="manual">Ручное управление</option>
+          <option value="assisted">Подсказки оператору</option></select></label>
+        <button class="button" type="submit">Создать сессию</button>
+      </form>
+    </section>
+    <section class="broadcast-card"><h2>Добавить выход</h2>
+      <form id="output-form">
+        <label>Сессия <select name="session_id" id="session-select" required></select></label>
+        <label>Название / заголовок YouTube <input name="name" required maxlength="120"></label>
+        <label>Сервер выхода <select name="node_id" class="node-select" required></select></label>
+        <label>Подключение <select name="mode" id="output-mode"><option value="manual">YouTube вручную</option>
+          <option value="youtube_api">YouTube API</option></select></label>
+        <div id="manual-fields">
+          <label>Основной RTMPS адрес <input name="primary_url" value="rtmps://a.rtmps.youtube.com/live2" maxlength="256"></label>
+          <label>Резервный RTMPS адрес <input name="backup_url" placeholder="Необязательно" maxlength="256"></label>
+          <label>Ключ YouTube <input name="stream_key" type="password" autocomplete="new-password" maxlength="256"></label>
+          <p>У каждого независимого выхода должен быть свой ключ. После сохранения ключ скрыт.</p>
+        </div>
+        <div id="api-fields" hidden>
+          <label>Канал <select name="channel_id" id="channel-select"></select></label>
+          <label>Доступ <select name="visibility"><option value="unlisted">По ссылке</option>
+            <option value="private">Личное</option><option value="public">Открытое</option></select></label>
+          <label>Начало, UTC <input name="scheduled_start" type="datetime-local"></label>
+          <p>Сначала сохраните выход, затем нажмите «Создать событие».</p>
+        </div>
+        <button class="button" type="submit">Сохранить выход</button>
+      </form>
+    </section>
+  </div>
+  <section class="broadcast-card"><h2>YouTube-каналы</h2><div id="channels"></div>
+    <button class="button button--quiet" id="youtube-connect" type="button">Подключить канал через Google</button>
+  </section>
+  <section aria-label="Сессии трансляций" id="broadcast-sessions"></section>
+  <p>Автоматическое переключение выключено. Готовность сервера не означает, что маршрут телефона до него измерен.
+    Передача на YouTube и воспроизведение у зрителя проверяются отдельно.</p>
+</div>
+{% endblock %}
+{% block scripts %}<script src="/static/broadcasts.js" defer></script>{% endblock %}

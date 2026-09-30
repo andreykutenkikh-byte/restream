@@ -19,6 +19,7 @@ from typing import Any, cast
 import pytest
 from test_moblin_hud import seed_existing_schema_v5_data
 
+from app.broadcast.schema import TABLES as BROADCAST_TABLES
 from app.db import Database
 from app.services.moblin_hud import (
     HudSessionAuthenticationError,
@@ -157,9 +158,9 @@ def test_pinned_main_upgrade_preserves_all_data_schema_sequences_and_admin_auth(
         candidate = Database(main.path)  # Fresh instance models process reopen.
         candidate.migrate()
         assert candidate.ready()
-        assert versions(candidate) == [1, 2, 3, 4, 5, 7]
+        assert versions(candidate) == [1, 2, 3, 4, 5, 7, 8]
         assert [
-            entry for entry in schema(candidate) if entry[2] not in HUD_TABLES
+            entry for entry in schema(candidate) if entry[2] not in HUD_TABLES | BROADCAST_TABLES
         ] == original_schema
         actual = rows(candidate, main_columns)
         actual["schema_migrations"] = [row for row in actual["schema_migrations"] if row[0] <= 5]
@@ -214,8 +215,11 @@ def test_actual_combined_migration_fills_v6_without_changing_existing_or_hud_sta
     for _ in range(2):
         combined = pinned_database("combined", main.path)
         combined.migrate()
+        assert not combined.ready(), "Older image cannot claim readiness for schema 8"
+        combined = Database(main.path)
+        combined.migrate()
         assert combined.ready()
-        assert versions(combined) == [1, 2, 3, 4, 5, 6, 7]
+        assert versions(combined) == [1, 2, 3, 4, 5, 6, 7, 8]
         assert rows(combined, original_columns, exclude_v6=True) == original_rows
         changed_tables = {"restream_nodes", "node_install_jobs"}
         assert [entry for entry in schema(combined) if entry[2] not in changed_tables] == [
@@ -352,5 +356,5 @@ def test_failed_hud_ddl_rolls_back_tables_indexes_and_marker_together(
     assert main.ready()
     candidate.migrate()
     assert candidate.ready()
-    assert versions(candidate) == [1, 2, 3, 4, 5, 7]
+    assert versions(candidate) == [1, 2, 3, 4, 5, 7, 8]
     assert_integrity(candidate)
