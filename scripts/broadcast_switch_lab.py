@@ -393,7 +393,9 @@ class SwitchingLab(Lab):
         runtime.accept(envelope)
         self.offline.add(node)
         started = time.monotonic()
-        while process.poll() is None and time.monotonic() - started < 7:
+        while (
+            process.poll() is None or route_id in runtime.publishers or worker.argv
+        ) and time.monotonic() - started < 7:
             time.sleep(0.05)  # Deliberately no tick/heartbeat: independent watchdog only.
         assert process.poll() is not None
         elapsed_ms = round((time.monotonic() - started) * 1000, 1)

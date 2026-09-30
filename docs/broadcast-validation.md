@@ -107,7 +107,7 @@ C reuses B's runtime and authority; schema 11 adds operator scope and measured p
 metadata. Source/merge/tree identity for C belongs in the final PR report so recording it
 does not create a new untested commit solely to change its own SHA.
 
-Local suite: 914 passed, 25 skipped (10 separately enabled engine cases and 15 existing
+Local suite: 916 passed, 25 skipped (10 separately enabled engine cases and 15 existing
 POSIX cases). JavaScript: all 89 tests passed. Ruff, strict mypy for Linux, repository
 policy, migration preservation and release-boundary checks passed. A full-suite collection
 failure exposed equal unit/integration test basenames; the new unit file was renamed.
@@ -122,3 +122,11 @@ phone receiver gap 5188/5250 ms. The independent watchdog stopped a real publish
 Full local Chromium run 009 passed all five scenarios in 186.13 seconds, including the
 standalone beta helper after the diagnosed Windows transport fix. Local WebKit/Docker
 remain host limitations; the unchanged mandatory Linux CI jobs cover both.
+
+Final requirement review added selected-output batch controls (individual controls retained)
+and deduplicated output/inter-relay/YouTube status events. The updated Chromium batch case
+passed, including selection surviving a render and an unchecked output remaining unchanged.
+The two added event tests bring the full Python gate to 916 passes. CI run 36674635482's
+original test and Chromium/WebKit jobs passed; its diagnosed expiry-test race and unchanged
+deadline fix are recorded in the route acceptance document. A new commit, not a blind rerun,
+receives the final full CI gate.

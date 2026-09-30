@@ -313,6 +313,38 @@ class MediaControl:
                     "UPDATE broadcast_routes SET source_kind=? WHERE id=?",
                     (obs.source_kind, obs.route_id),
                 )
+                output = self.store.row(
+                    db,
+                    "SELECT session_id,state FROM broadcast_outputs WHERE id=?",
+                    (route["output_id"],),
+                )
+                was_forwarded = bool(
+                    old
+                    and old["source_kind"] == "forwarded"
+                    and old["valid_samples"] >= 2
+                    and not old["safe_error_code"]
+                )
+                is_forwarded = bool(
+                    obs.source_kind == "forwarded" and samples >= 2 and not obs.safe_error_code
+                )
+                if was_forwarded != is_forwarded:
+                    self.store.event(
+                        db,
+                        output["session_id"],
+                        "interrelay.connected" if is_forwarded else "interrelay.disconnected",
+                        output_id=route["output_id"],
+                        detail={"route_id": obs.route_id},
+                    )
+                if obs.safe_error_code and (
+                    not old or old["safe_error_code"] != obs.safe_error_code
+                ):
+                    self.store.event(
+                        db,
+                        output["session_id"],
+                        "output.failed",
+                        output_id=route["output_id"],
+                        detail={"route_id": obs.route_id, "code": obs.safe_error_code},
+                    )
                 if route["role"] == "current":
                     state = (
                         "PUBLISHING"
@@ -325,6 +357,14 @@ class MediaControl:
                     )
                     if not route["desired_enabled"]:
                         state = "STOPPED" if not obs.publisher_connected else "STOP_REQUESTED"
+                    if state == "PUBLISHING" and state != output["state"]:
+                        self.store.event(
+                            db,
+                            output["session_id"],
+                            "output.live",
+                            output_id=route["output_id"],
+                            detail={"route_id": obs.route_id},
+                        )
                     db.execute(
                         "UPDATE broadcast_outputs SET state=? WHERE id=?",
                         (state, route["output_id"]),

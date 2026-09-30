@@ -27,6 +27,9 @@
 .broadcast-link-status[data-severity="alert"] { border-color: #ef716f; }
 .broadcast-link-status[data-severity="live"] { border-color: #59c794; }
 .broadcast-operation { padding: 8px 12px; background: #141f2d; color: #edf2f7; border-radius: 8px; }
+.broadcast-operation p { color: inherit; }
+.broadcast-selection { display: flex !important; align-items: center; gap: 8px; }
+.broadcast-selection input[type="checkbox"] { width: auto; min-height: 24px; }
 #operator-message[data-error="true"] { color: #ffaaa7; }
 #broadcast-monitor { margin-top: 24px; }
 #broadcast-monitor .broadcast-card { background: #121820; color: #edf2f7; border-color: #536171; }

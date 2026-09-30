@@ -99,6 +99,14 @@ RemoteProtocolError in its heartbeat helper; it is retained as a failure, not hi
 Final Chromium run 009 passed all five scenarios after that transport fix and the monitor
 pairing correction. Final gate provenance and Linux results are recorded in the PR/report.
 
+C CI run 36674635482 passed multicast, B→D, both full switches, rollback and controller
+restart, then failed the expiry test's immediate argv assertion. `process.poll()` can see
+the child exit before the watchdog thread finishes its close/argv cleanup. The test now
+waits for both process exit and cleanup within its unchanged seven-second deadline; no
+media or expiry threshold changed. Its Linux measurements were 0/0 ms egress overlap,
+9709.3/9698.3 ms publisher source gap and 11310.1/11296.9 ms conservative phone receiver gap.
+They are longer than the Windows spike and are retained as such.
+
 ## Physical acceptance still required
 
 Use the separately reviewed [staged deployment plan](staged-broadcast-deployment.md).

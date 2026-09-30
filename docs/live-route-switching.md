@@ -104,3 +104,8 @@ fresh agent/capability evidence. An unused phone route stays UNKNOWN; RTT/loss/r
 remain UNKNOWN when no measurement exists. Publisher connected is not viewer playback.
 YouTube API health is aggregate; per-slot viewer health remains UNKNOWN. Assisted policy
 offers a manual suggestion only. Auto failover remains disabled.
+
+Admin batch start/stop uses explicit output checkboxes; individual controls remain available.
+Selection survives status polling in memory and never enters browser storage. History records
+output live/failure and inter-relay connection transitions only when state changes, plus
+YouTube stream/health change events without copying provider payloads into event detail.
