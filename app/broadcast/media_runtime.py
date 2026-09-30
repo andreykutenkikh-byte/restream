@@ -633,7 +633,8 @@ class MediaRuntime:
                         "latency": "200000",
                         "mode": "caller",
                         "maxbw": str(route["profile"]["expected_bitrate_bps"] // 8 * 2),
-                    }
+                    },
+                    safe=":/",  # FFmpeg 5 av_find_info_tag does not percent-decode stream IDs.
                 )
                 source = f"srt://{forward['host']}:{forward['port']}?{query}"
                 self._worker(

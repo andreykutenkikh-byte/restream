@@ -75,3 +75,11 @@ Migration 10 implements the owner's explicit credential correction. Native lab 0
 with leases: 172/165/165 frames, 165 common hashes, A/C advanced 176/174 frames while B failed.
 New security tests cover expiry, revocation, removal, cold restart, stale replay, duplicate
 intent, and secret-free durable state. A fresh controller plan is required on cold restart.
+
+B run 36669838998 passed all original test/container/media/SSH gates, but its separate
+broadcast lab failed before source readiness on Debian FFmpeg 5.1.9. Cause verified in
+the upstream n5.1.9 libavutil/parseutils.c: av_find_info_tag does not percent-decode streamid.
+The FFmpeg 9 local spike decoded the encoded colons and slashes, masking that difference.
+SRT query generation now leaves those grammar separators literal; random URL-safe tokens
+stay scoped and encrypted. The failed run and its report remain available. No threshold
+or production binary was changed.

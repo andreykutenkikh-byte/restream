@@ -274,7 +274,8 @@ class Lab:
                 "passphrase": secret,
                 "pbkeylen": "32",
                 "latency": "200000",
-            }
+            },
+            safe=":/",  # Compatible with FFmpeg 5 and newer SRT URL parsers.
         )
         return launch(
             [
