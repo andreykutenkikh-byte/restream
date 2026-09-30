@@ -63,7 +63,7 @@ class HudBodyLimitMiddleware:
         path = str(scope.get("path", ""))
         if (
             scope["type"] != "http"
-            or not path.startswith(("/moblin-hud/api/", "/api/moblin-hud/"))
+            or not path.startswith(("/moblin-hud/api/", "/api/moblin-hud/", "/api/broadcasts/"))
             or str(scope.get("method", "")).upper() not in {"POST", "PUT", "PATCH"}
         ):
             await self.app(scope, receive, send)

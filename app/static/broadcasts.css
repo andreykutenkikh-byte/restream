@@ -1,0 +1,20 @@
+.broadcast-layout { padding-block: 2rem; max-width: 1180px; }
+.broadcast-layout h1 { margin: .25rem 0; font-size: clamp(2rem, 5vw, 3rem); }
+.broadcast-layout h2 { font-size: 1.25rem; margin-top: 0; }
+.broadcast-forms { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+.broadcast-card { background: #fff; border: 1px solid #dedbd4; border-radius: 14px; padding: 1.25rem; margin-block: 1rem; }
+.broadcast-card form { display: grid; gap: .8rem; }
+.broadcast-card label { display: grid; gap: .3rem; }
+.broadcast-card input, .broadcast-card select { width: 100%; min-height: 42px; padding: .5rem; border: 1px solid #b8b6ad; border-radius: 6px; }
+.broadcast-card p { color: #53544e; }
+.broadcast-actions { display: flex; gap: .5rem; flex-wrap: wrap; margin-block: .8rem; }
+.broadcast-output { border-top: 1px solid #dedbd4; padding-block: 1rem; }
+.broadcast-routes { display: flex; gap: 1rem; flex-wrap: wrap; }
+.broadcast-route { border: 1px solid #dedbd4; border-radius: 8px; padding: .75rem; min-width: 200px; }
+.broadcast-state { font-family: monospace; }
+#broadcast-message { min-height: 1.6em; }
+#broadcast-message[data-error="true"] { color: #a32220; }
+.broadcast-events { max-height: 220px; overflow: auto; font-size: .85rem; }
+.broadcast-dialog { max-width: 560px; border: 1px solid #b8b6ad; border-radius: 14px; padding: 1.5rem; }
+.broadcast-dialog::backdrop { background: #17262288; }
+@media (max-width: 760px) { .broadcast-forms { grid-template-columns: 1fr; } }

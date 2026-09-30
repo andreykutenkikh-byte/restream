@@ -9,9 +9,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from app.broadcast.schema import SCHEMA_VERSION
+from app.broadcast.schema import migrate as migrate_broadcast
+
 # Migration 6 belongs to the separate native relay classification release.
 # HUD retains its existing migration identity without recording that migration.
-SCHEMA_VERSION = 7
 
 
 def utc_now() -> str:
@@ -470,6 +472,8 @@ class Database:
                 COMMIT;
                 """
             )
+
+            migrate_broadcast(connection)
 
     def ready(self) -> bool:
         try:

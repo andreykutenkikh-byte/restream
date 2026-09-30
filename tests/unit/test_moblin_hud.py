@@ -96,7 +96,7 @@ def test_schema_v7_adds_scoped_hud_tables_idempotently(database: Database) -> No
             row["name"] for row in connection.execute("PRAGMA table_info(moblin_hud_pairings)")
         }
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
-    assert version == SCHEMA_VERSION == 7
+    assert version == SCHEMA_VERSION == 8
     assert tables == {"moblin_hud_devices", "moblin_hud_pairings"}
     assert {
         "id",
@@ -391,7 +391,7 @@ def test_schema_v5_upgrade_preserves_all_existing_rows_schema_and_foreign_keys(
         # The independent pinned-main/future checks live in test_hud_release_migrations.
         connection.execute("DROP TABLE moblin_hud_pairings")
         connection.execute("DROP TABLE moblin_hud_devices")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 7")
+        connection.execute("DELETE FROM schema_migrations WHERE version >= 7")
         legacy_schema = schema(connection)
         assert legacy_schema == [
             row
@@ -412,7 +412,7 @@ def test_schema_v5_upgrade_preserves_all_existing_rows_schema_and_foreign_keys(
             assert existing_rows(connection) == before
             assert [
                 row[0] for row in connection.execute("SELECT version FROM schema_migrations")
-            ] == [1, 2, 3, 4, 5, 7]
+            ] == [1, 2, 3, 4, 5, 7, 8]
             assert "node_kind" not in {
                 row["name"] for row in connection.execute("PRAGMA table_info(restream_nodes)")
             }
@@ -432,7 +432,7 @@ def test_schema_v5_upgrade_preserves_all_existing_rows_schema_and_foreign_keys(
             assert (
                 connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
                 == SCHEMA_VERSION
-                == 7
+                == 8
             )
 
 

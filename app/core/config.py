@@ -95,6 +95,9 @@ class Settings:
     node_protocol_version: int = 1
     public_control_url: str = "http://localhost:8000"
     test_ssh_target_allowlist: tuple[str, ...] = ()
+    youtube_client_id: str = ""
+    youtube_client_secret: str = ""
+    youtube_redirect_uri: str = ""
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -283,6 +286,9 @@ class Settings:
             node_protocol_version=node_protocol_version,
             public_control_url=public_control_url,
             test_ssh_target_allowlist=test_ssh_target_allowlist,
+            youtube_client_id=os.getenv("YOUTUBE_CLIENT_ID", ""),
+            youtube_client_secret=os.getenv("YOUTUBE_CLIENT_SECRET", ""),
+            youtube_redirect_uri=os.getenv("YOUTUBE_REDIRECT_URI", ""),
         )
 
     @property

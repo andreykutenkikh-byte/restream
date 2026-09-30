@@ -87,6 +87,9 @@ jobs:
       - name: HUD JavaScript tests
         run: node --test tests/frontend/moblin-hud.test.js tests/frontend/moblin-hud-admin.test.js
 
+      - name: Broadcast JavaScript syntax
+        run: node --check app/static/broadcasts.js
+
       - name: Shell syntax
         shell: bash
         run: |

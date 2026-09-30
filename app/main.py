@@ -20,6 +20,10 @@ from app import __version__
 from app.api import router
 from app.bootstrap_api import BootstrapRateLimiter
 from app.bootstrap_api import router as bootstrap_router
+from app.broadcast.api import router as broadcast_router
+from app.broadcast.models import BroadcastError
+from app.broadcast.oauth import YouTubeOAuth
+from app.broadcast.store import BroadcastStore
 from app.core.config import Settings
 from app.core.validation import destination_validator
 from app.db import Database
@@ -158,6 +162,13 @@ def create_app(
     )
     app.state.settings = settings
     app.state.database = database
+    app.state.broadcasts = BroadcastStore(database, settings.master_encryption_key)
+    app.state.youtube_oauth = YouTubeOAuth(
+        app.state.broadcasts,
+        settings.youtube_client_id,
+        settings.youtube_client_secret,
+        settings.youtube_redirect_uri,
+    )
     app.state.runtime = runtime
     app.state.preview = preview_service
     app.state.sessions = SessionManager(
@@ -201,6 +212,7 @@ def create_app(
     app.include_router(relay_preview_router)
     app.include_router(bootstrap_router)
     app.include_router(moblin_hud_router)
+    app.include_router(broadcast_router)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Callable[..., Any]) -> Any:
@@ -212,7 +224,9 @@ def create_app(
         ):
             relay_preview.clear()
         response.headers["X-Content-Type-Options"] = "nosniff"
-        hud_path = request.url.path.startswith(("/moblin-hud", "/api/moblin-hud"))
+        hud_path = request.url.path.startswith(
+            ("/moblin-hud", "/api/moblin-hud", "/api/broadcasts")
+        )
         response.headers["Referrer-Policy"] = "no-referrer" if hud_path else "same-origin"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
@@ -230,11 +244,18 @@ def create_app(
             "/",
             "/login",
             "/servers",
+            "/broadcasts",
         }:
             response.headers["Cache-Control"] = "no-store"
         if settings.environment == "production":
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         return response
+
+    @app.exception_handler(BroadcastError)
+    async def broadcast_exception_handler(_: Request, exc: BroadcastError) -> JSONResponse:
+        return JSONResponse(
+            {"error": {"code": exc.code, "message": exc.code}}, status_code=exc.status
+        )
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
