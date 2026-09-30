@@ -1,0 +1,67 @@
+{
+  "production_mutations": false,
+  "real_youtube": "NOT_RUN",
+  "mediamtx": "v1.19.2",
+  "ffmpeg": "ffmpeg version 9.0.2-essentials_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers",
+  "stages": {
+    "multicast": {
+      "outputs": [
+        {
+          "frames": 172,
+          "video_codec": "h264",
+          "audio_codec": "aac",
+          "width": 1080,
+          "height": 1920,
+          "fps": 30,
+          "max_packet_gap_seconds": {
+            "video": 0.034000000000000696,
+            "audio": 0.02200000000000024
+          },
+          "decode": "PASS",
+          "gop_max": 60
+        },
+        {
+          "frames": 165,
+          "video_codec": "h264",
+          "audio_codec": "aac",
+          "width": 1080,
+          "height": 1920,
+          "fps": 30,
+          "max_packet_gap_seconds": {
+            "video": 0.034000000000000696,
+            "audio": 0.02200000000000024
+          },
+          "decode": "PASS",
+          "gop_max": 60
+        },
+        {
+          "frames": 165,
+          "video_codec": "h264",
+          "audio_codec": "aac",
+          "width": 1080,
+          "height": 1920,
+          "fps": 30,
+          "max_packet_gap_seconds": {
+            "video": 0.034000000000000696,
+            "audio": 0.02200000000000024
+          },
+          "decode": "PASS",
+          "gop_max": 60
+        }
+      ],
+      "common_decoded_video_frames": 165
+    },
+    "failure_isolation": {
+      "status": "PASS",
+      "source_pid_preserved": true,
+      "other_publisher_pids_preserved": true,
+      "unaffected_frames_during_failure": [
+        175,
+        174
+      ],
+      "independent_stop_restart": "PASS",
+      "destination_failure_reconnect": "PASS"
+    }
+  },
+  "status": "PASS"
+}

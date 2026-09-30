@@ -37,3 +37,28 @@ tests passed. New control-plane Chromium scenario passed; WebKit failed at launc
 `icutu77.dll`, `libegl.dll`, `sqlite3.dll` are missing on this host. This is not an iPhone PASS.
 Linux CI retains the unmodified Docker/resource/media/SSH/security gates and required
 Chromium + WebKit job; the new browser scenario runs in that job too.
+
+A final head `0b2197500896f4ec2f56b24d930f76f10ae09efe`: both required CI jobs passed in
+[run 36665211255](https://github.com/andreykutenkikh-byte/restream/actions/runs/36665211255).
+All four Chromium scenarios also passed locally (163.71 s). Local WebKit remains unavailable.
+
+## B local media gate
+
+902 Python tests passed (23 unchanged category skips); Ruff, strict mypy, repository policy,
+boundary checks and the updated Chromium broadcast scenario passed. The dedicated
+three-node native-process lab passed with 172/165/165 decoded frames and 165 common frame
+hashes. Video packet gap ≤34 ms, audio ≤22 ms, H.264/AAC 1080×1920 at 30 fps, GOP ≤60;
+every stream had ≥90 frames and audio packets and passed full decoding and PTS/DTS checks.
+Stopping/restarting B and rejecting its destination left source/A/C PIDs unchanged and
+A/C advanced 175/174 frames during the failure window. Evidence is in
+`broadcast-media-windows-evidence.json`.
+
+Retained media development failures: run 001 used duplicate synthetic node addresses and
+hit the existing database uniqueness constraint (fixture fixed); run 002 found the default
+MoQ listener collision (disabled on dedicated instances); run 003 proved SRT audio/video
+but RTSP publishers rejected `rw_timeout` (changed to the documented RTSP `timeout`).
+Separate diagnostic spikes identified these causes. Runs 005 and 006 passed after the
+corrections; 006 includes durable agent fencing and per-node direct source credentials.
+The release-boundary test also caught an attempted shared middleware prefix edit; that
+edit was reverted and an existing unprotected body-limiter is reused instead. No legacy
+runtime hash or 90-frame threshold was changed.

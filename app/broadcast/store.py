@@ -8,7 +8,7 @@ import json
 import re
 import secrets
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any, cast
 
@@ -22,6 +22,7 @@ class BroadcastStore:
         self.database = database
         self.master_key = master_key
         self.limits = ResourceLimits()
+        self.admission: Callable[[sqlite3.Connection, str], None] | None = None
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -249,6 +250,8 @@ class BroadcastStore:
             binding = self.row(db, "SELECT * FROM youtube_bindings WHERE output_id=?", (output_id,))
             if enabled and not binding["credentials_encrypted"]:
                 raise BroadcastError("output_not_provisioned")
+            if enabled and self.admission is not None:
+                self.admission(db, output_id)
             db.execute(
                 "UPDATE broadcast_outputs SET desired_enabled=?,generation=generation+1,"
                 "state=?,updated_at=? WHERE id=?",

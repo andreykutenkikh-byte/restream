@@ -53,6 +53,8 @@ router = APIRouter()
 class HudBodyLimitMiddleware:
     """Bound HUD mutation bodies before JSON or form parsing."""
 
+    path_prefixes: tuple[str, ...] = ("/moblin-hud/api/", "/api/moblin-hud/", "/api/broadcasts/")
+
     def __init__(self, app: ASGIApp, *, max_body_bytes: int = MAX_HUD_BODY_BYTES) -> None:
         if max_body_bytes < 1:
             raise ValueError("max_body_bytes must be positive")
@@ -63,7 +65,7 @@ class HudBodyLimitMiddleware:
         path = str(scope.get("path", ""))
         if (
             scope["type"] != "http"
-            or not path.startswith(("/moblin-hud/api/", "/api/moblin-hud/", "/api/broadcasts/"))
+            or not path.startswith(self.path_prefixes)
             or str(scope.get("method", "")).upper() not in {"POST", "PUT", "PATCH"}
         ):
             await self.app(scope, receive, send)

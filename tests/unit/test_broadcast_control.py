@@ -297,7 +297,7 @@ def test_new_broadcast_rows_survive_later_native_v6_and_restart(store: Broadcast
         pinned_database("combined", store.database.path).migrate()
         reopened = Database(store.database.path)
         reopened.migrate()
-        assert versions(reopened) == [1, 2, 3, 4, 5, 6, 7, 8]
+        assert versions(reopened) == [1, 2, 3, 4, 5, 6, 7, 8, 9]
         assert rows(reopened, original_columns, exclude_v6=True) == original_rows
         assert_integrity(reopened)
     assert store.snapshot()["sessions"][0]["outputs"][0]["id"] == output

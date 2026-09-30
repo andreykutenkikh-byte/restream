@@ -201,3 +201,25 @@ jobs:
         env:
           ADOJAPAN_HUD_BROWSER_SMOKE: "1"
         run: uv run --locked --group browser pytest tests/browser -q
+
+  broadcast-media:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Build isolated media acceptance image
+        run: docker build -f Dockerfile.broadcast-lab -t adojapan-broadcast-lab .
+      - name: Synthetic three-node media acceptance
+        run: |
+          mkdir -p logs/broadcast-ci
+          docker run --rm --network none --cpus 2 --memory 3g --pids-limit 256 \
+            --cap-drop ALL --security-opt no-new-privileges \
+            -v "$PWD/logs/broadcast-ci:/evidence" adojapan-broadcast-lab
+      - name: Save secret-free media evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: broadcast-media-evidence
+          path: logs/broadcast-ci/run/report.json
+          if-no-files-found: error
+          retention-days: 14
