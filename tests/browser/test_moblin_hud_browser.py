@@ -179,6 +179,9 @@ def hud_server(
             app_logger.addHandler(fixture.application_logs)
             config = uvicorn.Config(
                 app,
+                # CPython 3.12 Proactor can fail before detaching reset TLS sockets.
+                # Select a supported network-only Windows loop; keep Linux unchanged.
+                loop="asyncio:SelectorEventLoop" if os.name == "nt" else "auto",
                 ssl_keyfile=str(key_path),
                 ssl_certfile=str(certificate_path),
                 log_config=None,

@@ -522,10 +522,14 @@ async def hud_page(request: Request) -> Response:
         paired = True
     except HudSessionAuthenticationError:
         pass
+    with request.app.state.broadcasts.database.connect() as db:
+        has_broadcasts = (
+            db.execute("SELECT 1 FROM broadcast_sessions LIMIT 1").fetchone() is not None
+        )
     return _templates(request).TemplateResponse(
         request=request,
         name="moblin_hud.html",
-        context={"hud_paired": paired},
+        context={"hud_paired": paired, "has_broadcasts": has_broadcasts},
     )
 
 

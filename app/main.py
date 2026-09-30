@@ -27,6 +27,9 @@ from app.broadcast.media_control import MediaControl
 from app.broadcast.models import BroadcastError
 from app.broadcast.oauth import YouTubeOAuth
 from app.broadcast.store import BroadcastStore
+from app.broadcast.switch_api import OperatorBodyLimit
+from app.broadcast.switch_api import router as broadcast_switch_router
+from app.broadcast.switching import SwitchController
 from app.core.config import Settings
 from app.core.validation import destination_validator
 from app.db import Database
@@ -123,6 +126,18 @@ def create_app(
                 except Exception:
                     LOGGER.exception("Node maintenance failed")
 
+        async def reconcile_broadcasts() -> None:
+            while True:
+                await asyncio.sleep(1)
+                try:
+                    await asyncio.to_thread(app.state.broadcast_switches.tick)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    LOGGER.error(
+                        "Broadcast reconciliation deferred"
+                    )  # No payload/traceback secrets.
+
         database.migrate()
         recover_interrupted = getattr(bootstrap_service, "recover_interrupted_jobs", None)
         if recover_interrupted is not None:
@@ -139,6 +154,9 @@ def create_app(
             maintenance_task = asyncio.create_task(maintain_node_state())
             background_tasks.add(maintenance_task)
             maintenance_task.add_done_callback(background_tasks.discard)
+            switch_task = asyncio.create_task(reconcile_broadcasts())
+            background_tasks.add(switch_task)
+            switch_task.add_done_callback(background_tasks.discard)
             yield
         finally:
             relay_preview.clear()
@@ -170,6 +188,7 @@ def create_app(
         app.state.broadcasts, test_loopback=settings.environment == "test"
     )
     app.state.broadcasts.admission = app.state.broadcast_media.admit
+    app.state.broadcast_switches = SwitchController(app.state.broadcasts, app.state.broadcast_media)
     app.state.youtube_oauth = YouTubeOAuth(
         app.state.broadcasts,
         settings.youtube_client_id,
@@ -188,6 +207,8 @@ def create_app(
     app.state.relay_quality = RelayQualityTracker()
     app.state.moblin_hud_pair_limiter = HudRateLimiter(attempts=8, window_seconds=60)
     app.state.moblin_hud_admin_limiter = HudRateLimiter(attempts=6, window_seconds=60)
+    app.state.operator_limiter = HudRateLimiter(attempts=12, window_seconds=60)
+    app.state.operator_pair_limiter = HudRateLimiter(attempts=8, window_seconds=60)
     app.state.moblin_hud_status_lock = asyncio.Lock()
     app.state.moblin_hud_status_cached_at = None
     app.state.moblin_hud_status_cache = None
@@ -213,6 +234,7 @@ def create_app(
     app.add_middleware(NodeBodyLimitMiddleware)
     app.add_middleware(HudBodyLimitMiddleware)
     app.add_middleware(MediaBodyLimitMiddleware)
+    app.add_middleware(OperatorBodyLimit)
     app.mount("/static", StaticFiles(directory=PACKAGE_DIR / "static"), name="static")
     app.include_router(router)
     app.include_router(node_router)
@@ -222,6 +244,7 @@ def create_app(
     app.include_router(moblin_hud_router)
     app.include_router(broadcast_router)
     app.include_router(broadcast_media_router)
+    app.include_router(broadcast_switch_router)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Callable[..., Any]) -> Any:
@@ -234,7 +257,7 @@ def create_app(
             relay_preview.clear()
         response.headers["X-Content-Type-Options"] = "nosniff"
         hud_path = request.url.path.startswith(
-            ("/moblin-hud", "/api/moblin-hud", "/api/broadcasts")
+            ("/moblin-hud", "/api/moblin-hud", "/api/broadcasts", "/stream-operator")
         )
         response.headers["Referrer-Policy"] = "no-referrer" if hud_path else "same-origin"
         response.headers["X-Frame-Options"] = "DENY"
@@ -255,6 +278,7 @@ def create_app(
                 "/relay-media/",
                 "/moblin-hud",
                 "/broadcast-agent/",
+                "/stream-operator",
             )
         ) or request.url.path in {
             "/",

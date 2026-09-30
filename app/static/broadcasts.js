@@ -64,6 +64,7 @@
     root.replaceChildren();
     for (const session of snapshot.sessions) {
       const card = el("article", undefined, "broadcast-card"); card.append(el("h2", session.name));
+      card.dataset.sessionId = session.id;
       card.append(el("p", `Moblin → ${nodeName(session.ingress_node_id)} · ${session.policy} · 1080 × 1920 / 30`));
       const batch = el("div", undefined, "broadcast-actions");
       for (const enabled of [true, false]) batch.append(button(enabled ? "Запустить все выходы" : "Остановить все выходы", async () => {
@@ -73,6 +74,7 @@
       card.append(batch);
       for (const output of session.outputs) {
         const block = el("section", undefined, "broadcast-output");
+        block.dataset.outputId = output.id;
         block.append(el("h3", output.name), el("p", output.state, "broadcast-state"));
         block.append(el("p", `YouTube: ${output.youtube.lifecycle_status} · Приём: ${output.youtube.stream_status} · Зритель: UNKNOWN`));
         if (output.safe_error_code) block.append(el("p", output.safe_error_code));
@@ -90,6 +92,7 @@
         const routes = el("div", undefined, "broadcast-routes");
         for (const route of output.routes) {
           const routeCard = el("div", undefined, "broadcast-route");
+          routeCard.dataset.routeId = route.id;
           routeCard.append(el("strong", nodeName(route.node_id)), el("p", `${route.role} · ${route.youtube_slot || "Свободный слот"}`));
           routeCard.append(el("p", `Источник: ${route.source_kind} · Телефон → резерв: UNKNOWN`));
           routes.append(routeCard);

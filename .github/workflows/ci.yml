@@ -88,7 +88,12 @@ jobs:
         run: node --test tests/frontend/moblin-hud.test.js tests/frontend/moblin-hud-admin.test.js
 
       - name: Broadcast JavaScript syntax
-        run: node --check app/static/broadcasts.js
+        run: |
+          node --check app/static/broadcasts.js
+          node --check app/static/broadcast-route-ui.js
+          node --check app/static/broadcast-switch-admin.js
+          node --check app/static/stream-operator.js
+          node --check app/static/broadcast-monitor.js
 
       - name: Shell syntax
         shell: bash
@@ -209,7 +214,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Build isolated media acceptance image
         run: docker build -f Dockerfile.broadcast-lab -t adojapan-broadcast-lab .
-      - name: Synthetic three-node media acceptance
+      - name: Synthetic four-node multicast and route switching acceptance
         run: |
           mkdir -p logs/broadcast-ci
           docker run --rm --network none --cpus 2 --memory 3g --pids-limit 256 \

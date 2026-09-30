@@ -1,0 +1,251 @@
+{
+  "production_mutations": false,
+  "real_youtube": "NOT_RUN",
+  "mediamtx": "v1.19.2",
+  "ffmpeg": "ffmpeg version 9.0.2-essentials_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers",
+  "stages": {
+    "multicast": {
+      "outputs": [
+        {
+          "frames": 179,
+          "video_codec": "h264",
+          "audio_codec": "aac",
+          "width": 1080,
+          "height": 1920,
+          "fps": 30,
+          "max_packet_gap_seconds": {
+            "video": 0.034000000000000696,
+            "audio": 0.02200000000000024
+          },
+          "decode": "PASS",
+          "gop_max": 60
+        },
+        {
+          "frames": 171,
+          "video_codec": "h264",
+          "audio_codec": "aac",
+          "width": 1080,
+          "height": 1920,
+          "fps": 30,
+          "max_packet_gap_seconds": {
+            "video": 0.034000000000000696,
+            "audio": 0.02200000000000024
+          },
+          "decode": "PASS",
+          "gop_max": 60
+        },
+        {
+          "frames": 171,
+          "video_codec": "h264",
+          "audio_codec": "aac",
+          "width": 1080,
+          "height": 1920,
+          "fps": 30,
+          "max_packet_gap_seconds": {
+            "video": 0.034000000000000696,
+            "audio": 0.02200000000000024
+          },
+          "decode": "PASS",
+          "gop_max": 60
+        }
+      ],
+      "common_decoded_video_frames": 171
+    },
+    "failure_isolation": {
+      "status": "PASS",
+      "source_pid_preserved": true,
+      "other_publisher_pids_preserved": true,
+      "unaffected_frames_during_failure": [
+        231,
+        230
+      ],
+      "independent_stop_restart": "PASS",
+      "destination_failure_reconnect": "PASS"
+    },
+    "multicast_b_to_d": {
+      "status": "PASS",
+      "credential_reentry": false,
+      "other_publisher_pids_preserved": true,
+      "media": {
+        "outputs": [
+          {
+            "frames": 122,
+            "video_codec": "h264",
+            "audio_codec": "aac",
+            "width": 1080,
+            "height": 1920,
+            "fps": 30,
+            "max_packet_gap_seconds": {
+              "video": 0.034000000000000696,
+              "audio": 0.02200000000000024
+            },
+            "decode": "PASS",
+            "gop_max": 60
+          }
+        ],
+        "common_decoded_video_frames": 122
+      }
+    },
+    "rollback_before_cutover": {
+      "status": "PASS",
+      "old_pid_preserved": true
+    },
+    "crash_reconciliation": {
+      "restart_after_target_lease": true,
+      "status": "PASS"
+    },
+    "switch_relay-a_to_relay-b": {
+      "status": "PASS",
+      "slot": "BACKUP",
+      "same_output_credential_and_binding": true,
+      "make_before_break": true,
+      "old_runtime_secret_removed": true,
+      "stale_generation_resurrection": "REJECTED",
+      "controller_outage": "SURVIVES_WITHIN_LEASE",
+      "youtube_egress_switch_gap_ms": 0.0,
+      "ffprobe_startup_observer_gap_ms": 0.0,
+      "egress_measurement": "mock RTMP receiver byte progress at 50ms plus decoded media",
+      "phone_direct_takeover_gap_ms": 5188.0,
+      "source_switch_gap_ms": 3406.0,
+      "phone_stop_to_new_receiver_ms": 10797.0,
+      "publisher_replaced_for_direct_input": true,
+      "states": [
+        "REQUESTED",
+        "VALIDATING_TARGET",
+        "PREPARING_TARGET",
+        "TARGET_MEDIA_READY",
+        "TARGET_CREDENTIAL_LEASED",
+        "TARGET_EGRESS_STARTING",
+        "TARGET_YOUTUBE_CONNECTED",
+        "CUTOVER_ARMED",
+        "OLD_EGRESS_DRAINING",
+        "OLD_CREDENTIAL_REVOKED",
+        "AWAITING_DIRECT_SOURCE",
+        "DIRECT_SOURCE_SEEN",
+        "DIRECT_SOURCE_CONFIRMED",
+        "REWARMING_OLD_ROUTE",
+        "COMPLETED"
+      ],
+      "forwarded_media": {
+        "outputs": [
+          {
+            "frames": 156,
+            "video_codec": "h264",
+            "audio_codec": "aac",
+            "width": 1080,
+            "height": 1920,
+            "fps": 30,
+            "max_packet_gap_seconds": {
+              "video": 0.034000000000000696,
+              "audio": 0.02200000000000024
+            },
+            "decode": "PASS",
+            "gop_max": 60
+          }
+        ],
+        "common_decoded_video_frames": 156
+      },
+      "direct_media": {
+        "outputs": [
+          {
+            "frames": 172,
+            "video_codec": "h264",
+            "audio_codec": "aac",
+            "width": 1080,
+            "height": 1920,
+            "fps": 30,
+            "max_packet_gap_seconds": {
+              "video": 0.034000000000000696,
+              "audio": 0.02200000000000024
+            },
+            "decode": "PASS",
+            "gop_max": 60
+          }
+        ],
+        "common_decoded_video_frames": 172
+      }
+    },
+    "switch_relay-b_to_relay-c": {
+      "status": "PASS",
+      "slot": "PRIMARY",
+      "same_output_credential_and_binding": true,
+      "make_before_break": true,
+      "old_runtime_secret_removed": true,
+      "stale_generation_resurrection": "REJECTED",
+      "controller_outage": "SURVIVES_WITHIN_LEASE",
+      "youtube_egress_switch_gap_ms": 0.0,
+      "ffprobe_startup_observer_gap_ms": 359.0,
+      "egress_measurement": "mock RTMP receiver byte progress at 50ms plus decoded media",
+      "phone_direct_takeover_gap_ms": 5250.0,
+      "source_switch_gap_ms": 3406.0,
+      "phone_stop_to_new_receiver_ms": 10860.0,
+      "publisher_replaced_for_direct_input": true,
+      "states": [
+        "REQUESTED",
+        "VALIDATING_TARGET",
+        "PREPARING_TARGET",
+        "TARGET_MEDIA_READY",
+        "TARGET_CREDENTIAL_LEASED",
+        "TARGET_EGRESS_STARTING",
+        "TARGET_YOUTUBE_CONNECTED",
+        "CUTOVER_ARMED",
+        "OLD_EGRESS_DRAINING",
+        "OLD_CREDENTIAL_REVOKED",
+        "AWAITING_DIRECT_SOURCE",
+        "DIRECT_SOURCE_SEEN",
+        "DIRECT_SOURCE_CONFIRMED",
+        "REWARMING_OLD_ROUTE",
+        "COMPLETED"
+      ],
+      "forwarded_media": {
+        "outputs": [
+          {
+            "frames": 135,
+            "video_codec": "h264",
+            "audio_codec": "aac",
+            "width": 1080,
+            "height": 1920,
+            "fps": 30,
+            "max_packet_gap_seconds": {
+              "video": 0.034000000000000696,
+              "audio": 0.02200000000000024
+            },
+            "decode": "PASS",
+            "gop_max": 60
+          }
+        ],
+        "common_decoded_video_frames": 135
+      },
+      "direct_media": {
+        "outputs": [
+          {
+            "frames": 170,
+            "video_codec": "h264",
+            "audio_codec": "aac",
+            "width": 1080,
+            "height": 1920,
+            "fps": 30,
+            "max_packet_gap_seconds": {
+              "video": 0.034000000000000696,
+              "audio": 0.08599999999999985
+            },
+            "decode": "PASS",
+            "gop_max": 60
+          }
+        ],
+        "common_decoded_video_frames": 170
+      }
+    },
+    "expiry_and_cold_restart": {
+      "status": "PASS",
+      "synthetic_lease_ttl_ms": 3000,
+      "publisher_stop_after_grant_ms": 3063.0,
+      "watchdog_without_tick_or_heartbeat": "PASS",
+      "runtime_secret_removed": true,
+      "expired_grant_replay": "REJECTED",
+      "cold_restart_stale_cache": "REJECTED",
+      "fence_file_has_no_credential": true
+    }
+  },
+  "status": "PASS"
+}

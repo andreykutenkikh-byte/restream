@@ -18,6 +18,7 @@ from app.broadcast.models import (
     SessionCreate,
 )
 from app.broadcast.oauth import YouTubeOAuth
+from app.broadcast.read_model import snapshot as broadcast_snapshot
 from app.broadcast.store import BroadcastStore
 from app.broadcast.youtube import YouTube, YouTubeHTTP, YouTubeProvisioner
 from app.db import utc_now
@@ -70,7 +71,7 @@ def page(request: Request) -> Response:
 
 @router.get("/api/broadcasts", dependencies=[Depends(require_session)])
 def snapshot(request: Request) -> dict[str, Any]:
-    return store(request).snapshot()
+    return broadcast_snapshot(store(request))
 
 
 @router.post("/api/broadcasts/sessions", dependencies=[Depends(mutation)], status_code=201)
