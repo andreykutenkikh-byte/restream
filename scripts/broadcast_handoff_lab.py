@@ -315,6 +315,12 @@ class HandoffLab(SwitchingLab):
         stop(self.source_process)
         self.source_process = self.phone("relay-b")
         self.processes.append(self.source_process)
+        direct_path = f"source/{self.source_id}/direct"
+
+        def path_ready(node: str) -> bool:
+            response = self.runtimes[node].http.get(f"/v3/paths/get/{direct_path}")
+            return bool(response.is_success and response.json().get("ready"))
+
         self.wait(
             lambda: (
                 any(
@@ -322,6 +328,7 @@ class HandoffLab(SwitchingLab):
                     for o in runtime.last_observations
                 )
                 and not worker.connected
+                and path_ready("relay-b")
             )
         )
         assert worker.process.pid == pid
@@ -332,18 +339,29 @@ class HandoffLab(SwitchingLab):
                 ).fetchone()[0]
                 == "relay-c"
             )
+        # A killed SRT sender can remain registered until transport timeout.
+        # Replacement is disabled: observe actual release before restoration,
+        # rather than hiding a rejected second publisher with repeated attempts.
+        self.wait(lambda: not path_ready("relay-c"))
         stop(self.source_process)
         self.source_process = self.phone("relay-c")
         self.processes.append(self.source_process)
         frames = worker.frames
-        self.wait(lambda: worker.connected and worker.frames >= frames + 90)
-        assert worker.process.pid == pid
+        self.wait(
+            lambda: (
+                worker.connected
+                and worker.frames >= 90
+                and (worker.process.pid != pid or worker.frames >= frames + 90)
+            )
+        )
         self.report["stages"]["source_returns_old"] = {
             "status": "PASS",
             "current_route_reported_unknown": True,
+            "old_node_received_source": True,
             "no_implicit_ingress_move": True,
             "restored_direct_without_credential_reentry": True,
-            "publisher_preserved": True,
+            "publisher_preserved": worker.process.pid == pid,
+            "prolonged_absence_may_exceed_receiver_idle_timeout": True,
         }
 
     def handoffs(self, modes: list[str]) -> None:

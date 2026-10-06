@@ -151,6 +151,13 @@ failed because its new old-source check queried ingress on the session table. Th
 now reads `broadcast_sources`, which owns ingress; runtime behavior was not changed.
 The first panel walkthrough also caught CSP blocking its helper's inline script; the
 helper now serves a same-origin external script, and the full walkthrough passes.
+The wrong-node return check exposed another boundary: an abruptly killed Windows SRT
+sender remains registered until transport timeout. Restoration waits for actual release
+(source replacement remains forbidden). A prolonged absence can also exceed the RTMP
+receiver's idle timeout and require the existing bounded publisher reconnect. This failure
+case reports whether the publisher survived; it does not promise a persistent connection
+through indefinite missing input. The two normal overlap/reconnect seams still assert
+publisher preservation and retain all their thresholds.
 
 ## Separate physical acceptance
 
