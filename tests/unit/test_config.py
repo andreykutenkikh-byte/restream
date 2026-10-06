@@ -1,12 +1,48 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import pytest
 
 from app.cli import main as cli_main
 from app.core.config import ConfigurationError, Settings
 from app.core.security import generate_master_key, hash_password
+
+
+def test_ssh_media_requires_separate_ingest_and_uses_only_private_transport(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    valid_environment(monkeypatch)
+    for name in ("key", "known_hosts"):
+        file = tmp_path / name
+        file.write_text("fixture")
+        file.chmod(0o600)
+    environment = {
+        "MEDIA_EXECUTION_MODE": "ssh",
+        "MEDIA_SSH_HOST": "8.8.8.8",
+        "MEDIA_SSH_USER": "restream-media",
+        "MEDIA_SSH_KEY_FILE": str(tmp_path / "key"),
+        "MEDIA_SSH_KNOWN_HOSTS_FILE": str(tmp_path / "known_hosts"),
+        "MEDIA_SSH_MEDIAMTX_ADDRESS": "172.22.0.3",
+        "MEDIA_SSH_AUTH_BIND_ADDRESS": "172.22.0.1",
+        "PUBLIC_DOMAIN": "restream.example.test",
+        "PUBLIC_RTMP_HOST": "RESTREAM.EXAMPLE.TEST.",
+    }
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    with pytest.raises(ConfigurationError, match="separate PUBLIC_RTMP_HOST"):
+        Settings.from_env()
+    monkeypatch.setenv("PUBLIC_RTMP_HOST", "ingest.example.test")
+    settings = Settings.from_env()
+    assert settings.media_ssh is not None
+    assert settings.mediamtx_api_url == "http://127.0.0.1:19997"
+    assert settings.mediamtx_hls_url == "http://127.0.0.1:18888"
+    assert settings.mediamtx_internal_rtmp_url == "rtmp://mediamtx:1935"
+    from app.main import create_app
+
+    with pytest.raises(ValueError, match="cannot be replaced"):
+        create_app(settings, worker_launcher=object())
 
 
 def valid_environment(monkeypatch: pytest.MonkeyPatch) -> None:

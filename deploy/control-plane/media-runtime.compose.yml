@@ -1,0 +1,29 @@
+# SOURCE only: reviewed helper mounted into the preserved backend image.
+name: adojapan-restream-media
+services:
+  runtime:
+    image: ${PRESERVED_BACKEND_IMAGE:?Set the original immutable backend image}
+    pull_policy: never
+    container_name: adojapan-restream-media-runtime
+    command: [python, -c, "import time;time.sleep(10**9)"]
+    user: "10001:10001"
+    volumes: ["./media_exec.py:/opt/media_exec.py:ro"]
+    networks: [source-internal, media-egress]
+    init: true
+    read_only: true
+    tmpfs: ["/tmp:size=16m,mode=1777"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    cpus: "0.40"
+    mem_limit: 384m
+    pids_limit: 96
+    stop_grace_period: 25s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+networks:
+  source-internal:
+    external: true
+    name: ${SOURCE_INTERNAL_NETWORK:?Set the existing source MediaMTX private network}
+  media-egress: {}

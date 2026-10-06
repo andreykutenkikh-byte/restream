@@ -9,6 +9,8 @@ from ipaddress import ip_network
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
+from app.core.media_ssh import MediaSSHConfig
+
 
 class ConfigurationError(RuntimeError):
     """Raised when required configuration is missing or unsafe."""
@@ -95,6 +97,7 @@ class Settings:
     node_protocol_version: int = 1
     public_control_url: str = "http://localhost:8000"
     test_ssh_target_allowlist: tuple[str, ...] = ()
+    media_ssh: MediaSSHConfig | None = None
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -244,6 +247,20 @@ class Settings:
         if environment == "production" and not cookie_secure:
             raise ConfigurationError("COOKIE_SECURE must be true in production")
 
+        try:
+            media_ssh = MediaSSHConfig.from_env()
+        except ValueError as exc:
+            raise ConfigurationError(str(exc)) from None
+        if media_ssh is not None:
+            control_host = os.getenv("PUBLIC_DOMAIN", "localhost").strip().lower().rstrip(".")
+            media_host = os.getenv("PUBLIC_RTMP_HOST", "localhost").strip().lower().rstrip(".")
+            if not media_host or media_host == control_host:
+                raise ConfigurationError("SSH media execution requires a separate PUBLIC_RTMP_HOST")
+            mediamtx_api_url = f"http://127.0.0.1:{media_ssh.api_local_port}"
+            mediamtx_hls_url = f"http://127.0.0.1:{media_ssh.hls_local_port}"
+            # FFmpeg executes in the source's private media network, never here.
+            mediamtx_internal_rtmp_url = "rtmp://mediamtx:1935"
+
         return cls(
             environment=environment,
             public_domain=os.getenv("PUBLIC_DOMAIN", "localhost").strip(),
@@ -283,6 +300,7 @@ class Settings:
             node_protocol_version=node_protocol_version,
             public_control_url=public_control_url,
             test_ssh_target_allowlist=test_ssh_target_allowlist,
+            media_ssh=media_ssh,
         )
 
     @property
