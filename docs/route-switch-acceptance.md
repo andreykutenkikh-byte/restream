@@ -36,13 +36,21 @@ RTMP receiver bytes and last advancing old receiver bytes, sampled independently
 50 ms, plus decoded-media validation. Zero means receiver overlap in this lab. It is not
 a YouTube player measurement or a guarantee about remote viewer latency.
 
-`phone_direct_takeover_gap_ms` measures the last old/first new received video packet using
+Historical PR20 `phone_direct_takeover_gap_ms` measures the last old/first new received video packet using
 persistent ffprobe observers across the controlled publisher replacement. It conservatively
 includes ffprobe startup/output buffering. `source_switch_gap_ms` measures the last old/
 first new FFmpeg publisher progress. `phone_stop_to_new_receiver_ms` also includes source
 reconnect, discovery and direct-source qualification before replacement. These clocks and
 sampling points are deliberately distinguished. The lab's reconnect budget is 30 seconds;
 it is not a product SLA, and no physical phone was used.
+
+The handoff candidate retains the original media, rollback, isolation and lease gates,
+but preserves the publisher and therefore the existing receiver. The original lab now
+asserts both identities remain unchanged. It delegates seam latency to the additional
+continuous **decoded video and audio** lab; the historical ffprobe startup metric is not
+reused as a current handoff result. `source_switch_gap_ms` now measures the selector's
+last video write to selection, not FFmpeg process restart progress. See
+[handoff acceptance and limitations](seamless-source-handoff.md).
 
 Latest committed native evidence is [broadcast-switch-windows-evidence.json](broadcast-switch-windows-evidence.json).
 The final PR description/report identifies the corresponding source and CI tested tree.

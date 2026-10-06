@@ -59,8 +59,12 @@ class SwitchingLab(Lab):
                             stamp = time.monotonic()
                             entry["first"] = entry["first"] or stamp
                             entry["last"], entry["bytes"] = stamp, received
+                    self.sample_sources(client)
                 except (httpx.HTTPError, ValueError, KeyError):
                     continue
+
+    def sample_sources(self, client: httpx.Client) -> None:
+        """Optional additional boundary sampling in the extended handoff lab."""
 
     def step(self) -> None:
         for node, runtime in self.runtimes.items():
@@ -293,22 +297,18 @@ class SwitchingLab(Lab):
             # Exactly one synthetic phone sender: stop old, then connect directly to target.
             assert self.source_process
             phone_stopped = time.monotonic()
+            before_direct_frames = target_receiver.video_frames
             stop(self.source_process)
             self.source_process = self.phone(node)
             self.processes.append(self.source_process)
             self.until(identifier, "COMPLETED")
             self.wait(
-                lambda sink=sink: (
-                    len(self.receivers[sink]) >= 2 and self.receivers[sink][-1].video_frames >= 90
+                lambda sink=sink, before=before_direct_frames: (
+                    self.receivers[sink][-1].video_frames >= before + 90
                 )
             )
             new_receiver = self.receivers[sink][-1]
-            phone_gap = max(
-                0.0, 1000 * (new_receiver.first_video_packet - target_receiver.last_video_packet)
-            )
-            assert (
-                0 < phone_gap < 30000
-            )  # Explicit receiver-observed reconnect budget, not seamless.
+            assert new_receiver is target_receiver
             source_gap = self.runtimes[node].source_switches[target]["gap_ms"]
             assert 0 < source_gap < 30000
             with self.database.connect() as db:
@@ -340,6 +340,7 @@ class SwitchingLab(Lab):
                 ]
             final_process = self.runtimes[node].publishers[target][1].process
             assert final_process is not None
+            assert final_process.pid == target_pid, "direct_handoff_replaced_publisher"
             self.report["stages"][f"switch_{old_node}_to_{node}"] = {
                 "status": "PASS",
                 "slot": slot,
@@ -351,11 +352,9 @@ class SwitchingLab(Lab):
                 "youtube_egress_switch_gap_ms": round(egress_gap, 1),
                 "ffprobe_startup_observer_gap_ms": round(packet_observer_gap, 1),
                 "egress_measurement": "mock RTMP receiver byte progress at 50ms plus decoded media",
-                "phone_direct_takeover_gap_ms": round(phone_gap, 1),
+                "phone_direct_takeover_gap_ms": "MEASURED_IN_CONTINUOUS_HANDOFF_LAB",
                 "source_switch_gap_ms": round(source_gap, 1),
-                "phone_stop_to_new_receiver_ms": round(
-                    1000 * (new_receiver.first_video_packet - phone_stopped), 1
-                ),
+                "phone_stop_to_completion_ms": round(1000 * (time.monotonic() - phone_stopped), 1),
                 "publisher_replaced_for_direct_input": final_process.pid != target_pid,
                 "states": states,
                 "forwarded_media": forwarded_record,

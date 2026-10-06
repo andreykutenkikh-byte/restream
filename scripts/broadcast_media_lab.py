@@ -77,7 +77,8 @@ class Lab:
         }
         self.database = Database(directory / "control.sqlite")
         self.database.migrate()
-        self.store = BroadcastStore(self.database, generate_master_key())
+        self.master_key = generate_master_key()
+        self.store = BroadcastStore(self.database, self.master_key)
         self.control = MediaControl(self.store, test_loopback=True)
         self.runtimes: dict[str, MediaRuntime] = {}
         self.keys: dict[str, X25519PrivateKey] = {}
@@ -265,7 +266,7 @@ class Lab:
     def destination(self, name: str) -> str:
         return f"rtmp://127.0.0.1:{self.sink_rtmp}/out/{name}?user=sink{name}&pass={self.sink_secrets[name]}"
 
-    def phone(self, node: str) -> subprocess.Popen[str]:
+    def phone(self, node: str, *, fixture: Path | None = None) -> subprocess.Popen[str]:
         runtime = self.runtimes[node]
         secret = runtime.plan["sources"][self.source_id]
         query = urlencode(
@@ -288,7 +289,7 @@ class Lab:
                 "-stream_loop",
                 "-1",
                 "-i",
-                str(self.directory / "source.mp4"),
+                str(fixture or self.directory / "source.mp4"),
                 "-c",
                 "copy",
                 "-f",

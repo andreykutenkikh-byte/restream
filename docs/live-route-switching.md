@@ -60,19 +60,19 @@ the entire source/session, including other outputs; the confirmation explains th
 Use egress-only move for an independent multicast output relocation.
 
 The relay has a stable logical source identity per route and two authenticated physical
-paths (`forward/...` and `source/.../direct`). The current copy pipeline replaces the
-publisher process when the selected physical input changes. It does not provide a stable
-downstream process or a zero-gap input splice. Measurements are in
-[route acceptance](route-switch-acceptance.md).
+paths (`forward/...` and `source/.../direct`). The handoff candidate adds a bounded H.264/AAC
+selector before a persistent copy publisher. Input changes retain its RTMP connection;
+destination/credential changes and process failures still require a new publisher.
+See [implementation, runnable panel and acceptance](seamless-source-handoff.md).
 
 The inspected [MediaMTX 1.19.2 path implementation](https://github.com/bluenviron/mediamtx/blob/v1.19.2/internal/core/path.go)
 closes the previous publisher when overriding it; ordinary source removal closes readers.
 Its `AlwaysAvailable` branch can retain a stream with offline media, but that is not proof
 of a decoded-frame-continuous splice between these two independently timed copy inputs.
-No such splice was implemented or certified here. FFmpeg's fixed input copy process is
-replaced deliberately; [the pinned protocol documentation](https://github.com/FFmpeg/FFmpeg/blob/n5.1.9/doc/protocols.texi)
-was used for RTSP/SRT timeout and transport options. This candidate is a measured bounded
-reconnect, not a claim that hot switching is impossible in every MediaMTX configuration.
+The selector explicitly maps the two input clocks; an unchanged MediaMTX URL alone does
+not provide this behavior. [FFmpeg's protocol documentation](https://github.com/FFmpeg/FFmpeg/blob/n5.1.9/doc/protocols.texi)
+documents the RTMP/RTSP/SRT transport options. Preparation, physical input absence,
+local selection and decoded receiver gaps are measured separately.
 
 ## Standard Moblin workflow
 
