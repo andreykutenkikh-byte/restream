@@ -1019,7 +1019,11 @@ class WorkerManager:
                 slot.live_since = None
                 argv = build_ffmpeg_argv(spec, ffmpeg_executable=self._runtime.ffmpeg_executable)
                 try:
-                    process = await self._launcher.spawn(argv)
+                    remote_spawn = getattr(self._launcher, "spawn_for_destination", None)
+                    if remote_spawn is not None:
+                        process = await remote_spawn(slot.destination_id, argv)
+                    else:
+                        process = await self._launcher.spawn(argv)
                 except asyncio.CancelledError:
                     raise
                 except Exception:

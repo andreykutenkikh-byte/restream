@@ -1,0 +1,92 @@
+# Standalone control project. Do not combine with the all-in-one root compose.yml.
+name: adojapan-restream-control
+services:
+  backend:
+    image: ${CONTROL_IMAGE:?Set the reviewed immutable control image}
+    pull_policy: never
+    env_file: ./backend.env
+    environment:
+      MEDIA_EXECUTION_MODE: ssh
+      MEDIA_SSH_HOST: ${MEDIA_SSH_HOST:?Set the pinned source public IP}
+      MEDIA_SSH_USER: restream-media
+      MEDIA_SSH_KEY_FILE: /run/media-ssh/key
+      MEDIA_SSH_KNOWN_HOSTS_FILE: /run/media-ssh/known_hosts
+      MEDIA_SSH_MEDIAMTX_ADDRESS: ${MEDIA_SSH_MEDIAMTX_ADDRESS:?Set the reserved source bridge IP}
+      MEDIA_SSH_AUTH_BIND_ADDRESS: ${MEDIA_SSH_AUTH_BIND_ADDRESS:?Set the source bridge gateway}
+      ENVIRONMENT: production
+      PUBLIC_DOMAIN: restream.adojapan.ru
+      PUBLIC_CONTROL_URL: https://restream.adojapan.ru
+      PUBLIC_RTMP_HOST: ${MEDIA_PUBLIC_HOST:?Set the separate media hostname}
+      PUBLIC_RTMP_PORT: "1935"
+      COOKIE_SECURE: "true"
+      SQLITE_PATH: /srv/app/data/restream.db
+      BOOTSTRAP_SOCKET_PATH: /run/adojapan-bootstrap/bootstrap.sock
+    ports: ["127.0.0.1:8088:8000/tcp"]
+    volumes:
+      - database:/srv/app/data
+      - logs:/srv/app/logs
+      - backups:/srv/app/backups
+      - bootstrap_socket:/run/adojapan-bootstrap:ro
+      - ./media-ssh:/run/media-ssh:ro
+    networks: [control-egress]
+    depends_on:
+      bootstrap: {condition: service_healthy}
+    init: true
+    read_only: true
+    tmpfs: ["/tmp:size=32m,mode=1777"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    cpus: "0.40"
+    mem_limit: 384m
+    pids_limit: 96
+    stop_grace_period: 25s
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, "http://127.0.0.1:8000/health/live"]
+      interval: 15s
+      timeout: 4s
+      retries: 4
+      start_period: 30s
+    logging: &logs
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+  bootstrap:
+    image: ${BOOTSTRAP_IMAGE:?Set the preserved immutable bootstrap image}
+    pull_policy: never
+    environment:
+      ENVIRONMENT: production
+      BOOTSTRAP_SOCKET_PATH: /run/adojapan-bootstrap/bootstrap.sock
+      BOOTSTRAP_SECRET_FILE: /run/secrets/bootstrap_worker_secret
+      BOOTSTRAP_MAX_ACTIVE_JOBS: "1"
+      BOOTSTRAP_JOB_TTL_SECONDS: "1200"
+    secrets: [bootstrap_worker_secret]
+    volumes: ["bootstrap_socket:/run/adojapan-bootstrap"]
+    networks: [bootstrap-egress]
+    init: true
+    read_only: true
+    tmpfs: ["/tmp:size=32m,mode=1777"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    cpus: "0.10"
+    mem_limit: 128m
+    pids_limit: 64
+    stop_grace_period: 90s
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, python, -c, "import socket;s=socket.socket(socket.AF_UNIX);s.settimeout(3);s.connect('/run/adojapan-bootstrap/bootstrap.sock');s.close()"]
+      interval: 15s
+      timeout: 4s
+      retries: 4
+      start_period: 15s
+    logging: *logs
+networks:
+  control-egress: {}
+  bootstrap-egress: {}
+volumes:
+  database: {}
+  logs: {}
+  backups: {}
+  bootstrap_socket: {}
+secrets:
+  bootstrap_worker_secret:
+    file: ./bootstrap_worker_secret

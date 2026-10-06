@@ -1,0 +1,6 @@
+#!/bin/sh
+# Root-owned, no arguments, one fixed non-root sandbox. Never add a generic exec.
+set -eu
+[ "$#" -eq 0 ] || exit 64
+exec /usr/bin/docker exec -i --user 10001:10001 \
+    adojapan-restream-media-runtime python /opt/media_exec.py

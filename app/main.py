@@ -35,6 +35,7 @@ from app.services.bootstrap import (
     BootstrapCoordinator,
     UnavailableBootstrapCoordinator,
 )
+from app.services.media_ssh import SSHMediaTransport
 from app.services.mediamtx import MediaMTXClient
 from app.services.nodes import NodeService
 from app.services.preview import PreviewService
@@ -59,9 +60,12 @@ def create_app(
     settings = settings or Settings.from_env()
     configure_logging(settings.log_level)
     database = Database(settings.database_path)
+    media_transport = SSHMediaTransport(settings.media_ssh) if settings.media_ssh else None
+    if media_transport is not None and worker_launcher is not None:
+        raise ValueError("SSH media execution cannot be replaced by a local launcher")
     runtime_kwargs: dict[str, Any] = {
         "mediamtx": mediamtx,
-        "worker_launcher": worker_launcher,
+        "worker_launcher": media_transport or worker_launcher,
     }
     runtime_kwargs["url_validator"] = url_validator or destination_validator(
         environment=settings.environment,
@@ -116,7 +120,14 @@ def create_app(
             await recover_interrupted()
         nodes.prune_retention()
         relays.prune_retention()
-        await runtime.startup()
+        if media_transport is not None:
+            await media_transport.start()
+        try:
+            await runtime.startup()
+        except BaseException:
+            if media_transport is not None:
+                await media_transport.close()
+            raise
         try:
             monitor_active = getattr(bootstrap_service, "monitor_active_jobs", None)
             if monitor_active is not None:
@@ -140,7 +151,11 @@ def create_app(
                         await asyncio.gather(*pending_background, return_exceptions=True)
                     await bootstrap_service.close()
                 finally:
-                    await runtime.shutdown()
+                    try:
+                        await runtime.shutdown()
+                    finally:
+                        if media_transport is not None:
+                            await media_transport.close()
 
     app = FastAPI(
         title="AdoJapan Restream",

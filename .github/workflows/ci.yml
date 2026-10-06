@@ -83,6 +83,8 @@ jobs:
         run: |
           for file in \
             scripts/*.sh \
+            deploy/control-plane/restream-media-exec \
+            deploy/control-plane/restream-media-exec-root \
             deploy/hk-relay-agent/*.sh \
             ci/rpm-fixture/* \
             ci/ssh-target/fake-*; do
@@ -103,6 +105,19 @@ jobs:
           docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml config --quiet
           uv run --locked python scripts/render_ci_node_compose.py \
             | docker compose -p adojapan-restream-node-ci -f - config --quiet
+
+      - name: SSH control and source media Compose configurations
+        shell: bash
+        run: |
+          task_dir="$(mktemp -d)"
+          cp deploy/control-plane/*.yml "$task_dir/"
+          touch "$task_dir/backend.env" "$task_dir/bootstrap_worker_secret" "$task_dir/media_exec.py"
+          CONTROL_IMAGE=synthetic/control:ci BOOTSTRAP_IMAGE=synthetic/bootstrap:ci \
+            MEDIA_SSH_HOST=8.8.8.8 MEDIA_SSH_MEDIAMTX_ADDRESS=172.22.0.3 \
+            MEDIA_SSH_AUTH_BIND_ADDRESS=172.22.0.1 MEDIA_PUBLIC_HOST=ingest.example.test \
+            docker compose -p adojapan-restream-control-ci -f "$task_dir/compose.yml" config --quiet
+          PRESERVED_BACKEND_IMAGE=synthetic/backend:ci SOURCE_INTERNAL_NETWORK=synthetic-source \
+            docker compose -p adojapan-restream-media-ci -f "$task_dir/media-runtime.compose.yml" config --quiet
 
       - name: Build images
         run: docker compose -p adojapan-restream --env-file .env.ci -f compose.yml -f compose.production.yml -f compose.ci.yml build
