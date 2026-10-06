@@ -146,6 +146,11 @@ clock conversion. The first RTMP run failed because 200 ms analysis did not disc
 dimensions; the explicit bounded 3 s analysis fixed that cause. A Windows cleanup failure
 also exposed a broken-pipe close after process exit; cleanup now handles that error and
 writes the safe report before teardown. No media threshold was relaxed to hide these runs.
+The first extended failure run passed all four seams and both process-crash cases, then
+failed because its new old-source check queried ingress on the session table. The check
+now reads `broadcast_sources`, which owns ingress; runtime behavior was not changed.
+The first panel walkthrough also caught CSP blocking its helper's inline script; the
+helper now serves a same-origin external script, and the full walkthrough passes.
 
 ## Separate physical acceptance
 

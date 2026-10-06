@@ -328,7 +328,7 @@ class HandoffLab(SwitchingLab):
         with self.database.connect() as db:
             assert (
                 db.execute(
-                    "SELECT ingress_node_id FROM broadcast_sessions WHERE id=?", (self.session_id,)
+                "SELECT ingress_node_id FROM broadcast_sources WHERE id=?", (self.source_id,)
                 ).fetchone()[0]
                 == "relay-c"
             )
