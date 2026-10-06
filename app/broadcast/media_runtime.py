@@ -8,17 +8,19 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import io
 import json
 import os
 import secrets
 import subprocess
 import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import IO, Any, cast
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 import httpx
@@ -26,6 +28,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
 from app.broadcast.envelope import open_envelope
 from app.broadcast.models import MediaProfile, ResourceLimits, youtube_endpoint
+from app.broadcast.selector import Selector
 
 
 @dataclass(frozen=True)
@@ -36,10 +39,10 @@ class MediaPorts:
     api: int
 
 
-def launch(argv: list[str], *, progress: bool = False) -> subprocess.Popen[str]:
+def launch(argv: list[str], *, progress: bool = False, feed: bool = False) -> subprocess.Popen[str]:
     return subprocess.Popen(  # noqa: S603 - argv comes from validated typed plans, never a shell
         argv,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.PIPE if feed else subprocess.DEVNULL,
         stdout=subprocess.PIPE if progress else subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         text=True,
@@ -47,7 +50,7 @@ def launch(argv: list[str], *, progress: bool = False) -> subprocess.Popen[str]:
     )
 
 
-def stop(process: subprocess.Popen[str]) -> None:
+def stop(process: subprocess.Popen[Any]) -> None:
     if process.poll() is None:
         process.terminate()
         try:
@@ -58,8 +61,10 @@ def stop(process: subprocess.Popen[str]) -> None:
 
 
 class Publisher:
-    def __init__(self, argv: list[str]) -> None:
+    def __init__(self, argv: list[str], *, feed: bool = False) -> None:
         self.argv = argv
+        self.feed = feed
+        self.selector: Selector | None = None
         self.process: subprocess.Popen[str] | None = None
         self.frames = 0
         self.time_us = 0
@@ -93,6 +98,8 @@ class Publisher:
 
     def tick(self) -> None:
         now = time.monotonic()
+        if self.selector and self.selector.error and self.process:
+            stop(self.process)
         if self.process and self.process.poll() is None:
             if now - self.started > 60 and now - self.last_progress < 3:
                 self.failures = 0
@@ -100,13 +107,22 @@ class Publisher:
         if self.process is not None:
             self.failures += 1
             self.retry_at = now + min(30, 2**self.failures)
+            self.close()
             self.process = None
         if now < self.retry_at or self.failures >= 5:
             return
         self.frames, self.time_us, self.last_progress, self.first_progress = 0, 0, 0, 0
         self.bytes = 0
         self.started = now
-        self.process = launch(self.argv, progress=True)
+        if self.selector:
+            self.selector.close()
+            self.selector = None
+        self.process = launch(self.argv, progress=True, feed=self.feed)
+        if self.feed:
+            assert self.process.stdin is not None
+            self.selector = Selector(
+                cast(IO[bytes], cast(io.TextIOWrapper, self.process.stdin).buffer)
+            )
         self.reader = threading.Thread(target=self._read, args=(self.process,), daemon=True)
         self.reader.start()
 
@@ -122,6 +138,13 @@ class Publisher:
     def close(self) -> None:
         if self.process:
             stop(self.process)
+        if self.selector:
+            self.selector.close()
+            self.selector = None
+        if self.process:
+            if self.process.stdin:
+                with suppress(OSError, ValueError):  # Child is already reaped; pipe may be broken.
+                    self.process.stdin.close()
             if self.process.stdout:
                 self.process.stdout.close()
         if self.reader:
@@ -513,12 +536,82 @@ class MediaRuntime:
             destination,
         ]
 
+    def _selector_input(self, path: str) -> list[str]:
+        return [
+            self.ffmpeg,
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-rw_timeout",
+            "3000000",
+            "-rtmp_live",
+            "live",
+            "-rtmp_buffer",
+            "0",
+            "-probesize",
+            "4194304",
+            "-analyzeduration",
+            "3000000",
+            "-i",
+            self.local_url(path, protocol="rtmp"),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0",
+            "-c",
+            "copy",
+            "-flvflags",
+            "no_duration_filesize",
+            "-flush_packets",
+            "1",
+            "-f",
+            "flv",
+            "pipe:1",
+        ]
+
+    def _selector_publisher(self, destination: str) -> list[str]:
+        return [
+            self.ffmpeg,
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-progress",
+            "pipe:1",
+            "-stats_period",
+            "0.25",
+            "-probesize",
+            "262144",
+            "-analyzeduration",
+            "200000",
+            "-f",
+            "flv",
+            "-i",
+            "pipe:0",
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0",
+            "-c",
+            "copy",
+            "-flvflags",
+            "no_duration_filesize",
+            "-flush_packets",
+            "1",
+            "-f",
+            "flv",
+            destination,
+        ]
+
     def _worker(
         self,
         mapping: dict[str, tuple[str, Publisher]],
         route_id: str,
         identity: str,
         argv: list[str],
+        *,
+        feed: bool = False,
     ) -> Publisher:
         existing = mapping.get(route_id)
         if existing and existing[0] != identity:
@@ -530,7 +623,7 @@ class MediaRuntime:
             existing[1].close()
             existing = None
         if existing is None:
-            worker = Publisher(argv)
+            worker = Publisher(argv, feed=feed)
             mapping[route_id] = (identity, worker)
         else:
             worker = existing[1]
@@ -619,6 +712,24 @@ class MediaRuntime:
                 observations.append({**status, "source_kind": "unknown"})
                 continue
             direct_path = f"source/{route['source_id']}/direct"
+            # Warm the compressed reader concurrently with format/PTS qualification.
+            # It cannot select itself: the normal probe and direct streak still gate select().
+            with self.egress_lock:
+                live = self.publishers.get(route_id)
+                lease = route["egress_lease"]
+                if (
+                    live
+                    and live[1].selector
+                    and direct_path not in live[1].selector.inputs
+                    and lease
+                    and lease["expires_at"] > datetime.now(UTC).isoformat()
+                ):
+                    try:
+                        ready = self.http.get(f"/v3/paths/get/{direct_path}")
+                        if ready.is_success and ready.json().get("ready"):
+                            live[1].selector.prepare(direct_path, self._selector_input(direct_path))
+                    except httpx.HTTPError:
+                        pass
             if direct_path not in probes:
                 probes[direct_path] = self.probe(direct_path, route["profile"])
             direct = probes[direct_path]
@@ -698,13 +809,33 @@ class MediaRuntime:
                 worker = self._worker(
                     self.publishers,
                     route_id,
-                    selected + destination,
-                    self._copy(self.local_url(selected), destination),
+                    route["source_id"] + destination,
+                    self._selector_publisher(destination),
+                    feed=True,
                 )
+                selector = worker.selector
+                if selector:
+                    selector.prepare(selected, self._selector_input(selected))
+                    selector.select(selected)
+                    # Telemetry reports the committed input, never merely the requested one.
+                    if selector.selected and selector.selected != selected:
+                        source_kind = (
+                            "forwarded" if selector.selected.startswith("forward/") else "direct"
+                        )
+                        measurement = self.probe(selector.selected, route["profile"])
+                    elif not selector.selected:
+                        measurement = None
+                    if selector.events:
+                        self.source_switches[route_id] = {
+                            "gap_ms": float(selector.events[-1]["video_gap_ms"])
+                        }
+            if not measurement:
+                observations.append({**status, "source_kind": "unknown"})
+                continue
             if source_kind == "direct" and route_id in self.forwarders and worker.connected:
                 self.forwarders.pop(route_id)[1].close()
             switch = self.source_switches.get(route_id)
-            if switch and worker.first_progress:
+            if switch and "last_old_progress" in switch and worker.first_progress:
                 switch["gap_ms"] = 1000 * (worker.first_progress - switch["last_old_progress"])
             observation = {
                 **status,

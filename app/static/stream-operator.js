@@ -30,7 +30,7 @@
         block.append(ui.el("h3", output.name), ui.el("p", `YouTube overall: ${output.youtube.stream_status} / ${output.youtube.health_status} · Зритель: UNKNOWN`), ui.operation(output, cancel));
         for (const route of output.routes) {
           const row = ui.el("div", undefined, "broadcast-route"); row.dataset.routeId = route.id;
-          row.append(ui.el("strong", `${ui.name(data, route.node_id)} · ${route.role} / ${route.youtube_slot || "NONE"}`), ui.links(route));
+          row.append(ui.el("strong", `${ui.name(data, route.node_id)} · ${route.role} / ${route.youtube_slot || "NONE"}`), ui.links(route, data, session));
           if (route.role === "standby") {
             const b = ui.button(`Переключиться на ${ui.name(data, route.node_id)}`, () => ui.switchDialog(data, output, route, switchRequest));
             b.disabled = !route.server_ready || !output.desired_enabled || !output.youtube.has_backup || Boolean(output.switch?.active);

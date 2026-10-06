@@ -19,7 +19,7 @@
         const card = ui.el("section", undefined, "broadcast-card"); card.append(ui.el("h2", session.name));
         for (const output of session.outputs) {
           card.append(ui.el("h3", output.name));
-          for (const route of output.routes) card.append(ui.el("strong", `${ui.name(data, route.node_id)} · ${route.role} / ${route.youtube_slot || "NONE"}`), ui.links(route));
+          for (const route of output.routes) card.append(ui.el("strong", `${ui.name(data, route.node_id)} · ${route.role} / ${route.youtube_slot || "NONE"}`), ui.links(route, data, session));
           card.append(ui.operation(output, null));
         } root.append(card);
       }

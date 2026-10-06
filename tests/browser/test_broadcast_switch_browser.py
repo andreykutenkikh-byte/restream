@@ -171,6 +171,13 @@ def test_switch_dialog_idempotency_reload_rollback_and_operator_revoke(
         page.get_by_role("button", name="Переключиться на Japan", exact=True).click()
         dialog = page.get_by_role("dialog")
         assert "Повторный ввод не нужен" in dialog.inner_text()
+        mode = dialog.get_by_label("Режим переключения")
+        mode.select_option("egress")
+        assert "EGRESS_ONLY" in dialog.inner_text()
+        assert "Старый ingress остаётся в маршруте" in dialog.inner_text()
+        mode.select_option("full")
+        assert "FULL_ROUTE" in dialog.inner_text()
+        assert "OBS:" in dialog.inner_text() and "Moblin:" in dialog.inner_text()
         dialog.get_by_role("button", name="Подготовить и переключить").evaluate(
             "b => { b.click(); b.click(); }"
         )

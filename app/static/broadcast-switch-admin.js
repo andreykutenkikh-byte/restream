@@ -44,7 +44,7 @@ document.addEventListener("broadcast-render", event => {
       block.append(el("p", `YouTube credential: ${output.credential_stored ? "Сохранён" : "Не создан"} · Активных leases: ${output.active_egress_leases}`),
         ui.operation(output, id => api(`/api/broadcasts/switches/${id}/cancel`, {})));
       for (const route of output.routes) {
-        const routeCard = block.querySelector(`[data-route-id="${route.id}"]`); routeCard.append(ui.links(route));
+        const routeCard = block.querySelector(`[data-route-id="${route.id}"]`); routeCard.append(ui.links(route, snapshot, session));
         if (route.role === "standby") {
           const switchButton = ui.button(`Переключиться на ${ui.name(snapshot, route.node_id)}`, () => ui.switchDialog(snapshot, output, route,
             (oid, rid, handoff) => api(`/api/broadcasts/outputs/${oid}/switch`, {target_route_id: rid, handoff_ingress: handoff}, `switch:${oid}:${rid}`)));
