@@ -26,6 +26,7 @@ from app.broadcast.media_api import router as broadcast_media_router
 from app.broadcast.media_control import MediaControl
 from app.broadcast.models import BroadcastError
 from app.broadcast.oauth import YouTubeOAuth
+from app.broadcast.presentation_api import router as broadcast_presentation_router
 from app.broadcast.store import BroadcastStore
 from app.broadcast.switch_api import OperatorBodyLimit
 from app.broadcast.switch_api import router as broadcast_switch_router
@@ -243,6 +244,7 @@ def create_app(
     app.include_router(bootstrap_router)
     app.include_router(moblin_hud_router)
     app.include_router(broadcast_router)
+    app.include_router(broadcast_presentation_router)
     app.include_router(broadcast_media_router)
     app.include_router(broadcast_switch_router)
 
@@ -284,6 +286,7 @@ def create_app(
             "/",
             "/login",
             "/servers",
+            "/legacy",
             "/broadcasts",
         }:
             response.headers["Cache-Control"] = "no-store"

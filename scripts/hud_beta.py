@@ -46,6 +46,7 @@ _NODE_READ = re.compile(r"/api/nodes/[A-Za-z0-9-]+(?:/relay(?:/status)?)?")
 _DEVICE_REVOKE = re.compile(r"/api/moblin-hud/devices/[A-Za-z0-9-]+/revoke")
 _READ_PATHS = {
     "/",
+    "/legacy",
     "/login",
     "/servers",
     "/health/live",

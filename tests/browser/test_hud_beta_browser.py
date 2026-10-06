@@ -128,6 +128,7 @@ async def _exercise_browser(
         await admin.locator("#password").fill(SYNTHETIC_PASSWORD)
         await admin.locator('[data-login-form] button[type="submit"]').click()
         await admin.wait_for_url(origin + "/")
+        await admin.goto(origin + "/legacy")
         assert await admin.locator('script[src*="moblin-hud-admin.js"]').count() == 1
         async with admin.expect_response(
             lambda response: urlsplit(response.url).path == "/api/moblin-hud/pairings"

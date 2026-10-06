@@ -169,6 +169,13 @@ def test_operator_pairing_scoping_csrf_monitor_isolation_revoke_and_expiry(
             == 401
         )
         assert client.get("/api/broadcasts").status_code == 401
+        assert client.get("/api/broadcasts/ui-state").status_code == 401
+        for path, payload in [
+            ("/api/broadcasts/prepare", {"ingress_node_id": nodes[0]}),
+            (f"/api/broadcasts/sessions/{sid}/connection", {}),
+            (f"/api/broadcasts/outputs/{outputs[0]}/connection", {}),
+        ]:
+            assert client.post(path, json=payload, headers=headers).status_code == 401
         assert (
             client.post(
                 f"/api/broadcasts/sessions/{sid}/moblin-profiles", json={}, headers=headers

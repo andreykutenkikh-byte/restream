@@ -61,6 +61,27 @@ def test_admin_write_csrf_origin_fetch_metadata_and_monitor_isolation(
         url = f"/api/broadcasts/sessions/{sid}/outputs"
         assert client.post(url, json=output, headers=headers).status_code == 201
         assert "synthetic-write-only-key" not in client.get("/api/broadcasts").text
+        ui_routes = [
+            ("/api/broadcasts/prepare", {"ingress_node_id": grant.node_id}),
+            (f"/api/broadcasts/sessions/{sid}/connection", {}),
+            ("/api/broadcasts/outputs/unknown/connection", {"stream_key": "synthetic-key"}),
+        ]
+        assert "Моя трансляция" in client.get("/").text
+        legacy = client.get("/legacy")
+        assert "data-relay-video" in legacy.text
+        assert legacy.headers["cache-control"] == "no-store"
+        ui_state = client.get("/api/broadcasts/ui-state")
+        assert ui_state.status_code == 200
+        assert ui_state.headers["cache-control"] == "no-store"
+        assert "synthetic-write-only-key" not in ui_state.text
+        for path, payload in ui_routes:
+            assert client.post(path, json=payload).status_code == 403
+            assert (
+                client.post(
+                    path, json=payload, headers={**headers, "Origin": "https://evil.example"}
+                ).status_code
+                == 403
+            )
         assert client.get("/broadcasts").headers["cache-control"] == "no-store"
         assert client.post(url, content="x" * 5000, headers=headers).status_code == 413
         pairing = app.state.moblin_hud.create_pairing("Monitor")
@@ -69,6 +90,9 @@ def test_admin_write_csrf_origin_fetch_metadata_and_monitor_isolation(
         client.cookies.set(HUD_SESSION_COOKIE, monitor.session_token)
         assert client.get("/api/broadcasts").status_code == 401
         assert client.post(url, json=output, headers=headers).status_code == 401
+        assert client.get("/api/broadcasts/ui-state").status_code == 401
+        for path, payload in ui_routes:
+            assert client.post(path, json=payload, headers=headers).status_code == 401
         assert "stream_key" not in json.dumps(app.state.broadcasts.snapshot())
 
 

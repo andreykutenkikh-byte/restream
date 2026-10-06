@@ -9,7 +9,7 @@ import re
 import secrets
 import sqlite3
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any, cast
 
 from app.broadcast.models import BroadcastError, OutputCreate, ResourceLimits, SessionCreate
@@ -99,9 +99,11 @@ class BroadcastStore:
             (session_id, output_id, switch_id, event_type, json.dumps(detail or {}), utc_now()),
         )
 
-    def create_session(self, data: SessionCreate, key: str) -> str:
+    def create_session(
+        self, data: SessionCreate, key: str, *, _db: sqlite3.Connection | None = None
+    ) -> str:
         value = data.model_dump()
-        with self.transaction() as db:
+        with self.transaction() if _db is None else nullcontext(_db) as db:
             prior = self.replay(db, "session", key, value)
             if prior:
                 return prior
@@ -123,11 +125,21 @@ class BroadcastStore:
             self.remember(db, "session", key, value, session_id)
             return session_id
 
-    def create_output(self, session_id: str, data: OutputCreate, key: str) -> str:
+    def create_output(
+        self,
+        session_id: str,
+        data: OutputCreate,
+        key: str,
+        *,
+        draft: bool = False,
+        _db: sqlite3.Connection | None = None,
+    ) -> str:
         value = data.model_dump(mode="json")
         value["stream_key"] = data.stream_key.get_secret_value() if data.stream_key else None
+        if draft:
+            value["draft"] = True
         scope = f"output:{session_id}"
-        with self.transaction() as db:
+        with self.transaction() if _db is None else nullcontext(_db) as db:
             prior = self.replay(db, scope, key, value)
             if prior:
                 return prior
@@ -139,7 +151,11 @@ class BroadcastStore:
             if count >= self.limits.max_outputs_per_source:
                 raise BroadcastError("output_limit")
             credentials: dict[str, Any] | None = None
-            if data.mode == "manual":
+            if draft:
+                if data.mode != "manual" or data.primary_url or data.backup_url or data.stream_key:
+                    raise BroadcastError("empty_manual_draft_required", 422)
+                fingerprint = None
+            elif data.mode == "manual":
                 if not data.primary_url or not data.stream_key:
                     raise BroadcastError("manual_credentials_required", 422)
                 if data.backup_url == data.primary_url:
