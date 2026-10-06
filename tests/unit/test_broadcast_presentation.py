@@ -58,6 +58,16 @@ def test_explicit_prepare_atomic_idempotent_and_reveal_read_only(store: Broadcas
     assert params["passphrase"][0] in params["streamid"][0]
     assert params["passphrase"][0] not in json.dumps(state)
     assert params["passphrase"][0] not in dump(store)
+    with store.transaction() as db:
+        db.execute("UPDATE broadcast_media_nodes SET last_seen_at='2000-01-01T00:00:00+00:00'")
+    before = dump(store)
+    assert first == view.connection(result["session_id"], None)
+    assert dump(store) == before
+    assert view.state()["nodes"][0]["setup_error"] == "media_heartbeat_stale"
+    with store.transaction() as db:
+        db.execute("UPDATE restream_nodes SET status='revoked' WHERE id='relay-a'")
+    with pytest.raises(BroadcastError, match="media_node_not_enabled"):
+        view.connection(result["session_id"], None)
 
 
 def test_prepare_rolls_back_on_capacity_and_private_or_v1_nodes(store: BroadcastStore) -> None:  # noqa: F811

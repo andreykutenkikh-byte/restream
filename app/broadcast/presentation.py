@@ -51,8 +51,19 @@ class BroadcastPresentation:
     def __init__(self, store: BroadcastStore, media: MediaControl, switches: SwitchController):
         self.store, self.media, self.switches = store, media, switches
 
-    def public_node(self, db: Any, node_id: str) -> Any:
-        node = self.media.ready_node(db, node_id)
+    def public_node(self, db: Any, node_id: str, *, require_fresh: bool = True) -> Any:
+        if require_fresh:
+            node = self.media.ready_node(db, node_id)
+        else:
+            # Revealing an existing address is not media admission: a missed
+            # heartbeat does not revoke its credential. Revocation still does.
+            node = db.execute(
+                "SELECT m.*,n.status,n.revoked_at FROM broadcast_media_nodes m "
+                "JOIN restream_nodes n ON n.id=m.node_id WHERE m.node_id=?",
+                (node_id,),
+            ).fetchone()
+            if not node or not node["enabled"] or node["revoked_at"] or node["status"] == "revoked":
+                raise BroadcastError("media_node_not_enabled")
         if not CAPABILITIES.issubset(json.loads(node["capabilities_json"])):
             raise BroadcastError("media_capability_missing")
         if not ip_address(node["srt_host"]).is_global:
@@ -117,7 +128,7 @@ class BroadcastPresentation:
                     (target_route_id, session_id),
                 )
                 node_id = route["node_id"]
-            node = self.public_node(db, node_id)
+            node = self.public_node(db, node_id, require_fresh=False)
             row = db.execute(
                 "SELECT encrypted FROM broadcast_source_secrets WHERE source_id=?",
                 (session["source_id"],),
