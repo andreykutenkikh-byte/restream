@@ -61,9 +61,10 @@ def stop(process: subprocess.Popen[Any]) -> None:
 
 
 class Publisher:
-    def __init__(self, argv: list[str], *, feed: bool = False) -> None:
+    def __init__(self, argv: list[str], *, feed: bool = False, fps: int = 30) -> None:
         self.argv = argv
         self.feed = feed
+        self.fps = fps
         self.selector: Selector | None = None
         self.process: subprocess.Popen[str] | None = None
         self.frames = 0
@@ -121,7 +122,7 @@ class Publisher:
         if self.feed:
             assert self.process.stdin is not None
             self.selector = Selector(
-                cast(IO[bytes], cast(io.TextIOWrapper, self.process.stdin).buffer)
+                cast(IO[bytes], cast(io.TextIOWrapper, self.process.stdin).buffer), fps=self.fps
             )
         self.reader = threading.Thread(target=self._read, args=(self.process,), daemon=True)
         self.reader.start()
@@ -154,7 +155,9 @@ class Publisher:
 class PacketProbe:
     """A persistent reader preserves a moving PTS timeline between heartbeats."""
 
-    def __init__(self, ffprobe: str, url: str, identity: str) -> None:
+    def __init__(
+        self, ffprobe: str, url: str, identity: str, *, timeout_us: int = 3_000_000
+    ) -> None:
         self.identity = identity
         self.video_pts = 0.0
         self.audio_pts = 0.0
@@ -173,7 +176,7 @@ class PacketProbe:
                 "-rtsp_transport",
                 "tcp",
                 "-timeout",
-                "3000000",
+                str(timeout_us),
                 "-show_packets",
                 "-show_entries",
                 "packet=codec_type,pts_time,size",
@@ -612,6 +615,7 @@ class MediaRuntime:
         argv: list[str],
         *,
         feed: bool = False,
+        fps: int = 30,
     ) -> Publisher:
         existing = mapping.get(route_id)
         if existing and existing[0] != identity:
@@ -623,7 +627,7 @@ class MediaRuntime:
             existing[1].close()
             existing = None
         if existing is None:
-            worker = Publisher(argv, feed=feed)
+            worker = Publisher(argv, feed=feed, fps=fps)
             mapping[route_id] = (identity, worker)
         else:
             worker = existing[1]
@@ -720,7 +724,10 @@ class MediaRuntime:
                 if (
                     live
                     and live[1].selector
-                    and direct_path not in live[1].selector.inputs
+                    and (
+                        direct_path not in live[1].selector.inputs
+                        or live[1].selector.inputs[direct_path].error
+                    )
                     and lease
                     and lease["expires_at"] > datetime.now(UTC).isoformat()
                 ):
@@ -812,6 +819,7 @@ class MediaRuntime:
                     route["source_id"] + destination,
                     self._selector_publisher(destination),
                     feed=True,
+                    fps=route["profile"]["fps"],
                 )
                 selector = worker.selector
                 if selector:

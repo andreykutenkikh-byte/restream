@@ -91,6 +91,7 @@ class SwitchingLab(Lab):
                         self.ffprobe,
                         f"rtsp://reader:{self.reader_secret}@127.0.0.1:{self.sink_rtsp}/out/{index}",
                         identity,
+                        timeout_us=30_000_000,  # Observe the existing 30s reconnect budget.
                     )
                 )
 
@@ -308,7 +309,7 @@ class SwitchingLab(Lab):
                 )
             )
             new_receiver = self.receivers[sink][-1]
-            assert new_receiver is target_receiver
+            assert new_receiver is target_receiver, "continuous_packet_observer_reconnected"
             source_gap = self.runtimes[node].source_switches[target]["gap_ms"]
             assert 0 < source_gap < 30000
             with self.database.connect() as db:

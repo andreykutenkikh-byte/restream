@@ -159,6 +159,17 @@ case reports whether the publisher survived; it does not promise a persistent co
 through indefinite missing input. The two normal overlap/reconnect seams still assert
 publisher preservation and retain all their thresholds.
 
+The first Linux CI passed the general and browser jobs but exposed two media regressions.
+The original lab's ffprobe observer timed out at 3 s during the already permitted 30 s
+reconnect window. Its observer now remains connected for that window; runtime readiness
+timeouts and all media gap thresholds are unchanged. The extended lab also found that a
+terminated, previously rejected direct reader was only restarted after format qualification,
+serializing preparation and exceeding the sink's idle timeout. Failed readers now rewarm
+alongside qualification, under the same lease lock and bounded retry policy. The decoded
+observer explicitly uses timestamp passthrough and a millisecond video output timebase;
+its null output must not quantize a valid splice to a coarser frame clock. Any decoded
+timestamp regression or error is still fatal.
+
 ## Separate physical acceptance
 
 After a new explicit authorization, record OBS/Moblin/iOS versions and encoder settings.

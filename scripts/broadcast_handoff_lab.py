@@ -61,6 +61,10 @@ class DecodeObserver:
                 "showinfo",
                 "-af",
                 "ashowinfo",
+                "-fps_mode",
+                "passthrough",
+                "-enc_time_base:v",
+                "1:1000",
                 "-threads",
                 "2",
                 "-f",
@@ -411,8 +415,10 @@ class HandoffLab(SwitchingLab):
                     self.source_process = self.phone(node)
                     self.processes.append(self.source_process)
                     self.until(identifier, "COMPLETED")
-                    assert worker.selector is selector and worker.process.pid == publisher_pid
-                    assert selector.events and selector.error is None
+                    assert worker.selector is selector and worker.process.pid == publisher_pid, (
+                        "handoff_replaced_publisher"
+                    )
+                    assert selector.events and selector.error is None, "selector_commit_missing"
                     event = dict(selector.events[-1])
                     decision = float(event["decision_at"])
                     checksum, av_offset = decoded_boundary(self.ffmpeg, selector)
