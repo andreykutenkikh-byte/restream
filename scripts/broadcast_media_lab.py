@@ -302,6 +302,7 @@ class Lab:
 
     def exchange(self, node: str, observations: list[dict[str, Any]]) -> None:
         runtime = self.runtimes[node]
+        events = runtime.diagnostics.snapshot()
         self.sequence[node] += 1
         envelope = self.control.heartbeat(
             node,
@@ -312,9 +313,13 @@ class Lab:
                 sequence=self.sequence[node],
                 plan_generation=max(0, runtime.generation),
                 observations=[Observation.model_validate(o) for o in observations],
+                diagnostics_version=1,
+                diagnostic_events=events,
             ),
         )
         runtime.accept(envelope)
+        if events:
+            runtime.diagnostics.acknowledge(events[-1].sequence)
 
     def step(self) -> None:
         for node, runtime in self.runtimes.items():

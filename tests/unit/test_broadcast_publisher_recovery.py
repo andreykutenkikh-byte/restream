@@ -20,6 +20,7 @@ def test_live_but_stalled_publisher_uses_bounded_retry(
     stopped = Mock(side_effect=lambda p: setattr(p, "returncode", -9))
     monkeypatch.setattr(media_runtime, "stop", stopped)
     publisher = Publisher.__new__(Publisher)
+    publisher.diagnostics = Mock()
     publisher.feed = feed
     publisher.selector = None
     publisher.process = process
@@ -31,6 +32,8 @@ def test_live_but_stalled_publisher_uses_bounded_retry(
     publisher.retry_at = 0.0
     publisher.reader = None
     publisher.tick()
+    if recover:
+        publisher.diagnostics.assert_any_call("publisher_stalled", 30)
     if recover:
         assert stopped.call_count >= 1
         assert publisher.process is None

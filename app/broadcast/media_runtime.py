@@ -28,6 +28,7 @@ import httpx
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
 from app.broadcast.envelope import open_envelope
+from app.broadcast.media_diagnostics import DiagnosticCollector, Emit, read_diagnostics
 from app.broadcast.models import MediaProfile, ResourceLimits, youtube_endpoint
 from app.broadcast.selector import Selector
 
@@ -60,15 +61,24 @@ def input_video_format(streams: list[dict[str, Any]]) -> tuple[int, int, float] 
     return None
 
 
-def launch(argv: list[str], *, progress: bool = False, feed: bool = False) -> subprocess.Popen[str]:
-    return subprocess.Popen(  # noqa: S603 - argv comes from validated typed plans, never a shell
+def launch(
+    argv: list[str], *, progress: bool = False, feed: bool = False, diagnostics: Emit | None = None
+) -> subprocess.Popen[str]:
+    process = subprocess.Popen(  # noqa: S603 - argv comes from validated typed plans, never a shell
         argv,
         stdin=subprocess.PIPE if feed else subprocess.DEVNULL,
-        stdout=subprocess.PIPE if progress else subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE if progress or diagnostics else subprocess.DEVNULL,
+        stderr=subprocess.PIPE if diagnostics else subprocess.DEVNULL,
         text=True,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
+    if diagnostics:
+        assert process.stderr is not None
+        read_diagnostics(process.stderr, diagnostics)
+        if not progress:
+            assert process.stdout is not None
+            read_diagnostics(process.stdout, diagnostics)
+    return process
 
 
 def stop(process: subprocess.Popen[Any]) -> None:
@@ -82,10 +92,18 @@ def stop(process: subprocess.Popen[Any]) -> None:
 
 
 class Publisher:
-    def __init__(self, argv: list[str], *, feed: bool = False, fps: float = 30) -> None:
+    def __init__(
+        self,
+        argv: list[str],
+        *,
+        feed: bool = False,
+        fps: float = 30,
+        diagnostics: Emit | None = None,
+    ) -> None:
         self.argv = argv
         self.feed = feed
         self.fps = fps
+        self.diagnostics = diagnostics
         self.selector: Selector | None = None
         self.process: subprocess.Popen[str] | None = None
         self.frames = 0
@@ -121,6 +139,8 @@ class Publisher:
     def tick(self) -> None:
         now = time.monotonic()
         if self.selector and self.selector.error and self.process:
+            if self.diagnostics:
+                self.diagnostics(self.selector.error, None)
             stop(self.process)
         if self.process and self.process.poll() is None:
             # A blocked pipe reader can leave FFmpeg alive forever after the
@@ -128,12 +148,16 @@ class Publisher:
             # input, so recover this stalled copy publisher using the same
             # bounded retry policy as an exited process.
             if self.feed and now - max(self.started, self.last_progress) > 30:
+                if self.diagnostics:
+                    self.diagnostics("publisher_stalled", 30)
                 stop(self.process)
             else:
                 if now - self.started > 60 and now - self.last_progress < 3:
                     self.failures = 0
                 return
         if self.process is not None:
+            if self.diagnostics:
+                self.diagnostics("process_exit", self.process.poll())
             self.failures += 1
             self.retry_at = now + min(30, 2**self.failures)
             self.close()
@@ -146,11 +170,16 @@ class Publisher:
         if self.selector:
             self.selector.close()
             self.selector = None
-        self.process = launch(self.argv, progress=True, feed=self.feed)
+        options = {"diagnostics": self.diagnostics} if self.diagnostics else {}
+        self.process = launch(self.argv, progress=True, feed=self.feed, **options)
+        if self.failures and self.diagnostics:
+            self.diagnostics("publisher_retry", self.failures)
         if self.feed:
             assert self.process.stdin is not None
             self.selector = Selector(
-                cast(IO[bytes], cast(io.TextIOWrapper, self.process.stdin).buffer), fps=self.fps
+                cast(IO[bytes], cast(io.TextIOWrapper, self.process.stdin).buffer),
+                fps=self.fps,
+                diagnostics=self.diagnostics,
             )
         self.reader = threading.Thread(target=self._read, args=(self.process,), daemon=True)
         self.reader.start()
@@ -190,10 +219,13 @@ class PacketProbe:
         identity: str,
         *,
         video_format: tuple[int, int, float],
+        b_frames: int | None = None,
         timeout_us: int = 3_000_000,
+        diagnostics: Emit | None = None,
     ) -> None:
         self.identity = identity
         self.video_format = video_format
+        self.b_frames = b_frames
         self.video_pts = 0.0
         self.audio_pts = 0.0
         self.video_frames = 0
@@ -220,6 +252,7 @@ class PacketProbe:
                 url,
             ],
             progress=True,
+            diagnostics=diagnostics,
         )
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
@@ -255,6 +288,13 @@ class PacketProbe:
             "video_frames": self.video_frames,
             "audio_packets": self.audio_packets,
             "bitrate_bps": int(self.bytes * 8 / max(0.01, time.monotonic() - self.started)),
+            "input_bytes": self.bytes,
+            "input_epoch": int(self.started * 1000),
+            "input_age_ms": int(max(0, time.monotonic() - self.last_packet) * 1000),
+            "video_width": self.video_format[0],
+            "video_height": self.video_format[1],
+            "video_b_frames": self.b_frames,
+            "video_fps": self.video_format[2],
         }
 
     def close(self) -> None:
@@ -286,6 +326,7 @@ class MediaRuntime:
             if urlsplit(url).hostname != "127.0.0.1" or urlsplit(url).scheme != "rtmp":
                 raise ValueError("Synthetic sinks must be loopback RTMP")
         directory.mkdir(parents=True, exist_ok=True)
+        self.diagnostics = DiagnosticCollector(directory)
         self.plan: dict[str, Any] = {"routes": [], "exports": [], "sources": {}}
         self.generation = -1
         self.issued_at = ""
@@ -332,7 +373,7 @@ class MediaRuntime:
         self.auth_thread = threading.Thread(target=self.auth_server.serve_forever, daemon=True)
         self.auth_thread.start()
         config = {
-            "logLevel": "error",
+            "logLevel": "info",  # RTMP disconnect reasons are informational; only codes persist.
             "api": True,
             "apiAddress": f"127.0.0.1:{ports.api}",
             "authMethod": "http",
@@ -351,7 +392,9 @@ class MediaRuntime:
         config_file.write_text(json.dumps(config), encoding="utf-8")
         if os.name != "nt":
             config_file.chmod(0o600)
-        self.media = launch([mediamtx, str(config_file)])
+        self.media = launch(
+            [mediamtx, str(config_file)], diagnostics=self.diagnostics.callback("mediamtx")
+        )
         self.http = httpx.Client(
             base_url=f"http://127.0.0.1:{ports.api}", timeout=2, trust_env=False
         )
@@ -663,7 +706,17 @@ class MediaRuntime:
             existing[1].close()
             existing = None
         if existing is None:
-            worker = Publisher(argv, feed=feed, fps=fps)
+            collector = getattr(self, "diagnostics", None)
+            options = (
+                {
+                    "diagnostics": collector.callback(
+                        "publisher" if mapping is self.publishers else "forwarder", route_id
+                    )
+                }
+                if collector
+                else {}
+            )
+            worker = Publisher(argv, feed=feed, fps=fps, **options)
             mapping[route_id] = (identity, worker)
         else:
             worker = existing[1]
@@ -716,7 +769,14 @@ class MediaRuntime:
             if video_format is None:
                 return None
             self.probes[path] = PacketProbe(
-                self.ffprobe, self.local_url(path), source_identity, video_format=video_format
+                self.ffprobe,
+                self.local_url(path),
+                source_identity,
+                video_format=video_format,
+                b_frames=next(s for s in result["streams"] if s["codec_type"] == "video").get(
+                    "has_b_frames"
+                ),
+                diagnostics=self.diagnostics.callback("probe"),
             )
             return None
         except (httpx.HTTPError, subprocess.TimeoutExpired, ValueError, KeyError, StopIteration):
@@ -729,11 +789,24 @@ class MediaRuntime:
         for route in self.plan["routes"]:
             route_id = route["id"]
             existing = self.publishers.get(route_id)
+            worker = existing[1] if existing else None
+            selector = worker.selector if worker else None
+            if selector and selector.rejection and getattr(self, "diagnostics", None):
+                self.diagnostics.emit("selector", route_id, selector.rejection)
             status = {
                 "route_id": route_id,
                 "egress_generation": route["egress_generation"],
                 "egress_lease_id": route["egress_lease"]["id"] if route["egress_lease"] else None,
                 "runtime_secret_present": route["destination"] is not None,
+                "publisher_retries": worker.failures if worker else 0,
+                "publisher_epoch": int(worker.started * 1000) if worker else None,
+                "publisher_progress_age_ms": int(
+                    max(0, time.monotonic() - worker.last_progress) * 1000
+                )
+                if worker and worker.last_progress
+                else None,
+                "selector_queue_packets": len(selector.queue) if selector else None,
+                "selector_queue_bytes": selector.queued_bytes if selector else None,
                 "publisher_running": bool(
                     existing and existing[1].process and existing[1].process.poll() is None
                 ),
@@ -913,3 +986,5 @@ class MediaRuntime:
         self.auth_thread.join(timeout=3)
         if hasattr(self, "http"):
             self.http.close()
+        if hasattr(self, "diagnostics"):
+            self.diagnostics.close()

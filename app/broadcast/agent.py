@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import secrets
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -65,13 +64,15 @@ def main() -> None:
         srt_bind_host=config["srt_bind_host"],
         rtmp_bind_host=config.get("rtmp_bind_host", "127.0.0.1"),
     )
-    boot_id, sequence = secrets.token_hex(16), 0
+    boot_id, sequence = runtime.diagnostics.boot_id, 0
+    control_failed = False
     reset_observations = False
     try:
         with httpx.Client(timeout=10, follow_redirects=False, trust_env=False) as client:
             while True:
                 observations = runtime.tick()
                 sequence += 1
+                events = runtime.diagnostics.snapshot()
                 data = MediaHeartbeat(
                     boot_id=boot_id,
                     sequence=sequence,
@@ -84,6 +85,8 @@ def main() -> None:
                     observations=[]
                     if reset_observations
                     else [Observation.model_validate(o) for o in observations],
+                    diagnostics_version=1,
+                    diagnostic_events=events,
                 )
                 try:
                     response = client.post(
@@ -95,11 +98,20 @@ def main() -> None:
                         raise SystemExit("Media node authorization ended")
                     if response.is_success:
                         runtime.accept(response.json())
+                        if events:
+                            runtime.diagnostics.acknowledge(events[-1].sequence)
+                        if control_failed:
+                            runtime.diagnostics.emit("agent", None, "control_recovered")
+                        control_failed = False
                         reset_observations = False
                     elif response.status_code == 409:
                         reset_observations = True
+                    else:
+                        control_failed = True
+                        runtime.diagnostics.emit("agent", None, "control_unreachable")
                 except (httpx.HTTPError, ValueError, KeyError, TypeError, InvalidTag):
-                    pass  # Preserve established media if the controller is unavailable.
+                    control_failed = True
+                    runtime.diagnostics.emit("agent", None, "control_unreachable")
                 time.sleep(2)
     finally:
         runtime.close()

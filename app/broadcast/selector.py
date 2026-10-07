@@ -15,6 +15,8 @@ from collections import deque
 from dataclasses import dataclass
 from typing import IO
 
+from app.broadcast.media_diagnostics import Emit, read_diagnostics
+
 FLV_HEADER = b"FLV\x01\x05\x00\x00\x00\x09\x00\x00\x00\x00"
 MAX_TAG = 2 * 1024 * 1024
 MAX_BYTES = 8 * 1024 * 1024
@@ -103,9 +105,12 @@ class Input:
             argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE if owner.diagnostics else subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        if owner.diagnostics:
+            assert self.process.stderr is not None
+            read_diagnostics(self.process.stderr, owner.diagnostics)
         self.thread = threading.Thread(target=self.read, daemon=True)
         self.thread.start()
 
@@ -186,6 +191,9 @@ class Input:
             self.error = str(exc)  # All ValueErrors above use fixed secret-free codes.
         except (EOFError, OSError):
             self.error = "input_ended"
+        finally:
+            if self.error and self.owner.diagnostics and not self.owner.ending:
+                self.owner.diagnostics(self.error, None)
 
     def close(self) -> None:
         if self.process.poll() is None:
@@ -201,8 +209,9 @@ class Input:
 
 
 class Selector:
-    def __init__(self, sink: IO[bytes], fps: float = 30) -> None:
+    def __init__(self, sink: IO[bytes], fps: float = 30, diagnostics: Emit | None = None) -> None:
         self.sink, self.fps = sink, fps
+        self.diagnostics = diagnostics
         self.inputs: dict[str, Input] = {}
         self.input_restarts: dict[str, int] = {}
         self.input_faults: list[str] = []

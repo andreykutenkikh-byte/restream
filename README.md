@@ -531,6 +531,34 @@ the SSH password or raw `.env` into a support request.
 30 seconds. Check outbound HTTPS, the marker-owned remote agent project, and its bounded safe logs.
 Do not expose an inbound agent port or run a command supplied through the UI.
 
+## Managed broadcast diagnostics
+
+The managed transmission page links to **История качества и диагностика** for the selected output.
+Administrators can select a time window (up to seven days) and download all retained records for it
+as JSONL. The page shows the latest 100 entries of each kind and explicitly marks truncation.
+Browser times are local; JSONL timestamps are UTC. HUD/operator credentials cannot read this history.
+
+Migration 13 adds quality samples and process events without changing stream credentials. Active
+routes are sampled about every five seconds, idle routes every minute, with immediate state edges.
+Counters include input/output bytes and frames, measured rates, source epochs, format, retries,
+queue occupancy and progress age. Unknown readings and heartbeat gaps are not healthy samples.
+Rates reset across source/agent/publisher changes. A completed switch is not proof of viewer continuity.
+New tables retain up to seven days, with global caps of 250,000 samples and 50,000 process events;
+maintenance prunes in batches every 30 seconds. Earlier measurements cannot be reconstructed.
+
+Managed media agents classify FFmpeg/MediaMTX output into fixed error codes and bounded numbers.
+Raw log lines, URLs, keys, tokens and provider bodies are never persisted or exported. Repeated
+messages of one type/route are limited to once every five seconds. Pending events are acknowledged
+and deduplicated at the controller; overflow and disk failures are explicit codes. A background
+writer stores at most three 2 MiB `diagnostics.jsonl` files in the existing runtime directory even
+when the controller is unreachable. These local files survive agent restart; unacknowledged events
+are kept in bounded memory and are not automatically replayed from disk after a restart.
+
+Roll out the backward-compatible backend first, then managed media agents in an idle input/output
+window. Existing agents can still send heartbeats without diagnostics. Before rollback to an older
+backend, restore the old agents and the pre-migration database backup while sending is stopped.
+This changes neither the media binaries nor legacy relay/VPN/bootstrap services and records no video.
+
 ## Stage 1 limitations
 
 - one administrator and one incoming stream;

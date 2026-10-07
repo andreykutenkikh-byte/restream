@@ -1,0 +1,8 @@
+.diag-controls {display:flex;flex-wrap:wrap;gap:1rem;align-items:end;margin:1.5rem 0}
+.diag-controls label {display:grid;gap:.4rem}
+.diag-controls select,.diag-controls input {padding:.65rem;border:1px solid #d4cec4;border-radius:8px;background:#fff}
+.diag-table {overflow-x:auto}
+.diag-table table {border-collapse:collapse;width:100%;font-size:.9rem}
+.diag-table th,.diag-table td {padding:.7rem;text-align:left;border-bottom:1px solid #e4ddd2;vertical-align:top}
+.diag-table time {white-space:nowrap}
+#stream-diagnostics .tx-card {margin:1.25rem 0}

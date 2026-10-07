@@ -21,6 +21,8 @@ from app.api import router
 from app.bootstrap_api import BootstrapRateLimiter
 from app.bootstrap_api import router as bootstrap_router
 from app.broadcast.api import router as broadcast_router
+from app.broadcast.diagnostics import prune as prune_diagnostics
+from app.broadcast.diagnostics_api import router as broadcast_diagnostics_router
 from app.broadcast.media_api import MediaBodyLimitMiddleware
 from app.broadcast.media_api import router as broadcast_media_router
 from app.broadcast.media_control import MediaControl
@@ -122,6 +124,7 @@ def create_app(
                     nodes.prune_retention()
                     relays.prune_retention()
                     moblin_hud.prune_expired_pairings()
+                    await asyncio.to_thread(prune_diagnostics, app.state.broadcasts)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -244,6 +247,7 @@ def create_app(
     app.include_router(bootstrap_router)
     app.include_router(moblin_hud_router)
     app.include_router(broadcast_router)
+    app.include_router(broadcast_diagnostics_router)
     app.include_router(broadcast_presentation_router)
     app.include_router(broadcast_media_router)
     app.include_router(broadcast_switch_router)

@@ -318,6 +318,8 @@
     $("youtube-settings").disabled = busy || stale || !output || output.switch?.active;
     $("youtube-settings").textContent = output?.mode === "youtube_api" ? "Настройки OAuth" : output?.credential_stored ? "Изменить" : "Сохранить ключ YouTube";
     $("youtube-state").textContent = output?.credential_stored ? "Ключ сохранён" : "Скопируйте ключ из YouTube Studio и сохраните здесь.";
+    $("tx-diagnostics").hidden = !output;
+    if (output) $("tx-diagnostics").href = `/broadcasts/outputs/${encodeURIComponent(output.id)}/diagnostics`;
     const ingress = state?.nodes.find((n) => n.id === session?.ingress_node_id);
     $("obs-node").textContent = ingress ? `Сервер приёма: ${serverAddress(ingress)}` : "Адрес выдаётся выбранным сервером приёма.";
     $("obs-state").textContent = output ? "Подключение сохранено. Получите действующий адрес по кнопке ниже." : outputs.length ? "Выберите эфир, чтобы получить его подключение." : "Адрес для OBS и Moblin. Ключ YouTube сюда не нужен.";

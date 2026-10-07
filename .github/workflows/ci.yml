@@ -90,6 +90,7 @@ jobs:
       - name: Broadcast JavaScript syntax
         run: |
           node --check app/static/transmission.js
+          node --check app/static/stream-diagnostics.js
           node --check app/static/broadcasts.js
           node --check app/static/broadcast-route-ui.js
           node --check app/static/broadcast-switch-admin.js
