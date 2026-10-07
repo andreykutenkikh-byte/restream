@@ -96,7 +96,7 @@ def test_schema_v7_adds_scoped_hud_tables_idempotently(database: Database) -> No
             row["name"] for row in connection.execute("PRAGMA table_info(moblin_hud_pairings)")
         }
         foreign_key_errors = connection.execute("PRAGMA foreign_key_check").fetchall()
-    assert version == SCHEMA_VERSION == 11
+    assert version == SCHEMA_VERSION == 12
     assert tables == {"moblin_hud_devices", "moblin_hud_pairings"}
     assert {
         "id",
@@ -412,7 +412,7 @@ def test_schema_v5_upgrade_preserves_all_existing_rows_schema_and_foreign_keys(
             assert existing_rows(connection) == before
             assert [
                 row[0] for row in connection.execute("SELECT version FROM schema_migrations")
-            ] == [1, 2, 3, 4, 5, 7, 8, 9, 10, 11]
+            ] == [1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]
             assert "node_kind" not in {
                 row["name"] for row in connection.execute("PRAGMA table_info(restream_nodes)")
             }
