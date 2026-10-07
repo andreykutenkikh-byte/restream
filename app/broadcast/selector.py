@@ -201,7 +201,7 @@ class Input:
 
 
 class Selector:
-    def __init__(self, sink: IO[bytes], fps: int = 30) -> None:
+    def __init__(self, sink: IO[bytes], fps: float = 30) -> None:
         self.sink, self.fps = sink, fps
         self.inputs: dict[str, Input] = {}
         self.input_restarts: dict[str, int] = {}

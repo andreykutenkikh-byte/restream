@@ -442,7 +442,13 @@ class MediaControl:
                     "source_id": source_id,
                     "profile": json.loads(route["profile_json"]),
                     "enabled": bool(route["desired_enabled"]),
-                    "media_enabled": bool(route["desired_enabled"] or route["media_warm"]),
+                    # Observe the existing ingress before and after output sending.
+                    # This grants neither an egress lease nor interrelay forwarding.
+                    "media_enabled": bool(
+                        route["desired_enabled"]
+                        or route["media_warm"]
+                        or route["ingress_node_id"] == node_id
+                    ),
                     "youtube_slot": route["youtube_slot"],
                     "generation": route["generation"],
                     "egress_generation": self.store.row(

@@ -79,7 +79,9 @@ class MediaLab:
                 generation = envelope["context"]["generation"]
                 for route in plan["routes"]:
                     lease = route["egress_lease"]
-                    measured = self.video and (node == self.a or self.forward)
+                    measured = (
+                        route["media_enabled"] and self.video and (node == self.a or self.forward)
+                    )
                     connected = bool(lease and measured and not (self.fail and node == self.b))
                     observations.append(
                         Observation(
@@ -266,6 +268,14 @@ def test_first_setup_copy_key_switch_reload_and_multiple_choice(
         original = connection(page)
         assert original.startswith("srt://8.8.8.8:19000?")
         assert original == connection(page)
+        lab.video = True
+        expect(page.locator("#input-status")).to_have_text("Видео поступает", timeout=15000)
+        expect(page.locator("#input-bitrate")).to_have_text("4 Мбит/с")
+        expect(page.locator("#output-status")).to_have_text("Отправка остановлена")
+        with lab.store.database.connect() as db:
+            assert not db.execute("SELECT 1 FROM broadcast_egress_leases").fetchone()
+        lab.video = False
+        expect(page.locator("#input-status")).to_have_text("Ожидаем видео из OBS", timeout=15000)
         with lab.store.database.connect() as db:
             assert db.execute("SELECT COUNT(*) FROM broadcast_sessions").fetchone()[0] == 1
             source_seed = db.execute("SELECT encrypted FROM broadcast_source_secrets").fetchone()[0]

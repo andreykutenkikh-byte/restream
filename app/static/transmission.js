@@ -200,8 +200,7 @@
         };
         copyField("Сервер", result.protocol === "rtmp" ? result.server : result.url, result.protocol === "rtmp" ? "Скопировать сервер" : "Скопировать адрес");
         if (result.protocol === "rtmp") copyField("Ключ трансляции OBS", result.stream_key, "Скопировать ключ", "password");
-        const p = result.profile;
-        fields.append(el("p", `Параметры источника: H.264 + AAC, ${p.width} × ${p.height}, ${p.fps} кадров/с; интервал ключевых кадров — ${p.gop / p.fps} с.`));
+        fields.append(el("p", "Видео: H.264 + AAC. Вертикальный или горизонтальный формат и частота кадров определяются автоматически и сохраняются при передаче. Рекомендуемый интервал ключевых кадров — 2 с."));
         fields.append(el("p", result.protocol === "rtmp" ? "RTMP передаёт видео и ключ без шифрования. Для защищённого подключения выберите SRT." : "Адрес содержит доступ к источнику. Не публикуйте его."));
         ui.status.textContent = "Параметры получены. Отправка на YouTube не запущена этим действием.";
       } catch (error) { if (ui.d.isConnected && current === request) { ui.status.textContent = error.message; ui.status.dataset.error = "true"; } }

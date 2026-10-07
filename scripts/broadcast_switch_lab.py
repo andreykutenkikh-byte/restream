@@ -91,6 +91,11 @@ class SwitchingLab(Lab):
                         self.ffprobe,
                         f"rtsp://reader:{self.reader_secret}@127.0.0.1:{self.sink_rtsp}/out/{index}",
                         identity,
+                        video_format=(
+                            self.fixture_profile.width,
+                            self.fixture_profile.height,
+                            self.fixture_profile.fps,
+                        ),
                         timeout_us=30_000_000,  # Observe the existing 30s reconnect budget.
                     )
                 )
