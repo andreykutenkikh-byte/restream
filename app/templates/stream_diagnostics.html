@@ -7,7 +7,7 @@
   <h1>Диагностика эфира</h1>
   <p>История приёма видео, отправки и переключений. Пробелы в измерениях означают отсутствие данных; состояние отправки не подтверждает воспроизведение у зрителя.</p>
   <form id="diagnostic-period" class="diag-controls" method="get">
-    <label>Период <select name="hours">{% for n, label in [(1,'1 час'),(6,'6 часов'),(24,'24 часа'),(168,'7 дней')] %}<option value="{{ n }}" {% if hours == n %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+    <div><label for="diagnostic-hours">Период</label><select id="diagnostic-hours" name="hours">{% for n, label in [(1,'1 час'),(6,'6 часов'),(24,'24 часа'),(168,'7 дней')] %}<option value="{{ n }}" {% if hours == n %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></div>
     <label>До момента <input id="diagnostic-until" type="datetime-local" step="1" data-until="{{ report.until }}"></label>
     <button class="button button--secondary" type="submit">Показать</button>
     <a class="button button--quiet" id="diagnostic-export" href="/api/broadcasts/outputs/{{ report.output_id }}/diagnostics/export?hours={{ hours }}&amp;until={{ report.until|urlencode }}">Скачать полный отчёт</a>
