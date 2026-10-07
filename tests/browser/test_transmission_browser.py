@@ -47,7 +47,9 @@ class MediaLab:
         self.store, self.media = server.app.state.broadcasts, server.app.state.broadcast_media
         self.keys: dict[str, X25519PrivateKey] = {}
         self.seq = 0
-        self.video, self.forward, self.fail, self.pause = False, False, False, False
+        self.video, self.forward, self.fail = False, False, False
+        self._pulse_lock = threading.Lock()
+        self._paused = False
         self.failure: BaseException | None = None
         for name, ip in (("Сервер A", "8.8.8.8"), ("Сервер B", "1.1.1.1")):
             node = server.app.state.relays.provision_node(
@@ -119,11 +121,18 @@ class MediaLab:
     def run(self) -> None:
         try:
             while not self.stop.wait(0.3):
-                if not self.pause:
-                    with suppress(BroadcastError):
-                        self.pulse()
+                with self._pulse_lock:
+                    if not self._paused:
+                        with suppress(BroadcastError):
+                            self.pulse()
         except BaseException as exc:
             self.failure = exc
+
+    def set_paused(self, paused: bool) -> None:
+        # Wait for any heartbeat already in flight before tests alter telemetry.
+        # Otherwise that heartbeat can overwrite deliberately stale observations.
+        with self._pulse_lock:
+            self._paused = paused
 
     def close(self) -> None:
         self.stop.set()
@@ -317,7 +326,7 @@ def test_first_setup_copy_key_switch_reload_and_multiple_choice(
         )
         page.get_by_role("button", name="Закрыть", exact=True).click()
         # A stale observation must not keep a green input/publisher metric.
-        lab.pause = True
+        lab.set_paused(True)
         with lab.store.transaction() as db:
             db.execute(
                 "UPDATE broadcast_media_observations SET observed_at='2000-01-01T00:00:00+00:00'"
@@ -325,7 +334,7 @@ def test_first_setup_copy_key_switch_reload_and_multiple_choice(
         page.locator("#tx-refresh").click()
         expect(page.locator("#input-bitrate")).to_have_text("Нет данных")
         expect(page.locator("#output-status")).not_to_have_text("Отправка работает")
-        lab.pause = False
+        lab.set_paused(False)
         page.locator("#add-broadcast").click()
         dialog = page.get_by_role("dialog")
         dialog.get_by_label("Название эфира").fill("Второй эфир")
@@ -392,7 +401,7 @@ def test_failed_target_never_becomes_current_and_capability_gate(
         )
         expect(target).to_have_attribute("data-current", "false")
         expect(page.locator(f'[data-node-id="{lab.a}"]')).to_have_attribute("data-current", "true")
-        lab.pause = True
+        lab.set_paused(True)
         with lab.store.transaction() as db:
             db.execute(
                 "UPDATE broadcast_media_nodes SET capabilities_json='[]' WHERE node_id=?", (lab.b,)
