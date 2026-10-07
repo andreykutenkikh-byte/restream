@@ -39,6 +39,7 @@ def test_failed_bootstrap_is_distinct_from_legacy_and_recovers(
 ) -> None:  # noqa: F811
     view = ui(store)
     with store.transaction() as db:
+        db.execute("DELETE FROM broadcast_media_nodes WHERE node_id='relay-a'")
         db.execute("UPDATE restream_nodes SET status='failed' WHERE id='relay-a'")
         db.execute(
             "INSERT INTO node_install_jobs(id,node_id,state,current_step,safe_error_code,"
@@ -52,12 +53,32 @@ def test_failed_bootstrap_is_distinct_from_legacy_and_recovers(
     assert node["installation_error"] == (None if error == "private" else error)
     assert "private" not in json.dumps(view.state())
     assert before == dump(store)
-    for status, expected in [("installing", "node_install_in_progress"), ("ready", None)]:
+    for status, expected in [
+        ("installing", "node_install_in_progress"),
+        ("ready", "media_node_not_enabled"),
+    ]:
         with store.transaction() as db:
             db.execute("UPDATE restream_nodes SET status=? WHERE id='relay-a'", (status,))
         node = next(n for n in view.state()["nodes"] if n["id"] == "relay-a")
         assert node["setup_error"] == expected
         assert node["installation_error"] is None
+
+
+@pytest.mark.parametrize("status", ["connecting", "installing", "failed"])
+def test_independent_ready_media_is_not_hidden_by_old_bootstrap_state(
+    store: BroadcastStore,
+    status: str,
+) -> None:  # noqa: F811
+    view = ui(store)
+    with store.transaction() as db:
+        db.execute("UPDATE restream_nodes SET status=? WHERE id='relay-a'", (status,))
+    node = next(n for n in view.state()["nodes"] if n["id"] == "relay-a")
+    assert node["setup_error"] is None
+    assert node["installation_error"] is None
+    with store.transaction() as db:
+        db.execute("UPDATE broadcast_media_nodes SET enabled=0 WHERE node_id='relay-a'")
+    node = next(n for n in view.state()["nodes"] if n["id"] == "relay-a")
+    assert node["setup_error"] == "media_node_not_enabled"
 
 
 def test_explicit_prepare_atomic_idempotent_and_reveal_read_only(store: BroadcastStore) -> None:  # noqa: F811

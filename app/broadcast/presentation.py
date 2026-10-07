@@ -255,10 +255,11 @@ class BroadcastPresentation:
         result = snapshot(self.store)
         with self.store.database.connect() as db:
             for node in result["nodes"]:
-                # A failed bootstrap is not a working legacy media server. Do not
-                # expose worker output, SSH coordinates or any credential fields.
+                # Before media enrollment, explain the bootstrap state. Once a
+                # separate media service exists, its own admission/heartbeat is
+                # authoritative; an old v1 installation state cannot hide it.
                 node["installation_error"] = None
-                if node["status"] == "failed":
+                if node["mode"] == "legacy_static" and node["status"] == "failed":
                     job = db.execute(
                         "SELECT safe_error_code FROM node_install_jobs WHERE node_id=? "
                         "ORDER BY created_at DESC,id DESC LIMIT 1",
@@ -268,7 +269,10 @@ class BroadcastPresentation:
                         node["installation_error"] = job["safe_error_code"]
                     node["setup_error"] = "node_install_failed"
                     continue
-                if node["status"] in {"installing", "connecting"}:
+                if node["mode"] == "legacy_static" and node["status"] in {
+                    "installing",
+                    "connecting",
+                }:
                     node["setup_error"] = "node_install_in_progress"
                     continue
                 try:
