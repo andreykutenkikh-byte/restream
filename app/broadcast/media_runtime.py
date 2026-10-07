@@ -123,9 +123,16 @@ class Publisher:
         if self.selector and self.selector.error and self.process:
             stop(self.process)
         if self.process and self.process.poll() is None:
-            if now - self.started > 60 and now - self.last_progress < 3:
-                self.failures = 0
-            return
+            # A blocked pipe reader can leave FFmpeg alive forever after the
+            # selector stops producing packets. tick() is called with qualified
+            # input, so recover this stalled copy publisher using the same
+            # bounded retry policy as an exited process.
+            if self.feed and now - max(self.started, self.last_progress) > 30:
+                stop(self.process)
+            else:
+                if now - self.started > 60 and now - self.last_progress < 3:
+                    self.failures = 0
+                return
         if self.process is not None:
             self.failures += 1
             self.retry_at = now + min(30, 2**self.failures)
