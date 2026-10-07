@@ -155,8 +155,28 @@ def test_draft_uses_existing_listener_plan_without_publisher_or_credential(
     assert list(plan["sources"].values()) == connection["passphrase"]
     assert len(plan["routes"]) == 1
     route = plan["routes"][0]
-    assert not route["enabled"] and not route["media_enabled"]
+    assert not route["enabled"] and route["media_enabled"]
     assert route["destination"] is None and route["egress_lease"] is None
+    assert route["forward"] is None and plan["exports"] == []
+    target = store.add_route(prepared["output_id"], "relay-b", "idle-transmission-target")
+    view.select_server(prepared["output_id"], target, "select-idle-transmission-target")
+    ingress = open_envelope(keys["relay-a"], media.desired("relay-a"), "relay-a")
+    reserve = open_envelope(keys["relay-b"], media.desired("relay-b"), "relay-b")
+    assert ingress["routes"][0]["media_enabled"]
+    assert not reserve["routes"][0]["media_enabled"]
+    for local in (ingress, reserve):
+        assert local["exports"] == []
+        for assignment in local["routes"]:
+            assert not assignment["enabled"]
+            assert (
+                assignment["destination"]
+                is assignment["egress_lease"]
+                is assignment["forward"]
+                is None
+            )
+    with store.database.connect() as db:
+        assert not db.execute("SELECT 1 FROM broadcast_egress_leases").fetchone()
+        assert not db.execute("SELECT 1 FROM broadcast_forwarding WHERE enabled=1").fetchone()
 
 
 def test_write_only_canonical_key_backup_only_live_change_and_stop_guard(

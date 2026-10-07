@@ -18,6 +18,7 @@ import time
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import IO, Any, cast
@@ -37,6 +38,26 @@ class MediaPorts:
     rtmp: int
     srt: int
     api: int
+
+
+def input_video_format(streams: list[dict[str, Any]]) -> tuple[int, int, float] | None:
+    """Qualify copy-compatible media without imposing a portrait template."""
+    try:
+        video = next(s for s in streams if s["codec_type"] == "video")
+        audio = next(s for s in streams if s["codec_type"] == "audio")
+        width, height = int(video["width"]), int(video["height"])
+        fps = float(Fraction(video.get("r_frame_rate", "0/1")))
+        if (
+            video["codec_name"] == "h264"
+            and audio["codec_name"] == "aac"
+            and 128 <= width <= 3840
+            and 128 <= height <= 3840
+            and 1 <= fps <= 60
+        ):
+            return width, height, fps
+    except (KeyError, StopIteration, TypeError, ValueError, ZeroDivisionError):
+        pass
+    return None
 
 
 def launch(argv: list[str], *, progress: bool = False, feed: bool = False) -> subprocess.Popen[str]:
@@ -61,7 +82,7 @@ def stop(process: subprocess.Popen[Any]) -> None:
 
 
 class Publisher:
-    def __init__(self, argv: list[str], *, feed: bool = False, fps: int = 30) -> None:
+    def __init__(self, argv: list[str], *, feed: bool = False, fps: float = 30) -> None:
         self.argv = argv
         self.feed = feed
         self.fps = fps
@@ -156,9 +177,16 @@ class PacketProbe:
     """A persistent reader preserves a moving PTS timeline between heartbeats."""
 
     def __init__(
-        self, ffprobe: str, url: str, identity: str, *, timeout_us: int = 3_000_000
+        self,
+        ffprobe: str,
+        url: str,
+        identity: str,
+        *,
+        video_format: tuple[int, int, float],
+        timeout_us: int = 3_000_000,
     ) -> None:
         self.identity = identity
+        self.video_format = video_format
         self.video_pts = 0.0
         self.audio_pts = 0.0
         self.video_frames = 0
@@ -616,7 +644,7 @@ class MediaRuntime:
         argv: list[str],
         *,
         feed: bool = False,
-        fps: int = 30,
+        fps: float = 30,
     ) -> Publisher:
         existing = mapping.get(route_id)
         if existing and existing[0] != identity:
@@ -635,7 +663,7 @@ class MediaRuntime:
             worker.tick()
         return worker
 
-    def probe(self, path: str, profile: dict[str, Any]) -> dict[str, Any] | None:
+    def probe(self, path: str) -> dict[str, Any] | None:
         try:
             response = self.http.get(f"/v3/paths/get/{path}")
             if not response.is_success or not response.json().get("ready"):
@@ -677,22 +705,12 @@ class MediaRuntime:
             if probe.returncode:
                 return None
             result = json.loads(probe.stdout)
-            video = next(s for s in result["streams"] if s["codec_type"] == "video")
-            audio = next(s for s in result["streams"] if s["codec_type"] == "audio")
-            if (
-                video["codec_name"] != "h264"
-                or audio["codec_name"] != "aac"
-                or video["width"] != profile["width"]
-                or video["height"] != profile["height"]
-            ):
+            video_format = input_video_format(result["streams"])
+            if video_format is None:
                 return None
-            numerator, denominator = video.get("r_frame_rate", "0/1").split("/")
-            if (
-                float(denominator) == 0
-                or abs(float(numerator) / float(denominator) - profile["fps"]) > 0.1
-            ):
-                return None
-            self.probes[path] = PacketProbe(self.ffprobe, self.local_url(path), source_identity)
+            self.probes[path] = PacketProbe(
+                self.ffprobe, self.local_url(path), source_identity, video_format=video_format
+            )
             return None
         except (httpx.HTTPError, subprocess.TimeoutExpired, ValueError, KeyError, StopIteration):
             return None
@@ -739,7 +757,7 @@ class MediaRuntime:
                     except httpx.HTTPError:
                         pass
             if direct_path not in probes:
-                probes[direct_path] = self.probe(direct_path, route["profile"])
+                probes[direct_path] = self.probe(direct_path)
             direct = probes[direct_path]
             streak = 0
             if direct:
@@ -780,7 +798,7 @@ class MediaRuntime:
                     forward["path"],
                     self._copy(source, self.local_url(selected, protocol="rtmp"), srt=True),
                 )
-                measurement = self.probe(selected, route["profile"])
+                measurement = self.probe(selected)
             if not measurement:
                 observations.append(
                     {
@@ -820,7 +838,7 @@ class MediaRuntime:
                     route["source_id"] + destination,
                     self._selector_publisher(destination),
                     feed=True,
-                    fps=route["profile"]["fps"],
+                    fps=self.probes[selected].video_format[2],
                 )
                 selector = worker.selector
                 if selector:
@@ -831,7 +849,7 @@ class MediaRuntime:
                         source_kind = (
                             "forwarded" if selector.selected.startswith("forward/") else "direct"
                         )
-                        measurement = self.probe(selector.selected, route["profile"])
+                        measurement = self.probe(selector.selected)
                     elif not selector.selected:
                         measurement = None
                     if selector.events:

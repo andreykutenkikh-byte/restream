@@ -93,9 +93,10 @@ class Lab:
         self.session_id = ""
         self.source_id = ""
         self.source_process: subprocess.Popen[str] | None = None
+        self.fixture_profile = MediaProfile()
         self.boot_ids = {node: secrets.token_hex(16) for node in ("relay-a", "relay-b", "relay-c")}
 
-    def setup(self) -> None:
+    def setup(self, *, start_outputs: bool = True) -> None:
         now = utc_now()
         with self.database.connect() as db:
             for node in self.boot_ids:
@@ -210,8 +211,9 @@ class Lab:
         )
         self.source_process = self.phone("relay-a")
         self.processes.append(self.source_process)
-        for output in self.outputs:
-            self.store.intent(output, True, secrets.token_hex(16))
+        if start_outputs:
+            for output in self.outputs:
+                self.store.intent(output, True, secrets.token_hex(16))
 
     def _sink(self) -> None:
         permissions = []
@@ -401,11 +403,11 @@ class Lab:
         assert (video["codec_name"], audio["codec_name"], video["width"], video["height"]) == (
             "h264",
             "aac",
-            1080,
-            1920,
+            self.fixture_profile.width,
+            self.fixture_profile.height,
         )
         assert int(video["nb_read_frames"]) >= 90
-        assert video["avg_frame_rate"] == "30/1"
+        assert video["avg_frame_rate"] == f"{self.fixture_profile.fps}/1"
         gaps = {}
         for kind in ("video", "audio"):
             packets = [p for p in data["packets"] if p["codec_type"] == kind]
@@ -423,7 +425,10 @@ class Lab:
             for i, p in enumerate(p for p in data["packets"] if p["codec_type"] == "video")
             if "K" in p["flags"]
         ]
-        assert len(keys) >= 2 and max(b - a for a, b in zip(keys, keys[1:], strict=False)) <= 60
+        assert (
+            len(keys) >= 2
+            and max(b - a for a, b in zip(keys, keys[1:], strict=False)) <= self.fixture_profile.gop
+        )
         run_command([self.ffmpeg, "-v", "error", "-xerror", "-i", str(path), "-f", "null", "-"])
         hashes = run_command(
             [self.ffmpeg, "-v", "error", "-i", str(path), "-map", "0:v:0", "-f", "framemd5", "-"]
@@ -432,12 +437,12 @@ class Lab:
             "frames": int(video["nb_read_frames"]),
             "video_codec": "h264",
             "audio_codec": "aac",
-            "width": 1080,
-            "height": 1920,
-            "fps": 30,
+            "width": self.fixture_profile.width,
+            "height": self.fixture_profile.height,
+            "fps": self.fixture_profile.fps,
             "max_packet_gap_seconds": gaps,
             "decode": "PASS",
-            "gop_max": 60,
+            "gop_max": self.fixture_profile.gop,
             "frame_hashes": [
                 line.rsplit(",", 1)[-1].strip()
                 for line in hashes.splitlines()
