@@ -232,12 +232,8 @@ def test_local_hls_reader_rebootstraps_after_session_expires(
     calls: list[str] = []
     root_responses = iter(
         (
-            (f"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n{first_resource}\n").encode(
-                "ascii"
-            ),
-            (f"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n{second_resource}\n").encode(
-                "ascii"
-            ),
+            (f"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n{first_resource}\n").encode("ascii"),
+            (f"#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n{second_resource}\n").encode("ascii"),
         )
     )
     first_media_calls = 0

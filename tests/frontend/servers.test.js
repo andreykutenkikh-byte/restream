@@ -441,7 +441,7 @@ test("UI includes progress, sudo, revoke confirmation, and mobile layout", () =>
   assert.match(template, /data-install-steps/);
   assert.match(template, /data-sudo-password/);
   assert.match(template, /data-revoke-dialog/);
-  assert.match(template, /Серверы и диагностика/);
+  assert.match(template, /Управление серверами/);
   assert.match(source, /Агент на связи/);
   assert.match(styles, /@media \(max-width: 680px\)/);
   assert.match(styles, /\.server-grid \{[\s\S]{0,140}align-items: start/);

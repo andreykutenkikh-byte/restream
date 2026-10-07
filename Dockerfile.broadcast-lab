@@ -1,0 +1,14 @@
+FROM bluenviron/mediamtx:1.19.2 AS mediamtx
+FROM python:3.12.11-slim-bookworm
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 UV_LINK_MODE=copy
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir uv==0.11.28
+COPY --from=mediamtx /mediamtx /usr/local/bin/mediamtx
+COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --no-dev --no-install-project
+COPY app ./app
+COPY scripts ./scripts
+ENV PATH="/app/.venv/bin:$PATH"
+ENTRYPOINT ["python", "-m", "scripts.broadcast_switch_lab", "--mediamtx", "/usr/local/bin/mediamtx", "--directory", "/evidence/run"]

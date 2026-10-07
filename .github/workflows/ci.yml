@@ -78,6 +78,24 @@ jobs:
       - name: JavaScript tests
         run: node --test tests/frontend/preview-player.test.js tests/frontend/relay-dashboard.test.js tests/frontend/servers.test.js
 
+      - name: HUD JavaScript syntax
+        run: |
+          node --check app/static/relay-dashboard.js
+          node --check app/static/moblin-hud-admin.js
+          node --check app/static/moblin-hud.js
+
+      - name: HUD JavaScript tests
+        run: node --test tests/frontend/moblin-hud.test.js tests/frontend/moblin-hud-admin.test.js
+
+      - name: Broadcast JavaScript syntax
+        run: |
+          node --check app/static/transmission.js
+          node --check app/static/broadcasts.js
+          node --check app/static/broadcast-route-ui.js
+          node --check app/static/broadcast-switch-admin.js
+          node --check app/static/stream-operator.js
+          node --check app/static/broadcast-monitor.js
+
       - name: Shell syntax
         shell: bash
         run: |
@@ -159,3 +177,81 @@ jobs:
           fi
           rm -f .env.ci .bootstrap-worker-secret.ci
           exit "$cleanup_status"
+
+  hud-browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned dependency manager
+        run: python -m pip install "uv==0.11.28"
+
+      - name: Dependency lock synchronization
+        run: uv lock --check
+
+      - name: Install locked browser test dependencies
+        run: uv sync --locked --group browser
+
+      - name: Installed dependency compatibility
+        run: uv pip check
+
+      - name: Install Chromium and WebKit with system dependencies
+        run: uv run --locked --group browser python -m playwright install --with-deps chromium webkit
+
+      - name: Real HTTPS HUD browser smoke
+        env:
+          ADOJAPAN_HUD_BROWSER_SMOKE: "1"
+        run: uv run --locked --group browser pytest tests/browser -q
+
+  broadcast-media:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Build isolated media acceptance image
+        run: docker build -f Dockerfile.broadcast-lab -t adojapan-broadcast-lab .
+      - name: Synthetic four-node multicast and route switching acceptance
+        run: |
+          mkdir -p logs/broadcast-ci
+          docker run --rm --network none --cpus 2 --memory 3g --pids-limit 256 \
+            --user "$(id -u):$(id -g)" \
+            --cap-drop ALL --security-opt no-new-privileges \
+            -v "$PWD/logs/broadcast-ci:/evidence" adojapan-broadcast-lab
+      - name: Save secret-free media evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: broadcast-media-evidence
+          path: logs/broadcast-ci/run/report.json
+          if-no-files-found: error
+          retention-days: 14
+
+  broadcast-handoff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Build the existing isolated media lab image
+        run: docker build -f Dockerfile.broadcast-lab -t adojapan-handoff-lab .
+      - name: Continuous decoded overlap and single-source reconnect, two transitions each
+        run: |
+          mkdir -p logs/handoff-ci
+          docker run --rm --network none --cpus 2 --memory 3g --pids-limit 256 \
+            --user "$(id -u):$(id -g)" \
+            --cap-drop ALL --security-opt no-new-privileges \
+            -v "$PWD/logs/handoff-ci:/evidence" --entrypoint python adojapan-handoff-lab \
+            -m scripts.broadcast_handoff_lab --mediamtx /usr/local/bin/mediamtx \
+            --directory /evidence/run --focused
+      - name: Save bounded secret-free handoff evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: broadcast-handoff-evidence
+          path: logs/handoff-ci/run/report.json
+          if-no-files-found: error
+          retention-days: 14

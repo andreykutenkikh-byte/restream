@@ -165,6 +165,7 @@ async def login_page(request: Request) -> Response:
 
 
 @router.get("/", response_class=HTMLResponse)
+@router.get("/legacy", response_class=HTMLResponse)
 async def dashboard_page(request: Request) -> Response:
     session_token = request.cookies.get(SESSION_COOKIE)
     if _sessions(request).get(session_token) is None or not session_token:
@@ -173,7 +174,7 @@ async def dashboard_page(request: Request) -> Response:
     runtime = _runtime(request)
     response = _templates(request).TemplateResponse(
         request=request,
-        name="dashboard.html",
+        name="dashboard.html" if request.url.path == "/legacy" else "transmission.html",
         context={
             "csrf_token": csrf_token,
             "current_user": {"login": runtime.settings.admin_login},

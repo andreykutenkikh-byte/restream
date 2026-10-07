@@ -20,11 +20,24 @@ from app import __version__
 from app.api import router
 from app.bootstrap_api import BootstrapRateLimiter
 from app.bootstrap_api import router as bootstrap_router
+from app.broadcast.api import router as broadcast_router
+from app.broadcast.media_api import MediaBodyLimitMiddleware
+from app.broadcast.media_api import router as broadcast_media_router
+from app.broadcast.media_control import MediaControl
+from app.broadcast.models import BroadcastError
+from app.broadcast.oauth import YouTubeOAuth
+from app.broadcast.presentation_api import router as broadcast_presentation_router
+from app.broadcast.store import BroadcastStore
+from app.broadcast.switch_api import OperatorBodyLimit
+from app.broadcast.switch_api import router as broadcast_switch_router
+from app.broadcast.switching import SwitchController
 from app.core.config import Settings
 from app.core.validation import destination_validator
 from app.db import Database
 from app.logging_config import configure_logging
 from app.login_limiter import LoginRateLimiter
+from app.moblin_hud_api import HudBodyLimitMiddleware, HudRateLimiter
+from app.moblin_hud_api import router as moblin_hud_router
 from app.node_api import NodeBodyLimitMiddleware, NodeCommandPollGate, NodeEnrollmentGate
 from app.node_api import router as node_router
 from app.relay_api import router as relay_router
@@ -36,9 +49,11 @@ from app.services.bootstrap import (
     UnavailableBootstrapCoordinator,
 )
 from app.services.mediamtx import MediaMTXClient
+from app.services.moblin_hud import MoblinHudService
 from app.services.nodes import NodeService
 from app.services.preview import PreviewService
 from app.services.relay_preview import RelayPreviewStore
+from app.services.relay_quality import RelayQualityTracker
 from app.services.relays import RelayService
 from app.session import SessionManager
 from app.step_up_limiter import StepUpRateLimiter
@@ -74,6 +89,7 @@ def create_app(
         password=settings.worker_auth_password,
     )
     relays = RelayService(database, settings.master_encryption_key)
+    moblin_hud = MoblinHudService(database)
     relay_preview = RelayPreviewStore()
     nodes = NodeService(
         database,
@@ -105,10 +121,23 @@ def create_app(
                 try:
                     nodes.prune_retention()
                     relays.prune_retention()
+                    moblin_hud.prune_expired_pairings()
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     LOGGER.exception("Node maintenance failed")
+
+        async def reconcile_broadcasts() -> None:
+            while True:
+                await asyncio.sleep(1)
+                try:
+                    await asyncio.to_thread(app.state.broadcast_switches.tick)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    LOGGER.error(
+                        "Broadcast reconciliation deferred"
+                    )  # No payload/traceback secrets.
 
         database.migrate()
         recover_interrupted = getattr(bootstrap_service, "recover_interrupted_jobs", None)
@@ -126,6 +155,9 @@ def create_app(
             maintenance_task = asyncio.create_task(maintain_node_state())
             background_tasks.add(maintenance_task)
             maintenance_task.add_done_callback(background_tasks.discard)
+            switch_task = asyncio.create_task(reconcile_broadcasts())
+            background_tasks.add(switch_task)
+            switch_task.add_done_callback(background_tasks.discard)
             yield
         finally:
             relay_preview.clear()
@@ -152,6 +184,18 @@ def create_app(
     )
     app.state.settings = settings
     app.state.database = database
+    app.state.broadcasts = BroadcastStore(database, settings.master_encryption_key)
+    app.state.broadcast_media = MediaControl(
+        app.state.broadcasts, test_loopback=settings.environment == "test"
+    )
+    app.state.broadcasts.admission = app.state.broadcast_media.admit
+    app.state.broadcast_switches = SwitchController(app.state.broadcasts, app.state.broadcast_media)
+    app.state.youtube_oauth = YouTubeOAuth(
+        app.state.broadcasts,
+        settings.youtube_client_id,
+        settings.youtube_client_secret,
+        settings.youtube_redirect_uri,
+    )
     app.state.runtime = runtime
     app.state.preview = preview_service
     app.state.sessions = SessionManager(
@@ -160,6 +204,16 @@ def create_app(
     app.state.login_limiter = LoginRateLimiter()
     app.state.relay_step_up_limiter = StepUpRateLimiter()
     app.state.bootstrap_limiter = BootstrapRateLimiter()
+    app.state.moblin_hud = moblin_hud
+    app.state.relay_quality = RelayQualityTracker()
+    app.state.moblin_hud_pair_limiter = HudRateLimiter(attempts=8, window_seconds=60)
+    app.state.moblin_hud_admin_limiter = HudRateLimiter(attempts=6, window_seconds=60)
+    app.state.operator_limiter = HudRateLimiter(attempts=12, window_seconds=60)
+    app.state.operator_pair_limiter = HudRateLimiter(attempts=8, window_seconds=60)
+    app.state.moblin_hud_status_lock = asyncio.Lock()
+    app.state.moblin_hud_status_cached_at = None
+    app.state.moblin_hud_status_cache = None
+    app.state.moblin_hud_status_observations = {}
     app.state.nodes = nodes
     app.state.relays = relays
     app.state.relay_preview = relay_preview
@@ -179,12 +233,20 @@ def create_app(
     )
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
     app.add_middleware(NodeBodyLimitMiddleware)
+    app.add_middleware(HudBodyLimitMiddleware)
+    app.add_middleware(MediaBodyLimitMiddleware)
+    app.add_middleware(OperatorBodyLimit)
     app.mount("/static", StaticFiles(directory=PACKAGE_DIR / "static"), name="static")
     app.include_router(router)
     app.include_router(node_router)
     app.include_router(relay_router)
     app.include_router(relay_preview_router)
     app.include_router(bootstrap_router)
+    app.include_router(moblin_hud_router)
+    app.include_router(broadcast_router)
+    app.include_router(broadcast_presentation_router)
+    app.include_router(broadcast_media_router)
+    app.include_router(broadcast_switch_router)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Callable[..., Any]) -> Any:
@@ -196,7 +258,10 @@ def create_app(
         ):
             relay_preview.clear()
         response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["Referrer-Policy"] = "same-origin"
+        hud_path = request.url.path.startswith(
+            ("/moblin-hud", "/api/moblin-hud", "/api/broadcasts", "/stream-operator")
+        )
+        response.headers["Referrer-Policy"] = "no-referrer" if hud_path else "same-origin"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
         response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
@@ -208,16 +273,32 @@ def create_app(
             "base-uri 'none'; form-action 'self'"
         )
         if request.url.path.startswith(
-            ("/api/", "/node-api/", "/relay-agent/", "/relay-media/")
+            (
+                "/api/",
+                "/node-api/",
+                "/relay-agent/",
+                "/relay-media/",
+                "/moblin-hud",
+                "/broadcast-agent/",
+                "/stream-operator",
+            )
         ) or request.url.path in {
             "/",
             "/login",
             "/servers",
+            "/legacy",
+            "/broadcasts",
         }:
             response.headers["Cache-Control"] = "no-store"
         if settings.environment == "production":
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         return response
+
+    @app.exception_handler(BroadcastError)
+    async def broadcast_exception_handler(_: Request, exc: BroadcastError) -> JSONResponse:
+        return JSONResponse(
+            {"error": {"code": exc.code, "message": exc.code}}, status_code=exc.status
+        )
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:

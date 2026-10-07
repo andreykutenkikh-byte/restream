@@ -554,6 +554,12 @@ Do not expose an inbound agent port or run a command supplied through the UI.
 
 ## Future stages
 
+The opt-in [Broadcast Orchestrator candidate](docs/broadcast-orchestrator.md) adds independent
+outputs, temporary output-owned credential leases, managed inter-relay media, route switching
+and a separate limited operator HUD. See [acceptance and limits](docs/route-switch-acceptance.md)
+and the [unexecuted staged plan](docs/staged-broadcast-deployment.md). The earlier stage
+limitations above describe the preserved legacy paths; existing nodes are not upgraded.
+
 Future stages can add browser upload-speed measurement, OBS bitrate/resolution/FPS recommendations,
 actual bitrate history, richer monitoring, multiple users, SSH-key onboarding, explicit remote
 uninstall, and a reviewed media-placement/switching design. The current implementation deliberately

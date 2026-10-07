@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Трансляция · AdoJapan Restream{% endblock %}
+{% block head %}<link rel="stylesheet" href="/static/transmission.css">{% endblock %}
+{% block header %}
+<header class="site-header"><div class="shell site-header__inner">
+  <a class="brand" href="/" aria-label="AdoJapan Restream"><span class="brand-mark" aria-hidden="true"><span class="brand-mark__sun"></span><span class="brand-mark__wave"></span></span><span class="brand-copy"><strong>AdoJapan</strong><span>Restream</span></span></a>
+  <nav class="primary-nav" aria-label="Основные разделы"><a class="primary-nav__link" href="/" aria-current="page">Трансляция</a><a class="primary-nav__link" href="/servers">Управление серверами</a></nav>
+  <form method="post" action="/api/auth/logout" data-logout-form><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button button--quiet button--small" type="submit">Выйти</button></form>
+</div></header>
+{% endblock %}
+{% block content %}
+<div class="shell transmission" id="transmission">
+  <header class="tx-heading"><div><p class="eyebrow">AdoJapan · Прямой эфир</p><h1>Моя трансляция</h1><p class="tx-lead">Подключите OBS или Moblin. Настройте YouTube один раз.</p></div>
+    <div class="tx-main-control"><button class="button button--primary" id="send-action" disabled>Начать отправку</button><p id="send-hint">Сначала подготовьте подключение и сохраните ключ.</p></div>
+  </header>
+  <div class="tx-selector"><label for="broadcast-choice">Эфир</label><select id="broadcast-choice" aria-label="Выбрать эфир"><option value="">Загружаем…</option></select><button class="button button--quiet button--small" id="add-broadcast" type="button">＋ Добавить ещё один эфир</button></div>
+  <p id="tx-message" class="tx-message" role="status" aria-live="polite"></p>
+  <div id="tx-operation" class="tx-notice" hidden aria-live="polite"></div>
+  <div class="tx-connections">
+    <section class="tx-card" aria-labelledby="obs-heading"><div class="tx-card-heading"><span class="tx-step">01</span><span class="tx-tag">Вход</span></div><h2 id="obs-heading">Подключение OBS</h2><p id="obs-state">Адрес для OBS и Moblin. Ключ YouTube сюда не нужен.</p><button class="button button--secondary" id="obs-connect" type="button" disabled>Получить подключение</button><p class="tx-footnote" id="obs-node">Адрес выдаётся выбранным сервером приёма.</p></section>
+    <section class="tx-card" aria-labelledby="youtube-heading"><div class="tx-card-heading"><span class="tx-step">02</span><span class="tx-tag">Выход</span></div><h2 id="youtube-heading">YouTube</h2><p id="youtube-state">Скопируйте ключ из YouTube Studio и сохраните здесь.</p><button class="button button--secondary" id="youtube-settings" type="button" disabled>Сохранить ключ YouTube</button><p class="tx-footnote">Ключ хранится у эфира и используется при смене сервера.</p></section>
+  </div>
+  <div class="tx-workspace">
+    <section class="tx-card tx-monitor" aria-labelledby="monitor-heading"><div class="tx-monitor-heading"><h2 id="monitor-heading">Видео и отправка</h2><button class="button button--quiet button--small" id="tx-refresh" type="button">Обновить</button></div>
+      <div class="tx-preview" aria-label="Предпросмотр"><span class="tx-preview-icon" aria-hidden="true">▷</span><strong id="tx-preview-title">Предпросмотр недоступен</strong><p id="tx-preview-note">Для выбранного режима пока нет отдельного защищённого предпросмотра. Состояние приёма и отправки показано ниже.</p></div>
+      <dl class="tx-metrics"><div><dt>Входящее видео</dt><dd id="input-status">Нет данных</dd></div><div><dt>Входящий битрейт</dt><dd id="input-bitrate">Нет данных</dd></div><div><dt>Отправка</dt><dd id="output-status">Нет данных</dd></div><div><dt>YouTube</dt><dd id="platform-status">Нет данных</dd></div></dl>
+      <p class="tx-topology" id="tx-topology">Маршрут появится после подготовки подключения.</p><p class="tx-footnote">Статус отправки не подтверждает воспроизведение у зрителя.</p>
+    </section>
+    <section class="tx-card tx-servers" aria-labelledby="server-heading"><div class="tx-monitor-heading"><h2 id="server-heading">Сервер передачи</h2><a href="/servers">Подключить сервер</a></div><p class="tx-footnote">При смене сервера передачи адрес OBS остаётся прежним.</p><div id="tx-servers" aria-label="Выбор сервера передачи"><p>Проверяем серверы…</p></div><p class="tx-footnote">Доступность переключения не означает, что новый маршрут быстрее.</p></section>
+  </div>
+  <details class="tx-advanced"><summary>Дополнительные действия</summary><div><a href="/broadcasts">YouTube OAuth, доступ оператора и история эфиров</a><a href="/legacy">Legacy: управление и защищённый предпросмотр</a><a href="/servers">Настройка серверов и диагностика</a></div><p>Legacy работает отдельно. Автоматического переноса его ключей в новый эфир нет.</p></details>
+</div>
+{% endblock %}
+{% block scripts %}<script src="/static/transmission.js" defer></script>{% endblock %}
