@@ -153,6 +153,32 @@ def login(page: Any, server: HudServer, password: str) -> None:
     expect(page.locator("#obs-connect")).to_be_enabled()
 
 
+def test_stream_diagnostics_page_period_and_export(
+    browser: Any, hud_server: HudServer, admin_password: str
+) -> None:
+    lab = MediaLab(hud_server)
+    context = browser.new_context(ignore_https_errors=True, viewport={"width": 390, "height": 844})
+    try:
+        page = context.new_page()
+        login(page, hud_server, admin_password)
+        prepare(page, lab.a)
+        page.get_by_role("link", name="История качества и диагностика").click()
+        expect(page.get_by_role("heading", name="Диагностика эфира", exact=True)).to_be_visible()
+        expect(page.locator("#diagnostic-timezone")).to_contain_text("Часовой пояс:")
+        page.get_by_label("Период", exact=True).select_option("1")
+        page.get_by_role("button", name="Показать", exact=True).click()
+        expect(page.get_by_label("Период", exact=True)).to_have_value("1")
+        with page.expect_download() as downloaded:
+            page.get_by_role("link", name="Скачать полный отчёт").click()
+        payload = Path(downloaded.value.path()).read_text()
+        assert '"kind": "metadata"' in payload
+        assert "passphrase=" not in payload and "stream_key" not in payload
+        screenshot(page, browser, "mobile", "diagnostics")
+    finally:
+        context.close()
+        lab.close()
+
+
 def connection(page: Any) -> str:
     page.locator("#obs-connect").click()
     field = page.get_by_role("dialog").get_by_label("Сервер", exact=True)

@@ -302,6 +302,7 @@ class Lab:
 
     def exchange(self, node: str, observations: list[dict[str, Any]]) -> None:
         runtime = self.runtimes[node]
+        events = runtime.diagnostics.snapshot()
         self.sequence[node] += 1
         envelope = self.control.heartbeat(
             node,
@@ -312,9 +313,13 @@ class Lab:
                 sequence=self.sequence[node],
                 plan_generation=max(0, runtime.generation),
                 observations=[Observation.model_validate(o) for o in observations],
+                diagnostics_version=1,
+                diagnostic_events=events,
             ),
         )
         runtime.accept(envelope)
+        if events:
+            runtime.diagnostics.acknowledge(events[-1].sequence)
 
     def step(self) -> None:
         for node, runtime in self.runtimes.items():
@@ -338,6 +343,27 @@ class Lab:
         return bool(worker and worker[1].connected and row and row[0] >= 2)
 
     def record(self, indices: list[int], label: str) -> dict[str, Any]:
+        def sink_ready() -> bool:
+            with httpx.Client(timeout=2, trust_env=False) as client:
+                return all(
+                    (
+                        response := client.get(
+                            f"http://127.0.0.1:{self.sink_api}/v3/paths/get/out/{index}"
+                        )
+                    ).is_success
+                    and response.json().get("ready")
+                    for index in indices
+                )
+
+        # FFmpeg progress can precede the receiver's path becoming readable.
+        # Require real sink readiness before launching the decode recordings.
+        self.wait(sink_ready, seconds=20)
+        faults: list[dict[str, Any]] = []
+
+        def diagnostic(code: str, value: int | None) -> None:
+            faults.append({"code": code, "value": value})
+            del faults[:-20]
+
         jobs = []
         for index in indices:
             path = self.directory / f"{label}-{index}.mkv"
@@ -362,7 +388,8 @@ class Lab:
                             "-c",
                             "copy",
                             str(path),
-                        ]
+                        ],
+                        diagnostics=diagnostic,
                     ),
                 )
             )
@@ -374,6 +401,11 @@ class Lab:
                 stop(process)
                 raise RuntimeError("recording_timeout")
             if process.returncode:
+                self.report["recording_failure"] = {
+                    "stage": label,
+                    "codes": faults,
+                    "exit_codes": [p.returncode for _, p in jobs],
+                }
                 raise RuntimeError("recording_failed")
         reports = [self.inspect(path) for path, _ in jobs]
         hashes = [set(report.pop("frame_hashes")) for report in reports]
@@ -479,7 +511,13 @@ class Lab:
         old_destination = bad.test_destinations[self.outputs[1]]
         bad.test_destinations[self.outputs[1]] = f"rtmp://127.0.0.1:{self.sink_rtmp}/out/forbidden"
         counts = (a.frames, c.frames)
-        self.wait(lambda: a.frames > counts[0] + 120 and c.frames > counts[1] + 120)
+        self.wait(
+            lambda: (
+                a.frames > counts[0] + 120
+                and c.frames > counts[1] + 120
+                and not bad.publishers[self.routes[1]][1].connected
+            )
+        )
         assert not bad.publishers[self.routes[1]][1].connected
         assert (a.process.pid, c.process.pid, self.source_process.pid) == pids
         bad.test_destinations[self.outputs[1]] = old_destination

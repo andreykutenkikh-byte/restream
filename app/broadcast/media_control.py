@@ -11,8 +11,10 @@ from typing import Any, Literal
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PublicKey
 from pydantic import Field
 
+from app.broadcast.diagnostics import record_events, record_sample
 from app.broadcast.egress import EgressLeases
 from app.broadcast.envelope import decode, seal
+from app.broadcast.media_diagnostics import DiagnosticEvent
 from app.broadcast.models import CAPABILITIES, BroadcastError, Input, MediaProfile, ResourceLimits
 from app.broadcast.store import BroadcastStore
 from app.db import utc_now
@@ -48,6 +50,18 @@ class Observation(Input):
     egress_generation: int = Field(default=0, ge=0, le=10**15)
     egress_lease_id: str | None = Field(default=None, max_length=64)
     safe_error_code: Literal["publisher_failed", "source_lost", "retry_exhausted"] | None = None
+    input_bytes: int | None = Field(default=None, ge=0, le=10**18)
+    input_epoch: int | None = Field(default=None, ge=0, le=10**15)
+    input_age_ms: int | None = Field(default=None, ge=0, le=10**12)
+    video_width: int | None = Field(default=None, ge=1, le=16384)
+    video_height: int | None = Field(default=None, ge=1, le=16384)
+    video_b_frames: int | None = Field(default=None, ge=0, le=16)
+    video_fps: float | None = Field(default=None, ge=0, le=240, allow_inf_nan=False)
+    publisher_retries: int = Field(default=0, ge=0, le=10**9)
+    publisher_epoch: int | None = Field(default=None, ge=0, le=10**15)
+    publisher_progress_age_ms: int | None = Field(default=None, ge=0, le=10**12)
+    selector_queue_packets: int | None = Field(default=None, ge=0, le=1024)
+    selector_queue_bytes: int | None = Field(default=None, ge=0, le=16 * 1024 * 1024)
 
 
 class MediaHeartbeat(Input):
@@ -59,6 +73,8 @@ class MediaHeartbeat(Input):
     plan_generation: int = Field(ge=0, le=10**15)
     rtmp_port: int | None = Field(default=None, ge=1024, le=65535)
     observations: list[Observation] = Field(default_factory=list, max_length=32)
+    diagnostics_version: Literal[0, 1] = 0
+    diagnostic_events: list[DiagnosticEvent] = Field(default_factory=list, max_length=64)
 
 
 class MediaControl:
@@ -227,6 +243,7 @@ class MediaControl:
             if data.observations and data.plan_generation != node["generation"]:
                 raise BroadcastError("stale_plan_generation")
             now = utc_now()
+            record_events(db, node_id, data, now)
             db.execute(
                 "UPDATE broadcast_media_nodes SET last_seen_at=?,last_sequence=?,boot_id=?,"
                 "capabilities_json=?,rtmp_port=? WHERE node_id=?",
@@ -326,6 +343,7 @@ class MediaControl:
                     "SELECT session_id,state FROM broadcast_outputs WHERE id=?",
                     (route["output_id"],),
                 )
+                record_sample(db, node_id, data, route, obs, now)
                 was_forwarded = bool(
                     old
                     and old["source_kind"] == "forwarded"

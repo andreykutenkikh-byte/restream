@@ -12,10 +12,53 @@ from urllib.parse import urlencode
 from app.broadcast.media_runtime import launch, stop
 from app.broadcast.models import MediaProfile
 from app.db import utc_now
-from scripts.broadcast_media_lab import Lab, run_command
+from scripts.broadcast_media_lab import Lab, run_command, unused_ports
 
 
 class RtmpLab(Lab):
+    def diagnostics(self) -> None:
+        runtime = self.runtimes["relay-a"]
+        port = unused_ports(1)[0]
+        failed_reader = launch(
+            [
+                self.ffmpeg,
+                "-hide_banner",
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-i",
+                f"rtmp://127.0.0.1:{port}/DIAGNOSTIC_SECRET_CANARY",
+                "-f",
+                "null",
+                "-",
+            ],
+            diagnostics=runtime.diagnostics.callback("probe"),
+        )
+        self.processes.append(failed_reader)
+        assert failed_reader.wait(timeout=15) != 0
+
+        def captured() -> bool:
+            with self.database.connect() as db:
+                return bool(
+                    db.execute(
+                        "SELECT 1 FROM broadcast_diagnostic_events WHERE code='connection_refused'"
+                    ).fetchone()
+                )
+
+        self.wait(captured, seconds=20)
+        with self.database.connect() as db:
+            samples = db.execute("SELECT payload_json FROM broadcast_quality_history").fetchall()
+            assert any(json.loads(row[0]).get("input_bitrate_bps", 0) for row in samples)
+            assert "DIAGNOSTIC_SECRET_CANARY" not in "\n".join(db.iterdump())
+        for path in self.directory.rglob("diagnostics.jsonl*"):
+            assert "DIAGNOSTIC_SECRET_CANARY" not in path.read_text()
+        self.report["diagnostics"] = {
+            "status": "PASS",
+            "quality_samples": len(samples),
+            "real_process_error_captured": True,
+            "secret_excluded": True,
+        }
+
     def idle_ingress(self, label: str = "idle_ingress") -> None:
         def measured() -> bool:
             with self.database.connect() as db:
@@ -153,6 +196,7 @@ def main() -> None:
         lab.idle_ingress()
         lab.multicast()
         lab.landscape()
+        lab.diagnostics()
         lab.report["status"] = "PASS"
         lab.report["input_protocol"] = "RTMP"
     except BaseException as exc:

@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Диагностика эфира · AdoJapan Restream{% endblock %}
+{% block head %}<link rel="stylesheet" href="/static/transmission.css"><link rel="stylesheet" href="/static/stream-diagnostics.css">{% endblock %}
+{% block content %}
+<main class="shell transmission" id="stream-diagnostics">
+  <a href="/?output={{ report.output_id }}">← К трансляции</a>
+  <h1>Диагностика эфира</h1>
+  <p>История приёма видео, отправки и переключений. Пробелы в измерениях означают отсутствие данных; состояние отправки не подтверждает воспроизведение у зрителя.</p>
+  <form id="diagnostic-period" class="diag-controls" method="get">
+    <div><label for="diagnostic-hours">Период</label><select id="diagnostic-hours" name="hours">{% for n, label in [(1,'1 час'),(6,'6 часов'),(24,'24 часа'),(168,'7 дней')] %}<option value="{{ n }}" {% if hours == n %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></div>
+    <label>До момента <input id="diagnostic-until" type="datetime-local" step="1" data-until="{{ report.until }}"></label>
+    <button class="button button--secondary" type="submit">Показать</button>
+    <a class="button button--quiet" id="diagnostic-export" href="/api/broadcasts/outputs/{{ report.output_id }}/diagnostics/export?hours={{ hours }}&amp;until={{ report.until|urlencode }}">Скачать полный отчёт</a>
+  </form>
+  <p>Период: <time datetime="{{ report.since }}">{{ report.since }}</time> — <time datetime="{{ report.until }}">{{ report.until }}</time>. <span id="diagnostic-timezone">Время UTC.</span></p>
+  <p class="tx-footnote">Новые измерения хранятся до 7 дней: не более 250 000 точек и 50 000 диагностических событий на панель. При активном видео — примерно каждые 5 секунд, в ожидании — раз в минуту; изменения состояния сохраняются сразу. Повторяющиеся сообщения одного типа объединяются. До установки диагностики подробных данных нет.</p>
+  <section class="tx-card"><h2>Ошибки медиасервера</h2>
+    <p>Здесь конкретные причины: разрыв соединения, тайм-аут, потеря RTP-пакетов, ошибки времени кадров и переполнение очереди. Сообщения сервера без номера маршрута относятся ко всему узлу.</p>
+    {% if report.truncated.process %}<p>Показаны последние 100 записей. Полная история выбранного периода — в отчёте.</p>{% endif %}
+    <div class="diag-table"><table><thead><tr><th>Время</th><th>Сервер</th><th>Компонент</th><th>Причина</th><th>Значение</th></tr></thead><tbody>{% for row in report.process %}<tr><td><time datetime="{{ row.at }}">{{ row.at }}</time></td><td>{{ row.server }}</td><td>{{ row.component }}</td><td><span data-diagnostic-code="{{ row.code }}">{{ row.code }}</span></td><td>{{ row.value if row.value is not none else '—' }}</td></tr>{% else %}<tr><td colspan="5">За выбранный период сообщений нет. Это не подтверждает отсутствие проблем.</td></tr>{% endfor %}</tbody></table></div>
+  </section>
+  <section class="tx-card"><h2>История качества</h2>
+    {% if report.truncated.sample %}<p>Показаны последние 100 измерений. Остальные доступны в полном отчёте.</p>{% endif %}
+    <div class="diag-table"><table><thead><tr><th>Время</th><th>Сервер</th><th>Вход</th><th>Вход, Мбит/с</th><th>Кадров/с</th><th>Выход, Мбит/с</th><th>Отправка</th></tr></thead><tbody>{% for row in report.sample %}<tr><td><time datetime="{{ row.at }}">{{ row.at }}</time></td><td>{{ row.server }}</td><td>{{ {'direct':'Прямой','forwarded':'С другого сервера','unknown':'Нет данных'}.get(row.source_kind, row.source_kind) }}</td><td>{{ '%.2f'|format(row.input_bitrate_bps / 1000000) if row.input_bitrate_bps is defined and row.input_bitrate_bps is not none else '—' }}</td><td>{{ '%.1f'|format(row.input_fps) if row.input_fps is defined and row.input_fps is not none else '—' }}</td><td>{{ '%.2f'|format(row.output_bitrate_bps / 1000000) if row.output_bitrate_bps is defined and row.output_bitrate_bps is not none else '—' }}</td><td>{{ 'Работает' if row.publisher_connected else 'Нет подтверждения' }}{% if row.safe_error_code %}: <span data-diagnostic-code="{{ row.safe_error_code }}">{{ row.safe_error_code }}</span>{% endif %}</td></tr>{% else %}<tr><td colspan="7">Измерений за этот период ещё нет.</td></tr>{% endfor %}</tbody></table></div>
+  </section>
+  <section class="tx-card"><h2>События эфира</h2>
+    {% if report.truncated.event %}<p>Показаны последние 100 событий. Полная история — в отчёте.</p>{% endif %}
+    <div class="diag-table"><table><thead><tr><th>Время</th><th>Событие</th><th>Причина</th></tr></thead><tbody>{% for row in report.event %}<tr><td><time datetime="{{ row.at }}">{{ row.at }}</time></td><td>{{ row.event }}</td><td><span data-diagnostic-code="{{ row.code or '' }}">{{ row.code or '—' }}</span></td></tr>{% else %}<tr><td colspan="3">Событий за этот период нет.</td></tr>{% endfor %}</tbody></table></div>
+  </section>
+</main>
+{% endblock %}
+{% block scripts %}<script src="/static/stream-diagnostics.js" defer></script>{% endblock %}
