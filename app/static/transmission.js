@@ -8,6 +8,8 @@
   let state = null, selected = new URL(location.href).searchParams.get("output") || "";
   let busy = false, stale = true, loading = false, activeDialog = null;
   const explanations = {
+    node_install_failed: "Установка сервера не завершена. Откройте управление сервером для повторной настройки.",
+    node_install_in_progress: "Установка сервера ещё выполняется.",
     media_node_unavailable: "Сервер недоступен. Проверьте его в управлении серверами.",
     media_node_disabled: "Требует настройки в управлении серверами.",
     media_capability_missing: "Требует настройки: версия агента не поддерживает переключение.",
@@ -246,7 +248,19 @@
       if (route?.role === "current") title.append(el("span", "Используется", "tx-current"));
       card.append(title);
       if (node.setup_error) {
-        card.append(el("p", node.mode === "legacy_static" ? "Legacy · Требует настройки для управляемого переключения." : explain(node.setup_error)), link("Управление сервером", "/servers"));
+        const installing = ["node_install_failed", "node_install_in_progress"].includes(node.setup_error);
+        let reason = installing ? explain(node.setup_error) : node.mode === "legacy_static" ? "Сервер не настроен для передачи видео и управляемого переключения." : explain(node.setup_error);
+        if (node.setup_error === "node_install_failed") {
+          const failures = {
+            docker_install_failed: "Не удалось установить Docker.",
+            docker_repository_incomplete: "В репозитории Docker отсутствуют необходимые пакеты.",
+            remote_command_timeout: "Превышено время ожидания шага установки.",
+            remote_output_limit_exceeded: "Вывод команды установки превысил допустимый размер.",
+            ssh_authentication_failed: "Сервер отклонил SSH-аутентификацию.",
+          };
+          if (failures[node.installation_error]) reason += ` ${failures[node.installation_error]}`;
+        }
+        card.append(el("p", reason), link("Управление сервером", "/servers"));
       } else if (!output) card.append(el("p", "Выберите эфир или подготовьте подключение."));
       else if (!route) {
         card.append(el("p", "Можно добавить к этому эфиру. Пригодность маршрута будет проверена отдельно."));

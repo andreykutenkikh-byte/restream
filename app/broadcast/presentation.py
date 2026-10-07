@@ -19,6 +19,16 @@ from app.broadcast.store import BroadcastStore
 from app.broadcast.switching import SwitchController
 from app.db import utc_now
 
+_INSTALLATION_ERRORS = frozenset(
+    {
+        "docker_install_failed",
+        "docker_repository_incomplete",
+        "remote_command_timeout",
+        "remote_output_limit_exceeded",
+        "ssh_authentication_failed",
+    }
+)
+
 
 class Prepare(Input):
     name: str = Field(default="Моя трансляция", min_length=1, max_length=120)
@@ -245,6 +255,22 @@ class BroadcastPresentation:
         result = snapshot(self.store)
         with self.store.database.connect() as db:
             for node in result["nodes"]:
+                # A failed bootstrap is not a working legacy media server. Do not
+                # expose worker output, SSH coordinates or any credential fields.
+                node["installation_error"] = None
+                if node["status"] == "failed":
+                    job = db.execute(
+                        "SELECT safe_error_code FROM node_install_jobs WHERE node_id=? "
+                        "ORDER BY created_at DESC,id DESC LIMIT 1",
+                        (node["id"],),
+                    ).fetchone()
+                    if job and job["safe_error_code"] in _INSTALLATION_ERRORS:
+                        node["installation_error"] = job["safe_error_code"]
+                    node["setup_error"] = "node_install_failed"
+                    continue
+                if node["status"] in {"installing", "connecting"}:
+                    node["setup_error"] = "node_install_in_progress"
+                    continue
                 try:
                     self.public_node(db, node["id"])
                     node["setup_error"] = None

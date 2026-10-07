@@ -15,6 +15,7 @@ from app.broadcast.models import BroadcastError
 from app.broadcast.presentation import BroadcastPresentation, Prepare, YouTubeSettings
 from app.broadcast.store import BroadcastStore
 from app.broadcast.switching import SwitchController
+from app.db import utc_now
 
 store = fixtures.store
 
@@ -29,6 +30,34 @@ def ui(store: BroadcastStore) -> BroadcastPresentation:  # noqa: F811
 def dump(store: BroadcastStore) -> str:  # noqa: F811
     with store.database.connect() as db:
         return "\n".join(db.iterdump())
+
+
+@pytest.mark.parametrize("error", ["docker_install_failed", "remote_command_timeout", "private"])
+def test_failed_bootstrap_is_distinct_from_legacy_and_recovers(
+    store: BroadcastStore,
+    error: str,
+) -> None:  # noqa: F811
+    view = ui(store)
+    with store.transaction() as db:
+        db.execute("UPDATE restream_nodes SET status='failed' WHERE id='relay-a'")
+        db.execute(
+            "INSERT INTO node_install_jobs(id,node_id,state,current_step,safe_error_code,"
+            "safe_error_message,created_at,updated_at) VALUES "
+            "('failed-install','relay-a','failed','docker_check',?,'private-output',?,?)",
+            (error, utc_now(), utc_now()),
+        )
+    before = dump(store)
+    node = next(n for n in view.state()["nodes"] if n["id"] == "relay-a")
+    assert node["setup_error"] == "node_install_failed"
+    assert node["installation_error"] == (None if error == "private" else error)
+    assert "private" not in json.dumps(view.state())
+    assert before == dump(store)
+    for status, expected in [("installing", "node_install_in_progress"), ("ready", None)]:
+        with store.transaction() as db:
+            db.execute("UPDATE restream_nodes SET status=? WHERE id='relay-a'", (status,))
+        node = next(n for n in view.state()["nodes"] if n["id"] == "relay-a")
+        assert node["setup_error"] == expected
+        assert node["installation_error"] is None
 
 
 def test_explicit_prepare_atomic_idempotent_and_reveal_read_only(store: BroadcastStore) -> None:  # noqa: F811

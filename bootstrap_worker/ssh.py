@@ -105,7 +105,7 @@ async def _read_bounded(reader: Any) -> str:
             return "".join(chunks)
         byte_count += len(chunk.encode("utf-8"))
         if byte_count > _OUTPUT_LIMIT_BYTES:
-            raise safe_failure("remote_command_failed")
+            raise safe_failure("remote_output_limit_exceeded")
         chunks.append(chunk)
 
 
@@ -141,7 +141,9 @@ class AsyncSSHSession:
                 completed = True
         except BootstrapError:
             raise
-        except (asyncssh.Error, OSError, TimeoutError) as exc:
+        except TimeoutError as exc:
+            raise safe_failure("remote_command_timeout") from exc
+        except (asyncssh.Error, OSError) as exc:
             raise safe_failure("remote_command_failed") from exc
         finally:
             if process is not None and not completed:

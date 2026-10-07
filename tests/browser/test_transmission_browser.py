@@ -22,6 +22,7 @@ from test_moblin_hud_browser import HudServer
 from app.broadcast.envelope import open_envelope, public_key
 from app.broadcast.media_control import MediaHeartbeat, MediaNodeEnable, Observation
 from app.broadcast.models import CAPABILITIES, BroadcastError, ResourceLimits
+from app.db import utc_now
 
 hud_server = hud_fixtures.hud_server
 pytestmark = pytest.mark.skipif(
@@ -185,6 +186,39 @@ def screenshot(page: Any, browser: Any, size: str, scenario: str) -> None:
     )
 
 
+def test_failed_installation_is_not_offered_as_a_legacy_or_ready_route(
+    browser: Any,
+    hud_server: HudServer,
+    admin_password: str,
+) -> None:
+    store = hud_server.app.state.broadcasts
+    node_id = store.snapshot()["nodes"][0]["id"]
+    with store.transaction() as db:
+        db.execute("UPDATE restream_nodes SET status='failed' WHERE id=?", (node_id,))
+        db.execute(
+            "INSERT INTO node_install_jobs(id,node_id,state,current_step,safe_error_code,"
+            "created_at,updated_at) VALUES "
+            "('failed-browser-install',?,'failed','docker_check','docker_install_failed',?,?)",
+            (node_id, utc_now(), utc_now()),
+        )
+    context = browser.new_context(ignore_https_errors=True)
+    try:
+        page = context.new_page()
+        login(page, hud_server, admin_password)
+        card = page.locator(f'[data-node-id="{node_id}"]')
+        expect(card).to_contain_text("Установка сервера не завершена")
+        expect(card).to_contain_text("Не удалось установить Docker")
+        expect(card).not_to_contain_text("Legacy")
+        expect(card.get_by_role("button")).to_have_count(0)
+        expect(card.get_by_role("link", name="Управление сервером")).to_be_visible()
+        with store.transaction() as db:
+            db.execute("UPDATE restream_nodes SET status='installing' WHERE id=?", (node_id,))
+        page.locator("#tx-refresh").click()
+        expect(card).to_contain_text("Установка сервера ещё выполняется")
+    finally:
+        context.close()
+
+
 @pytest.mark.parametrize("size", ["desktop", "mobile"])
 def test_first_setup_copy_key_switch_reload_and_multiple_choice(
     browser: Any, hud_server: HudServer, admin_password: str, size: str
@@ -209,7 +243,7 @@ def test_first_setup_copy_key_switch_reload_and_multiple_choice(
         expect(page.get_by_role("heading", name="Подключение OBS", exact=True)).to_be_visible()
         expect(page.get_by_role("heading", name="YouTube", exact=True)).to_be_visible()
         expect(page.get_by_role("heading", name="Сервер передачи", exact=True)).to_be_visible()
-        expect(page.locator("#tx-servers")).to_contain_text("Legacy")
+        expect(page.locator("#tx-servers")).to_contain_text("Сервер не настроен для передачи видео")
         assert len(posts) == 1  # Login only; page load has no mutation.
         assert hud_server.app.state.broadcasts.snapshot()["sessions"] == []
         lab = MediaLab(hud_server)

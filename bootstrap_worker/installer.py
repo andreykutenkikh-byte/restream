@@ -44,6 +44,7 @@ MIN_CPU_COUNT = 1
 MIN_AVAILABLE_MEMORY_BYTES = 700 * 1024 * 1024
 MIN_FREE_DISK_BYTES = 8 * 1024 * 1024 * 1024
 DOCKER_GPG_FINGERPRINT = "060A61C51B558A7F742B77AAC52FEB6B621E9F35"
+DOCKER_APT_GPG_FINGERPRINT = "9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
 RPM_REPOSITORY_PATH = "/etc/yum.repos.d/docker-ce.repo"
 RPM_REPOSITORY_TEMP_PATH = f"{RPM_REPOSITORY_PATH}.adojapan-tmp"
 RPM_GPG_KEY_PATH = "/etc/pki/rpm-gpg/docker-ce.asc"
@@ -415,7 +416,7 @@ class AptDockerAdapter:
             f"fingerprints=$(gpg --batch --with-colons --show-keys {temporary_key} "
             '2>/dev/null | awk -F: \'$1 == "pub" {primary=1; next} '
             'primary && $1 == "fpr" {print $10; primary=0}\') && '
-            f'if [ "$fingerprints" = {DOCKER_GPG_FINGERPRINT} ]; then '
+            f'if [ "$fingerprints" = {DOCKER_APT_GPG_FINGERPRINT} ]; then '
             f"install -m 0644 {temporary_key} /etc/apt/keyrings/docker.asc && "
             f"rm -f {temporary_key}; else rm -f {temporary_key}; exit 1; fi"
         )

@@ -5,6 +5,17 @@ from the **Servers** page. The control plane performs a bounded SSH bootstrap, i
 outbound-only Node Agent, waits for one-time enrollment, and runs a fixed installation check. The
 remote node is not yet part of the media path.
 
+The transmission screen distinguishes a failed or ongoing bootstrap from a node that still
+needs media setup. A successful Stage 4A installation is **not** managed-media readiness:
+the v2 media service and explicit pinned-key enablement described in
+[staged deployment](staged-broadcast-deployment.md) are still required. Stage 4A does not
+silently open media ports or migrate legacy keys.
+
+Remote command failures distinguish a command deadline (`remote_command_timeout`) and the
+64 KiB per-stream output ceiling (`remote_output_limit_exceeded`) from a general transport
+failure. The deadline and bounded buffering remain enforced; raw output is never displayed.
+Historical `remote_command_failed` records cannot prove which of those causes occurred.
+
 This document describes the implemented workflow. It is not authorization to run it against a
 production server.
 

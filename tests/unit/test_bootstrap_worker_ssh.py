@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from typing import Any
 
@@ -212,8 +213,28 @@ async def test_remote_session_stops_before_buffering_unbounded_output() -> None:
     session = AsyncSSHSession(connection)  # type: ignore[arg-type]
     with pytest.raises(BootstrapError) as captured:
         await session.run("safe-command", timeout=10)
-    assert captured.value.code == "remote_command_failed"
+    assert captured.value.code == "remote_output_limit_exceeded"
     assert connection.processes[0].closed is True
+
+
+async def test_remote_timeout_has_distinct_safe_code_and_closes_process() -> None:
+    connection = FakeConnection()
+    process = FakeProcess("", "")
+
+    async def stalled() -> None:
+        await asyncio.Event().wait()
+
+    process.wait_closed = stalled  # type: ignore[method-assign]
+
+    async def create_process(command: str, **kwargs: Any) -> FakeProcess:
+        return process
+
+    connection.create_process = create_process  # type: ignore[method-assign]
+    session = AsyncSSHSession(connection)  # type: ignore[arg-type]
+    with pytest.raises(BootstrapError) as captured:
+        await session.run("safe-command", timeout=0.01)
+    assert captured.value.code == "remote_command_timeout"
+    assert process.closed is True
 
 
 async def test_remote_upload_is_created_exclusively_with_requested_mode() -> None:

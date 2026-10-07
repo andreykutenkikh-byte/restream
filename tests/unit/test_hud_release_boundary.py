@@ -15,6 +15,13 @@ MAIN_SHA = "8136480d22ca7d4fdae82c70b4b34c1d638a9026"
 MAIN_CI_BLOB = "adbf87e76d14c85eebbcc3683411551521c52d73"
 PROTECTED_TREES = ("bootstrap_worker", "node_agent", "relay_agent", "deploy", "mediamtx")
 PREVIEW_FORMAT_EXCEPTION = "relay_agent/preview.py"
+# The subsequent server-recovery release explicitly changes these three files.
+# Preserve the historical HUD manifest and pin this narrow delta separately.
+INSTALLER_REPAIR_FILES = {
+    "bootstrap_worker/installer.py",
+    "bootstrap_worker/errors.py",
+    "bootstrap_worker/ssh.py",
+}
 
 
 def _git_blob(path: Path) -> str:
@@ -40,7 +47,13 @@ def test_media_protocol_bootstrap_and_runtime_match_pinned_main() -> None:
     assert manifest["main_ci_blob_sha1"] == MAIN_CI_BLOB
     expected = manifest["files"]
     assert len(expected) == 89
+    repair = json.loads((FIXTURES / "installer_repair_boundary.json").read_text(encoding="utf-8"))
+    assert repair["base_commit"] == "53e0a6f032b6edaf755c4cd11b4f3eb3c2bcce2c"
+    assert set(repair["files"]) == INSTALLER_REPAIR_FILES
     for relative, expected_blob in expected.items():
+        if relative in INSTALLER_REPAIR_FILES:
+            assert _git_blob(ROOT / relative) == repair["files"][relative], relative
+            continue
         if relative == PREVIEW_FORMAT_EXCEPTION:
             fixture = FIXTURES / "main_preview.py.txt"
             assert _git_blob(fixture) == expected_blob

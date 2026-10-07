@@ -512,7 +512,8 @@ def test_docker_plan_uses_official_apt_repository_without_convenience_script(
     assert "--connect-timeout 10 --max-time 20" in steps[repository_probe]
     assert "--location" not in commands
     assert "gpgcheck=0" not in commands
-    assert "060A61C51B558A7F742B77AAC52FEB6B621E9F35" in commands
+    assert "9DC858229FC7DD38854AE2D88D81803C0EBFCD88" in commands
+    assert "060A61C51B558A7F742B77AAC52FEB6B621E9F35" not in commands
 
 
 @pytest.mark.parametrize(

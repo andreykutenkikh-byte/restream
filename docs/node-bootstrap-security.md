@@ -156,6 +156,12 @@ no convenience script. Both adapters map repository reachability, signing-key,
 conflicting-runtime, unsupported-installation, and installation failures to distinct safe codes
 without attaching package-manager output.
 
+Signing-key pins are distribution-family specific. Docker's Debian/Ubuntu key is
+`9DC858229FC7DD38854AE2D88D81803C0EBFCD88`; its RPM key is
+`060A61C51B558A7F742B77AAC52FEB6B621E9F35`. The apt adapter must not accept the RPM key
+or vice versa. Public-key fixtures retrieved from Docker's official HTTPS endpoints exercise
+the generated verification shell against both the matching and wrong-family key in Linux CI.
+
 SELinux remains in the detected host mode, including Enforcing. The generated agent Compose uses a
 private `Z` relabel on only `./data` and disables automatic source-path creation. Bootstrap does not
 change SELinux configuration, mode, or host policy and does not run manual relabel tools.
