@@ -16,25 +16,28 @@
     media_heartbeat_stale: "Нет свежего подтверждения от сервера.",
     public_media_address_required: "Требует настройки: нужен внешний адрес приёма.",
     connection_not_prepared: "Агент ещё не подготовил подключение. Повторите получение после его синхронизации.",
+    rtmp_ingress_not_configured: "RTMP на этом сервере ещё не настроен. Используйте SRT или откройте управление сервером.",
     publisher_limit: "На сервере нет свободного места для отправки.",
     egress_limit: "Недостаточно пропускной способности сервера.",
     forward_limit: "Достигнут лимит маршрутов между серверами.",
     media_profile_incompatible: "Параметры видео несовместимы с сервером.",
     output_limit: "Достигнут лимит эфиров для этого источника.",
     output_not_running: "Сначала начните отправку.",
+    stop_before_selecting_server: "Отправка уже запущена. Используйте переключение во время эфира.",
     youtube_dual_ingest_required: "Для переключения добавьте резервный адрес из YouTube Studio.",
     youtube_slot_not_free: "Предыдущий маршрут ещё освобождается.",
     current_server_unavailable: "Нет подтверждения доступности текущего сервера.",
     switch_in_progress: "Дождитесь завершения текущего переключения.",
     source_handoff_in_progress: "Перенос подключения этого источника уже выполняется.",
     stop_before_changing_youtube: "Сначала остановите отправку, чтобы изменить ключ или адрес.",
-    waiting_for_publisher_stop: "Ожидаем подтверждения остановки отправки. Повторите сохранение позже.",
+    waiting_for_publisher_stop: "Ожидаем подтверждения остановки отправки. Повторите действие позже.",
     independent_output_requires_unique_stream: "Этот ключ уже используется другим эфиром. Нужен отдельный ключ.",
     distinct_backup_endpoint_required: "Основной и резервный адреса должны различаться.",
     manual_credentials_required: "Укажите ключ трансляции и основной адрес YouTube.",
     use_youtube_api_settings: "Этот эфир настроен через OAuth. Откройте дополнительные действия.",
   };
   const explain = (code) => explanations[code] || "Действие недоступно. Проверьте настройку сервера и эфира в дополнительных действиях.";
+  const serverAddress = (node) => node?.ip_address || "IP-адрес не определён";
   const el = (tag, text, className) => {
     const node = document.createElement(tag);
     if (text !== undefined) node.textContent = text;
@@ -151,7 +154,7 @@
     const updateNodes = () => {
       const session = state.sessions.find((s) => s.id === source.value);
       node.replaceChildren(new Option("Выберите сервер", ""));
-      for (const n of state.nodes.filter((n) => !n.setup_error && (!session || n.id === session.ingress_node_id))) node.append(new Option(n.display_name, n.id));
+      for (const n of state.nodes.filter((n) => !n.setup_error && (!session || n.id === session.ingress_node_id))) node.append(new Option(serverAddress(n), n.id));
       if (session && node.options.length === 2) node.selectedIndex = 1;
     };
     source.addEventListener("change", updateNodes); updateNodes();
@@ -173,21 +176,37 @@
   }
   async function reveal(sid, routeId) {
     const ui = dialog(routeId ? "Целевое подключение OBS / Moblin" : "Подключение OBS / Moblin");
-    ui.status.textContent = "Получаем действующее подключение…";
-    try {
-      const result = await api(`/api/broadcasts/sessions/${sid}/connection`, { target_route_id: routeId || null });
-      if (!ui.d.isConnected) return;
-      ui.body.append(el("p", routeId ? "Это отдельный целевой адрес. Текущее подключение не заменится, пока сервер не подтвердит прямое видео и звук." : "OBS → Настройки → Трансляция → Пользовательский. Вставьте адрес в «Сервер», поле ключа оставьте пустым. В Moblin выберите SRT."));
-      const input = field(ui.body, "Сервер", "text", result.url); input.readOnly = true; input.dataset.sensitive = "true";
-      const profile = result.profile;
-      ui.body.append(el("p", `Параметры источника: H.264 + AAC, ${profile.width} × ${profile.height}, ${profile.fps} кадров/с; интервал ключевых кадров — ${profile.gop / profile.fps} с.`));
-      ui.body.append(el("p", "Адрес содержит доступ к источнику. Не публикуйте его. Наличие адреса само по себе не подтверждает приём видео."));
-      ui.actions.append(button("Скопировать адрес", async () => {
-        try { await navigator.clipboard.writeText(input.value); ui.status.textContent = "Адрес скопирован."; }
-        catch { input.select(); ui.status.textContent = "Выделите адрес и скопируйте его вручную."; }
-      }));
-      ui.status.textContent = "Параметры получены. Отправка на YouTube не запущена этим действием.";
-    } catch (error) { ui.status.textContent = error.message; ui.status.dataset.error = "true"; }
+    const label = el("label", "Протокол подключения"), protocol = el("select");
+    protocol.append(new Option("SRT", "srt"), new Option("RTMP", "rtmp")); label.append(protocol);
+    const fields = el("div"), copies = el("div", undefined, "tx-dialog-actions");
+    ui.body.append(label, fields); ui.actions.append(copies);
+    let request = 0;
+    const load = async () => {
+      const current = ++request;
+      fields.querySelectorAll("input").forEach((input) => { input.value = ""; });
+      fields.replaceChildren(); copies.replaceChildren();
+      ui.status.textContent = "Получаем действующее подключение…"; ui.status.dataset.error = "false";
+      try {
+        const result = await api(`/api/broadcasts/sessions/${sid}/connection`, { target_route_id: routeId || null, protocol: protocol.value });
+        if (!ui.d.isConnected || current !== request) return;
+        if (routeId) fields.append(el("p", "Это отдельное целевое подключение. Текущий адрес источника сохраняется до подтверждения переноса."));
+        fields.append(el("p", result.protocol === "rtmp" ? "OBS → Настройки → Трансляция → Пользовательский. Скопируйте сервер и ключ в соответствующие поля. Это ключ входа OBS, а не ключ YouTube." : "OBS → Настройки → Трансляция → Пользовательский. Вставьте адрес в «Сервер», поле ключа оставьте пустым. В Moblin выберите SRT."));
+        const copyField = (name, value, copyLabel, type = "text") => {
+          const input = field(fields, name, type, value); input.readOnly = true; input.dataset.sensitive = "true";
+          copies.append(button(copyLabel, async () => {
+            try { await navigator.clipboard.writeText(input.value); ui.status.textContent = "Скопировано."; }
+            catch { input.select(); ui.status.textContent = "Выделите значение и скопируйте его вручную."; }
+          }));
+        };
+        copyField("Сервер", result.protocol === "rtmp" ? result.server : result.url, result.protocol === "rtmp" ? "Скопировать сервер" : "Скопировать адрес");
+        if (result.protocol === "rtmp") copyField("Ключ трансляции OBS", result.stream_key, "Скопировать ключ", "password");
+        const p = result.profile;
+        fields.append(el("p", `Параметры источника: H.264 + AAC, ${p.width} × ${p.height}, ${p.fps} кадров/с; интервал ключевых кадров — ${p.gop / p.fps} с.`));
+        fields.append(el("p", result.protocol === "rtmp" ? "RTMP передаёт видео и ключ без шифрования. Для защищённого подключения выберите SRT." : "Адрес содержит доступ к источнику. Не публикуйте его."));
+        ui.status.textContent = "Параметры получены. Отправка на YouTube не запущена этим действием.";
+      } catch (error) { if (ui.d.isConnected && current === request) { ui.status.textContent = error.message; ui.status.dataset.error = "true"; } }
+    };
+    protocol.addEventListener("change", load); await load();
   }
   function youtubeDialog(output, needBackup = false) {
     if (output.mode !== "manual") { location.assign("/broadcasts"); return; }
@@ -198,7 +217,7 @@
     details.append(el("summary", "Дополнительные настройки подключения"));
     const primary = field(details, "Основной адрес отправки", "url", output.connection.primary_url || "rtmps://a.rtmps.youtube.com/live2");
     const backup = field(details, "Резервный адрес из YouTube Studio", "url", output.connection.backup_url || "");
-    details.append(el("p", "Для смены сервера нужен реальный резервный RTMPS-адрес этого же потока. Не составляйте его самостоятельно."));
+    details.append(el("p", "Для смены сервера во время отправки нужен резервный RTMPS-адрес этого же потока из YouTube Studio. До запуска можно выбрать сервер без резервного адреса."));
     ui.body.append(details);
     submitDialog(ui, "Сохранить", async () => {
       const value = key.value; key.value = "";
@@ -210,7 +229,7 @@
   function switchDialog(session, output, route, full) {
     const target = state.nodes.find((n) => n.id === route.node_id);
     const ui = dialog(full ? "Переключить подключение OBS/Moblin" : "Переключить сервер передачи");
-    ui.body.append(el("p", `Сервер назначения: ${target.display_name}. Ключ YouTube этого эфира сохраняется.`));
+    ui.body.append(el("p", `Сервер назначения: ${serverAddress(target)}. Ключ YouTube этого эфира сохраняется.`));
     ui.body.append(el("p", full ? "Потребуется изменить адрес источника и переподключиться. Перенос подключения влияет на все эфиры с этим источником. Сначала подготовим новый маршрут, затем предложим целевой адрес. Непрерывность просмотра на YouTube не гарантируется." : "OBS продолжит передавать на прежний сервер приёма. Изменится путь отправки в YouTube. Текущий сервер изменится после подтверждения переключения."));
     if (full) ui.body.append(button("Показать целевой адрес отдельно", () => reveal(session.id, route.id)));
     submitDialog(ui, "Подтвердить переключение", async () => {
@@ -229,7 +248,7 @@
       text = ["AWAITING_DIRECT_SOURCE", "EGRESS_SWITCH_COMPLETED"].includes(sw.state) ? "Сервер передачи переключён. Измените адрес в OBS / Moblin и переподключитесь; ждём прямое видео и звук." : sw.state === "ROLLING_BACK" ? "Переключение не удалось. Проверяем возврат к прежнему маршруту…" : ["CUTOVER_ARMED", "OLD_EGRESS_DRAINING", "OLD_CREDENTIAL_REVOKED"].includes(sw.state) ? "Переключаем… Проверяем состояние обоих серверов." : "Подготавливаем… Ожидаем подтверждения нового маршрута.";
     } else if (["FAILED", "CANCELLED"].includes(sw.state)) {
       text = "Не удалось переключиться.";
-      if (!stale && current.id === sw.old_route_id && current.egress_link.state === "CONNECTED" && current.media_state === "LIVE") text += ` Передача через ${state.nodes.find((n) => n.id === current.node_id).display_name} продолжается.`;
+      if (!stale && current.id === sw.old_route_id && current.egress_link.state === "CONNECTED" && current.media_state === "LIVE") text += ` Передача через ${serverAddress(state.nodes.find((n) => n.id === current.node_id))} продолжается.`;
       else text += " Текущее состояние передачи показано ниже.";
     } else text = "Переключение подтверждено. Текущий сервер отмечен «Используется».";
     box.append(el("p", text));
@@ -244,8 +263,8 @@
       const route = output?.routes.find((r) => r.node_id === node.id);
       const card = el("div", undefined, "tx-server"), title = el("div", undefined, "tx-server-title");
       card.dataset.nodeId = node.id; card.dataset.outputId = output?.id || ""; card.dataset.current = String(route?.role === "current");
-      title.append(el("strong", node.display_name));
-      if (route?.role === "current") title.append(el("span", "Используется", "tx-current"));
+      title.append(el("strong", serverAddress(node)));
+      if (route?.role === "current") title.append(el("span", output.desired_enabled ? "Используется" : "Выбран", "tx-current"));
       card.append(title);
       if (node.setup_error) {
         const installing = ["node_install_failed", "node_install_in_progress"].includes(node.setup_error);
@@ -266,7 +285,10 @@
         card.append(el("p", "Можно добавить к этому эфиру. Пригодность маршрута будет проверена отдельно."));
         card.append(button("Добавить сервер к эфиру", () => action(() => api(`/api/broadcasts/outputs/${output.id}/routes`, { node_id: node.id }, `route:${output.id}:${node.id}`)), busy || stale || output.switch?.active));
       } else if (route.role === "current") card.append(el("p", stale ? "Нет данных" : route.admission_error ? explain(route.admission_error) : route.egress_link.state === "CONNECTED" ? "Отправка работает" : output.desired_enabled ? "Ожидаем подтверждения отправки" : output.stop_confirmed ? "Отправка остановлена" : "Останавливаем…"));
-      else {
+      else if (!output.desired_enabled) {
+        card.append(el("p", stale ? "Нет данных" : route.selection_error ? explain(route.selection_error) : "Можно выбрать до начала отправки. Адрес OBS останется прежним."));
+        card.append(button("Выбрать для отправки", () => action(() => api(`/api/broadcasts/outputs/${output.id}/server`, { target_route_id: route.id }, `select:${output.id}:${route.id}`), `Выбран сервер ${serverAddress(node)}. Нажмите «Начать отправку», когда источник готов.`), busy || stale || Boolean(route.selection_error)));
+      } else {
         card.append(el("p", stale ? "Нет данных" : route.switch_error ? explain(route.switch_error) : "Доступен для подготовки переключения. Качество нового пути ещё не подтверждено."));
         if (route.switch_error === "youtube_dual_ingest_required") card.append(button("Добавить резервный адрес YouTube", () => youtubeDialog(output, true), busy || stale));
         card.append(button("Переключить передачу на этот сервер", () => switchDialog(session, output, route, false), busy || stale || Boolean(route.switch_error)));
@@ -298,7 +320,7 @@
     $("youtube-settings").textContent = output?.mode === "youtube_api" ? "Настройки OAuth" : output?.credential_stored ? "Изменить" : "Сохранить ключ YouTube";
     $("youtube-state").textContent = output?.credential_stored ? "Ключ сохранён" : "Скопируйте ключ из YouTube Studio и сохраните здесь.";
     const ingress = state?.nodes.find((n) => n.id === session?.ingress_node_id);
-    $("obs-node").textContent = ingress ? `Сервер приёма: ${ingress.display_name}` : "Адрес выдаётся выбранным сервером приёма.";
+    $("obs-node").textContent = ingress ? `Сервер приёма: ${serverAddress(ingress)}` : "Адрес выдаётся выбранным сервером приёма.";
     $("obs-state").textContent = output ? "Подключение сохранено. Получите действующий адрес по кнопке ниже." : outputs.length ? "Выберите эфир, чтобы получить его подключение." : "Адрес для OBS и Moblin. Ключ YouTube сюда не нужен.";
     const current = output?.routes.find((r) => r.role === "current");
     const startError = !output ? "Подготовьте подключение или выберите эфир." : !output.credential_stored ? "Сохраните ключ YouTube." : output.switch?.active ? explain("switch_in_progress") : !output.desired_enabled && !output.stop_confirmed ? "Ожидаем подтверждения остановки отправки." : !output.desired_enabled && current.admission_error ? explain(current.admission_error) : "";
@@ -319,7 +341,7 @@
     const platform = known && yt ? [yt.lifecycle_status, yt.stream_status, yt.health_status].filter((value) => value && value !== "unknown").map((value) => platformLabels[value] || value) : [];
     $("platform-status").textContent = platform.length ? `Последний ответ: ${platform.join(" · ")}` : "Нет данных";
     const egress = state?.nodes.find((n) => n.id === current?.node_id);
-    $("tx-topology").textContent = output ? `OBS / Moblin → приём: ${ingress?.display_name || "Нет данных"} → передача: ${egress?.display_name || "Нет данных"} → YouTube` : "Маршрут появится после подготовки подключения.";
+    $("tx-topology").textContent = output ? `OBS / Moblin → приём: ${serverAddress(ingress)} → передача: ${serverAddress(egress)} → YouTube` : "Маршрут появится после подготовки подключения.";
     renderServers(session, output); operation(session, output);
   }
   $("broadcast-choice").addEventListener("change", (event) => { message(); select(event.target.value); });

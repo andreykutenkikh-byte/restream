@@ -110,6 +110,7 @@ class MediaLab:
                     public_key=public_key(key),
                     sequence=self.seq,
                     plan_generation=generation,
+                    rtmp_port=19001,
                     capabilities=sorted(CAPABILITIES),
                     observations=observations,
                 ),
@@ -248,7 +249,7 @@ def test_first_setup_copy_key_switch_reload_and_multiple_choice(
         assert hud_server.app.state.broadcasts.snapshot()["sessions"] == []
         lab = MediaLab(hud_server)
         page.locator("#tx-refresh").click()
-        expect(page.locator("#tx-servers")).to_contain_text("Сервер A")
+        expect(page.locator("#tx-servers")).to_contain_text("8.8.8.8")
         prepare(page, lab.a)
         output = lab.store.snapshot()["sessions"][0]["outputs"][0]
         oid = output["id"]
@@ -402,6 +403,59 @@ def test_failed_target_never_becomes_current_and_capability_gate(
             target.get_by_role("button", name="Переключить передачу на этот сервер")
         ).to_have_count(0)
         screenshot(page, browser, size, "failure")
+    finally:
+        context.close()
+        lab.close()
+
+
+def test_select_ip_before_sending_preserves_obs_and_does_not_start(
+    browser: Any, hud_server: HudServer, admin_password: str
+) -> None:
+    lab = MediaLab(hud_server)
+    context = browser.new_context(ignore_https_errors=True, viewport={"width": 390, "height": 844})
+    try:
+        page = context.new_page()
+        login(page, hud_server, admin_password)
+        prepare(page, lab.a)
+        original = connection(page)
+        target = page.locator(f'[data-node-id="{lab.b}"]')
+        page.locator("#obs-connect").click()
+        dialog = page.get_by_role("dialog")
+        dialog.get_by_label("Протокол подключения").select_option("rtmp")
+        expect(dialog.get_by_label("Ключ трансляции OBS")).to_be_visible()
+        assert (
+            dialog.get_by_label("Сервер", exact=True)
+            .input_value()
+            .startswith("rtmp://8.8.8.8:19001/source/")
+        )
+        key = dialog.get_by_label("Ключ трансляции OBS").input_value()
+        assert key.startswith("direct?user=phone&pass=")
+        dialog.get_by_role("button", name="Скопировать ключ").click()
+        dialog.get_by_label("Протокол подключения").select_option("srt")
+        expect(dialog.get_by_label("Ключ трансляции OBS")).to_have_count(0)
+        expect(dialog.get_by_label("Сервер", exact=True)).to_have_value(original)
+        dialog.get_by_role("button", name="Закрыть", exact=True).click()
+        assert key not in page.content()
+        expect(target.locator("strong")).to_have_text("1.1.1.1")
+        target.get_by_role("button", name="Добавить сервер к эфиру").click()
+        target.get_by_role("button", name="Выбрать для отправки").click()
+        expect(target).to_have_attribute("data-current", "true")
+        expect(target).to_contain_text("Выбран")
+        expect(page.locator("#tx-topology")).to_contain_text("приём: 8.8.8.8 → передача: 1.1.1.1")
+        page.reload()
+        expect(target).to_have_attribute("data-current", "true")
+        assert connection(page) == original
+        with lab.store.database.connect() as db:
+            assert not db.execute(
+                "SELECT 1 FROM broadcast_outputs WHERE desired_enabled=1"
+            ).fetchone()
+            assert not db.execute("SELECT 1 FROM broadcast_egress_leases").fetchone()
+        screenshot(page, browser, "mobile", "selected-before-start")
+        save_key(page)
+        lab.video = lab.forward = True
+        page.locator("#send-action").click()
+        expect(page.locator("#output-status")).to_have_text("Отправка работает", timeout=15000)
+        expect(target).to_have_attribute("data-current", "true")
     finally:
         context.close()
         lab.close()

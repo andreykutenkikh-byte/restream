@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 from ipaddress import ip_address
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlencode
 
 from pydantic import Field, SecretStr, field_validator
@@ -38,6 +38,11 @@ class Prepare(Input):
 
 class Connection(Input):
     target_route_id: str | None = Field(default=None, min_length=1, max_length=128)
+    protocol: Literal["srt", "rtmp"] = "srt"
+
+
+class ServerSelection(Input):
+    target_route_id: str = Field(min_length=1, max_length=128)
 
 
 class YouTubeSettings(Input):
@@ -120,7 +125,9 @@ class BroadcastPresentation:
             self.store.remember(db, "ui-prepare", key, value, oid)
             return {"session_id": sid, "output_id": oid}
 
-    def connection(self, session_id: str, target_route_id: str | None) -> dict[str, Any]:
+    def connection(
+        self, session_id: str, target_route_id: str | None, protocol: Literal["srt", "rtmp"] = "srt"
+    ) -> dict[str, Any]:
         # Explicit reveal only. Never issue desired intent or rotate a source secret here.
         with self.store.database.connect() as db:
             session = self.store.row(
@@ -149,6 +156,17 @@ class BroadcastPresentation:
                 [self.store.unseal(row["encrypted"])["passphrase"], node_id]
             )
             host = f"[{node['srt_host']}]" if ":" in node["srt_host"] else node["srt_host"]
+            if protocol == "rtmp":
+                if not node["rtmp_port"]:
+                    raise BroadcastError("rtmp_ingress_not_configured")
+                return {
+                    "protocol": "rtmp",
+                    "node_id": node_id,
+                    "server": f"rtmp://{host}:{node['rtmp_port']}/source/{session['source_id']}",
+                    "stream_key": "direct?" + urlencode({"user": "phone", "pass": secret}),
+                    "listener_confirmed": False,
+                    "profile": json.loads(session["profile_json"]),
+                }
             query = urlencode(
                 {
                     "streamid": f"publish:source/{session['source_id']}/direct:phone:{secret}",
@@ -251,10 +269,67 @@ class BroadcastPresentation:
             )
             self.store.remember(db, scope, key, value, output_id)
 
+    def select_server(self, output_id: str, target_route_id: str, key: str) -> None:
+        """Choose the next sender only after all prior publishers have stopped."""
+        with self.store.transaction() as db:
+            scope = f"ui-server:{output_id}"
+            if self.store.replay(db, scope, key, target_route_id):
+                return
+            output = self.store.row(db, "SELECT * FROM broadcast_outputs WHERE id=?", (output_id,))
+            if output["desired_enabled"]:
+                raise BroadcastError("stop_before_selecting_server")
+            if db.execute(
+                "SELECT 1 FROM broadcast_switches w JOIN broadcast_outputs o ON o.id=w.output_id "
+                "WHERE o.session_id=? AND w.active=1",
+                (output["session_id"],),
+            ).fetchone():
+                raise BroadcastError("switch_in_progress")
+            target = self.store.row(
+                db,
+                "SELECT * FROM broadcast_routes WHERE id=? AND output_id=?",
+                (target_route_id, output_id),
+            )
+            for route in db.execute(
+                "SELECT id FROM broadcast_routes WHERE output_id=?", (output_id,)
+            ):
+                if db.execute(
+                    "SELECT 1 FROM broadcast_egress_leases WHERE route_id=?", (route["id"],)
+                ).fetchone() and not self.switches.stopped(db, route["id"], output["updated_at"]):
+                    raise BroadcastError("waiting_for_publisher_stop")
+            self.public_node(db, target["node_id"])
+            self.media.admit(db, output_id, target_route_id)
+            if target["role"] != "current":
+                now = utc_now()
+                db.execute(
+                    "UPDATE broadcast_routes SET role='standby',youtube_slot=NULL,"
+                    "desired_enabled=0,media_warm=0,generation=generation+1,updated_at=? "
+                    "WHERE output_id=?",
+                    (now, output_id),
+                )
+                db.execute(
+                    "UPDATE broadcast_routes SET role='current',youtube_slot='PRIMARY' WHERE id=?",
+                    (target_route_id,),
+                )
+                db.execute(
+                    "UPDATE broadcast_outputs SET generation=generation+1,updated_at=? WHERE id=?",
+                    (now, output_id),
+                )
+                self.media.egress.sync(db, output_id)
+                self.store.event(
+                    db, output["session_id"], "output.server_selected", output_id=output_id
+                )
+            self.store.remember(db, scope, key, target_route_id, target_route_id)
+
     def state(self) -> dict[str, Any]:
         result = snapshot(self.store)
         with self.store.database.connect() as db:
             for node in result["nodes"]:
+                address = db.execute(
+                    "SELECT n.resolved_ip,m.srt_host FROM restream_nodes n "
+                    "LEFT JOIN broadcast_media_nodes m ON m.node_id=n.id WHERE n.id=?",
+                    (node["id"],),
+                ).fetchone()
+                node["ip_address"] = address["srt_host"] or address["resolved_ip"]
                 # Before media enrollment, explain the bootstrap state. Once a
                 # separate media service exists, its own admission/heartbeat is
                 # authoritative; an old v1 installation state cannot hide it.
@@ -332,6 +407,17 @@ class BroadcastPresentation:
                     current = next(r for r in output["routes"] if r["role"] == "current")
                     slot = "BACKUP" if current["youtube_slot"] == "PRIMARY" else "PRIMARY"
                     for route in output["routes"]:
+                        route["selection_error"] = (
+                            "switch_in_progress"
+                            if any(
+                                o["switch"] and o["switch"]["active"] for o in session["outputs"]
+                            )
+                            else "stop_before_selecting_server"
+                            if output["desired_enabled"]
+                            else "waiting_for_publisher_stop"
+                            if not output["stop_confirmed"]
+                            else route["admission_error"]
+                        )
                         error = route["admission_error"]
                         if output["switch"] and output["switch"]["active"]:
                             error = "switch_in_progress"
