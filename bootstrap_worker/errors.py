@@ -75,6 +75,12 @@ def safe_failure(code: str) -> BootstrapError:
         "docker_repository_key_invalid": (
             "Ключ подписи официального репозитория Docker не прошёл проверку."
         ),
+        "docker_repository_incomplete": (
+            "В выбранном официальном репозитории Docker отсутствует необходимый пакет."
+        ),
+        "docker_failed_install_recovery_unsafe": (
+            "Незавершённую установку Docker нельзя безопасно восстановить автоматически."
+        ),
         "docker_install_failed": "Не удалось безопасно установить Docker Engine.",
         "remote_directory_conflict": (
             "Каталог установки уже существует и не принадлежит AdoJapan Restream."
@@ -83,6 +89,13 @@ def safe_failure(code: str) -> BootstrapError:
             "Существующий ключ узла нельзя безопасно заменить в текущем состоянии."
         ),
         "remote_command_failed": "Не удалось выполнить безопасный шаг установки.",
+        "remote_command_timeout": (
+            "Шаг установки не завершился за отведённое время. "
+            "Проверьте доступ к репозиториям и занятость менеджера пакетов на сервере."
+        ),
+        "remote_output_limit_exceeded": (
+            "Шаг установки остановлен: вывод команды превысил допустимый размер."
+        ),
         "remote_upload_failed": "Не удалось безопасно загрузить файлы установки.",
         "agent_install_failed": "Node Agent не удалось установить.",
         "agent_enrollment_failed": (

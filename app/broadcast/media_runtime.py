@@ -241,6 +241,7 @@ class MediaRuntime:
         directory: Path,
         ports: MediaPorts,
         srt_bind_host: str,
+        rtmp_bind_host: str = "127.0.0.1",
         test_destinations: dict[str, str] | None = None,
     ) -> None:
         self.node_id, self.private_key = node_id, private_key
@@ -304,7 +305,7 @@ class MediaRuntime:
             "authHTTPExclude": [{"action": "api"}],
             "rtspAddress": f"127.0.0.1:{ports.rtsp}",
             "rtspTransports": ["tcp"],
-            "rtmpAddress": f"127.0.0.1:{ports.rtmp}",
+            "rtmpAddress": f"{rtmp_bind_host}:{ports.rtmp}",
             "srtAddress": f"{srt_bind_host}:{ports.srt}",
             "hls": False,
             "webrtc": False,

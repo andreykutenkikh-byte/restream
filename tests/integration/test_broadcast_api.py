@@ -65,6 +65,7 @@ def test_admin_write_csrf_origin_fetch_metadata_and_monitor_isolation(
             ("/api/broadcasts/prepare", {"ingress_node_id": grant.node_id}),
             (f"/api/broadcasts/sessions/{sid}/connection", {}),
             ("/api/broadcasts/outputs/unknown/connection", {"stream_key": "synthetic-key"}),
+            ("/api/broadcasts/outputs/unknown/server", {"target_route_id": "unknown"}),
         ]
         assert "Моя трансляция" in client.get("/").text
         legacy = client.get("/legacy")

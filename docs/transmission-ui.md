@@ -1,12 +1,39 @@
 # One broadcast screen
 
-This UI is based on the **unmerged PR21 candidate**,
-`9203469a972931bc5903b17e5950926d8e06e2ce`, branch
-`feat/broadcast-seamless-source-handoff`. It is not a UI-only patch for current
-main (`8136480d22ca7d4fdae82c70b4b34c1d638a9026` at inspection).
-It requires the candidate's existing managed media admission, canonical output
-credentials, switch transactions, leases and agent capabilities. There is no
-installation, migration, merge or deployment in this change; PR22 is separate.
+The managed broadcast stack and this screen were integrated through PR23.
+The server recovery update adds IP labels, stopped-output server selection and
+optional RTMP ingress. It continues to use the existing admission, credentials,
+switch transactions and leases; the unrelated hosting migration remains separate.
+
+## Server and protocol selection
+
+- Cards, ingress choices, dialogs and topology show public IP addresses.
+- Before sending, **Выбрать для отправки** selects the current egress route
+  without starting a publisher, changing the OBS ingress or changing any key.
+  It requires a ready target, no active handoff in the source session, and stop
+  acknowledgment or expiry of all prior publisher grants. It does not need a
+  YouTube backup endpoint. The mutation uses the same admin/CSRF/origin guards.
+- While sending, the existing make-before-break switch and its backup-ingest
+  requirement remain unchanged.
+- **Получить подключение → Протокол подключения** offers SRT and RTMP.
+  SRT returns one URL; RTMP returns separate **Сервер** and **Ключ трансляции OBS**
+  values. Both authenticate the same per-source/per-node credential. No secret
+  rotates and no desired intent changes when revealing or changing protocol.
+  The dialog explains that RTMP is unencrypted; SRT remains available.
+- Media agents keep RTMP bound to loopback by default. An explicit
+  `rtmp_bind_host: "0.0.0.0"` uses their configured `ports.rtmp` and advertises
+  that port in an authenticated heartbeat. Migration 12 adds only a nullable
+  `broadcast_media_nodes.rtmp_port`; older agents still work and clear it.
+  Upgrade the backend before enabling updated agents. Production uses TCP 24002
+  for this opt-in listener, preserving the legacy RTMP service on TCP 1935.
+  RTSP and the MediaMTX management API remain bound to loopback.
+- `scripts.broadcast_rtmp_lab` reuses the existing three-node media laboratory,
+  rejects an incorrect input credential and checks decoded RTMP → relay → sink
+  video/audio and isolation. It does not contact YouTube.
+
+The original UI acceptance notes below describe its initial integration. The
+RTMP configuration, migration and stopped-selection additions above supersede
+the original SRT-only and UI-only scope statements.
 
 ## User path
 

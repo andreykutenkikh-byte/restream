@@ -10,8 +10,9 @@ from pathlib import Path
 from typing import Any
 
 from app.broadcast.egress_schema import migrate as migrate_egress
+from app.broadcast.ingest_schema import SCHEMA_VERSION
+from app.broadcast.ingest_schema import migrate as migrate_ingest
 from app.broadcast.media_schema import migrate as migrate_media
-from app.broadcast.operator_schema import SCHEMA_VERSION
 from app.broadcast.operator_schema import migrate as migrate_operator
 from app.broadcast.schema import migrate as migrate_broadcast
 
@@ -480,6 +481,7 @@ class Database:
             migrate_media(connection)
             migrate_egress(connection)
             migrate_operator(connection)
+            migrate_ingest(connection)
 
     def ready(self) -> bool:
         try:

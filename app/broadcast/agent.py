@@ -63,6 +63,7 @@ def main() -> None:
         directory=Path(config["runtime_directory"]),
         ports=MediaPorts(**config["ports"]),
         srt_bind_host=config["srt_bind_host"],
+        rtmp_bind_host=config.get("rtmp_bind_host", "127.0.0.1"),
     )
     boot_id, sequence = secrets.token_hex(16), 0
     reset_observations = False
@@ -77,6 +78,9 @@ def main() -> None:
                     public_key=public_key(private),
                     capabilities=sorted(CAPABILITIES),
                     plan_generation=max(0, runtime.generation),
+                    rtmp_port=runtime.ports.rtmp
+                    if config.get("rtmp_bind_host") == "0.0.0.0"  # noqa: S104 - explicit opt-in
+                    else None,
                     observations=[]
                     if reset_observations
                     else [Observation.model_validate(o) for o in observations],

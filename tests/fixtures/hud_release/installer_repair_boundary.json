@@ -1,0 +1,9 @@
+{
+  "base_commit": "53e0a6f032b6edaf755c4cd11b4f3eb3c2bcce2c",
+  "reason": "Post-HUD server installation recovery: AlmaLinux repository, Ubuntu signing key, safe SSH failure diagnostics. Other historical HUD boundaries remain pinned.",
+  "files": {
+    "bootstrap_worker/installer.py": "6c2e94834cf2588bc9607df5a8471c9fcc133771",
+    "bootstrap_worker/errors.py": "86f163b3b2870af13a3e0a0436d3a3c3af3e37e6",
+    "bootstrap_worker/ssh.py": "e0e4cc9c982860b470cc14adb67bd2cad3925cde"
+  }
+}

@@ -7,9 +7,24 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
-from bootstrap_worker.installer import AptDockerAdapter, DnfDockerAdapter
-from bootstrap_worker.models import PackageManager, PlatformFamily, SELinuxMode, SystemFacts
+from bootstrap_worker.errors import BootstrapError
+from bootstrap_worker.installer import (
+    AptDockerAdapter,
+    DnfDockerAdapter,
+    DockerBootstrap,
+    PrivilegeContext,
+)
+from bootstrap_worker.models import (
+    PackageManager,
+    PlatformFamily,
+    PrivilegeMode,
+    SELinuxMode,
+    SystemFacts,
+    TimeoutPolicy,
+)
+from bootstrap_worker.ssh import RemoteResult
 
 FIXTURE = Path(__file__).resolve().parents[2] / "ci" / "rpm-fixture"
 
@@ -90,8 +105,101 @@ def test_dnf_fixture_accepts_only_the_adapter_package_commands() -> None:
         "containerd.io docker-buildx-plugin docker-compose-plugin",
     )
     assert all(_run_tool("dnf", *shlex.split(command)[1:]).returncode == 0 for command in commands)
+    for package in (
+        "docker-ce",
+        "docker-ce-cli",
+        "containerd.io",
+        "docker-buildx-plugin",
+        "docker-compose-plugin",
+    ):
+        arguments = (
+            "-q",
+            "--disablerepo=*",
+            "--enablerepo=docker-ce-stable",
+            "list",
+            "--available",
+            package,
+        )
+        assert _run_tool("dnf", *arguments).returncode == 0
+        incomplete = _run_tool(
+            "dnf",
+            *arguments,
+            mode="alma_native_repo_incomplete",
+        )
+        if package in {"docker-ce", "docker-ce-cli"}:
+            assert incomplete.returncode != 0
+        else:
+            assert incomplete.returncode == 0
     assert _run_tool("dnf", "-y", "update").returncode == 64
     assert _run_tool("dnf", "-y", "remove", "podman", "runc").returncode == 64
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="POSIX fixture runs in Linux CI")
+async def test_alma_native_incomplete_fixture_stops_before_dnf_engine_install() -> None:
+    platform = _facts(rhel=True)
+
+    class FixtureSession:
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+
+        async def run(
+            self,
+            command: str,
+            *,
+            stdin: SecretStr | None = None,
+            timeout: float,
+        ) -> RemoteResult:
+            del stdin, timeout
+            self.commands.append(command)
+            if "repo_kind=$(kind" in command:
+                return RemoteResult(
+                    0,
+                    "repo_kind=missing\nrepo_uid=-1\nrepo_sha256=\n"
+                    "key_kind=missing\nkey_uid=-1\nkey_fingerprint=\n"
+                    "foreign_repository=0\ntemporary_artifact=0\n",
+                )
+            if "list --available" in command:
+                results = (
+                    _run_tool(
+                        "dnf",
+                        "-q",
+                        "--disablerepo=*",
+                        "--enablerepo=docker-ce-stable",
+                        "list",
+                        "--available",
+                        package,
+                        mode="alma_native_repo_incomplete",
+                    )
+                    for package in (
+                        "docker-ce",
+                        "docker-ce-cli",
+                        "containerd.io",
+                        "docker-buildx-plugin",
+                        "docker-compose-plugin",
+                    )
+                )
+                return RemoteResult(1 if any(item.returncode != 0 for item in results) else 0)
+            if (
+                "install docker-ce docker-ce-cli containerd.io "
+                "docker-buildx-plugin docker-compose-plugin" in command
+            ):
+                raise AssertionError("engine package installation must not run")
+            return RemoteResult(0)
+
+    session = FixtureSession()
+    with pytest.raises(BootstrapError) as captured:
+        await DockerBootstrap().install(
+            session,  # type: ignore[arg-type]
+            PrivilegeContext(PrivilegeMode.ROOT),
+            platform,
+            timeouts=TimeoutPolicy(),
+        )
+    assert captured.value.code == "docker_repository_incomplete"
+    assert not any(
+        "install docker-ce docker-ce-cli containerd.io "
+        "docker-buildx-plugin docker-compose-plugin" in command
+        for command in session.commands
+    )
 
 
 @pytest.mark.skipif(shutil.which("sh") is None, reason="POSIX fixture runs in Linux CI")
@@ -102,8 +210,8 @@ def test_rpm_systemctl_fixture_has_a_bounded_surface() -> None:
 
 
 @pytest.mark.skipif(
-    os.name == "nt" or shutil.which("sh") is None,
-    reason="generated remote shell is parsed in Linux CI",
+    shutil.which("sh") is None,
+    reason="generated remote shell requires a POSIX parser",
 )
 def test_generated_apt_and_dnf_plans_have_valid_posix_shell_syntax() -> None:
     shell = shutil.which("sh")

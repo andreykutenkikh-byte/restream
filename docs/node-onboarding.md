@@ -5,6 +5,17 @@ from the **Servers** page. The control plane performs a bounded SSH bootstrap, i
 outbound-only Node Agent, waits for one-time enrollment, and runs a fixed installation check. The
 remote node is not yet part of the media path.
 
+The transmission screen distinguishes a failed or ongoing bootstrap from a node that still
+needs media setup. A successful Stage 4A installation is **not** managed-media readiness:
+the v2 media service and explicit pinned-key enablement described in
+[staged deployment](staged-broadcast-deployment.md) are still required. Stage 4A does not
+silently open media ports or migrate legacy keys.
+
+Remote command failures distinguish a command deadline (`remote_command_timeout`) and the
+64 KiB per-stream output ceiling (`remote_output_limit_exceeded`) from a general transport
+failure. The deadline and bounded buffering remain enforced; raw output is never displayed.
+Historical `remote_command_failed` records cannot prove which of those causes occurred.
+
 This document describes the implemented workflow. It is not authorization to run it against a
 production server.
 
@@ -127,16 +138,38 @@ supported existing installation is inspected only: package ownership, server res
 and active service are checked without repository access, package changes, daemon configuration, or
 daemon restart.
 
-The RPM repository mapping is a code allowlist, not SSH/browser input: AlmaLinux and CentOS Stream
-use Docker's CentOS-compatible endpoint, Rocky uses Docker's Rocky endpoint, and RHEL uses Docker's
-RHEL endpoint. Redirect following is disabled for repository/key fetches, HTTPS is mandatory, the
-downloaded key must match Docker's reviewed fingerprint, and the generated RPM repository keeps
-`gpgcheck=1`.
+The RPM repository mapping is a code allowlist, not SSH/browser input. AlmaLinux remains detected,
+stored, and displayed as AlmaLinux, while Docker Engine packages use the RHEL compatibility profile
+for the matching Enterprise Linux major: AlmaLinux 8 uses `linux/rhel/8` and AlmaLinux 9 uses
+`linux/rhel/9`. RHEL uses the same explicit major profiles; the existing Rocky and CentOS Stream
+profiles remain separate. This relies on AlmaLinux's RHEL ABI compatibility and is **not** a claim
+that Docker documents AlmaLinux itself as an officially supported Docker Engine platform. No OS or
+repository selector is exposed to the administrator.
+
+After the selected repository refreshes, the dnf adapter proves that every required package
+(`docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-buildx-plugin`, and
+`docker-compose-plugin`) is available from `docker-ce-stable` with every other repository disabled
+for that check. A successful metadata refresh alone is not sufficient, and package installation is
+never attempted when the exact package gate fails. Redirect following remains disabled for
+repository/key fetches, HTTPS is mandatory, the downloaded key must match Docker's reviewed
+fingerprint, and the generated RPM repository keeps `gpgcheck=1`.
+
+New dnf repository files contain the fixed
+`managed-by-adojapan-restream-node-bootstrap:v1` comment and are treated as owned only when the
+regular root-owned file has the exact generated content and the regular root-owned key has the
+approved fingerprint. A retry can also recognize the one exact markerless AlmaLinux repository
+state produced by the earlier AdoJapan failed-install version, but only while Docker packages,
+daemon, socket, data roots, Node Agent root, and every conflicting repository/runtime remain absent.
+Any modified file, symlink, owner, fingerprint, or foreign state fails without mutation. On a later
+failure the installer removes only an exactly proven owned repository/key pair while Docker is
+still wholly absent; it never uninstalls partially installed packages or removes ambiguous files.
 
 The UI receives only stable localized failures. Platform/package/install failures are distinguished
 as `unsupported_operating_system`, `unsupported_package_manager`,
 `unsupported_docker_installation`, `conflicting_container_runtime`,
-`docker_repository_unavailable`, `docker_repository_key_invalid`, or `docker_install_failed`.
+`docker_repository_unavailable`, `docker_repository_key_invalid`,
+`docker_repository_incomplete`, `docker_failed_install_recovery_unsafe`, or
+`docker_install_failed`.
 Package-manager output, repository contents, remote commands, and credentials are never included.
 
 In this workflow, “the installer does not change the firewall” means that AdoJapan never invokes

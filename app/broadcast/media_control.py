@@ -57,6 +57,7 @@ class MediaHeartbeat(Input):
     capabilities: list[str] = Field(max_length=8)
     sequence: int = Field(ge=0, le=10**15)
     plan_generation: int = Field(ge=0, le=10**15)
+    rtmp_port: int | None = Field(default=None, ge=1024, le=65535)
     observations: list[Observation] = Field(default_factory=list, max_length=32)
 
 
@@ -228,8 +229,15 @@ class MediaControl:
             now = utc_now()
             db.execute(
                 "UPDATE broadcast_media_nodes SET last_seen_at=?,last_sequence=?,boot_id=?,"
-                "capabilities_json=? WHERE node_id=?",
-                (now, data.sequence, data.boot_id, json.dumps(sorted(CAPABILITIES)), node_id),
+                "capabilities_json=?,rtmp_port=? WHERE node_id=?",
+                (
+                    now,
+                    data.sequence,
+                    data.boot_id,
+                    json.dumps(sorted(CAPABILITIES)),
+                    data.rtmp_port,
+                    node_id,
+                ),
             )
             for obs in data.observations:
                 route = self.store.row(
