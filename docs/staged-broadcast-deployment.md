@@ -13,6 +13,9 @@ firewall change, installation, merge, OAuth grant, or real YouTube event.
    permanent legacy configuration unchanged. Explicitly opt new nodes into `managed_egress`
    with pinned X25519 public keys, exact capabilities, compatible media profiles, measured
    resource capacity and separate ports/runtime directories. There is no automatic migration.
+   A separately installed v2 service may use an existing Node Agent or relay identity after
+   explicit media enablement with its pinned key. The original v1 credentials and services
+   remain unchanged; v2 acceptance does not authorize either identity in the other v1 API.
 3. Verify HTTPS certificate/hostname and time synchronization on control plane and nodes.
    Configure proxy access logs to omit OAuth callback query values. Exclude environment,
    process argv, memory/core dumps, transport URLs and runtime files from log/crash/backup

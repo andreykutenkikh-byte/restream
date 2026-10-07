@@ -10,6 +10,7 @@ from app.broadcast.media_control import MediaControl, MediaHeartbeat, MediaNodeE
 from app.broadcast.models import BroadcastError
 from app.moblin_hud_api import HudBodyLimitMiddleware
 from app.relay_api import _bearer_token
+from app.services.nodes import NodeAuthenticationError
 from app.services.relays import RelayAuthenticationError
 
 router = APIRouter()
@@ -39,5 +40,10 @@ def heartbeat(
     try:
         node = request.app.state.relays.authenticate(token)
     except RelayAuthenticationError:
-        raise BroadcastError("media_authentication_failed", 401) from None
+        # The explicit v2 opt-in and pinned key below authorize media capability.
+        # Keep both legacy authentication domains unchanged at their own APIs.
+        try:
+            node = request.app.state.nodes.authenticate(token)
+        except NodeAuthenticationError:
+            raise BroadcastError("media_authentication_failed", 401) from None
     return control(request).heartbeat(str(node["node_id"]), data)
