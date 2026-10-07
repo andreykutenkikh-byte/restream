@@ -432,7 +432,7 @@ def test_schema_v5_upgrade_preserves_all_existing_rows_schema_and_foreign_keys(
             assert (
                 connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
                 == SCHEMA_VERSION
-                == 11
+                == 12
             )
 
 
