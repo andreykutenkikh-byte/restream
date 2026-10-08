@@ -99,11 +99,13 @@ class Publisher:
         feed: bool = False,
         fps: float = 30,
         diagnostics: Emit | None = None,
+        exhausted_retry_seconds: float | None = None,
     ) -> None:
         self.argv = argv
         self.feed = feed
         self.fps = fps
         self.diagnostics = diagnostics
+        self.exhausted_retry_seconds = exhausted_retry_seconds
         self.selector: Selector | None = None
         self.process: subprocess.Popen[str] | None = None
         self.frames = 0
@@ -158,11 +160,14 @@ class Publisher:
         if self.process is not None:
             if self.diagnostics:
                 self.diagnostics("process_exit", self.process.poll())
-            self.failures += 1
-            self.retry_at = now + min(30, 2**self.failures)
+            self.failures = min(5, self.failures + 1)
+            delay = min(30, 2**self.failures)
+            if self.failures >= 5 and self.exhausted_retry_seconds is not None:
+                delay = max(delay, self.exhausted_retry_seconds)
+            self.retry_at = now + delay
             self.close()
             self.process = None
-        if now < self.retry_at or self.failures >= 5:
+        if now < self.retry_at or (self.failures >= 5 and self.exhausted_retry_seconds is None):
             return
         self.frames, self.time_us, self.last_progress, self.first_progress = 0, 0, 0, 0
         self.bytes = 0
@@ -716,7 +721,16 @@ class MediaRuntime:
                 if collector
                 else {}
             )
-            worker = Publisher(argv, feed=feed, fps=fps, **options)
+            # A remote ingress may start long after output sending is enabled.
+            # Keep its reader reconnecting at a slow rate after the fast retry
+            # budget; YouTube publishers retain their finite failure budget.
+            worker = Publisher(
+                argv,
+                feed=feed,
+                fps=fps,
+                exhausted_retry_seconds=60 if mapping is self.forwarders else None,
+                **options,
+            )
             mapping[route_id] = (identity, worker)
         else:
             worker = existing[1]
