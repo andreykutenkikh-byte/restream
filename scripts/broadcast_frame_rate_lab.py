@@ -97,7 +97,12 @@ def copy(directory: Path, fixture: Path, fps: float, slot: str) -> dict[str, Any
         publisher.stdin.close()
         assert publisher.wait(timeout=5) == 0
         result = inspect(output)
-        assert len(result["rates"]) == 1 and math.isclose(result["rates"][0], fps, abs_tol=1e-9)
+        # FLV demuxers reduce AMF numbers to a bounded rational. Integer rates
+        # must be exact; NTSC rates may differ by <0.005 fps in that representation.
+        tolerance = 1e-9 if fps.is_integer() else 0.005
+        assert len(result["rates"]) == 1 and math.isclose(
+            result["rates"][0], fps, abs_tol=tolerance
+        )
         streams = json.loads(
             run(
                 [
@@ -186,6 +191,7 @@ def main() -> None:
         )
         original = inspect(reference)
         copies = [copy(directory, fixture, fps, slot) for slot in ["PRIMARY", "BACKUP"]]
+        assert copies[0]["rates"] == copies[1]["rates"], "primary_backup_rate_mismatch"
         for result in copies:
             assert result["counts"] == original["counts"]
             assert result["payloads"] == original["payloads"], "compressed_media_changed"
