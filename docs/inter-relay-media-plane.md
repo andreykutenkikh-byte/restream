@@ -62,7 +62,10 @@ publishers survive controller outages within their 300-second egress lease. A 25
 watchdog stops expired publishers and clears runtime credentials and command arguments.
 An expired credential cannot open a new remote connection. Local publisher retries are
 bounded to five consecutive failures with exponential backoff, and reset after stable
-progress. Explicit revoke/HTTP 401 or 403 stops the agent. No raw command, URL, node token
+progress. Inter-relay readers use the same initial backoff, then keep reconnecting once
+per minute while their media route remains enabled. This lets a late or returning ingress
+recover after the initial five attempts; it does not reset the YouTube publisher budget
+or grant any output credentials. Explicit revoke/HTTP 401 or 403 stops the agent. No raw command, URL, node token
 or passphrase is logged. MediaMTX and FFmpeg diagnostics can contain secrets, so runtime
 discards them and exports only bounded numeric measurements and constant error codes.
 
