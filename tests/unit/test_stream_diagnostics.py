@@ -30,6 +30,10 @@ def test_raw_log_credentials_never_reach_disk_or_heartbeat(tmp_path: Path) -> No
     assert classify("arbitrary SECRET_CANARY body") is None
     collector.callback("publisher", "route-safe")(*classify(line))
     assert classify("137 RTP packets lost [SECRET_CANARY]") == ("rtp_packets_lost", 137)
+    for warning in ("Packet corrupt", "Error while decoding"):
+        classified = classify(warning + " rtmp://user:SECRET_CANARY@host/live/STREAM_CANARY")
+        assert classified == ("invalid_media", None)
+        collector.callback("forwarder", "route-safe")(*classified)
     pending = collector.snapshot()
     collector.acknowledge(pending[-1].sequence)
     assert collector.snapshot() == []

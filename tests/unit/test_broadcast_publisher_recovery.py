@@ -107,3 +107,37 @@ def test_only_interrelay_reader_receives_slow_recovery_policy(
     assert constructor.call_args.kwargs["exhausted_retry_seconds"] == 60
     runtime._worker(runtime.publishers, "route", "output", ["publisher"], feed=True)
     assert constructor.call_args.kwargs["exhausted_retry_seconds"] is None
+
+
+def test_verified_frame_rate_change_reopens_publisher_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    constructor = Mock()
+    monkeypatch.setattr(media_runtime, "Publisher", constructor)
+    runtime = MediaRuntime.__new__(MediaRuntime)
+    runtime.forwarders = {}
+    runtime.publishers = {}
+    runtime.source_switches = {}
+    old = Mock(fps=30, last_progress=123.0)
+    runtime.publishers["route"] = ("same-source-and-destination", old)
+    runtime._worker(
+        runtime.publishers,
+        "route",
+        "same-source-and-destination",
+        ["publisher"],
+        feed=True,
+        fps=30,
+    )
+    old.tick.assert_called_once()
+    old.close.assert_not_called()
+    constructor.assert_not_called()
+    runtime._worker(
+        runtime.publishers,
+        "route",
+        "same-source-and-destination",
+        ["publisher"],
+        feed=True,
+        fps=60,
+    )
+    old.close.assert_called_once()
+    assert constructor.call_args.kwargs["fps"] == 60

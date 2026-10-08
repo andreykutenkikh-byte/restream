@@ -600,7 +600,7 @@ class MediaRuntime:
             "-hide_banner",
             "-nostdin",
             "-loglevel",
-            "error",
+            "warning" if srt else "error",
             "-progress",
             "pipe:1",
             "-stats_period",
@@ -702,7 +702,7 @@ class MediaRuntime:
         fps: float = 30,
     ) -> Publisher:
         existing = mapping.get(route_id)
-        if existing and existing[0] != identity:
+        if existing and (existing[0] != identity or (feed and existing[1].fps != fps)):
             if mapping is self.publishers:
                 self.source_switches[route_id] = {
                     "last_old_progress": existing[1].last_progress,
@@ -879,7 +879,9 @@ class MediaRuntime:
                         "streamid": f"read:{forward['path']}:{route_id}:{forward['token']}",
                         "passphrase": forward["passphrase"],
                         "pbkeylen": "32",
-                        "latency": "200000",
+                        # A distant relay can have >200 ms RTT. Allow several
+                        # retransmission rounds instead of losing late H.264 data.
+                        "latency": "1000000",
                         "mode": "caller",
                         "maxbw": str(route["profile"]["expected_bitrate_bps"] // 8 * 2),
                     },
