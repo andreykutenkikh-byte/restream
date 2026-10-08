@@ -22,6 +22,17 @@ INSTALLER_REPAIR_FILES = {
     "bootstrap_worker/errors.py",
     "bootstrap_worker/ssh.py",
 }
+# The owner requested safe co-installation on existing Docker/Amnezia hosts.
+# Keep the earlier release manifests intact and pin only this authorized delta.
+COEXISTENCE_FILES = {
+    "app/services/bootstrap.py",
+    "bootstrap_worker/compose_plugin.py",
+    "bootstrap_worker/errors.py",
+    "bootstrap_worker/installer.py",
+    "bootstrap_worker/jobs.py",
+    "bootstrap_worker/models.py",
+    "bootstrap_worker/state_machine.py",
+}
 
 
 def _git_blob(path: Path) -> str:
@@ -50,7 +61,14 @@ def test_media_protocol_bootstrap_and_runtime_match_pinned_main() -> None:
     repair = json.loads((FIXTURES / "installer_repair_boundary.json").read_text(encoding="utf-8"))
     assert repair["base_commit"] == "53e0a6f032b6edaf755c4cd11b4f3eb3c2bcce2c"
     assert set(repair["files"]) == INSTALLER_REPAIR_FILES
+    coexistence = json.loads((FIXTURES / "docker_coexistence_boundary.json").read_text("utf-8"))
+    assert coexistence["base_commit"] == "f193191b1bc4ede0fade56d4936c1f485bbc373b"
+    assert set(coexistence["files"]) == COEXISTENCE_FILES
+    for relative, expected_blob in coexistence["files"].items():
+        assert _git_blob(ROOT / relative) == expected_blob, relative
     for relative, expected_blob in expected.items():
+        if relative in COEXISTENCE_FILES:
+            continue
         if relative in INSTALLER_REPAIR_FILES:
             assert _git_blob(ROOT / relative) == repair["files"][relative], relative
             continue
@@ -70,6 +88,9 @@ def test_media_protocol_bootstrap_and_runtime_match_pinned_main() -> None:
             if path.is_file() and "__pycache__" not in path.parts
         }
         original_paths = {path for path in expected if path.startswith(f"{directory}/")}
+        original_paths.update(
+            path for path in COEXISTENCE_FILES if path.startswith(f"{directory}/")
+        )
         assert actual_paths == original_paths, directory
     assert not (ROOT / "deploy/moblin-relay").exists()
     assert not (ROOT / "bootstrap_worker/relay_installer.py").exists()

@@ -355,6 +355,12 @@ class BootstrapExecutor:
                     timeouts=self.timeouts,
                 )
                 record.docker_installed = True
+            elif docker_state is DockerDisposition.COMPOSE_MISSING:
+                # Only the client plugin is added. Do not mark Docker for install/recovery.
+                record.transition(JobState.INSTALLING_COMPOSE)
+                await self._docker.install_compose(
+                    session, privilege, facts, timeouts=self.timeouts
+                )
             # READY is intentionally observation-only: the install/start plan is
             # unreachable for an existing supported Docker daemon.
             record.checkpoint()

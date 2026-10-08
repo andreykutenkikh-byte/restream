@@ -18,6 +18,7 @@
     checking_resources: "Проверяем ресурсы",
     checking_docker: "Проверяем Docker",
     installing_docker: "Устанавливаем Docker",
+    installing_compose: "Добавляем Docker Compose. Работающий Docker сохраняется",
     needs_enrollment_token: "Подготавливаем Node Agent",
     preparing_agent: "Подготавливаем Node Agent",
     installing_agent: "Устанавливаем Node Agent",

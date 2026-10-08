@@ -285,6 +285,20 @@ is absent from the production Compose definition.
 
 ## Isolation and resources
 
+Server bootstrap reuses a healthy, local, rootful Docker CE or Debian/Ubuntu `docker.io`
+installation. It does not replace runtime packages, upgrade the engine, restart Docker, or
+change daemon configuration. Podman shims, rootless or remote contexts, inactive daemons, and
+partial package installations require an operator to resolve them first.
+
+If an existing engine lacks Compose, bootstrap adds only the CLI plugin using Docker's
+[manual plugin installation method](https://docs.docker.com/compose/install/linux/).
+The official v5.6.0 binary is pinned by architecture and SHA-256, verified before execution,
+and installed without overwriting an existing file or symlink. Custom plugin directories
+and broken pre-existing plugins are not repaired automatically. This plugin can remain after
+a later node installation failure; a retry reuses it. Existing VPN containers, their ports,
+and their configuration remain outside the Restream project. Shared CPU, memory, and network
+capacity still need to accommodate both services.
+
 Compose creates project-scoped database, log, backup, and bootstrap-socket volumes; an internal
 backend/MediaMTX network; a dedicated MediaMTX ingest bridge for its published RTMP port; a backend
 egress network; and a separate bootstrap-only egress network. The backend mounts the bootstrap UDS

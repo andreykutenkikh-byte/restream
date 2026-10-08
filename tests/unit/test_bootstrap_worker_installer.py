@@ -876,9 +876,9 @@ async def test_conflicting_runtime_has_specific_error_and_no_mutation(
             timeout=60,
         )
     assert captured.value.code == "conflicting_container_runtime"
-    assert len(session.commands) == 1
-    assert "apt-get" not in session.commands[0][0]
-    assert "dnf " not in session.commands[0][0]
+    assert len(session.commands) == 2
+    assert session.commands[0][0] == "command -v docker >/dev/null 2>&1"
+    assert all("apt-get" not in c and "dnf " not in c for c, _, _ in session.commands)
 
 
 @pytest.mark.parametrize(
@@ -1154,11 +1154,9 @@ async def test_docker_absence_detection_fails_closed_on_existing_installation_st
     assert disposition is DockerDisposition.UNSUPPORTED
 
 
-async def test_functional_non_official_docker_installation_is_unsupported() -> None:
+async def test_unsupported_existing_package_layout_is_not_repaired() -> None:
     def responder(command: str, stdin: SecretStr | None) -> RemoteResult:
         del stdin
-        if "for package in docker.io" in command:
-            return RemoteResult(0)
         if command == "command -v docker >/dev/null 2>&1":
             return RemoteResult(0)
         assert "dpkg-query" in command

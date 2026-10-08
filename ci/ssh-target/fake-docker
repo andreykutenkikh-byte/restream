@@ -9,6 +9,18 @@ fi
 
 if [ "${1:-}" != "compose" ]; then
   case "$*" in
+    "context show")
+      printf '%s\n' default
+      exit 0
+      ;;
+    "context inspect default --format {{.Endpoints.docker.Host}}")
+      printf '%s\n' 'unix:///run/docker.sock'
+      exit 0
+      ;;
+    "info --format {{json .SecurityOptions}}")
+      printf '%s\n' '["name=seccomp,profile=builtin"]'
+      exit 0
+      ;;
     "ps -aq --filter label=com.docker.compose.project=adojapan-restream-node"|\
     "network ls -q --filter label=com.docker.compose.project=adojapan-restream-node"|\
     "volume ls -q --filter label=com.docker.compose.project=adojapan-restream-node"|\

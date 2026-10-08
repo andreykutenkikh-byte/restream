@@ -24,9 +24,10 @@ _NEXT: dict[JobState, frozenset[JobState]] = {
     JobState.CHECKING_SYSTEM: frozenset({JobState.CHECKING_RESOURCES}),
     JobState.CHECKING_RESOURCES: frozenset({JobState.CHECKING_DOCKER}),
     JobState.CHECKING_DOCKER: frozenset(
-        {JobState.INSTALLING_DOCKER, JobState.NEEDS_ENROLLMENT_TOKEN}
+        {JobState.INSTALLING_DOCKER, JobState.INSTALLING_COMPOSE, JobState.NEEDS_ENROLLMENT_TOKEN}
     ),
     JobState.INSTALLING_DOCKER: frozenset({JobState.NEEDS_ENROLLMENT_TOKEN}),
+    JobState.INSTALLING_COMPOSE: frozenset({JobState.NEEDS_ENROLLMENT_TOKEN}),
     JobState.NEEDS_ENROLLMENT_TOKEN: frozenset({JobState.PREPARING_AGENT}),
     JobState.PREPARING_AGENT: frozenset({JobState.INSTALLING_AGENT}),
     JobState.INSTALLING_AGENT: frozenset({JobState.WAITING_FOR_ENROLLMENT}),
@@ -55,6 +56,7 @@ _STATE_STEP: dict[JobState, BootstrapStep | None] = {
     JobState.CHECKING_RESOURCES: BootstrapStep.RESOURCES_CHECK,
     JobState.CHECKING_DOCKER: BootstrapStep.DOCKER_CHECK,
     JobState.INSTALLING_DOCKER: BootstrapStep.DOCKER_CHECK,
+    JobState.INSTALLING_COMPOSE: BootstrapStep.DOCKER_CHECK,
     JobState.NEEDS_ENROLLMENT_TOKEN: BootstrapStep.AGENT_INSTALL,
     JobState.PREPARING_AGENT: BootstrapStep.AGENT_INSTALL,
     JobState.INSTALLING_AGENT: BootstrapStep.AGENT_INSTALL,

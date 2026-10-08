@@ -35,6 +35,7 @@ class JobState(StrEnum):
     CHECKING_RESOURCES = "checking_resources"
     CHECKING_DOCKER = "checking_docker"
     INSTALLING_DOCKER = "installing_docker"
+    INSTALLING_COMPOSE = "installing_compose"
     NEEDS_ENROLLMENT_TOKEN = "needs_enrollment_token"  # noqa: S105 - state name
     PREPARING_AGENT = "preparing_agent"
     INSTALLING_AGENT = "installing_agent"
@@ -75,6 +76,7 @@ class HostTrustMode(StrEnum):
 
 class DockerDisposition(StrEnum):
     READY = "ready"
+    COMPOSE_MISSING = "compose_missing"
     ABSENT = "absent"
     UNSUPPORTED = "unsupported"
 
