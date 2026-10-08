@@ -90,6 +90,8 @@ def classify(line: str) -> tuple[str, int | None] | None:
         ("i/o timeout", "io_timeout"),
         ("input/output error", "io_error"),
         ("invalid data found", "invalid_media"),
+        ("packet corrupt", "invalid_media"),
+        ("error while decoding", "invalid_media"),
     ):
         if phrase in text:
             match = (

@@ -600,7 +600,7 @@ class MediaRuntime:
             "-hide_banner",
             "-nostdin",
             "-loglevel",
-            "error",
+            "warning" if srt else "error",
             "-progress",
             "pipe:1",
             "-stats_period",
@@ -879,7 +879,9 @@ class MediaRuntime:
                         "streamid": f"read:{forward['path']}:{route_id}:{forward['token']}",
                         "passphrase": forward["passphrase"],
                         "pbkeylen": "32",
-                        "latency": "200000",
+                        # A distant relay can have >200 ms RTT. Allow several
+                        # retransmission rounds instead of losing late H.264 data.
+                        "latency": "1000000",
                         "mode": "caller",
                         "maxbw": str(route["profile"]["expected_bitrate_bps"] // 8 * 2),
                     },
