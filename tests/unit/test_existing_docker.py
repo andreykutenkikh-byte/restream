@@ -136,7 +136,9 @@ def test_real_package_probe_accepts_distro_and_ce_but_not_podman(tmp_path, packa
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Execute POSIX no-clobber/checksum guards in Linux CI")
-@pytest.mark.parametrize("failure", [None, "checksum", "existing", "symlink", "download"])
+@pytest.mark.parametrize(
+    "failure", [None, "checksum", "existing", "symlink", "download", "custom", "writable"]
+)
 def test_plugin_binary_is_verified_before_execution_and_never_overwrites(
     tmp_path, monkeypatch, failure
 ):
@@ -173,6 +175,13 @@ def test_plugin_binary_is_verified_before_execution_and_never_overwrites(
             plugin.write_text("owned by another application")
         else:
             plugin.symlink_to(tmp_path / "foreign")
+    elif failure == "custom":
+        config = private_home / ".docker/config.json"
+        config.parent.mkdir()
+        config.write_text('{"cliPluginsExtraDirs":["/custom"]}')
+    elif failure == "writable":
+        plugin.parent.mkdir(parents=True)
+        plugin.parent.chmod(0o777)
     # All installation paths stay under the test directory; external commands are sandbox shims.
     command = compose_plugin.install_command("x86_64").replace("/usr", str(usr))
     result = subprocess.run(  # noqa: S603 - fixed generated installer in a private test tree

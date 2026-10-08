@@ -20,19 +20,21 @@ def install_command(architecture: str) -> str:
     return f"""set -eu
 test -z "${{DOCKER_CONFIG-}}"
 if [ -f "$HOME/.docker/config.json" ]; then
-  ! grep -q 'cliPluginsExtraDirs' "$HOME/.docker/config.json"
+  test -r "$HOME/.docker/config.json"
+  if grep -q 'cliPluginsExtraDirs' "$HOME/.docker/config.json"; then exit 1; fi
 fi
 for path in "$HOME/.docker/cli-plugins/docker-compose" \
   /usr/lib/docker/cli-plugins/docker-compose /usr/libexec/docker/cli-plugins/docker-compose \
   /usr/local/libexec/docker/cli-plugins/docker-compose {PLUGIN_DIR}/docker-compose; do
-  test ! -e "$path" && test ! -L "$path"
+  if [ -e "$path" ] || [ -L "$path" ]; then exit 1; fi
 done
 daemon_pid=$(systemctl show -p MainPID --value docker)
 test "$daemon_pid" -gt 0
 for path in /usr /usr/local /usr/local/lib /usr/local/lib/docker {PLUGIN_DIR}; do
   test ! -L "$path"
   if [ ! -e "$path" ]; then mkdir -m 755 -- "$path"; fi
-  test -d "$path" && test "$(stat -c %u "$path")" = 0
+  test -d "$path"
+  test "$(stat -c %u "$path")" = 0
   test -z "$(find "$path" -maxdepth 0 -perm /022 -print)"
 done
 stage=$(mktemp -d {PLUGIN_DIR}/.adojapan-compose.XXXXXX)
