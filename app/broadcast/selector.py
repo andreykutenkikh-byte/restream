@@ -8,6 +8,7 @@ packets and the old queued tail are counted, never called lossless continuity.
 
 from __future__ import annotations
 
+import struct
 import subprocess
 import threading
 import time
@@ -212,6 +213,8 @@ class Input:
 
 class Selector:
     def __init__(self, sink: IO[bytes], fps: float = 30, diagnostics: Emit | None = None) -> None:
+        if not 1 <= fps <= 60:
+            raise ValueError("selector_invalid_frame_rate")
         self.sink, self.fps = sink, fps
         self.diagnostics = diagnostics
         self.inputs: dict[str, Input] = {}
@@ -369,7 +372,15 @@ class Selector:
 
     def write(self) -> None:
         try:
-            self.sink.write(FLV_HEADER)
+            # The publisher's short probe otherwise guesses avg_frame_rate from
+            # integer-ms FLV timestamps (e.g. 62.5 for actual 60 fps). Declare the
+            # already verified source rate before codec headers; media stays copy.
+            metadata = (
+                b"\x02\x00\x0aonMetaData\x08\x00\x00\x00\x01\x00\x09framerate\x00"
+                + struct.pack(">d", self.fps)
+                + b"\x00\x00\x09"
+            )
+            self.sink.write(FLV_HEADER + Tag(18, 0, metadata).encode())
             initialized = False
             while True:
                 with self.lock:

@@ -702,7 +702,7 @@ class MediaRuntime:
         fps: float = 30,
     ) -> Publisher:
         existing = mapping.get(route_id)
-        if existing and existing[0] != identity:
+        if existing and (existing[0] != identity or (feed and existing[1].fps != fps)):
             if mapping is self.publishers:
                 self.source_switches[route_id] = {
                     "last_old_progress": existing[1].last_progress,
