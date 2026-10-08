@@ -19,8 +19,10 @@ from app.broadcast.media_diagnostics import Emit, read_diagnostics
 
 FLV_HEADER = b"FLV\x01\x05\x00\x00\x00\x09\x00\x00\x00\x00"
 MAX_TAG = 2 * 1024 * 1024
-MAX_BYTES = 8 * 1024 * 1024
-MAX_PACKETS = 256
+# About nine seconds at 60 fps plus 48 kHz AAC. Both caps also fit the
+# controller's status bounds and keep two publishers within the 512 MiB runtime.
+MAX_BYTES = 16 * 1024 * 1024
+MAX_PACKETS = 1024
 
 
 @dataclass(frozen=True)
@@ -275,8 +277,25 @@ class Selector:
                 return
             if self.selected == source.identity:
                 if len(self.queue) >= MAX_PACKETS or self.queued_bytes + len(tag.data) > MAX_BYTES:
-                    self.error = "active_queue_overflow"
-                    self.lock.notify_all()
+                    if self.diagnostics:
+                        self.diagnostics("queue_full", len(self.queue))
+                    # Slow this compressed reader instead of killing a healthy
+                    # publisher during a short destination stall. Condition.wait
+                    # releases the control lock: selection and lease expiry must
+                    # remain responsive. Publisher's no-progress watchdog still
+                    # recovers a destination that stays blocked for 30 seconds.
+                    self.lock.wait_for(
+                        lambda: (
+                            self.ending
+                            or self.error
+                            or self.selected != source.identity
+                            or (
+                                len(self.queue) < MAX_PACKETS
+                                and self.queued_bytes + len(tag.data) <= MAX_BYTES
+                            )
+                        )
+                    )
+                if self.ending or self.error or self.selected != source.identity:
                     return
                 self.queue.append(tag)
                 self.queued_bytes += len(tag.data)
@@ -367,6 +386,7 @@ class Selector:
                     mapped = tag.dts + self.offset
                     if mapped <= self.last_out.get(tag.kind, -1):
                         self.error = "mapped_timestamp_regression"
+                        self.lock.notify_all()
                         return  # Fail closed; do not discard frames and carry on.
                     data = headers + tag.encode(self.offset)
                     self.inflight = True
@@ -382,7 +402,9 @@ class Selector:
                     self.inflight = False
                     self.lock.notify_all()
         except (OSError, ValueError):
-            self.error = "selector_sink_failed"
+            with self.lock:
+                self.error = "selector_sink_failed"
+                self.lock.notify_all()
 
     def close(self) -> None:
         with self.lock:
