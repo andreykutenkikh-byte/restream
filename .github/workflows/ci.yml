@@ -280,3 +280,18 @@ jobs:
           path: logs/handoff-ci/run/report.json
           if-no-files-found: error
           retention-days: 14
+      - name: Paused destination at 60 fps preserves all copied packets
+        run: |
+          docker run --rm --network none --cpus 1 --memory 512m --pids-limit 64 \
+            --user "$(id -u):$(id -g)" \
+            --cap-drop ALL --security-opt no-new-privileges \
+            -v "$PWD/logs/handoff-ci:/evidence" --entrypoint python adojapan-handoff-lab \
+            -m scripts.broadcast_backpressure_lab --directory /evidence/backpressure
+      - name: Save backpressure acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: broadcast-backpressure-evidence
+          path: logs/handoff-ci/backpressure/report.json
+          if-no-files-found: error
+          retention-days: 14

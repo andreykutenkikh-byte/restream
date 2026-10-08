@@ -8,7 +8,15 @@ from typing import cast
 
 import pytest
 
-from app.broadcast.selector import FLV_HEADER, MAX_PACKETS, Input, Selector, Tag, read_tag
+from app.broadcast.selector import (
+    FLV_HEADER,
+    MAX_BYTES,
+    MAX_PACKETS,
+    Input,
+    Selector,
+    Tag,
+    read_tag,
+)
 
 
 def source(name: str, *, config: bytes = b"same") -> Input:
@@ -113,35 +121,104 @@ def test_incompatible_or_unaligned_direct_keeps_forwarded() -> None:
         selector.close()
 
 
-def test_blocked_publisher_does_not_hold_control_lock_or_discard_queued_tail() -> None:
+@pytest.mark.parametrize("byte_limit", [False, True])
+def test_full_queue_backpressures_reader_then_preserves_every_packet(byte_limit: bool) -> None:
     entered, release = threading.Event(), threading.Event()
 
     class BlockedSink(io.BytesIO):
         def flush(self) -> None:
             entered.set()
-            assert release.wait(3), "test did not release blocked publisher"
+            assert release.wait(5), "test did not release blocked publisher"
 
-    selector = Selector(BlockedSink())
+    sink = BlockedSink()
+    selector = Selector(sink)
     a, b = source("forward"), source("direct")
+    payload = b"\xaf\x01x" if not byte_limit else b"\xaf\x01" + b"x" * (1024 * 1024)
+    count = MAX_PACKETS + 1 if not byte_limit else MAX_BYTES // len(payload) + 1
+    submitted = threading.Event()
+
+    def produce() -> None:
+        for stamp in range(1, count + 1):
+            selector.offer(a, Tag(8, stamp * 21 + 1, payload))
+        submitted.set()
+
+    producer = threading.Thread(target=produce, daemon=True)
     try:
         selector.select("forward")
         selector.offer(a, video(0))
         selector.offer(a, Tag(8, 1, b"\xaf\x01x"))
         assert entered.wait(1)
+        producer.start()
+        wait(
+            lambda: (
+                len(selector.queue) == MAX_PACKETS
+                or selector.queued_bytes + len(payload) > MAX_BYTES
+            )
+        )
+        assert not submitted.is_set() and selector.error is None
         # These calls must complete even while sink I/O is blocked. Otherwise an
         # expired lease cannot acquire this lock to close the media pipeline.
         selector.select("direct")
         selector.offer(b, video(1000))
         selector.offer(b, Tag(8, 1001, b"\xaf\x01x"))
         assert selector.selected == "forward" and selector.inflight
-        for stamp in range(1, MAX_PACKETS + 2):
-            selector.offer(a, video(stamp * 33, idr=False))
-        assert selector.error == "active_queue_overflow"
-        assert len(selector.queue) == MAX_PACKETS
+        assert len(selector.queue) <= MAX_PACKETS and selector.queued_bytes <= MAX_BYTES
         assert selector.old_tail_packets == 0
         assert selector.events == []
+        release.set()
+        assert submitted.wait(2)
+        wait(lambda: selector.audio_packets == count + 1)
+        assert selector.error is None and selector.selected == "forward"
+        data = io.BytesIO(sink.getvalue())
+        assert data.read(13) == FLV_HEADER
+        packets = []
+        while data.tell() < len(data.getvalue()):
+            tag = read_tag(data)
+            if not tag.configuration:
+                packets.append(tag)
+        assert len(packets) == count + 2
+        assert [p.data for p in packets[2:]] == [payload] * count
+        assert [p.dts for p in packets[2:]] == [stamp * 21 + 2 for stamp in range(1, count + 1)]
     finally:
         release.set()
+        producer.join(timeout=2)
+        selector.close()
+    assert not selector.thread.is_alive()
+
+
+def test_close_wakes_a_backpressured_reader() -> None:
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    class BlockedSink(io.BytesIO):
+        def flush(self) -> None:
+            entered.set()
+            assert release.wait(5)
+
+    selector = Selector(BlockedSink())
+    a = source("forward")
+    selector.select("forward")
+    selector.offer(a, video(0))
+    selector.offer(a, Tag(8, 1, b"\xaf\x01x"))
+    assert entered.wait(1)
+
+    def produce() -> None:
+        for stamp in range(1, MAX_PACKETS + 2):
+            selector.offer(a, video(stamp * 17, idr=False))
+        finished.set()
+
+    producer = threading.Thread(target=produce, daemon=True)
+    producer.start()
+    try:
+        wait(lambda: len(selector.queue) == MAX_PACKETS)
+        with selector.lock:
+            selector.ending = True
+            selector.lock.notify_all()
+        assert finished.wait(1)
+        assert selector.error is None
+        assert len(selector.queue) == MAX_PACKETS
+    finally:
+        release.set()
+        producer.join(timeout=2)
         selector.close()
     assert not selector.thread.is_alive()
 
