@@ -37,6 +37,7 @@ ACTIVE_JOB_STATES: Final = frozenset(
         "checking_resources",
         "checking_docker",
         "installing_docker",
+        "installing_compose",
         "needs_enrollment_token",
         "preparing_agent",
         "installing_agent",

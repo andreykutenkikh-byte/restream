@@ -13,6 +13,7 @@ from uuid import UUID
 
 from pydantic import SecretStr
 
+from bootstrap_worker.compose_plugin import install_command as compose_install_command
 from bootstrap_worker.errors import BootstrapError, safe_failure
 from bootstrap_worker.models import (
     BootstrapRequest,
@@ -339,6 +340,8 @@ class DockerPlatformAdapter(Protocol):
 
     def supported_packages_check(self) -> str: ...
 
+    def reusable_packages_check(self) -> str: ...
+
     def repository_probe_command(self, facts: SystemFacts) -> str: ...
 
     def install_plan(self, facts: SystemFacts) -> tuple[DockerInstallStep, ...]: ...
@@ -378,6 +381,24 @@ class AptDockerAdapter:
             f"for package in {_APT_OFFICIAL_PACKAGES}; do "
             "dpkg-query -W -f='${db:Status-Abbrev}\\n' \"$package\" 2>/dev/null "
             "| grep -q '^ii ' || exit 1; done"
+        )
+
+    @staticmethod
+    def reusable_packages_check() -> str:
+        # docker.io uses the distro's containerd/runc. They only conflict with installing CE.
+        def installed(packages: str) -> str:
+            return (
+                f"(for package in {packages}; do "
+                "dpkg-query -W -f='${db:Status-Abbrev}\\n' \"$package\" 2>/dev/null "
+                "| grep -q '^ii ' || exit 1; done)"
+            )
+
+        return (
+            "if dpkg-query -W -f='${db:Status-Abbrev}\\n' podman-docker 2>/dev/null "
+            "| grep -q '^ii '; then exit 1; fi; "
+            + installed("docker-ce docker-ce-cli containerd.io")
+            + " || "
+            + installed("docker.io containerd runc")
         )
 
     @staticmethod
@@ -486,6 +507,14 @@ class DnfDockerAdapter:
         return (
             f"for package in {_RPM_CONFLICTING_PACKAGES}; do "
             'if rpm -q "$package" >/dev/null 2>&1; then exit 1; fi; done'
+        )
+
+    @staticmethod
+    def reusable_packages_check() -> str:
+        return (
+            "if rpm -q podman-docker >/dev/null 2>&1; then exit 1; fi; "
+            "for package in docker-ce docker-ce-cli containerd.io; do "
+            'rpm -q "$package" >/dev/null 2>&1 || exit 1; done'
         )
 
     @staticmethod
@@ -991,14 +1020,9 @@ class DockerBootstrap:
         timeout: float,
     ) -> DockerDisposition:
         adapter = self.adapter_for(facts)
-        await self._assert_no_conflicting_runtime(
-            session,
-            privilege,
-            adapter,
-            timeout=timeout,
-        )
         present = await session.run("command -v docker >/dev/null 2>&1", timeout=timeout)
         if present.exit_status != 0:
+            await self._assert_no_conflicting_runtime(session, privilege, adapter, timeout=timeout)
             self.assert_install_manager_available(facts)
             if isinstance(adapter, DnfDockerAdapter):
                 repository_state = await self._dnf_repository_state(
@@ -1020,16 +1044,49 @@ class DockerBootstrap:
                     return DockerDisposition.UNSUPPORTED
             return DockerDisposition.ABSENT
         checks = (
-            adapter.supported_packages_check(),
+            adapter.reusable_packages_check(),
+            # Never point an installation at another host, Podman, or a rootless daemon.
+            'test -z "${DOCKER_HOST-}${DOCKER_CONTEXT-}${DOCKER_TLS_VERIFY-}'
+            '${DOCKER_CERT_PATH-}" && test "$(docker context show)" = default && '
+            "endpoint=$(docker context inspect default --format '{{.Endpoints.docker.Host}}') && "
+            'case "$endpoint" in unix://*) ;; *) exit 1 ;; esac && '
+            'test "$(readlink -f -- "${endpoint#unix://}")" = /run/docker.sock',
             "docker version --format '{{.Server.Version}}' >/dev/null",
-            f"{DOCKER_COMPOSE} version --short >/dev/null",
+            "security=$(docker info --format '{{json .SecurityOptions}}') && "
+            'case "$security" in *rootless*) exit 1 ;; esac',
             "systemctl is-active --quiet docker",
         )
         for command in checks:
             result = await privilege.run(session, command, timeout=timeout)
             if result.exit_status != 0:
                 return DockerDisposition.UNSUPPORTED
+        compose = await privilege.run(
+            session, f"{DOCKER_COMPOSE} version --short >/dev/null", timeout=timeout
+        )
+        if compose.exit_status != 0:
+            return DockerDisposition.COMPOSE_MISSING
         return DockerDisposition.READY
+
+    async def install_compose(
+        self,
+        session: RemoteSession,
+        privilege: PrivilegeContext,
+        facts: SystemFacts,
+        *,
+        timeouts: TimeoutPolicy,
+    ) -> None:
+        state = await self.inspect(session, privilege, facts, timeout=timeouts.command_seconds)
+        if state is DockerDisposition.READY:
+            return
+        if state is not DockerDisposition.COMPOSE_MISSING:
+            raise safe_failure("unsupported_docker_installation")
+        result = await privilege.run(
+            session,
+            compose_install_command(facts.architecture),
+            timeout=timeouts.package_seconds,
+        )
+        if result.exit_status != 0:
+            raise safe_failure("docker_compose_install_failed")
 
     def repository_probe_command(self, facts: SystemFacts) -> str:
         return self.adapter_for(facts).repository_probe_command(facts)

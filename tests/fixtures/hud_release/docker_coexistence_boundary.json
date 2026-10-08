@@ -1,0 +1,13 @@
+{
+  "base_commit": "f193191b1bc4ede0fade56d4936c1f485bbc373b",
+  "hash_format": "git-blob-sha1",
+  "files": {
+    "app/services/bootstrap.py": "004da5a7ce73d2259a8f8cb667b3ac34dfbf4332",
+    "bootstrap_worker/compose_plugin.py": "a1fe76de0ee502600a9101b5b737498ced499dfe",
+    "bootstrap_worker/errors.py": "37821f538090469ae2550efcf1b344fadd437755",
+    "bootstrap_worker/installer.py": "39203b12f93ecf716eaeb4731454fc83db5f4cc7",
+    "bootstrap_worker/jobs.py": "28c1d221a9015652d7e2e1a99ad490ec8279c707",
+    "bootstrap_worker/models.py": "d4af35852fdc1bade796d05963e03d7bdb1c9c7d",
+    "bootstrap_worker/state_machine.py": "972210a4adf929bc8eec9a85925551fda9fbedde"
+  }
+}
