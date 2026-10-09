@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import time
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from test_transmission_browser import (
@@ -17,6 +20,8 @@ from test_transmission_browser import (
 )
 
 from app.broadcast.network_models import NETWORK_CAPABILITY, IngressMeasurement, LinkMeasurement
+from app.broadcast.server_quality import QualityReader
+from app.broadcast.server_quality import context as quality_context
 
 __all__ = ["browser", "hud_server", "pytestmark"]
 
@@ -34,6 +39,7 @@ def test_monitoring_and_armed_output_selection(
         target = page.locator(f'[data-node-id="{lab.b}"]')
         target.get_by_role("button", name="Добавить сервер к эфиру").click()
         expect(target.get_by_role("button", name="Выбрать для отправки")).to_be_visible()
+        expect(target).to_contain_text("Нужен тест видеопотока")
         with lab.store.transaction() as db:
             source = db.execute("SELECT id FROM broadcast_sources").fetchone()[0]
             route = db.execute(
@@ -94,4 +100,68 @@ def test_monitoring_and_armed_output_selection(
         screenshot(page, browser, "mobile", "network-monitoring")
     finally:
         context.close()
+        lab.close()
+
+
+def test_quality_explanation_and_candidates_preserve_manual_selection(
+    browser: Any, hud_server: Any, admin_password: str
+) -> None:
+    lab = MediaLab(hud_server)
+    ctx = browser.new_context(ignore_https_errors=True, viewport={"width": 390, "height": 844})
+    try:
+        page = ctx.new_page()
+        login(page, hud_server, admin_password)
+        prepare(page, lab.a)
+        original = connection(page)
+        current = page.locator(f'[data-node-id="{lab.a}"]')
+        with lab.store.transaction() as db:
+            route = db.execute(
+                "SELECT id,output_id FROM broadcast_routes WHERE node_id=?", (lab.a,)
+            ).fetchone()
+            boot_id = db.execute(
+                "SELECT boot_id FROM broadcast_media_nodes WHERE node_id=?", (lab.a,)
+            ).fetchone()[0]
+            scope = quality_context(db, route["id"])
+            now = datetime.now(UTC) - timedelta(seconds=5)
+            for i in range(0, 1861, 5):
+                stamp = (now - timedelta(seconds=1860 - i)).isoformat()
+                data = dict(
+                    assessment_context=scope,
+                    boot=hashlib.sha256(boot_id.encode()).hexdigest()[:24],
+                    source_epoch="synthetic-source",
+                    role="current",
+                    desired_enabled=True,
+                    source_kind="direct",
+                    input_epoch=1,
+                    egress_generation=1,
+                    publisher_epoch=1,
+                    publisher_frames=i * 30,
+                    publisher_running=True,
+                    publisher_connected=True,
+                    publisher_progress_age_ms=100,
+                    publisher_retries=0,
+                    selector_queue_packets=0,
+                    ingress_network={"state": "FRESH", "bitrate_bps": 10_000_000},
+                )
+                db.execute(
+                    "INSERT INTO broadcast_quality_history(output_id,route_id,node_id,"
+                    "observed_at,signature,payload_json) VALUES(?,?,?,?,'synthetic',?)",
+                    (route["output_id"], route["id"], lab.a, stamp, json.dumps(data)),
+                )
+        lab.store.quality = QualityReader()
+        page.locator("#tx-refresh").click()
+        expect(current).to_contain_text("Стабилен по измерениям")
+        expect(page.locator("#tx-quality-summary")).to_contain_text("По измерениям подходит")
+        current.get_by_text("Почему такая оценка", exact=True).click()
+        expect(current).to_contain_text("не менее 30", ignore_case=True)
+        expect(current).to_contain_text("воспроизведение у зрителя")
+        page.locator("#tx-refresh").click()
+        expect(current.locator(".tx-quality details")).to_have_attribute("open", "")
+        assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+        assert connection(page) == original
+        with lab.store.database.connect() as db:
+            assert db.execute("SELECT desired_enabled FROM broadcast_outputs").fetchone()[0] == 0
+        screenshot(page, browser, "mobile", "server-quality")
+    finally:
+        ctx.close()
         lab.close()

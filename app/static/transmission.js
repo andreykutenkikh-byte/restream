@@ -266,6 +266,10 @@
   }
   function renderServers(session, output) {
     const box = $("tx-servers"), items = [];
+    const recommendation = output?.quality_recommendation;
+    const suggested = recommendation?.route_ids?.map(id => output.routes.find(r => r.id === id)).filter(Boolean) || [];
+    const names = suggested.map(r => serverAddress(state.nodes.find(n => n.id === r.node_id)));
+    $("tx-quality-summary").textContent = stale ? "Оценка недоступна: обновите состояние панели." : !output ? "Оценка появится после подготовки эфира." : names.length ? `${recommendation.basis === "STABLE" ? "По измерениям подходит" : recommendation.basis === "HISTORY" ? "Лучший по прошлым наблюдениям" : "Предварительный выбор"}: ${names[0]}.${names[1] ? ` Резерв: ${names[1]}.` : ""}${recommendation.basis !== "STABLE" ? " Нужна проверка видеопотоком." : ""} Сервер выбираете вы.` : "Проверенного кандидата пока нет. Запустите контрольный эфир; оценка обновляется автоматически.";
     const nodes = [...(state?.nodes || [])];
     const rank = (node) => output?.routes.some((r) => r.node_id === node.id && r.role === "current") ? 0 : node.setup_error ? 2 : 1;
     nodes.sort((a, b) => rank(a) - rank(b));
@@ -276,6 +280,7 @@
       title.append(el("strong", serverAddress(node)));
       if (route?.role === "current") title.append(el("span", output.desired_enabled ? "Используется" : "Выбран", "tx-current"));
       card.append(title);
+      if (route) renderQuality(card, route, recommendation);
       if (route) renderNetwork(card, route, session, output);
       if (node.setup_error) {
         const installing = ["node_install_failed", "node_install_in_progress"].includes(node.setup_error);
@@ -300,7 +305,7 @@
         card.append(el("p", stale ? "Нет данных" : route.selection_error ? explain(route.selection_error) : "Можно выбрать до начала отправки. Адрес OBS останется прежним."));
         card.append(button("Выбрать для отправки", () => action(() => api(`/api/broadcasts/outputs/${output.id}/server`, { target_route_id: route.id }, `select:${output.id}:${route.id}`), `Выбран сервер ${serverAddress(node)}. Нажмите «Начать отправку», когда источник готов.`), busy || stale || Boolean(route.selection_error)));
       } else {
-        card.append(el("p", stale ? "Нет данных" : route.switch_error ? explain(route.switch_error) : "Доступен для подготовки переключения. Качество нового пути ещё не подтверждено."));
+        card.append(el("p", stale ? "Нет данных" : route.switch_error ? explain(route.switch_error) : "Доступен для подготовки переключения. Оценка маршрута показана выше."));
         if (route.switch_error === "youtube_dual_ingest_required") card.append(button("Добавить резервный адрес YouTube", () => youtubeDialog(output, true), busy || stale));
         card.append(button("Переключить передачу на этот сервер", () => switchDialog(session, output, route, false), busy || stale || Boolean(route.switch_error)));
         const details = el("details"), summary = el("summary", "Сменить также подключение источника");
@@ -318,7 +323,61 @@
     if (!items.length) items.push(el("p", "Нет подготовленного сервера приёма. Подключите сервер в управлении серверами."));
     // Keep focus and expanded secondary actions stable during unchanged polls.
     const signature = items.map((i) => i.outerHTML).join("");
-    if (box.dataset.signature !== signature) { box.replaceChildren(...items); box.dataset.signature = signature; }
+    if (box.dataset.signature !== signature) {
+      const expanded = new Map([...box.querySelectorAll(".tx-server")].map(card => [card.dataset.nodeId, [...card.querySelectorAll("details")].map(d => d.open)]));
+      for (const card of items) [...card.querySelectorAll("details")].forEach((d, i) => { d.open = Boolean(expanded.get(card.dataset.nodeId)?.[i]); });
+      const focused = document.activeElement, focusedCard = focused?.closest(".tx-server");
+      const focusNode = focusedCard?.dataset.nodeId, focusText = focused?.tagName === "BUTTON" ? focused.textContent : null;
+      box.replaceChildren(...items); box.dataset.signature = signature;
+      if (focusNode && focusText) [...box.querySelectorAll(".tx-server button")].find(b => b.closest(".tx-server").dataset.nodeId === focusNode && b.textContent === focusText && !b.disabled)?.focus({ preventScroll: true });
+    }
+  }
+  function renderQuality(card, route, recommendation) {
+    const q = route.quality;
+    if (!q) return;
+    const labels = { STABLE: "Стабилен по измерениям", HISTORY: "Стабилен в прошлом тесте", PRECHECK: "Предварительная проверка пройдена", RISK: "Есть риск сбоев", PROBLEM: "Выявлены сбои", UNTESTED: "Нужен тест видеопотока", UNAVAILABLE: "Сервер недоступен" };
+    const reasons = {
+      server_unavailable: "Сервер не готов к отправке или перестал отвечать.",
+      sustained_backlog: "Видео долго накапливалось в очереди отправки.",
+      sender_stalled: "Отправитель зависал при работающем входе OBS.",
+      sender_slow: "Отправитель устойчиво передавал кадры медленнее входа.",
+      sender_restarted: "Отправителю потребовались переподключения.",
+      media_warnings: "В обычной работе отмечены ошибки медиаданных.",
+      srt_sender_drops: "SRT отбрасывал пакеты на стороне отправителя.",
+      backlog_observed: "Очередь видео приближалась к своему пределу.",
+      little_capacity_headroom: "В проверке скорости запас меньше 1,5× требуемого трафика.",
+      probe_ceiling: "Проверка достигла предела 64 Мбит/с. Требуемый запас этим ограниченным тестом не подтверждён.",
+      tcp_check_failed: "Последняя проверка TCP не удалась; это ещё не доказывает отказ SRT.",
+      tcp_unstable: "За последние 15 минут больше 10% записанных проверок TCP завершились неудачно.",
+      steady_stream_observed: "Не менее 30 минут наблюдалась передача кадров. Длительных зависаний и устойчивого накопления очереди не выявлено.",
+      precheck_only: "Проверены подключение и скорость до эфира. Устойчивость отправки в YouTube ещё не проверена.",
+      stream_evidence_stale: "Наблюдения видеопотока старше 6 часов: повторите контрольную проверку.",
+      retest_after_update: "История относится к прежнему запуску сервера. После обновления нужен контрольный эфир.",
+      capacity_unknown: "Актуального измерения запаса скорости нет.",
+      history_limited: "История ограничена; часть периода не попала в оценку.",
+      not_enough_stream_observation: "Для устойчивой оценки нужно 30 минут наблюдения работающего видеопотока.",
+    };
+    const grade = el("div", undefined, "tx-quality"), label = el("strong", stale ? "Нет свежего состояния" : labels[q.state] || "Нет оценки", "tx-quality-label");
+    grade.dataset.quality = stale ? "UNTESTED" : q.state;
+    grade.append(label);
+    const position = recommendation?.route_ids?.indexOf(route.id);
+    if (!stale && position >= 0) grade.append(el("span", position === 0 ? "Первый выбор по оценке" : "Резерв по оценке", "tx-quality-choice"));
+    const metrics = el("dl", undefined, "tx-network-metrics");
+    metric(metrics, "Проверено видеопотоком", q.observed_seconds ? `${number(q.observed_seconds / 60)} мин` : "Пока не проверено");
+    metric(metrics, "Запас в TCP-проверке", q.probe_headroom_ratio != null ? `${q.probe_capped ? "≥ " : ""}${number(q.probe_headroom_ratio, 2)}×` : route.network?.local ? "Не применимо" : "Не измерен");
+    grade.append(metrics);
+    const details = el("details"), summary = el("summary", "Почему такая оценка");
+    details.append(summary);
+    for (const code of q.reasons || []) if (reasons[code]) details.append(el("p", reasons[code]));
+    if (q.last_stream_at) details.append(el("p", `Последнее наблюдение видео: ${new Date(q.last_stream_at).toLocaleString("ru-RU")}.`));
+    if (q.observed_seconds) {
+      details.append(el("p", `За последние ${q.history_hours} ч: длительных проблем — ${number(q.incidents, 0)}, переподключений отправителя — ${number(q.restarts, 0)}, предупреждений о медиаданных — ${number(q.media_warnings, 0)}. Максимальная очередь: ${q.max_queue_packets == null ? "нет данных" : `${number(q.max_queue_packets, 0)} пак.`}${q.max_queue_bytes != null ? ` / ${number(q.max_queue_bytes / 1048576, 2)} МБ` : ""}.`));
+      if (q.previous_incidents) details.append(el("p", `В прежнем запуске было проблемных эпизодов: ${number(q.previous_incidents, 0)}. Новая оценка основана на контрольном эфире.`));
+    }
+    if (q.tcp_samples) details.append(el("p", `TCP за 15 мин: ${number(q.tcp_p50_ms)} мс обычно, ${number(q.tcp_p95_ms)} мс для 95% выборок. Неудачных проверок: ${number(q.tcp_failed_samples, 0)} из ${number(q.tcp_samples, 0)}. Это проверки соединения, не процент потерь видео.`));
+    if (q.overhead_percent != null) details.append(el("p", `Дополнительный трафик SRT: ${number(q.overhead_percent)}% к полезному видео. Повторы восстанавливают передачу и не равны окончательным потерям.`));
+    details.append(el("p", `Переходные интервалы исключены: ${number(q.transition_seconds / 60)} мин. Пропуски измерений и неподтверждённый вход: ${number(q.unknown_seconds / 60)} мин. Оценка не подтверждает воспроизведение у зрителя.`));
+    grade.append(details); card.append(grade);
   }
   function renderNetwork(card, route, session, output) {
     const network = route.network || {}, tcp = network.tcp, srt = network.srt;
@@ -338,7 +397,7 @@
     metric(list, "Отброшено отправителем SRT", fresh(srt) ? number(srt.sender_dropped_packets, 0) : "Нет данных", fresh(srt) && srt.sender_dropped_packets > 0);
     const sender = network.sender;
     if (route.role === "current") {
-      metric(list, "Очередь видео", fresh(sender) && sender.queue_packets != null ? `${number(sender.queue_packets, 0)} пак. · ${number(sender.queue_bytes / 1048576, 2)} МБ` : "Нет данных");
+    metric(list, "Очередь видео", fresh(sender) && sender.queue_packets != null ? `${number(sender.queue_packets, 0)} пак.${sender.queue_bytes != null ? ` · ${number(sender.queue_bytes / 1048576, 2)} МБ` : ""}` : "Нет данных");
       metric(list, "Частота кадров", fresh(sender) && sender.video_fps != null ? `${number(sender.video_fps, 2)} кадр/с` : "Нет данных");
     }
     card.append(list);
