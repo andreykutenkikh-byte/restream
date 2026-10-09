@@ -42,6 +42,13 @@
 .tx-server p { margin:8px 0; font-size:13px; color:#68645e; }
 .tx-server button { width:100%; font-size:13px; margin-top:6px; min-height:42px; }
 .tx-server details { margin-top:12px; font-size:12px; }
+.tx-network-metrics { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:14px 0; }
+.tx-network-metrics dt { font-size:11px; color:#706b64; margin-bottom:4px; }
+.tx-network-metrics dd { margin:0; font-size:13px; font-weight:600; overflow-wrap:anywhere; }
+.tx-network-metrics dd[data-tone="error"] { color:#a52822; }
+.tx-input-network h3 { font-size:15px; margin:22px 0 10px; }
+.tx-input-network p { font-size:12px; color:#706b64; }
+.tx-network-note { font-size:11px !important; }
 .tx-notice { margin:0 0 18px; padding:16px 20px; border:1px solid #d6c29b; border-radius:12px; background:#fbf4e5; font-size:14px; }
 .tx-notice p { margin:4px 0 10px; }
 .tx-notice[data-state="complete"] { background:#f1f7f2; border-color:#b8cfbd; }

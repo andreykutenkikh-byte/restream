@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.broadcast.models import CAPABILITIES
+from app.broadcast.network_control import NetworkControl
 from app.broadcast.store import BroadcastStore
 
 
@@ -36,6 +37,7 @@ def snapshot(store: BroadcastStore, session_id: str | None = None) -> dict[str, 
                 and CAPABILITIES.issubset(json.loads(media["capabilities_json"]))
             )
         for session in result["sessions"]:
+            session["network"] = NetworkControl.source_view(db, session["source_id"])
             for output in session["outputs"]:
                 output["credential_stored"] = bool(
                     db.execute(
@@ -50,11 +52,31 @@ def snapshot(store: BroadcastStore, session_id: str | None = None) -> dict[str, 
                     (output["id"], now.isoformat()),
                 ).fetchone()[0]
                 for route in output["routes"]:
+                    route["network"] = NetworkControl.route_view(
+                        db, route["id"], route["node_id"] == session["ingress_node_id"]
+                    )
                     obs = observations.get(route["id"])
                     fresh = bool(
                         obs
                         and (now - datetime.fromisoformat(obs["observed_at"])).total_seconds() <= 5
                     )
+                    quality = db.execute(
+                        "SELECT observed_at,payload_json FROM broadcast_quality_history "
+                        "WHERE route_id=? ORDER BY id DESC LIMIT 1",
+                        (route["id"],),
+                    ).fetchone()
+                    quality_fresh = bool(
+                        quality
+                        and (now - datetime.fromisoformat(quality["observed_at"])).total_seconds()
+                        <= 10
+                    )
+                    values = json.loads(quality["payload_json"]) if quality_fresh else {}
+                    route["network"]["sender"] = {
+                        "state": "FRESH" if fresh and quality_fresh else "UNKNOWN",
+                        "queue_packets": values.get("selector_queue_packets"),
+                        "queue_bytes": values.get("selector_queue_bytes"),
+                        "video_fps": values.get("video_fps"),
+                    }
                     node = next(n for n in result["nodes"] if n["id"] == route["node_id"])
                     measured = bool(fresh and obs and obs["valid_samples"] >= 2)
                     direct = bool(measured and obs and obs["source_kind"] == "direct")

@@ -27,6 +27,8 @@ from app.broadcast.media_api import MediaBodyLimitMiddleware
 from app.broadcast.media_api import router as broadcast_media_router
 from app.broadcast.media_control import MediaControl
 from app.broadcast.models import BroadcastError
+from app.broadcast.network_api import ObsBodyLimitMiddleware
+from app.broadcast.network_api import router as broadcast_network_router
 from app.broadcast.oauth import YouTubeOAuth
 from app.broadcast.presentation_api import router as broadcast_presentation_router
 from app.broadcast.store import BroadcastStore
@@ -250,6 +252,8 @@ def create_app(
     app.include_router(broadcast_diagnostics_router)
     app.include_router(broadcast_presentation_router)
     app.include_router(broadcast_media_router)
+    app.include_router(broadcast_network_router)
+    app.add_middleware(ObsBodyLimitMiddleware)
     app.include_router(broadcast_switch_router)
 
     @app.middleware("http")

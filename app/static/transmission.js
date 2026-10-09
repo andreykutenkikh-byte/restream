@@ -35,8 +35,19 @@
     distinct_backup_endpoint_required: "Основной и резервный адреса должны различаться.",
     manual_credentials_required: "Укажите ключ трансляции и основной адрес YouTube.",
     use_youtube_api_settings: "Этот эфир настроен через OAuth. Откройте дополнительные действия.",
+    network_probe_media_active: "Проверка скорости доступна только без входящего видео и при остановленной отправке.",
+    network_probe_busy: "Другая проверка скорости ещё выполняется.",
+    network_probe_unavailable: "Проверка скорости на этом сервере ещё недоступна.",
+    network_local_route: "Это сам сервер приёма: межсерверного участка нет.",
   };
   const explain = (code) => explanations[code] || "Действие недоступно. Проверьте настройку сервера и эфира в дополнительных действиях.";
+  const number = (value, digits = 1) => value == null ? "Нет данных" : Number(value).toLocaleString("ru-RU", { maximumFractionDigits: digits });
+  const bitrate = (value) => value == null ? "Нет данных" : `${number(value / 1000000, 2)} Мбит/с`;
+  const fresh = (item) => !stale && item?.state === "FRESH";
+  const metric = (list, title, value, error = false) => {
+    const row = el("div"), detail = el("dd", value); if (error) detail.dataset.tone = "error";
+    row.append(el("dt", title), detail); list.append(row);
+  };
   const serverAddress = (node) => node?.ip_address || "IP-адрес не определён";
   const el = (tag, text, className) => {
     const node = document.createElement(tag);
@@ -83,7 +94,7 @@
     if (logicalKey && (response.ok || response.status < 500)) pending.delete(logicalKey);
     if (!response.ok) {
       const code = typeof data.detail === "string" ? data.detail : data.error?.code;
-      throw new Error(response.status === 422 ? "Проверьте формат ключа и штатных RTMPS-адресов YouTube." : explain(code));
+      throw new Error(response.status === 422 && !explanations[code] ? "Проверьте формат введённых параметров." : explain(code));
     }
     return data;
   }
@@ -265,6 +276,7 @@
       title.append(el("strong", serverAddress(node)));
       if (route?.role === "current") title.append(el("span", output.desired_enabled ? "Используется" : "Выбран", "tx-current"));
       card.append(title);
+      if (route) renderNetwork(card, route, session, output);
       if (node.setup_error) {
         const installing = ["node_install_failed", "node_install_in_progress"].includes(node.setup_error);
         let reason = installing ? explain(node.setup_error) : node.mode === "legacy_static" ? "Сервер не настроен для передачи видео и управляемого переключения." : explain(node.setup_error);
@@ -295,6 +307,11 @@
         details.append(summary, button("Переключить подключение OBS/Moblin", () => switchDialog(session, output, route, true), busy || stale || Boolean(route.handoff_error)));
         if (route.handoff_error && route.handoff_error !== route.switch_error) details.append(el("p", explain(route.handoff_error)));
         card.append(details);
+        // A stopped OBS input may leave sending intent armed from the previous broadcast.
+        // This explicit action first obtains normal publisher-stop proof, then selects.
+        if (!fresh(session.network?.ingress) && !output.switch?.active) {
+          card.append(button("Выбрать до следующего эфира", () => selectBeforeStream(output, route, node), busy || stale || Boolean(route.admission_error)));
+        }
       }
       items.push(card);
     }
@@ -302,6 +319,86 @@
     // Keep focus and expanded secondary actions stable during unchanged polls.
     const signature = items.map((i) => i.outerHTML).join("");
     if (box.dataset.signature !== signature) { box.replaceChildren(...items); box.dataset.signature = signature; }
+  }
+  function renderNetwork(card, route, session, output) {
+    const network = route.network || {}, tcp = network.tcp, srt = network.srt;
+    if (network.local) {
+      card.append(el("p", "Сам сервер приёма: межсерверной передачи нет.", "tx-network-note"));
+      const local = el("dl", undefined, "tx-network-metrics"), sender = network.sender;
+      metric(local, "Очередь видео", fresh(sender) && sender.queue_packets != null ? `${number(sender.queue_packets, 0)} пак.` : "Нет данных");
+      metric(local, "Частота кадров", fresh(sender) && sender.video_fps != null ? `${number(sender.video_fps, 2)} кадр/с` : "Нет данных");
+      card.append(local); return;
+    }
+    const list = el("dl", undefined, "tx-network-metrics");
+    metric(list, "Задержка TCP", fresh(tcp) ? tcp.reachable ? `${number(tcp.rtt_ms)} мс` : "Не отвечает" : tcp?.state === "STALE" ? "Данные устарели" : "Нет данных", fresh(tcp) && !tcp.reachable);
+    metric(list, "Задержка потока SRT", fresh(srt) && srt.rtt_ms != null ? `${number(srt.rtt_ms)} мс` : srt?.state === "STALE" ? "Данные устарели" : "Нет активного измерения");
+    metric(list, "Видео между серверами", fresh(srt) ? bitrate(srt.media_bitrate_bps) : "Нет данных");
+    metric(list, "Трафик с повторами", fresh(srt) ? bitrate(srt.wire_bitrate_bps) : "Нет данных");
+    metric(list, "Повторно передано SRT", fresh(srt) ? number(srt.retransmitted_packets, 0) : "Нет данных");
+    metric(list, "Отброшено отправителем SRT", fresh(srt) ? number(srt.sender_dropped_packets, 0) : "Нет данных", fresh(srt) && srt.sender_dropped_packets > 0);
+    const sender = network.sender;
+    if (route.role === "current") {
+      metric(list, "Очередь видео", fresh(sender) && sender.queue_packets != null ? `${number(sender.queue_packets, 0)} пак. · ${number(sender.queue_bytes / 1048576, 2)} МБ` : "Нет данных");
+      metric(list, "Частота кадров", fresh(sender) && sender.video_fps != null ? `${number(sender.video_fps, 2)} кадр/с` : "Нет данных");
+    }
+    card.append(list);
+    if (fresh(srt)) card.append(el("p", `Счётчики за ${number(srt.window_seconds)} с. Отбрасывания получателем и воспроизведение на YouTube отдельно не измерены.`, "tx-network-note"));
+    const probe = network.probe;
+    const status = { WAITING: "Ожидаем сервер", READY: "Готовим передачу", RUNNING: "Измеряем скорость", FAILED: "Проверка не завершена" };
+    if (probe) card.append(el("p", probe.state === "COMPLETED" ? `Проверка скорости: ${bitrate(probe.throughput_bps)} · ${new Date(probe.finished_at).toLocaleString("ru-RU")}. Результат в пределах 64 Мбит/с, не максимальная скорость канала.` : status[probe.state] || "Нет результата", "tx-network-note"));
+    const runningProbe = probe && ["WAITING", "READY", "RUNNING"].includes(probe.state);
+    card.append(button(runningProbe ? "Проверка выполняется…" : "Проверить скорость до эфира", () => action(() => api(`/api/broadcasts/routes/${route.id}/network-probe`, {}, `probe:${route.id}`), "Проверка принята. Результат появится в карточке сервера."), busy || stale || output.desired_enabled || fresh(session.network?.ingress) || runningProbe));
+  }
+  function selectBeforeStream(output, route, node) {
+    const ui = dialog("Выбрать сервер до эфира");
+    ui.body.append(el("p", `Сначала остановим оставшуюся отправку этого эфира и дождёмся подтверждения. Затем выберем ${serverAddress(node)}. Адрес OBS сохранится. Следующую отправку запустите кнопкой «Начать отправку».`));
+    submitDialog(ui, "Остановить отправку и выбрать", async () => {
+      await api(`/api/broadcasts/outputs/${output.id}/intent`, { enabled: false }, `stop:${output.id}`);
+      for (let attempt = 0; attempt < 20; attempt++) {
+        await refresh();
+        const latest = state.sessions.flatMap(s => s.outputs).find(o => o.id === output.id);
+        if (latest?.stop_confirmed && !latest.switch?.active) {
+          await api(`/api/broadcasts/outputs/${output.id}/server`, { target_route_id: route.id }, `select:${output.id}:${route.id}`);
+          ui.d.close(); message(`Выбран сервер ${serverAddress(node)}. Начните отправку, когда источник готов.`); await refresh(); return;
+        }
+        ui.status.textContent = "Ожидаем подтверждения остановки…";
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      }
+      throw new Error("Подтверждение остановки ещё не пришло. Отправка остановлена по вашей команде; обновите состояние и выберите сервер повторно.");
+    });
+  }
+  function renderInputNetwork(session) {
+    const box = $("tx-input-network"), ingress = session?.network?.ingress, obs = session?.network?.obs;
+    const list = el("dl", undefined, "tx-network-metrics");
+    metric(list, "Битрейт на входе приёмника", fresh(ingress) ? bitrate(ingress.bitrate_bps) : ingress?.state === "STALE" ? "Данные устарели" : "Нет активного измерения");
+    metric(list, "Пропущено кадров в OBS", fresh(obs) ? number(obs.dropped_frames_delta, 0) : "Нет данных");
+    metric(list, "Доля пропусков кадров OBS", fresh(obs) && obs.dropped_frames_percent != null ? `${number(obs.dropped_frames_percent, 2)} %` : "Нет данных");
+    metric(list, "Переподключения OBS", fresh(obs) ? number(obs.reconnects_delta, 0) : "Нет данных");
+    box.replaceChildren(list);
+    if (ingress?.protocol === "srt" && fresh(ingress)) {
+      metric(list, "Задержка SRT от источника", ingress.rtt_ms == null ? "Нет данных" : `${number(ingress.rtt_ms)} мс`);
+      metric(list, "Отброшено на входе SRT", number(ingress.dropped_packets, 0));
+    } else box.append(el("p", "Точные потери пакетов OBS → приёмник по RTMP неизвестны. TCP восстанавливает доставку; стабильный битрейт не доказывает отсутствие сетевых потерь."));
+    box.append(el("p", fresh(obs) ? `Показатели OBS за ${number(obs.window_seconds)} с. Пропуски кадров — отдельный показатель, не счётчик потерянных пакетов.` : "Для пропусков кадров нужна статистика самого OBS через локальный помощник. Пока она не подключена, значения остаются неизвестными."));
+    if (session) box.append(button("Подключить статистику OBS", () => obsMonitorDialog(session), busy || stale));
+    if (session && obs?.paired) box.append(button("Отключить статистику OBS", () => action(() => api(`/api/broadcasts/sources/${session.source_id}/obs-monitor/revoke`, {}), "Доступ помощника OBS отозван."), busy || stale));
+  }
+  function obsMonitorDialog(session) {
+    const ui = dialog("Подключить статистику OBS");
+    ui.body.append(el("p", "Локальный помощник читает статистику отдельного выхода OBS / Aitum Vertical. В OBS должен быть включён WebSocket. Узнайте имя выхода командой python -m scripts.obs_network_monitor --list-outputs в окружении проекта."));
+    const outputName = field(ui.body, "Имя выхода OBS"); outputName.maxLength = 128;
+    ui.body.append(el("p", "Конфигурация содержит доступ только к передаче статистики. Сохраните её на своём компьютере; пароль OBS в ней не хранится."));
+    submitDialog(ui, "Скачать конфигурацию помощника", async () => {
+      if (!outputName.value.trim()) throw new Error("Введите имя именно вертикального выхода OBS.");
+      const result = await api(`/api/broadcasts/sources/${session.source_id}/obs-monitor`, {});
+      const config = { endpoint: `${location.origin}/obs-monitor/v1/sample`, token: result.token, output_name: outputName.value.trim() };
+      const url = URL.createObjectURL(new Blob([JSON.stringify(config, null, 2)], { type: "application/json" }));
+      const download = link("Скачать", url); download.download = "obs-monitor.json";
+      document.body.append(download); download.click(); download.remove(); URL.revokeObjectURL(url);
+      result.token = ""; config.token = "";
+      ui.status.textContent = "Конфигурация сохранена. Запустите помощник: python -m scripts.obs_network_monitor --config obs-monitor.json";
+      await refresh();
+    });
   }
   function render() {
     const { session, output } = pick(), outputs = state?.sessions.flatMap((s) => s.outputs) || [];
@@ -343,7 +440,7 @@
     $("platform-status").textContent = platform.length ? `Последний ответ: ${platform.join(" · ")}` : "Нет данных";
     const egress = state?.nodes.find((n) => n.id === current?.node_id);
     $("tx-topology").textContent = output ? `OBS / Moblin → приём: ${serverAddress(ingress)} → передача: ${serverAddress(egress)} → YouTube` : "Маршрут появится после подготовки подключения.";
-    renderServers(session, output); operation(session, output);
+    renderInputNetwork(session); renderServers(session, output); operation(session, output);
   }
   $("broadcast-choice").addEventListener("change", (event) => { message(); select(event.target.value); });
   $("add-broadcast").addEventListener("click", prepareDialog);

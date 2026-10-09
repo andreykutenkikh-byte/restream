@@ -30,6 +30,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from app.broadcast.envelope import open_envelope
 from app.broadcast.media_diagnostics import DiagnosticCollector, Emit, read_diagnostics
 from app.broadcast.models import MediaProfile, ResourceLimits, youtube_endpoint
+from app.broadcast.network_runtime import NetworkMonitor
 from app.broadcast.selector import Selector
 
 
@@ -322,6 +323,7 @@ class MediaRuntime:
         ports: MediaPorts,
         srt_bind_host: str,
         rtmp_bind_host: str = "127.0.0.1",
+        network_probe_port: int | None = None,
         test_destinations: dict[str, str] | None = None,
     ) -> None:
         self.node_id, self.private_key = node_id, private_key
@@ -418,6 +420,28 @@ class MediaRuntime:
             raise RuntimeError("media_server_unavailable")
         self.expiry_thread = threading.Thread(target=self._expiry_watchdog, daemon=True)
         self.expiry_thread.start()
+        self.network = NetworkMonitor(
+            ports.api, lambda: self.plan, self.network_idle, network_probe_port
+        )
+
+    def network_idle(self) -> bool:
+        if self.plan.get("exports") or any(
+            r.get("enabled") or r.get("forward") for r in self.plan["routes"]
+        ):
+            return False
+        if any(
+            worker.process is not None and worker.process.poll() is None
+            for _, worker in [*self.publishers.values(), *self.forwarders.values()]
+        ):
+            return False
+        try:
+            response = self.http.get("/v3/paths/list")
+            if not response.is_success:
+                return False
+            items = response.json().get("items")
+            return isinstance(items, list) and not any(p.get("ready") for p in items)
+        except (httpx.HTTPError, ValueError, TypeError):
+            return False
 
     def _expiry_watchdog(self) -> None:
         while not self.ending.wait(0.25):
@@ -985,6 +1009,8 @@ class MediaRuntime:
 
     def close(self) -> None:
         self.ending.set()
+        if hasattr(self, "network"):
+            self.network.close()
         if hasattr(self, "expiry_thread"):
             self.expiry_thread.join(timeout=4)
         for probe in self.probes.values():

@@ -22,6 +22,7 @@ from test_moblin_hud import seed_existing_schema_v5_data
 from app.broadcast.diagnostic_schema import TABLES as DIAGNOSTIC_TABLES
 from app.broadcast.egress_schema import TABLES as EGRESS_TABLES
 from app.broadcast.media_schema import TABLES as MEDIA_TABLES
+from app.broadcast.network_schema import TABLES as NETWORK_TABLES
 from app.broadcast.operator_schema import TABLES as OPERATOR_TABLES
 from app.broadcast.schema import TABLES as BROADCAST_TABLES
 from app.db import Database
@@ -162,7 +163,7 @@ def test_pinned_main_upgrade_preserves_all_data_schema_sequences_and_admin_auth(
         candidate = Database(main.path)  # Fresh instance models process reopen.
         candidate.migrate()
         assert candidate.ready()
-        assert versions(candidate) == [1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13]
+        assert versions(candidate) == [1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14]
         assert [
             entry
             for entry in schema(candidate)
@@ -173,6 +174,7 @@ def test_pinned_main_upgrade_preserves_all_data_schema_sequences_and_admin_auth(
             | EGRESS_TABLES
             | OPERATOR_TABLES
             | DIAGNOSTIC_TABLES
+            | NETWORK_TABLES
         ] == original_schema
         actual = rows(candidate, main_columns)
         actual["schema_migrations"] = [row for row in actual["schema_migrations"] if row[0] <= 5]
@@ -231,7 +233,7 @@ def test_actual_combined_migration_fills_v6_without_changing_existing_or_hud_sta
         combined = Database(main.path)
         combined.migrate()
         assert combined.ready()
-        assert versions(combined) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        assert versions(combined) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
         assert rows(combined, original_columns, exclude_v6=True) == original_rows
         changed_tables = {"restream_nodes", "node_install_jobs"}
         assert [entry for entry in schema(combined) if entry[2] not in changed_tables] == [
@@ -368,5 +370,5 @@ def test_failed_hud_ddl_rolls_back_tables_indexes_and_marker_together(
     assert main.ready()
     candidate.migrate()
     assert candidate.ready()
-    assert versions(candidate) == [1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13]
+    assert versions(candidate) == [1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14]
     assert_integrity(candidate)
