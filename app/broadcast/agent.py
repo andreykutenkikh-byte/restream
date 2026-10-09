@@ -19,6 +19,7 @@ from app.broadcast.envelope import public_key
 from app.broadcast.media_control import MediaHeartbeat, Observation
 from app.broadcast.media_runtime import MediaPorts, MediaRuntime
 from app.broadcast.models import CAPABILITIES
+from app.broadcast.network_models import NETWORK_CAPABILITY, PROBE_CAPABILITY
 
 
 def main() -> None:
@@ -63,6 +64,7 @@ def main() -> None:
         ports=MediaPorts(**config["ports"]),
         srt_bind_host=config["srt_bind_host"],
         rtmp_bind_host=config.get("rtmp_bind_host", "127.0.0.1"),
+        network_probe_port=config.get("network_probe_port"),
     )
     boot_id, sequence = runtime.diagnostics.boot_id, 0
     control_failed = False
@@ -73,11 +75,15 @@ def main() -> None:
                 observations = runtime.tick()
                 sequence += 1
                 events = runtime.diagnostics.snapshot()
+                links, ingress, probes = runtime.network.snapshot()
+                capabilities = CAPABILITIES | {NETWORK_CAPABILITY}
+                if runtime.network.port is not None:
+                    capabilities |= {PROBE_CAPABILITY}
                 data = MediaHeartbeat(
                     boot_id=boot_id,
                     sequence=sequence,
                     public_key=public_key(private),
-                    capabilities=sorted(CAPABILITIES),
+                    capabilities=sorted(capabilities),
                     plan_generation=max(0, runtime.generation),
                     rtmp_port=runtime.ports.rtmp
                     if config.get("rtmp_bind_host") == "0.0.0.0"  # noqa: S104 - explicit opt-in
@@ -87,6 +93,11 @@ def main() -> None:
                     else [Observation.model_validate(o) for o in observations],
                     diagnostics_version=1,
                     diagnostic_events=events,
+                    network_version=1,
+                    probe_port=runtime.network.port,
+                    link_measurements=links,
+                    ingress_measurements=ingress,
+                    probe_progress=probes,
                 )
                 try:
                     response = client.post(

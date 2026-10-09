@@ -16,6 +16,14 @@ from app.broadcast.egress import EgressLeases
 from app.broadcast.envelope import decode, seal
 from app.broadcast.media_diagnostics import DiagnosticEvent
 from app.broadcast.models import CAPABILITIES, BroadcastError, Input, MediaProfile, ResourceLimits
+from app.broadcast.network_control import NetworkControl
+from app.broadcast.network_models import (
+    NETWORK_CAPABILITY,
+    PROBE_CAPABILITY,
+    IngressMeasurement,
+    LinkMeasurement,
+    ProbeProgress,
+)
 from app.broadcast.store import BroadcastStore
 from app.db import utc_now
 
@@ -75,6 +83,11 @@ class MediaHeartbeat(Input):
     observations: list[Observation] = Field(default_factory=list, max_length=32)
     diagnostics_version: Literal[0, 1] = 0
     diagnostic_events: list[DiagnosticEvent] = Field(default_factory=list, max_length=64)
+    network_version: Literal[0, 1] = 0
+    probe_port: int | None = Field(default=None, ge=1024, le=65535)
+    link_measurements: list[LinkMeasurement] = Field(default_factory=list, max_length=64)
+    ingress_measurements: list[IngressMeasurement] = Field(default_factory=list, max_length=32)
+    probe_progress: list[ProbeProgress] = Field(default_factory=list, max_length=4)
 
 
 class MediaControl:
@@ -82,6 +95,7 @@ class MediaControl:
         self.store = store
         self.test_loopback = test_loopback
         self.egress = EgressLeases(store)
+        self.network = NetworkControl(store, self)
         store.egress_sync = self.egress.sync
 
     def admit(self, db: Any, output_id: str, target_route: str | None = None) -> None:
@@ -240,22 +254,35 @@ class MediaControl:
                 raise BroadcastError("stale_heartbeat")
             if node["boot_id"] != data.boot_id:
                 db.execute("DELETE FROM broadcast_media_observations WHERE node_id=?", (node_id,))
+                db.execute(
+                    "DELETE FROM broadcast_network_links WHERE reporter_node_id=?", (node_id,)
+                )
+                db.execute(
+                    "DELETE FROM broadcast_ingress_metrics WHERE reporter_node_id=?", (node_id,)
+                )
             if data.observations and data.plan_generation != node["generation"]:
                 raise BroadcastError("stale_plan_generation")
             now = utc_now()
             record_events(db, node_id, data, now)
             db.execute(
                 "UPDATE broadcast_media_nodes SET last_seen_at=?,last_sequence=?,boot_id=?,"
-                "capabilities_json=?,rtmp_port=? WHERE node_id=?",
+                "capabilities_json=?,rtmp_port=?,probe_port=? WHERE node_id=?",
                 (
                     now,
                     data.sequence,
                     data.boot_id,
-                    json.dumps(sorted(CAPABILITIES)),
+                    json.dumps(
+                        sorted(
+                            set(data.capabilities)
+                            & (CAPABILITIES | {NETWORK_CAPABILITY, PROBE_CAPABILITY})
+                        )
+                    ),
                     data.rtmp_port,
+                    data.probe_port,
                     node_id,
                 ),
             )
+            self.network.record(db, node_id, data)
             for obs in data.observations:
                 route = self.store.row(
                     db,
@@ -530,6 +557,8 @@ class MediaControl:
                         **self.store.unseal(forward["encrypted"]),
                     }
                 )
+            if NETWORK_CAPABILITY in json.loads(node["capabilities_json"]):
+                plan.update(self.network.plan(db, node_id))
             fingerprint = self.store.fingerprint(plan)
             generation = node["generation"] + (fingerprint != node["plan_fingerprint"])
             db.execute(

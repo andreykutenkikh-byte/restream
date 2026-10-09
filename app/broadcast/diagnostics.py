@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from app.broadcast.models import BroadcastError
+from app.broadcast.network_control import NetworkControl
 
 if TYPE_CHECKING:
     from app.broadcast.media_control import MediaHeartbeat, Observation
@@ -43,6 +44,21 @@ def record_sample(
         sequence=heartbeat.sequence,
         diagnostics_version=heartbeat.diagnostics_version,
     )
+    source = db.execute(
+        "SELECT s.source_id,src.ingress_node_id FROM broadcast_outputs o "
+        "JOIN broadcast_sessions s ON s.id=o.session_id "
+        "JOIN broadcast_sources src ON src.id=s.source_id WHERE o.id=?",
+        (route["output_id"],),
+    ).fetchone()
+    data["network"] = NetworkControl.route_view(
+        db, route["id"], node_id == source["ingress_node_id"]
+    )
+    source_view = NetworkControl.source_view(db, source["source_id"])
+    # No pairing token, OBS output name, peer address, path, query or credentials enter history.
+    data["ingress_network"] = source_view["ingress"]
+    data["obs_network"] = {
+        k: v for k, v in source_view["obs"].items() if k not in ("boot_id", "sequence")
+    }
     signature = digest(
         json.dumps(
             [
@@ -143,6 +159,13 @@ def record_events(
 def prune(store: BroadcastStore) -> None:
     cutoff = (datetime.now(UTC) - timedelta(days=RETENTION_DAYS)).isoformat()
     with store.transaction() as db:
+        NetworkControl.expire(db)
+        db.execute(
+            "DELETE FROM broadcast_network_probe_jobs WHERE id IN "
+            "(SELECT id FROM broadcast_network_probe_jobs WHERE finished_at<? "
+            "ORDER BY created_at LIMIT 1000)",
+            (cutoff,),
+        )
         for table, stamp, cap in (
             ("broadcast_quality_history", "observed_at", MAX_SAMPLES),
             ("broadcast_diagnostic_events", "received_at", MAX_EVENTS),
