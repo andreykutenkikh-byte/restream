@@ -19,11 +19,74 @@ from test_transmission_browser import (
     screenshot,
 )
 
-from app.broadcast.network_models import NETWORK_CAPABILITY, IngressMeasurement, LinkMeasurement
+from app.broadcast.network_models import (
+    NETWORK_CAPABILITY,
+    IngressMeasurement,
+    LinkMeasurement,
+    ObsMeasurement,
+)
 from app.broadcast.server_quality import QualityReader
 from app.broadcast.server_quality import context as quality_context
 
 __all__ = ["browser", "hud_server", "pytestmark"]
+
+
+def test_compact_monitor_keeps_input_problems_visible(
+    browser: Any, hud_server: Any, admin_password: str
+) -> None:
+    lab = MediaLab(hud_server)
+    ctx = browser.new_context(ignore_https_errors=True, viewport={"width": 390, "height": 844})
+    try:
+        page = ctx.new_page()
+        login(page, hud_server, admin_password)
+        prepare(page, lab.a)
+        with lab.store.database.connect() as db:
+            source = db.execute("SELECT id FROM broadcast_sources").fetchone()[0]
+        token = lab.media.network.pair_obs(source)
+        sample = ObsMeasurement(
+            sequence=1,
+            boot_id="synthetic-ui-obs-boot",
+            active=True,
+            reconnecting=False,
+            duration_ms=10000,
+            total_frames=600,
+            dropped_frames=0,
+            bytes_sent=1000000,
+        )
+        lab.media.network.record_obs(token, sample)
+        with lab.store.transaction() as db:
+            db.execute(
+                "UPDATE broadcast_obs_samples SET observed_at=? WHERE source_id=?",
+                ((datetime.now(UTC) - timedelta(seconds=5)).isoformat(), source),
+            )
+        lab.media.network.record_obs(
+            token,
+            sample.model_copy(
+                update=dict(
+                    sequence=2,
+                    reconnecting=True,
+                    duration_ms=15000,
+                    total_frames=900,
+                    dropped_frames=7,
+                    bytes_sent=6000000,
+                )
+            ),
+        )
+        page.locator("#tx-refresh").click()
+        expect(page.locator(".tx-monitor-details")).not_to_have_attribute("open", "")
+        expect(page.locator("#tx-input-warning")).to_be_visible()
+        expect(page.locator("#tx-input-warning")).to_contain_text("OBS пропустил кадров: 7")
+        expect(page.locator("#tx-input-warning")).to_contain_text("Переподключений OBS: 1")
+        expect(page.locator("#tx-input-network")).not_to_be_visible()
+        assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+        with lab.store.database.connect() as db:
+            assert db.execute("SELECT desired_enabled FROM broadcast_outputs").fetchone()[0] == 0
+        page.get_by_text("Подробный мониторинг", exact=True).click()
+        expect(page.locator("#tx-input-network")).to_contain_text("Точные потери пакетов")
+        expect(page.get_by_role("button", name="Подключить статистику OBS")).to_be_visible()
+    finally:
+        ctx.close()
+        lab.close()
 
 
 def test_monitoring_and_armed_output_selection(
@@ -78,7 +141,13 @@ def test_monitoring_and_armed_output_selection(
                 ),
             )
         page.locator("#tx-refresh").click()
-        expect(target).to_contain_text("22,5 мс")
+        expect(target.locator(".tx-server-facts")).to_contain_text("22,5 мс")
+        expect(page.locator(".tx-monitor-details")).not_to_have_attribute("open", "")
+        expect(page.locator("#tx-input-network")).not_to_be_visible()
+        expect(page.locator("#tx-input-warning")).not_to_be_visible()
+        expect(target.get_by_role("button", name="Проверить скорость до эфира")).not_to_be_visible()
+        page.get_by_text("Подробный мониторинг", exact=True).click()
+        target.get_by_text("Подробнее", exact=True).click()
         expect(page.locator("#tx-input-network")).to_contain_text("10 Мбит/с")
         expect(page.locator("#tx-input-network")).to_contain_text("Точные потери пакетов")
         assert "0 %" not in page.locator("#tx-input-network").inner_text()
@@ -152,11 +221,13 @@ def test_quality_explanation_and_candidates_preserve_manual_selection(
         page.locator("#tx-refresh").click()
         expect(current).to_contain_text("Стабилен по измерениям")
         expect(page.locator("#tx-quality-summary")).to_contain_text("По измерениям подходит")
-        current.get_by_text("Почему такая оценка", exact=True).click()
+        expect(current.locator(".tx-server-details")).not_to_have_attribute("open", "")
+        expect(current.get_by_text("Почему такая оценка", exact=True)).not_to_be_visible()
+        current.get_by_text("Подробнее", exact=True).click()
         expect(current).to_contain_text("не менее 30", ignore_case=True)
         expect(current).to_contain_text("воспроизведение у зрителя")
         page.locator("#tx-refresh").click()
-        expect(current.locator(".tx-quality details")).to_have_attribute("open", "")
+        expect(current.locator(".tx-server-details")).to_have_attribute("open", "")
         assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
         assert connection(page) == original
         with lab.store.database.connect() as db:
