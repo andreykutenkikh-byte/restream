@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from typing import Any
 
 from app.broadcast.models import CAPABILITIES
 from app.broadcast.network_control import NetworkControl
+from app.broadcast.server_quality import assessment, context
 from app.broadcast.store import BroadcastStore
 
 
@@ -18,7 +20,8 @@ def snapshot(store: BroadcastStore, session_id: str | None = None) -> dict[str, 
         nodes = {
             r["node_id"]: dict(r)
             for r in db.execute(
-                "SELECT m.node_id,m.enabled,m.capabilities_json,m.last_seen_at,n.revoked_at "
+                "SELECT m.node_id,m.enabled,m.capabilities_json,m.last_seen_at,"
+                "m.boot_id,n.revoked_at "
                 "FROM broadcast_media_nodes m JOIN restream_nodes n ON n.id=m.node_id"
             )
         }
@@ -51,6 +54,16 @@ def snapshot(store: BroadcastStore, session_id: str | None = None) -> dict[str, 
                     "WHERE output_id=? AND state='ACTIVE' AND expires_at>?",
                     (output["id"], now.isoformat()),
                 ).fetchone()[0]
+                scopes = {r["id"]: context(db, r["id"]) for r in output["routes"]}
+                boots: dict[str, str | None] = {
+                    r["id"]: hashlib.sha256(
+                        str(nodes.get(r["node_id"], {}).get("boot_id") or "").encode()
+                    ).hexdigest()[:24]
+                    for r in output["routes"]
+                }
+                history = store.quality.history(
+                    db, output["id"], session["ingress_node_id"], scopes, boots, now
+                )
                 for route in output["routes"]:
                     route["network"] = NetworkControl.route_view(
                         db, route["id"], route["node_id"] == session["ingress_node_id"]
@@ -107,6 +120,27 @@ def snapshot(store: BroadcastStore, session_id: str | None = None) -> dict[str, 
                         "LOST"
                         if fresh and obs and obs["safe_error_code"] == "source_lost"
                         else ("LIVE" if measured else "UNKNOWN")
+                    )
+                    required = max(
+                        session["profile"]["expected_bitrate_bps"],
+                        session["network"]["ingress"].get("bitrate_bps") or 0
+                        if session["network"]["ingress"].get("state") == "FRESH"
+                        else 0,
+                    )
+                    probe_source = db.execute(
+                        "SELECT source_node_id FROM broadcast_network_probe_jobs "
+                        "WHERE route_id=? ORDER BY created_at DESC LIMIT 1",
+                        (route["id"],),
+                    ).fetchone()
+                    quality_network = dict(route["network"])
+                    if probe_source and probe_source[0] != session["ingress_node_id"]:
+                        quality_network.pop("probe", None)
+                    route["quality"] = assessment(
+                        history[route["id"]],
+                        quality_network,
+                        ready=node["server_ready"],
+                        required_bps=required,
+                        now=now.timestamp(),
                     )
                 current = next(r for r in output["routes"] if r["role"] == "current")
                 candidates = [

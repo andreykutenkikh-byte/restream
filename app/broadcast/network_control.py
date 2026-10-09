@@ -389,16 +389,24 @@ class NetworkControl:
     def route_view(db: sqlite3.Connection, route_id: str, local: bool) -> dict[str, Any]:
         if local:
             return {"local": True, "tcp": {"state": "LOCAL"}, "srt": {"state": "LOCAL"}}
+        source = db.execute(
+            "SELECT src.ingress_node_id FROM broadcast_routes r "
+            "JOIN broadcast_outputs o ON o.id=r.output_id "
+            "JOIN broadcast_sessions s ON s.id=o.session_id "
+            "JOIN broadcast_sources src ON src.id=s.source_id WHERE r.id=?",
+            (route_id,),
+        ).fetchone()
         links = {
             r["kind"]: r
             for r in db.execute(
-                "SELECT * FROM broadcast_network_links WHERE route_id=?", (route_id,)
+                "SELECT * FROM broadcast_network_links WHERE route_id=? AND reporter_node_id=?",
+                (route_id, source[0] if source else None),
             )
         }
         job = db.execute(
-            "SELECT * FROM broadcast_network_probe_jobs WHERE route_id=? "
+            "SELECT * FROM broadcast_network_probe_jobs WHERE route_id=? AND source_node_id=? "
             "ORDER BY created_at DESC LIMIT 1",
-            (route_id,),
+            (route_id, source[0] if source else None),
         ).fetchone()
         probe = (
             {

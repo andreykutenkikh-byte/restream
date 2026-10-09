@@ -13,6 +13,7 @@ from contextlib import contextmanager, nullcontext
 from typing import Any, cast
 
 from app.broadcast.models import BroadcastError, OutputCreate, ResourceLimits, SessionCreate
+from app.broadcast.server_quality import QualityReader
 from app.core.security import decrypt_destination_key, encrypt_destination_key
 from app.db import Database, utc_now
 
@@ -24,6 +25,7 @@ class BroadcastStore:
         self.limits = ResourceLimits()
         self.admission: Callable[[sqlite3.Connection, str], None] | None = None
         self.egress_sync: Callable[[sqlite3.Connection, str], None] | None = None
+        self.quality = QualityReader()
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

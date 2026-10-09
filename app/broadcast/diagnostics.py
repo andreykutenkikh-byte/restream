@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from app.broadcast.models import BroadcastError
 from app.broadcast.network_control import NetworkControl
+from app.broadcast.server_quality import context
 
 if TYPE_CHECKING:
     from app.broadcast.media_control import MediaHeartbeat, Observation
@@ -43,6 +44,17 @@ def record_sample(
         plan_generation=heartbeat.plan_generation,
         sequence=heartbeat.sequence,
         diagnostics_version=heartbeat.diagnostics_version,
+        assessment_context=context(db, route["id"]),
+        assessment_transition=bool(
+            db.execute(
+                "SELECT 1 FROM broadcast_switches WHERE output_id=? "
+                "AND (active=1 OR updated_at>=?) LIMIT 1",
+                (
+                    route["output_id"],
+                    (datetime.fromisoformat(now) - timedelta(seconds=5)).isoformat(),
+                ),
+            ).fetchone()
+        ),
     )
     source = db.execute(
         "SELECT s.source_id,src.ingress_node_id FROM broadcast_outputs o "
@@ -75,6 +87,8 @@ def record_sample(
                     "publisher_running",
                     "publisher_connected",
                     "safe_error_code",
+                    "assessment_context",
+                    "assessment_transition",
                 )
             ]
         )
@@ -84,7 +98,7 @@ def record_sample(
         (obs.route_id,),
     ).fetchone()
     interval = (
-        5 if route["desired_enabled"] or route["media_warm"] or obs.source_kind != "unknown" else 60
+        5 if route["desired_enabled"] or route["media_warm"] or obs.source_kind != "unknown" else 15
     )
     if previous:
         elapsed = (
@@ -293,7 +307,7 @@ def report(
         "until": end,
         "retention_days": RETENTION_DAYS,
         "sample_interval_seconds": 5,
-        "idle_interval_seconds": 60,
+        "idle_interval_seconds": 15,
         "truncated": {kind: len(rows) > 100 for kind, rows in groups.items()},
         **{kind: rows[:100] for kind, rows in groups.items()},
     }

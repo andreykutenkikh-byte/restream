@@ -15,6 +15,7 @@ from pydantic import Field, SecretStr, field_validator
 from app.broadcast.media_control import MediaControl
 from app.broadcast.models import CAPABILITIES, BroadcastError, Input, OutputCreate, SessionCreate
 from app.broadcast.read_model import snapshot
+from app.broadcast.server_quality import recommend
 from app.broadcast.store import BroadcastStore
 from app.broadcast.switching import SwitchController
 from app.db import utc_now
@@ -437,6 +438,14 @@ class BroadcastPresentation:
                             )
                             else None
                         )
+                    for route in output["routes"]:
+                        if route["admission_error"]:
+                            route["quality"] = {
+                                **route["quality"],
+                                "state": "UNAVAILABLE",
+                                "reasons": ["server_unavailable"],
+                            }
+                    output["quality_recommendation"] = recommend(output["routes"])
                     # Managed v2 has no source-scoped preview in this candidate.
                     # Reusing the legacy node preview could show an unrelated stream.
                     output["preview"] = {

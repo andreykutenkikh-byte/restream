@@ -49,6 +49,18 @@
 .tx-input-network h3 { font-size:15px; margin:22px 0 10px; }
 .tx-input-network p { font-size:12px; color:#706b64; }
 .tx-network-note { font-size:11px !important; }
+.tx-quality-summary { padding:12px 14px; border-radius:8px; background:#edf1ee; font-size:13px; line-height:1.6; }
+.tx-quality { margin-top:14px; padding:12px; border-radius:8px; border-left:3px solid #a4aba7; background:#f3f4f1; }
+.tx-quality-label { display:block; font-size:13px; line-height:1.5; color:#3c4941; }
+.tx-quality[data-quality="STABLE"] { border-color:#2b7c55; background:#edf6ee; }
+.tx-quality[data-quality="HISTORY"], .tx-quality[data-quality="PRECHECK"] { border-color:#6885a1; background:#eef3f7; }
+.tx-quality[data-quality="RISK"] { border-color:#a97719; background:#fbf4e6; }
+.tx-quality[data-quality="PROBLEM"], .tx-quality[data-quality="UNAVAILABLE"] { border-color:#b5453c; background:#fbefec; }
+.tx-quality[data-quality="RISK"] .tx-quality-label { color:#795214; }
+.tx-quality[data-quality="PROBLEM"] .tx-quality-label, .tx-quality[data-quality="UNAVAILABLE"] .tx-quality-label { color:#912c25; }
+.tx-quality-choice { display:block; margin-top:4px; font-size:11px; color:#3c5361; }
+.tx-quality .tx-network-metrics { margin:12px 0 0; }
+.tx-quality details p { font-size:12px; line-height:1.6; }
 .tx-notice { margin:0 0 18px; padding:16px 20px; border:1px solid #d6c29b; border-radius:12px; background:#fbf4e5; font-size:14px; }
 .tx-notice p { margin:4px 0 10px; }
 .tx-notice[data-state="complete"] { background:#f1f7f2; border-color:#b8cfbd; }
