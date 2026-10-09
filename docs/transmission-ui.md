@@ -37,6 +37,23 @@ the original SRT-only and UI-only scope statements.
 
 ## User path
 
+The main screen keeps a compact broadcast state and server choice. Connection
+cards show the saved OBS and YouTube setup. Each server row shows its address,
+quality assessment, measured ping and the latest bounded speed test, with the
+manual select/switch action always visible. The selected server is listed first,
+then the recommended primary and reserve. This sorting never changes intent.
+
+**Подробнее** opens the evidence, queues, frame rate, SRT counters, speed-test
+action and optional source handoff for that server. **Подробный мониторинг** opens
+OBS telemetry, the actual last YouTube response, preview availability and the
+diagnostic history. Both are closed on initial load. Server disclosures retain
+their open state and keyboard focus through polling and changes of node order.
+Unknown measurements remain unknown; the compact view never calls them zero.
+Expired speed measurements are labelled as stale. Fresh OBS frame skips,
+reconnects, ingress SRT drops and reported YouTube problems appear on the main
+screen even with monitoring closed. Admission/switch errors and pending/failed
+operations remain visible beside the affected action.
+
 1. After login, **Трансляция** is the main screen. Use **Получить подключение →
    Подготовить подключение**, choose the actual public media ingress, then
    **Скопировать адрес**. In OBS, choose Custom under Settings → Stream, paste

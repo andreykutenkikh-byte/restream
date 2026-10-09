@@ -49,6 +49,7 @@
     row.append(el("dt", title), detail); list.append(row);
   };
   const serverAddress = (node) => node?.ip_address || "IP-адрес не определён";
+  const qualityLabels = { STABLE: "Стабилен по измерениям", HISTORY: "Стабилен в прошлом тесте", PRECHECK: "Предварительная проверка пройдена", RISK: "Есть риск сбоев", PROBLEM: "Выявлены сбои", UNTESTED: "Нужен тест видеопотока", UNAVAILABLE: "Сервер недоступен" };
   const el = (tag, text, className) => {
     const node = document.createElement(tag);
     if (text !== undefined) node.textContent = text;
@@ -269,19 +270,27 @@
     const recommendation = output?.quality_recommendation;
     const suggested = recommendation?.route_ids?.map(id => output.routes.find(r => r.id === id)).filter(Boolean) || [];
     const names = suggested.map(r => serverAddress(state.nodes.find(n => n.id === r.node_id)));
-    $("tx-quality-summary").textContent = stale ? "Оценка недоступна: обновите состояние панели." : !output ? "Оценка появится после подготовки эфира." : names.length ? `${recommendation.basis === "STABLE" ? "По измерениям подходит" : recommendation.basis === "HISTORY" ? "Лучший по прошлым наблюдениям" : "Предварительный выбор"}: ${names[0]}.${names[1] ? ` Резерв: ${names[1]}.` : ""}${recommendation.basis !== "STABLE" ? " Нужна проверка видеопотоком." : ""} Сервер выбираете вы.` : "Проверенного кандидата пока нет. Запустите контрольный эфир; оценка обновляется автоматически.";
+    $("tx-quality-summary").textContent = stale ? "Оценка недоступна: обновите состояние панели." : !output ? "Оценка появится после подготовки эфира." : names.length ? `${recommendation.basis === "STABLE" ? "По измерениям подходит" : recommendation.basis === "HISTORY" ? "Лучший в прошлом тесте" : "Предварительный выбор"}: ${names[0]}.${names[1] ? ` Резерв: ${names[1]}.` : ""}${recommendation.basis !== "STABLE" ? " Проверьте видеопотоком." : ""}` : "Для оценки стабильности нужен контрольный эфир.";
     const nodes = [...(state?.nodes || [])];
-    const rank = (node) => output?.routes.some((r) => r.node_id === node.id && r.role === "current") ? 0 : node.setup_error ? 2 : 1;
+    const rank = (node) => output?.routes.some((r) => r.node_id === node.id && r.role === "current") ? 0 : node.setup_error ? 4 : suggested.some(r => r.node_id === node.id) ? 1 + suggested.findIndex(r => r.node_id === node.id) : 3;
     nodes.sort((a, b) => rank(a) - rank(b));
     for (const node of nodes) {
       const route = output?.routes.find((r) => r.node_id === node.id);
-      const card = el("div", undefined, "tx-server"), title = el("div", undefined, "tx-server-title");
+      const card = el("div", undefined, "tx-server"), title = el("div", undefined, "tx-server-title"), actions = el("div", undefined, "tx-server-actions");
+      card.setAttribute("role", "group"); card.setAttribute("aria-label", `Сервер ${serverAddress(node)}`);
+      const detail = el("details", undefined, "tx-server-details"); detail.dataset.detail = "monitoring";
+      detail.append(el("summary", "Подробнее"));
+      const body = el("div", undefined, "tx-detail-body"); detail.append(body);
       card.dataset.nodeId = node.id; card.dataset.outputId = output?.id || ""; card.dataset.current = String(route?.role === "current");
       title.append(el("strong", serverAddress(node)));
       if (route?.role === "current") title.append(el("span", output.desired_enabled ? "Используется" : "Выбран", "tx-current"));
       card.append(title);
-      if (route) renderQuality(card, route, recommendation);
-      if (route) renderNetwork(card, route, session, output);
+      if (route) {
+        renderQualitySummary(card, route, recommendation);
+        renderQuickNetwork(card, route);
+        renderQuality(body, route);
+        renderNetwork(body, route, session, output);
+      }
       if (node.setup_error) {
         const installing = ["node_install_failed", "node_install_in_progress"].includes(node.setup_error);
         let reason = installing ? explain(node.setup_error) : node.mode === "legacy_static" ? "Сервер не настроен для передачи видео и управляемого переключения." : explain(node.setup_error);
@@ -295,47 +304,73 @@
           };
           if (failures[node.installation_error]) reason += ` ${failures[node.installation_error]}`;
         }
-        card.append(el("p", reason), link("Управление сервером", "/servers"));
+        if (!route) card.append(el("p", "Требует настройки", "tx-quality-label"));
+        body.append(el("p", reason)); actions.append(link("Настроить сервер", "/servers"));
       } else if (!output) card.append(el("p", "Выберите эфир или подготовьте подключение."));
       else if (!route) {
-        card.append(el("p", "Можно добавить к этому эфиру. Пригодность маршрута будет проверена отдельно."));
-        card.append(button("Добавить сервер к эфиру", () => action(() => api(`/api/broadcasts/outputs/${output.id}/routes`, { node_id: node.id }, `route:${output.id}:${node.id}`)), busy || stale || output.switch?.active));
-      } else if (route.role === "current") card.append(el("p", stale ? "Нет данных" : route.admission_error ? explain(route.admission_error) : route.egress_link.state === "CONNECTED" ? "Отправка работает" : output.desired_enabled ? "Ожидаем подтверждения отправки" : output.stop_confirmed ? "Отправка остановлена" : "Останавливаем…"));
-      else if (!output.desired_enabled) {
-        card.append(el("p", stale ? "Нет данных" : route.selection_error ? explain(route.selection_error) : "Можно выбрать до начала отправки. Адрес OBS останется прежним."));
-        card.append(button("Выбрать для отправки", () => action(() => api(`/api/broadcasts/outputs/${output.id}/server`, { target_route_id: route.id }, `select:${output.id}:${route.id}`), `Выбран сервер ${serverAddress(node)}. Нажмите «Начать отправку», когда источник готов.`), busy || stale || Boolean(route.selection_error)));
+        card.append(el("p", "Ещё не добавлен к эфиру", "tx-server-note"));
+        actions.append(button("Добавить сервер к эфиру", () => action(() => api(`/api/broadcasts/outputs/${output.id}/routes`, { node_id: node.id }, `route:${output.id}:${node.id}`)), busy || stale || output.switch?.active));
+      } else if (route.role === "current") {
+        if (route.admission_error && !stale) card.append(el("p", explain(route.admission_error), "tx-server-error"));
+        body.append(el("p", stale ? "Нет данных" : route.admission_error ? explain(route.admission_error) : route.egress_link.state === "CONNECTED" ? "Отправка работает" : output.desired_enabled ? "Ожидаем подтверждения отправки" : output.stop_confirmed ? "Отправка остановлена" : "Останавливаем…"));
+      } else if (!output.desired_enabled) {
+        if (route.selection_error && !stale) card.append(el("p", explain(route.selection_error), "tx-server-error"));
+        actions.append(button("Выбрать для отправки", () => action(() => api(`/api/broadcasts/outputs/${output.id}/server`, { target_route_id: route.id }, `select:${output.id}:${route.id}`), `Выбран сервер ${serverAddress(node)}. Нажмите «Начать отправку», когда источник готов.`), busy || stale || Boolean(route.selection_error)));
       } else {
-        card.append(el("p", stale ? "Нет данных" : route.switch_error ? explain(route.switch_error) : "Доступен для подготовки переключения. Оценка маршрута показана выше."));
-        if (route.switch_error === "youtube_dual_ingest_required") card.append(button("Добавить резервный адрес YouTube", () => youtubeDialog(output, true), busy || stale));
-        card.append(button("Переключить передачу на этот сервер", () => switchDialog(session, output, route, false), busy || stale || Boolean(route.switch_error)));
+        if (route.switch_error && !stale) card.append(el("p", explain(route.switch_error), "tx-server-error"));
+        if (route.switch_error === "youtube_dual_ingest_required") actions.append(button("Добавить резервный адрес YouTube", () => youtubeDialog(output, true), busy || stale));
+        actions.append(button("Переключить передачу на этот сервер", () => switchDialog(session, output, route, false), busy || stale || Boolean(route.switch_error)));
         const details = el("details"), summary = el("summary", "Сменить также подключение источника");
+        details.dataset.detail = "handoff";
         details.append(summary, button("Переключить подключение OBS/Moblin", () => switchDialog(session, output, route, true), busy || stale || Boolean(route.handoff_error)));
         if (route.handoff_error && route.handoff_error !== route.switch_error) details.append(el("p", explain(route.handoff_error)));
-        card.append(details);
+        body.append(details);
         // A stopped OBS input may leave sending intent armed from the previous broadcast.
         // This explicit action first obtains normal publisher-stop proof, then selects.
         if (!fresh(session.network?.ingress) && !output.switch?.active) {
-          card.append(button("Выбрать до следующего эфира", () => selectBeforeStream(output, route, node), busy || stale || Boolean(route.admission_error)));
+          body.append(button("Выбрать до следующего эфира", () => selectBeforeStream(output, route, node), busy || stale || Boolean(route.admission_error)));
         }
       }
+      if (actions.childElementCount) card.append(actions);
+      if (body.childElementCount) card.append(detail);
       items.push(card);
     }
     if (!items.length) items.push(el("p", "Нет подготовленного сервера приёма. Подключите сервер в управлении серверами."));
     // Keep focus and expanded secondary actions stable during unchanged polls.
     const signature = items.map((i) => i.outerHTML).join("");
     if (box.dataset.signature !== signature) {
-      const expanded = new Map([...box.querySelectorAll(".tx-server")].map(card => [card.dataset.nodeId, [...card.querySelectorAll("details")].map(d => d.open)]));
-      for (const card of items) [...card.querySelectorAll("details")].forEach((d, i) => { d.open = Boolean(expanded.get(card.dataset.nodeId)?.[i]); });
+      const expanded = new Map([...box.querySelectorAll(".tx-server")].map(card => [card.dataset.nodeId, new Map([...card.querySelectorAll("details")].map(d => [d.dataset.detail, d.open]))]));
+      for (const card of items) for (const d of card.querySelectorAll("details")) d.open = Boolean(expanded.get(card.dataset.nodeId)?.get(d.dataset.detail));
       const focused = document.activeElement, focusedCard = focused?.closest(".tx-server");
       const focusNode = focusedCard?.dataset.nodeId, focusText = focused?.tagName === "BUTTON" ? focused.textContent : null;
+      const focusDetail = focused?.tagName === "SUMMARY" ? focused.parentElement.dataset.detail : null;
       box.replaceChildren(...items); box.dataset.signature = signature;
       if (focusNode && focusText) [...box.querySelectorAll(".tx-server button")].find(b => b.closest(".tx-server").dataset.nodeId === focusNode && b.textContent === focusText && !b.disabled)?.focus({ preventScroll: true });
+      if (focusNode && focusDetail) [...box.querySelectorAll(".tx-server summary")].find(s => s.closest(".tx-server").dataset.nodeId === focusNode && s.parentElement.dataset.detail === focusDetail)?.focus({ preventScroll: true });
     }
   }
-  function renderQuality(card, route, recommendation) {
+  function renderQualitySummary(card, route, recommendation) {
     const q = route.quality;
     if (!q) return;
-    const labels = { STABLE: "Стабилен по измерениям", HISTORY: "Стабилен в прошлом тесте", PRECHECK: "Предварительная проверка пройдена", RISK: "Есть риск сбоев", PROBLEM: "Выявлены сбои", UNTESTED: "Нужен тест видеопотока", UNAVAILABLE: "Сервер недоступен" };
+    const grade = el("div", undefined, "tx-quality"); grade.dataset.quality = stale ? "UNTESTED" : q.state;
+    grade.append(el("strong", stale ? "Нет свежего состояния" : qualityLabels[q.state] || "Нет оценки", "tx-quality-label"));
+    const position = recommendation?.route_ids?.indexOf(route.id);
+    if (!stale && position >= 0) grade.append(el("span", position === 0 ? "Рекомендуем" : "Резерв", "tx-quality-choice"));
+    card.append(grade);
+  }
+  function renderQuickNetwork(card, route) {
+    if (route.network?.local) { card.append(el("p", "Приём и отправка на одном сервере", "tx-server-facts")); return; }
+    const network = route.network || {}, check = network.tcp, probe = network.probe;
+    const speedKnown = !stale && probe?.state === "COMPLETED" && probe.throughput_bps != null;
+    const speedFresh = speedKnown && Date.now() - new Date(probe.finished_at).getTime() <= 6 * 3600000;
+    const facts = el("div", undefined, "tx-server-facts");
+    facts.append(el("span", `Пинг: ${fresh(check) && check.reachable && check.rtt_ms != null ? `${number(check.rtt_ms)} мс` : fresh(check) && !check.reachable ? "нет ответа" : "не измерен"}`));
+    facts.append(el("span", `Замер скорости: ${speedFresh ? `${route.quality?.probe_capped ? "≥ " : ""}${bitrate(probe.throughput_bps)}` : speedKnown ? "устарел" : "не выполнен"}`));
+    card.append(facts);
+  }
+  function renderQuality(card, route) {
+    const q = route.quality;
+    if (!q) return;
     const reasons = {
       server_unavailable: "Сервер не готов к отправке или перестал отвечать.",
       sustained_backlog: "Видео долго накапливалось в очереди отправки.",
@@ -357,16 +392,12 @@
       history_limited: "История ограничена; часть периода не попала в оценку.",
       not_enough_stream_observation: "Для устойчивой оценки нужно 30 минут наблюдения работающего видеопотока.",
     };
-    const grade = el("div", undefined, "tx-quality"), label = el("strong", stale ? "Нет свежего состояния" : labels[q.state] || "Нет оценки", "tx-quality-label");
-    grade.dataset.quality = stale ? "UNTESTED" : q.state;
-    grade.append(label);
-    const position = recommendation?.route_ids?.indexOf(route.id);
-    if (!stale && position >= 0) grade.append(el("span", position === 0 ? "Первый выбор по оценке" : "Резерв по оценке", "tx-quality-choice"));
+    const grade = el("div", undefined, "tx-quality-detail");
     const metrics = el("dl", undefined, "tx-network-metrics");
     metric(metrics, "Проверено видеопотоком", q.observed_seconds ? `${number(q.observed_seconds / 60)} мин` : "Пока не проверено");
     metric(metrics, "Запас в TCP-проверке", q.probe_headroom_ratio != null ? `${q.probe_capped ? "≥ " : ""}${number(q.probe_headroom_ratio, 2)}×` : route.network?.local ? "Не применимо" : "Не измерен");
     grade.append(metrics);
-    const details = el("details"), summary = el("summary", "Почему такая оценка");
+    const details = el("div", undefined, "tx-quality-reasons"), summary = el("h4", "Почему такая оценка");
     details.append(summary);
     for (const code of q.reasons || []) if (reasons[code]) details.append(el("p", reasons[code]));
     if (q.last_stream_at) details.append(el("p", `Последнее наблюдение видео: ${new Date(q.last_stream_at).toLocaleString("ru-RU")}.`));
@@ -377,6 +408,7 @@
     if (q.tcp_samples) details.append(el("p", `TCP за 15 мин: ${number(q.tcp_p50_ms)} мс обычно, ${number(q.tcp_p95_ms)} мс для 95% выборок. Неудачных проверок: ${number(q.tcp_failed_samples, 0)} из ${number(q.tcp_samples, 0)}. Это проверки соединения, не процент потерь видео.`));
     if (q.overhead_percent != null) details.append(el("p", `Дополнительный трафик SRT: ${number(q.overhead_percent)}% к полезному видео. Повторы восстанавливают передачу и не равны окончательным потерям.`));
     details.append(el("p", `Переходные интервалы исключены: ${number(q.transition_seconds / 60)} мин. Пропуски измерений и неподтверждённый вход: ${number(q.unknown_seconds / 60)} мин. Оценка не подтверждает воспроизведение у зрителя.`));
+    details.append(el("p", "Оценка учитывает последние 24 часа. Для подтверждения стабильности нужно не менее 30 минут видеопотока. Проверка скорости до эфира даёт только предварительную оценку."));
     grade.append(details); card.append(grade);
   }
   function renderNetwork(card, route, session, output) {
@@ -478,7 +510,7 @@
     if (output) $("tx-diagnostics").href = `/broadcasts/outputs/${encodeURIComponent(output.id)}/diagnostics`;
     const ingress = state?.nodes.find((n) => n.id === session?.ingress_node_id);
     $("obs-node").textContent = ingress ? `Сервер приёма: ${serverAddress(ingress)}` : "Адрес выдаётся выбранным сервером приёма.";
-    $("obs-state").textContent = output ? "Подключение сохранено. Получите действующий адрес по кнопке ниже." : outputs.length ? "Выберите эфир, чтобы получить его подключение." : "Адрес для OBS и Moblin. Ключ YouTube сюда не нужен.";
+    $("obs-state").textContent = output ? "Подключение сохранено" : outputs.length ? "Выберите эфир" : "Адрес для OBS и Moblin";
     const current = output?.routes.find((r) => r.role === "current");
     const startError = !output ? "Подготовьте подключение или выберите эфир." : !output.credential_stored ? "Сохраните ключ YouTube." : output.switch?.active ? explain("switch_in_progress") : !output.desired_enabled && !output.stop_confirmed ? "Ожидаем подтверждения остановки отправки." : !output.desired_enabled && current.admission_error ? explain(current.admission_error) : "";
     $("send-action").disabled = busy || stale || Boolean(startError);
@@ -498,6 +530,16 @@
     const platform = known && yt ? [yt.lifecycle_status, yt.stream_status, yt.health_status].filter((value) => value && value !== "unknown").map((value) => platformLabels[value] || value) : [];
     $("platform-status").textContent = platform.length ? `Последний ответ: ${platform.join(" · ")}` : "Нет данных";
     const egress = state?.nodes.find((n) => n.id === current?.node_id);
+    $("tx-selected-server").textContent = egress ? serverAddress(egress) : "Не выбран";
+    const obs = session?.network?.obs, inputSrt = session?.network?.ingress;
+    const warnings = [];
+    if (fresh(obs) && obs.dropped_frames_delta > 0) warnings.push(`OBS пропустил кадров: ${number(obs.dropped_frames_delta, 0)}`);
+    if (fresh(obs) && obs.reconnects_delta > 0) warnings.push(`Переподключений OBS: ${number(obs.reconnects_delta, 0)}`);
+    if (fresh(inputSrt) && inputSrt.protocol === "srt" && inputSrt.dropped_packets > 0) warnings.push(`Отброшено на входе SRT: ${number(inputSrt.dropped_packets, 0)}`);
+    $("tx-input-warning").hidden = !warnings.length;
+    $("tx-input-warning").textContent = warnings.length ? `${warnings.join(" · ")}. Подробности в мониторинге.` : "";
+    $("tx-platform-warning").hidden = !(known && yt && (yt.health_status === "bad" || yt.lifecycle_status === "revoked"));
+    $("tx-platform-warning").textContent = $("tx-platform-warning").hidden ? "" : `В последнем ответе YouTube отмечена проблема: ${platform.join(" · ")}.`;
     $("tx-topology").textContent = output ? `OBS / Moblin → приём: ${serverAddress(ingress)} → передача: ${serverAddress(egress)} → YouTube` : "Маршрут появится после подготовки подключения.";
     renderInputNetwork(session); renderServers(session, output); operation(session, output);
   }

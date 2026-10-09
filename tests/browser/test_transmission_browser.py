@@ -162,6 +162,7 @@ def test_stream_diagnostics_page_period_and_export(
         page = context.new_page()
         login(page, hud_server, admin_password)
         prepare(page, lab.a)
+        page.get_by_text("Подробный мониторинг", exact=True).click()
         page.get_by_role("link", name="История качества и диагностика").click()
         expect(page.get_by_role("heading", name="Диагностика эфира", exact=True)).to_be_visible()
         expect(page.locator("#diagnostic-timezone")).to_contain_text("Часовой пояс:")
@@ -248,7 +249,10 @@ def test_failed_installation_is_not_offered_as_a_legacy_or_ready_route(
         expect(card).to_contain_text("Не удалось установить Docker")
         expect(card).not_to_contain_text("Legacy")
         expect(card.get_by_role("button")).to_have_count(0)
-        expect(card.get_by_role("link", name="Управление сервером")).to_be_visible()
+        expect(card.get_by_role("link", name="Настроить сервер")).to_be_visible()
+        expect(card.get_by_text("Подробнее", exact=True)).to_be_visible()
+        card.get_by_text("Подробнее", exact=True).click()
+        expect(card).to_contain_text("Не удалось установить Docker")
         with store.transaction() as db:
             db.execute("UPDATE restream_nodes SET status='installing' WHERE id=?", (node_id,))
         page.locator("#tx-refresh").click()
@@ -355,6 +359,7 @@ def test_first_setup_copy_key_switch_reload_and_multiple_choice(
             )
         screenshot(page, browser, size, "configured")
         old = page.locator(f'[data-node-id="{lab.a}"]')
+        old.get_by_text("Подробнее", exact=True).click()
         old.get_by_text("Сменить также подключение источника", exact=True).click()
         old.get_by_role("button", name="Переключить подключение OBS/Moblin", exact=True).click()
         expect(page.get_by_role("dialog")).to_contain_text(
